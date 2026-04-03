@@ -54,7 +54,8 @@ export default function Board() {
       setDelegated(delegatedRes)
       setDone(doneRes)
 
-      for (const task of delegatedRes) {
+      // Fetch agent runs for delegated and done tasks (done tasks may have agent history)
+      for (const task of [...delegatedRes, ...doneRes]) {
         try {
           const runsRes = await fetch(`/api/agent/runs?task_id=${task.id}`)
           if (!runsRes.ok) continue
@@ -330,13 +331,22 @@ export default function Board() {
           count={done.length}
           isOver={overColumn === 'done' && getColumn(activeId!) !== 'done'}
         >
-          <SortableContext items={done.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+          <SortableContext items={done.filter((t) => !agentRuns[t.id]).map((t) => t.id)} strategy={verticalListSortingStrategy}>
             {done.length === 0 ? (
               <EmptyColumn>No completed items</EmptyColumn>
             ) : (
-              done.map((task) => (
-                <SortableTaskCard key={task.id} task={task} />
-              ))
+              done.map((task) =>
+                agentRuns[task.id] ? (
+                  <AgentCard
+                    key={task.id}
+                    task={task}
+                    run={agentRuns[task.id]}
+                    messages={agentMessages[agentRuns[task.id].ID] || []}
+                  />
+                ) : (
+                  <SortableTaskCard key={task.id} task={task} />
+                )
+              )
             )}
           </SortableContext>
         </DroppableColumn>
