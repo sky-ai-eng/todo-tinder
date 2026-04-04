@@ -1,5 +1,10 @@
 import { useState, useEffect } from 'react'
 
+interface JiraStatus {
+  id: string
+  name: string
+}
+
 interface SettingsData {
   github: {
     enabled: boolean
@@ -13,6 +18,8 @@ interface SettingsData {
     has_token: boolean
     poll_interval: string
     projects: string[]
+    pickup_statuses: string[]
+    in_progress_status: string
   }
   server: { port: number }
   ai: {
@@ -34,11 +41,15 @@ export default function Settings() {
     github_poll_interval: '60s',
     jira_poll_interval: '60s',
     jira_projects: '',
+    jira_pickup_statuses: [] as string[],
+    jira_in_progress_status: '',
     ai_model: 'sonnet',
     server_port: 3000,
   })
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [jiraStatuses, setJiraStatuses] = useState<JiraStatus[]>([])
+  const [statusesLoading, setStatusesLoading] = useState(false)
 
   useEffect(() => {
     fetch('/api/settings')
@@ -55,11 +66,35 @@ export default function Settings() {
           github_poll_interval: d.github.poll_interval,
           jira_poll_interval: d.jira.poll_interval,
           jira_projects: (d.jira.projects || []).join(', '),
+          jira_pickup_statuses: d.jira.pickup_statuses || [],
+          jira_in_progress_status: d.jira.in_progress_status || '',
           ai_model: d.ai.model,
           server_port: d.server.port,
         })
+        // Fetch available statuses if Jira is configured with projects
+        if (d.jira.enabled && d.jira.projects?.length > 0) {
+          fetchJiraStatuses(d.jira.projects)
+        }
       })
   }, [])
+
+  const fetchJiraStatuses = async (projects?: string[]) => {
+    setStatusesLoading(true)
+    try {
+      const projectList = projects || form.jira_projects.split(',').map((s) => s.trim()).filter(Boolean)
+      if (projectList.length === 0) return
+      const params = projectList.map((p) => `project=${encodeURIComponent(p)}`).join('&')
+      const res = await fetch(`/api/jira/statuses?${params}`)
+      if (res.ok) {
+        const statuses: JiraStatus[] = await res.json()
+        setJiraStatuses(statuses)
+      }
+    } catch {
+      // Non-critical — statuses just won't be selectable
+    } finally {
+      setStatusesLoading(false)
+    }
+  }
 
   const update = (field: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
     setForm((f) => ({ ...f, [field]: e.target.value }))
@@ -88,6 +123,8 @@ export default function Settings() {
           github_poll_interval: form.github_poll_interval,
           jira_poll_interval: form.jira_poll_interval,
           jira_projects: projects,
+          jira_pickup_statuses: form.jira_pickup_statuses,
+          jira_in_progress_status: form.jira_in_progress_status,
           ai_model: form.ai_model,
           server_port: form.server_port,
         }),
@@ -206,14 +243,64 @@ export default function Settings() {
                 </select>
               </Field>
               <Field label="Projects (comma-separated)">
-                <input
-                  type="text"
-                  placeholder="PROJ, INFRA"
-                  value={form.jira_projects}
-                  onChange={update('jira_projects')}
-                  className={inputClass}
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="PROJ, INFRA"
+                    value={form.jira_projects}
+                    onChange={update('jira_projects')}
+                    className={inputClass + ' flex-1'}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fetchJiraStatuses()}
+                    disabled={statusesLoading || !form.jira_projects.trim()}
+                    className="shrink-0 text-[11px] text-accent hover:text-accent/80 disabled:opacity-40 border border-accent/20 rounded-xl px-3 py-2 transition-colors"
+                  >
+                    {statusesLoading ? 'Loading...' : 'Fetch Statuses'}
+                  </button>
+                </div>
               </Field>
+              {jiraStatuses.length > 0 && (
+                <>
+                  <Field label="Pickup statuses (poll for these unassigned tickets)">
+                    <div className="flex flex-wrap gap-2">
+                      {jiraStatuses.map((s) => (
+                        <StatusChip
+                          key={s.id}
+                          label={s.name}
+                          selected={form.jira_pickup_statuses.includes(s.name)}
+                          onClick={() =>
+                            setForm((f) => ({
+                              ...f,
+                              jira_pickup_statuses: f.jira_pickup_statuses.includes(s.name)
+                                ? f.jira_pickup_statuses.filter((n) => n !== s.name)
+                                : [...f.jira_pickup_statuses, s.name],
+                            }))
+                          }
+                        />
+                      ))}
+                    </div>
+                  </Field>
+                  <Field label="In-progress status (set when you claim a ticket)">
+                    <div className="flex flex-wrap gap-2">
+                      {jiraStatuses.map((s) => (
+                        <StatusChip
+                          key={s.id}
+                          label={s.name}
+                          selected={form.jira_in_progress_status === s.name}
+                          onClick={() =>
+                            setForm((f) => ({
+                              ...f,
+                              jira_in_progress_status: f.jira_in_progress_status === s.name ? '' : s.name,
+                            }))
+                          }
+                        />
+                      ))}
+                    </div>
+                  </Field>
+                </>
+              )}
             </div>
           )}
         </Section>
@@ -313,6 +400,22 @@ function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean
           enabled ? 'translate-x-4' : 'translate-x-0'
         }`}
       />
+    </button>
+  )
+}
+
+function StatusChip({ label, selected, onClick }: { label: string; selected: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`text-[11px] px-3 py-1.5 rounded-full border transition-colors ${
+        selected
+          ? 'bg-accent/[0.1] border-accent/30 text-accent font-medium'
+          : 'bg-white/50 border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-subtle/80'
+      }`}
+    >
+      {label}
     </button>
   )
 }
