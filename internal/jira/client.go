@@ -83,6 +83,13 @@ func (c *Client) AssignToSelf(issueKey string) error {
 	return c.put(url, payload)
 }
 
+// Unassign removes the assignee from an issue.
+func (c *Client) Unassign(issueKey string) error {
+	url := fmt.Sprintf("%s/rest/api/2/issue/%s/assignee", c.baseURL, issueKey)
+	// Setting assignee to null/nil clears the assignee on both Cloud and Server.
+	return c.put(url, map[string]*string{"accountId": nil, "name": nil})
+}
+
 // TransitionTo transitions an issue to the target status name.
 // It finds the appropriate transition by matching the target status name.
 func (c *Client) TransitionTo(issueKey, targetStatusName string) error {

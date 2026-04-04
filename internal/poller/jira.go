@@ -203,17 +203,18 @@ func (issue jiraIssue) toTask(baseURL string) domain.Task {
 	}
 
 	return domain.Task{
-		ID:          uuid.New().String(),
-		Source:      "jira",
-		SourceID:    issue.Key,
-		SourceURL:   fmt.Sprintf("%s/browse/%s", baseURL, issue.Key),
-		Title:       issue.Fields.Summary,
-		Description: issue.Fields.Description,
-		Author:      author,
-		Labels:      issue.Fields.Labels,
-		Severity:    severity,
-		CreatedAt:   createdAt,
-		FetchedAt:   time.Now(),
-		Status:      "queued",
+		ID:           uuid.New().String(),
+		Source:       "jira",
+		SourceID:     issue.Key,
+		SourceURL:    fmt.Sprintf("%s/browse/%s", baseURL, issue.Key),
+		Title:        issue.Fields.Summary,
+		Description:  issue.Fields.Description,
+		Author:       author,
+		Labels:       issue.Fields.Labels,
+		Severity:     severity,
+		SourceStatus: issue.Fields.Status.Name,
+		CreatedAt:    createdAt,
+		FetchedAt:    time.Now(),
+		Status:       "queued",
 	}
 }

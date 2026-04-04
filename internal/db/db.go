@@ -42,8 +42,18 @@ func Open() (*sql.DB, error) {
 
 // Migrate runs the schema migration on the database.
 func Migrate(db *sql.DB) error {
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	// Add columns that may not exist in older databases (ALTER TABLE IF NOT EXISTS isn't supported).
+	for _, stmt := range migrations {
+		db.Exec(stmt) // Ignore "duplicate column" errors
+	}
+	return nil
+}
+
+var migrations = []string{
+	`ALTER TABLE tasks ADD COLUMN source_status TEXT`,
 }
 
 const schema = `
@@ -63,6 +73,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     files_changed INTEGER,
     ci_status TEXT,
     relevance_reason TEXT,
+    source_status TEXT,
     created_at DATETIME NOT NULL,
     fetched_at DATETIME NOT NULL,
     status TEXT DEFAULT 'queued',

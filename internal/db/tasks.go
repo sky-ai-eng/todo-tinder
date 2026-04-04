@@ -19,8 +19,8 @@ func UpsertTask(db *sql.DB, t domain.Task) error {
 	}
 
 	_, err = db.Exec(`
-		INSERT INTO tasks (id, source, source_id, source_url, title, description, repo, author, labels, severity, diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, created_at, fetched_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO tasks (id, source, source_id, source_url, title, description, repo, author, labels, severity, diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, source_status, created_at, fetched_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(source, source_id) DO UPDATE SET
 			source_url = excluded.source_url,
 			title = excluded.title,
@@ -34,12 +34,13 @@ func UpsertTask(db *sql.DB, t domain.Task) error {
 			files_changed = excluded.files_changed,
 			ci_status = excluded.ci_status,
 			relevance_reason = excluded.relevance_reason,
+			source_status = excluded.source_status,
 			fetched_at = excluded.fetched_at
 	`,
 		t.ID, t.Source, t.SourceID, t.SourceURL,
 		t.Title, t.Description, t.Repo, t.Author,
 		string(labelsJSON), t.Severity, t.DiffAdditions, t.DiffDeletions, t.FilesChanged,
-		t.CIStatus, t.RelevanceReason,
+		t.CIStatus, t.RelevanceReason, t.SourceStatus,
 		t.CreatedAt, t.FetchedAt,
 	)
 	return err
@@ -49,7 +50,7 @@ func UpsertTask(db *sql.DB, t domain.Task) error {
 func QueuedTasks(db *sql.DB) ([]domain.Task, error) {
 	return queryTasks(db, `
 		SELECT id, source, source_id, source_url, title, description, repo, author, labels, severity,
-		       diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, created_at, fetched_at, status, priority_score, ai_summary,
+		       diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, source_status, created_at, fetched_at, status, priority_score, ai_summary,
 		       priority_reasoning, agent_confidence, snooze_until
 		FROM tasks
 		WHERE status = 'queued' AND (snooze_until IS NULL OR snooze_until <= datetime('now'))
@@ -61,7 +62,7 @@ func QueuedTasks(db *sql.DB) ([]domain.Task, error) {
 func TasksByStatus(db *sql.DB, status string) ([]domain.Task, error) {
 	return queryTasks(db, `
 		SELECT id, source, source_id, source_url, title, description, repo, author, labels, severity,
-		       diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, created_at, fetched_at, status, priority_score, ai_summary,
+		       diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, source_status, created_at, fetched_at, status, priority_score, ai_summary,
 		       priority_reasoning, agent_confidence, snooze_until
 		FROM tasks
 		WHERE status = ?
@@ -73,7 +74,7 @@ func TasksByStatus(db *sql.DB, status string) ([]domain.Task, error) {
 func GetTask(db *sql.DB, id string) (*domain.Task, error) {
 	tasks, err := queryTasks(db, `
 		SELECT id, source, source_id, source_url, title, description, repo, author, labels, severity,
-		       diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, created_at, fetched_at, status, priority_score, ai_summary,
+		       diff_additions, diff_deletions, files_changed, ci_status, relevance_reason, source_status, created_at, fetched_at, status, priority_score, ai_summary,
 		       priority_reasoning, agent_confidence, snooze_until
 		FROM tasks
 		WHERE id = ?
@@ -99,7 +100,7 @@ func queryTasks(database *sql.DB, query string, args ...any) ([]domain.Task, err
 		var t domain.Task
 		var labelsStr sql.NullString
 		var desc, repo, author, severity, aiSummary, priorityReasoning sql.NullString
-		var ciStatus, relevanceReason sql.NullString
+		var ciStatus, relevanceReason, sourceStatus sql.NullString
 		var priorityScore, agentConfidence sql.NullFloat64
 		var diffAdditions, diffDeletions, filesChanged sql.NullInt64
 		var snoozeUntil sql.NullTime
@@ -107,7 +108,7 @@ func queryTasks(database *sql.DB, query string, args ...any) ([]domain.Task, err
 		err := rows.Scan(
 			&t.ID, &t.Source, &t.SourceID, &t.SourceURL, &t.Title,
 			&desc, &repo, &author, &labelsStr, &severity,
-			&diffAdditions, &diffDeletions, &filesChanged, &ciStatus, &relevanceReason,
+			&diffAdditions, &diffDeletions, &filesChanged, &ciStatus, &relevanceReason, &sourceStatus,
 			&t.CreatedAt, &t.FetchedAt,
 			&t.Status, &priorityScore, &aiSummary,
 			&priorityReasoning, &agentConfidence, &snoozeUntil,
@@ -124,6 +125,7 @@ func queryTasks(database *sql.DB, query string, args ...any) ([]domain.Task, err
 		t.PriorityReasoning = priorityReasoning.String
 		t.CIStatus = ciStatus.String
 		t.RelevanceReason = relevanceReason.String
+		t.SourceStatus = sourceStatus.String
 		t.DiffAdditions = int(diffAdditions.Int64)
 		t.DiffDeletions = int(diffDeletions.Int64)
 		t.FilesChanged = int(filesChanged.Int64)

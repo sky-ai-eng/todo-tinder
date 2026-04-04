@@ -19,6 +19,7 @@ type Task struct {
 	FilesChanged      int
 	CIStatus          string // "success" | "failure" | "pending" | ""
 	RelevanceReason   string // "review_requested" | "authored" | "mentioned" | "assigned"
+	SourceStatus      string // Original status in external system (e.g. Jira workflow status)
 	CreatedAt         time.Time
 	FetchedAt         time.Time
 	Status            string

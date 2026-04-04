@@ -205,9 +205,24 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	// Read task before undo so we know the source status to revert to
+	task, _ := db.GetTask(s.db, id)
+
 	if err := db.UndoLastSwipe(s.db, id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+
+	// Revert Jira ticket: unassign and transition back to original status
+	if task != nil && task.Source == "jira" && task.SourceStatus != "" && s.jiraClient != nil {
+		go func(issueKey, originalStatus string) {
+			if err := s.jiraClient.Unassign(issueKey); err != nil {
+				log.Printf("[jira] failed to unassign %s on undo: %v", issueKey, err)
+			}
+			if err := s.jiraClient.TransitionTo(issueKey, originalStatus); err != nil {
+				log.Printf("[jira] failed to transition %s back to %q on undo: %v", issueKey, originalStatus, err)
+			}
+		}(task.SourceID, task.SourceStatus)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
