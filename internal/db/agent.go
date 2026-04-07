@@ -13,10 +13,17 @@ import (
 // CreateAgentRun inserts a new agent run.
 func CreateAgentRun(database *sql.DB, run domain.AgentRun) error {
 	_, err := database.Exec(`
-		INSERT INTO agent_runs (id, task_id, status, model, worktree_path)
-		VALUES (?, ?, ?, ?, ?)
-	`, run.ID, run.TaskID, run.Status, run.Model, run.WorktreePath)
+		INSERT INTO agent_runs (id, task_id, prompt_id, status, model, worktree_path)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, run.ID, run.TaskID, nullIfEmpty(run.PromptID), run.Status, run.Model, run.WorktreePath)
 	return err
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // CompleteAgentRun updates a run with completion info.

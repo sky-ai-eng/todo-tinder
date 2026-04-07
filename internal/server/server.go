@@ -78,9 +78,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/jira/statuses", s.handleJiraStatuses)
 
 	s.mux.HandleFunc("GET /api/prompts", s.handlePromptsList)
-	s.mux.HandleFunc("GET /api/prompts/{type}", s.handlePromptGet)
-	s.mux.HandleFunc("PUT /api/prompts/{type}", s.handlePromptPut)
-	s.mux.HandleFunc("DELETE /api/prompts/{type}", s.handlePromptDelete)
+	s.mux.HandleFunc("POST /api/prompts", s.handlePromptCreate)
+	s.mux.HandleFunc("GET /api/prompts/{id}", s.handlePromptGet)
+	s.mux.HandleFunc("PUT /api/prompts/{id}", s.handlePromptPut)
+	s.mux.HandleFunc("DELETE /api/prompts/{id}", s.handlePromptDelete)
+	s.mux.HandleFunc("GET /api/prompts/{id}/bindings", s.handlePromptBindingsGet)
+	s.mux.HandleFunc("PUT /api/prompts/{id}/bindings", s.handlePromptBindingsSet)
 
 	// Frontend: serve embedded SPA, with fallback to index.html for client-side routing
 	s.mux.HandleFunc("/", s.handleFrontend)
@@ -142,21 +145,7 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not yet implemented"})
 }
 
-func (s *Server) handlePromptsList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not yet implemented"})
-}
-
-func (s *Server) handlePromptGet(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not yet implemented"})
-}
-
-func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not yet implemented"})
-}
-
-func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not yet implemented"})
-}
+// Prompt handlers are in prompts_handler.go
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

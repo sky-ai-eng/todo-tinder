@@ -63,7 +63,9 @@ func (s *Spawner) Cancel(runID string) error {
 
 // DelegatePR kicks off an async PR review agent run.
 // It creates the run record, sets up the worktree, spawns claude, and returns the run ID immediately.
-func (s *Spawner) DelegatePR(task domain.Task) (string, error) {
+// DelegatePR kicks off an async PR review agent run.
+// If explicitPromptID is non-empty, that prompt is used instead of the default lookup.
+func (s *Spawner) DelegatePR(task domain.Task, explicitPromptID string) (string, error) {
 	// Parse owner/repo from task
 	owner, repo := parseOwnerRepo(task.Repo)
 	if owner == "" || repo == "" {
@@ -75,14 +77,46 @@ func (s *Spawner) DelegatePR(task domain.Task) (string, error) {
 		return "", fmt.Errorf("invalid PR number from task.SourceID: %q", task.SourceID)
 	}
 
+	// Resolve which prompt to use:
+	// 1. Explicit prompt_id from the frontend picker
+	// 2. Default prompt for the task's event type
+	// No fallback — if no prompt is found, fail loudly
+	var promptID string
+	var mission string
+	if explicitPromptID != "" {
+		p, err := db.GetPrompt(s.database, explicitPromptID)
+		if err != nil {
+			return "", fmt.Errorf("failed to load prompt %s: %w", explicitPromptID, err)
+		}
+		if p == nil {
+			return "", fmt.Errorf("prompt %s not found", explicitPromptID)
+		}
+		promptID = p.ID
+		mission = p.Body
+	} else if task.EventType != "" {
+		p, err := db.FindDefaultPrompt(s.database, task.EventType)
+		if err != nil {
+			return "", fmt.Errorf("failed to look up default prompt for %s: %w", task.EventType, err)
+		}
+		if p != nil {
+			promptID = p.ID
+			mission = p.Body
+		}
+	}
+	if mission == "" {
+		return "", fmt.Errorf("no prompt available for event type %q — configure one on the Prompts page", task.EventType)
+	}
+	db.IncrementPromptUsage(s.database, promptID)
+
 	runID := uuid.New().String()
 
-	// Create agent run record
+	// Create agent run record with prompt reference
 	if err := db.CreateAgentRun(s.database, domain.AgentRun{
-		ID:     runID,
-		TaskID: task.ID,
-		Status: "cloning",
-		Model:  s.model,
+		ID:       runID,
+		TaskID:   task.ID,
+		PromptID: promptID,
+		Status:   "cloning",
+		Model:    s.model,
 	}); err != nil {
 		return "", fmt.Errorf("create agent run: %w", err)
 	}
@@ -90,12 +124,12 @@ func (s *Spawner) DelegatePR(task domain.Task) (string, error) {
 	s.broadcastRunUpdate(runID, "cloning")
 
 	// Run async
-	go s.runPRReview(runID, task, owner, repo, prNumber)
+	go s.runPRReview(runID, task, owner, repo, prNumber, mission)
 
 	return runID, nil
 }
 
-func (s *Spawner) runPRReview(runID string, task domain.Task, owner, repo string, prNumber int) {
+func (s *Spawner) runPRReview(runID string, task domain.Task, owner, repo string, prNumber int, mission string) {
 	// 1. Get PR details for clone URL and head SHA
 	s.updateStatus(runID, "fetching")
 	pr, err := s.ghClient.GetPR(owner, repo, prNumber, false)
@@ -127,8 +161,8 @@ func (s *Spawner) runPRReview(runID string, task domain.Task, owner, repo string
 		return
 	}
 
-	// 4. Build prompt with absolute binary path
-	prompt := buildPRReviewPrompt(owner, repo, prNumber, selfBin)
+	// 4. Build prompt: envelope (tool guidance) + mission (what to do)
+	prompt := buildPrompt(mission, owner, repo, prNumber, selfBin)
 
 	// 5. Spawn claude
 	s.updateStatus(runID, "agent_starting")
@@ -346,14 +380,19 @@ func parseAgentResult(text string) *agentResult {
 	return nil
 }
 
-func buildPRReviewPrompt(owner, repo string, prNumber int, binaryPath string) string {
+// buildPrompt composes the system envelope + mission body, with variable substitution.
+// The envelope provides tool guidance, repo scoping, and completion format.
+// The mission is the user/system prompt that describes what the agent should do.
+func buildPrompt(mission, owner, repo string, prNumber int, binaryPath string) string {
 	r := strings.NewReplacer(
 		"{{OWNER}}", owner,
 		"{{REPO}}", repo,
 		"{{PR_NUMBER}}", fmt.Sprintf("%d", prNumber),
 		"todotinder exec", binaryPath+" exec",
 	)
-	return r.Replace(ai.PRReviewPromptTemplate)
+	envelope := r.Replace(ai.EnvelopeTemplate)
+	body := r.Replace(mission)
+	return body + "\n\n" + envelope
 }
 
 func parseOwnerRepo(s string) (string, string) {

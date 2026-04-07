@@ -15,6 +15,9 @@ import (
 //go:embed prompts/batch-prioritize.txt
 var batchPrioritizePrompt string
 
+//go:embed prompts/envelope.txt
+var EnvelopeTemplate string
+
 //go:embed prompts/pr-review.txt
 var PRReviewPromptTemplate string
 

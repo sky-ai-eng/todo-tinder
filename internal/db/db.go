@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS swipe_events (
 CREATE TABLE IF NOT EXISTS agent_runs (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id),
+    prompt_id TEXT REFERENCES prompts(id),
     status TEXT DEFAULT 'running',
     model TEXT,
     started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -178,6 +179,26 @@ CREATE TABLE IF NOT EXISTS poller_state (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (source, source_id)
 );
+
+CREATE TABLE IF NOT EXISTS prompts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'user',
+    usage_count INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS prompt_bindings (
+    prompt_id TEXT NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    is_default BOOLEAN DEFAULT 0,
+    PRIMARY KEY (prompt_id, event_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_bindings_event_type ON prompt_bindings(event_type);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_prompt_id ON agent_runs(prompt_id);
 
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);

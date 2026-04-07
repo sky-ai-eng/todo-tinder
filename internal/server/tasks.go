@@ -119,6 +119,7 @@ func (s *Server) handleTaskGet(w http.ResponseWriter, r *http.Request) {
 type swipeRequest struct {
 	Action       string `json:"action"`
 	HesitationMs int    `json:"hesitation_ms"`
+	PromptID     string `json:"prompt_id,omitempty"` // optional: explicit prompt for delegation
 }
 
 func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +167,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	if req.Action == "delegate" && s.spawner != nil {
 		task, err := db.GetTask(s.db, id)
 		if err == nil && task != nil && task.Source == "github" {
-			runID, err := s.spawner.DelegatePR(*task)
+			runID, err := s.spawner.DelegatePR(*task, req.PromptID)
 			if err != nil {
 				response["delegate_error"] = err.Error()
 			} else {

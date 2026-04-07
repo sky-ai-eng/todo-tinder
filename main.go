@@ -87,10 +87,11 @@ func main() {
 	// Clean up any orphaned worktrees from crashed runs
 	worktree.Cleanup()
 
-	// Seed event type catalog
+	// Seed event type catalog and default prompts
 	if err := db.SeedEventTypes(database); err != nil {
 		log.Fatalf("failed to seed event types: %v", err)
 	}
+	seedDefaultPrompts(database)
 
 	// Event bus — central pub/sub replacing direct callbacks
 	bus := eventbus.New()

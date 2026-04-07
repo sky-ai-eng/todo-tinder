@@ -6,6 +6,7 @@ import "time"
 type AgentRun struct {
 	ID            string
 	TaskID        string
+	PromptID      string // FK to prompts.id — which prompt was used for this run
 	Status        string // "cloning" | "fetching" | "worktree_created" | "agent_starting" | "running" | "completed" | "failed" | "cancelled"
 	Model         string
 	StartedAt     time.Time
