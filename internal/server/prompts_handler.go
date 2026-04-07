@@ -208,6 +208,16 @@ func (s *Server) handleBindingSetDefault(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, b)
 }
 
+func (s *Server) handlePromptStats(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	stats, err := db.GetPromptStats(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 func (s *Server) handlePromptBindingsGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	bindings, err := db.GetBindingsForPrompt(s.db, id)

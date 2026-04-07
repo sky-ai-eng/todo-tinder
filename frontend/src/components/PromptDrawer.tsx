@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
-import type { PromptBinding } from '../types'
 
 interface Props {
   promptId: string | null
@@ -15,6 +14,18 @@ const TEMPLATE_VARS = [
   { name: '{{REPO}}', desc: 'Repository name' },
   { name: '{{PR_NUMBER}}', desc: 'Pull request number' },
 ]
+
+interface PromptStatsData {
+  total_runs: number
+  completed_runs: number
+  failed_runs: number
+  success_rate: number
+  avg_cost_usd: number
+  avg_duration_ms: number
+  total_cost_usd: number
+  last_used_at: string | null
+  runs_per_day: { date: string; count: number }[]
+}
 
 const MIN_WIDTH = 380
 const MAX_WIDTH = 900
@@ -35,7 +46,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
   const [name, setName] = useState('')
   const [body, setBody] = useState('')
   const [source, setSource] = useState('user')
-  const [bindings, setBindings] = useState<PromptBinding[]>([])
+  const [stats, setStats] = useState<PromptStatsData | null>(null)
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState('')
@@ -51,7 +62,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
       setName('')
       setBody('')
       setSource('user')
-      setBindings([])
+      setStats(null)
       setError('')
       return
     }
@@ -62,10 +73,14 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
         setName(data.prompt.name)
         setBody(data.prompt.body)
         setSource(data.prompt.source)
-        setBindings(data.bindings || [])
         setError('')
       })
       .catch(() => setError('Failed to load prompt'))
+
+    fetch(`/api/prompts/${promptId}/stats`)
+      .then(res => res.json())
+      .then(setStats)
+      .catch(() => setStats(null))
   }, [promptId, isNew])
 
   // Resize drag handlers
@@ -114,7 +129,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
         const res = await fetch('/api/prompts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, body, bindings }),
+          body: JSON.stringify({ name, body }),
         })
         if (!res.ok) throw new Error('Failed to create')
       } else {
@@ -230,27 +245,62 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
                 </div>
               </div>
 
-              {/* Bindings info */}
-              {bindings.length > 0 && (
+              {/* Stats */}
+              {!isNew && stats && stats.total_runs > 0 && (
                 <div>
-                  <label className="block text-[12px] font-medium text-text-secondary mb-1.5">Event Bindings</label>
-                  <div className="space-y-1">
-                    {bindings.map(b => (
-                      <div key={b.event_type} className="flex items-center gap-2 text-[12px]">
-                        <code className="text-text-secondary font-mono bg-black/[0.03] px-1.5 py-0.5 rounded">{b.event_type}</code>
-                        {b.is_default && (
-                          <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-700">Default</span>
-                        )}
+                  <label className="block text-[12px] font-medium text-text-secondary mb-2">Performance</label>
+                  <div className="bg-black/[0.02] rounded-lg border border-border-subtle p-3 space-y-3">
+                    {/* Stat pills */}
+                    <div className="flex gap-2 flex-wrap">
+                      <StatPill label="Runs" value={String(stats.total_runs)} />
+                      <StatPill label="Avg cost" value={`$${stats.avg_cost_usd.toFixed(3)}`} />
+                      <StatPill label="Success" value={`${Math.round(stats.success_rate * 100)}%`} color={stats.success_rate >= 0.8 ? 'text-claim' : stats.success_rate >= 0.5 ? 'text-amber-600' : 'text-dismiss'} />
+                      <StatPill label="Avg time" value={formatDuration(stats.avg_duration_ms)} />
+                    </div>
+
+                    {/* Sparkline */}
+                    {stats.runs_per_day.length > 0 && (
+                      <div>
+                        <div className="flex items-end gap-[2px] h-8">
+                          {stats.runs_per_day.map((d, i) => {
+                            const max = Math.max(...stats.runs_per_day.map(r => r.count), 1)
+                            const pct = d.count / max
+                            return (
+                              <div
+                                key={i}
+                                className="flex-1 rounded-sm transition-all"
+                                style={{
+                                  height: `${Math.max(pct * 100, 4)}%`,
+                                  background: d.count > 0 ? 'var(--color-accent)' : 'var(--color-border-subtle)',
+                                  opacity: d.count > 0 ? 0.7 : 0.3,
+                                }}
+                                title={`${d.date}: ${d.count} run${d.count !== 1 ? 's' : ''}`}
+                              />
+                            )
+                          })}
+                        </div>
+                        <div className="flex justify-between mt-1">
+                          <span className="text-[9px] text-text-tertiary">30d ago</span>
+                          <span className="text-[9px] text-text-tertiary">today</span>
+                        </div>
                       </div>
-                    ))}
+                    )}
+
+                    {/* Last used + totals */}
+                    <div className="flex justify-between text-[10px] text-text-tertiary pt-1 border-t border-border-subtle">
+                      <span>Total spend: ${stats.total_cost_usd.toFixed(2)}</span>
+                      {stats.last_used_at && <span>Last used {formatAge(stats.last_used_at)}</span>}
+                    </div>
                   </div>
                 </div>
               )}
 
-              {/* Metadata */}
+              {/* Source badge */}
               {!isNew && source && (
-                <div className="text-[11px] text-text-tertiary space-y-0.5">
-                  <p>Source: <span className="font-medium">{source}</span></p>
+                <div className="flex items-center gap-2">
+                  <span className={`text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded ${source === 'system' ? 'bg-black/[0.04] text-text-tertiary' : 'bg-accent/10 text-accent'}`}>
+                    {source}
+                  </span>
                 </div>
               )}
             </div>
@@ -291,4 +341,31 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
       )}
     </AnimatePresence>
   )
+}
+
+function StatPill({ label, value, color }: { label: string; value: string; color?: string }) {
+  return (
+    <div className="bg-white/60 border border-border-subtle rounded-md px-2 py-1">
+      <div className={`text-[12px] font-semibold ${color || 'text-text-primary'}`}>{value}</div>
+      <div className="text-[9px] text-text-tertiary">{label}</div>
+    </div>
+  )
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  const rem = s % 60
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`
+}
+
+function formatAge(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime()
+  const hours = Math.floor(diff / (1000 * 60 * 60))
+  if (hours < 1) return 'just now'
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
 }

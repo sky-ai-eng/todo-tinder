@@ -87,6 +87,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/prompts/{id}", s.handlePromptGet)
 	s.mux.HandleFunc("PUT /api/prompts/{id}", s.handlePromptPut)
 	s.mux.HandleFunc("DELETE /api/prompts/{id}", s.handlePromptDelete)
+	s.mux.HandleFunc("GET /api/prompts/{id}/stats", s.handlePromptStats)
 	s.mux.HandleFunc("GET /api/prompts/{id}/bindings", s.handlePromptBindingsGet)
 	s.mux.HandleFunc("PUT /api/prompts/{id}/bindings", s.handlePromptBindingsSet)
 
