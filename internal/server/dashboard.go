@@ -10,6 +10,34 @@ import (
 	ghclient "github.com/sky-ai-eng/todo-tinder/internal/github"
 )
 
+func (s *Server) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
+	creds, err := auth.Load()
+	if err != nil || creds.GitHubPAT == "" {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	cfg, _ := config.Load()
+	baseURL := cfg.GitHub.BaseURL
+	if baseURL == "" {
+		baseURL = creds.GitHubURL
+	}
+
+	ghUser, err := auth.ValidateGitHub(baseURL, creds.GitHubPAT)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	client := ghclient.NewClient(baseURL, creds.GitHubPAT)
+	stats, err := client.GetDashboardStats(ghUser.Login)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
 func (s *Server) handleDashboardPRs(w http.ResponseWriter, r *http.Request) {
 	creds, err := auth.Load()
 	if err != nil || creds.GitHubPAT == "" {
