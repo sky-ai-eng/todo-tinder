@@ -69,6 +69,22 @@ export interface TriageEvent {
   created_at: string
 }
 
+export interface Prompt {
+  id: string
+  name: string
+  body: string
+  source: string
+  usage_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface PromptBinding {
+  prompt_id: string
+  event_type: string
+  is_default: boolean
+}
+
 export type WSEvent =
   | { type: 'agent_run_update'; run_id: string; data: { status: string } }
   | { type: 'agent_message'; run_id: string; data: AgentMessage }

@@ -8,6 +8,7 @@ import Board from './pages/Board'
 import PRDashboard from './pages/PRDashboard'
 import Brief from './pages/Brief'
 import Settings from './pages/Settings'
+import Prompts from './pages/Prompts'
 import Shell from './Shell'
 import AuthGate from './AuthGate'
 
@@ -26,6 +27,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="/" element={<Cards />} />
           <Route path="/board" element={<Board />} />
           <Route path="/prs" element={<PRDashboard />} />
+          <Route path="/prompts" element={<Prompts />} />
           <Route path="/brief" element={<Brief />} />
           <Route path="/settings" element={<Settings />} />
         </Route>
