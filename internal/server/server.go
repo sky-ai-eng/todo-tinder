@@ -75,6 +75,7 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
 	s.mux.HandleFunc("POST /api/settings", s.handleSettingsPost)
+	s.mux.HandleFunc("POST /api/skills/import", s.handleSkillsImport)
 	s.mux.HandleFunc("GET /api/jira/statuses", s.handleJiraStatuses)
 
 	s.mux.HandleFunc("GET /api/event-types", s.handleEventTypes)
@@ -152,6 +153,7 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 }
 
 // Prompt handlers are in prompts_handler.go
+// Skill import handler is in skills_handler.go
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

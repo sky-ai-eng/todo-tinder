@@ -142,7 +142,6 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	// Prevent deleting system prompts
 	prompt, err := db.GetPrompt(s.db, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -152,8 +151,14 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "prompt not found"})
 		return
 	}
-	if prompt.Source == "system" {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot delete system prompts"})
+
+	// System and imported prompts are soft-deleted (hidden), user prompts are hard-deleted
+	if prompt.Source == "system" || prompt.Source == "imported" {
+		if err := db.HidePrompt(s.db, id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "hidden"})
 		return
 	}
 

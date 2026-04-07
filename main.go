@@ -17,6 +17,7 @@ import (
 	ghclient "github.com/sky-ai-eng/todo-tinder/internal/github"
 	"github.com/sky-ai-eng/todo-tinder/internal/jira"
 	"github.com/sky-ai-eng/todo-tinder/internal/poller"
+	"github.com/sky-ai-eng/todo-tinder/internal/skills"
 	"github.com/sky-ai-eng/todo-tinder/internal/server"
 	"github.com/sky-ai-eng/todo-tinder/internal/worktree"
 	"github.com/sky-ai-eng/todo-tinder/pkg/websocket"
@@ -92,6 +93,9 @@ func main() {
 		log.Fatalf("failed to seed event types: %v", err)
 	}
 	seedDefaultPrompts(database)
+
+	// Auto-import Claude Code skill files as prompts
+	skills.ImportAll(database)
 
 	// Event bus — central pub/sub replacing direct callbacks
 	bus := eventbus.New()

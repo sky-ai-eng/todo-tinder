@@ -149,7 +149,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
   }
 
   const handleDelete = async () => {
-    if (!promptId || source === 'system') return
+    if (!promptId) return
     setDeleting(true)
     try {
       const res = await fetch(`/api/prompts/${promptId}`, { method: 'DELETE' })
@@ -308,13 +308,14 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
             {/* Footer */}
             <div className="px-6 py-4 border-t border-border-subtle flex items-center justify-between shrink-0">
               <div>
-                {!isNew && source !== 'system' && (
+                {!isNew && (
                   <button
                     onClick={handleDelete}
                     disabled={deleting}
-                    className="text-[12px] text-red-500 hover:text-red-600 font-medium transition-colors disabled:opacity-50"
+                    title={source === 'user' ? 'Permanently delete this prompt' : 'Hide this prompt — it will not reappear on import'}
+                    className="text-[12px] text-text-tertiary hover:text-red-500 font-medium transition-colors disabled:opacity-50"
                   >
-                    {deleting ? 'Deleting...' : 'Delete'}
+                    {deleting ? (source === 'user' ? 'Deleting...' : 'Hiding...') : (source === 'user' ? 'Delete' : 'Hide')}
                   </button>
                 )}
               </div>

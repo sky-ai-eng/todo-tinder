@@ -342,6 +342,33 @@ export default function Settings() {
           {saving ? 'Saving...' : 'Save Settings'}
         </button>
 
+        {/* Integrations */}
+        <Section>
+          <h2 className="text-[13px] font-medium text-text-primary mb-3">Integrations</h2>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-[13px] text-text-primary">Import Claude Code Skills</p>
+              <p className="text-[11px] text-text-tertiary mt-0.5">Import SKILL.md files from ~/.claude/skills/ as delegation prompts</p>
+            </div>
+            <button
+              type="button"
+              onClick={async () => {
+                const res = await fetch('/api/skills/import', { method: 'POST' })
+                const data = await res.json()
+                setMessage({
+                  type: data.imported > 0 ? 'success' : 'error',
+                  text: data.imported > 0
+                    ? `Imported ${data.imported} skill${data.imported !== 1 ? 's' : ''} (${data.skipped} already imported)`
+                    : `No new skills found (${data.scanned} scanned, ${data.skipped} already imported)`
+                })
+              }}
+              className="text-[13px] text-accent hover:text-accent/80 border border-accent/20 hover:border-accent/30 rounded-xl px-4 py-2 transition-colors shrink-0"
+            >
+              Import Skills
+            </button>
+          </div>
+        </Section>
+
         {/* Danger zone */}
         <Section danger>
           <h2 className="text-[13px] font-medium text-dismiss mb-3">Danger Zone</h2>

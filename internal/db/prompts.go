@@ -37,11 +37,11 @@ func SeedPrompt(db *sql.DB, p domain.Prompt, bindings []domain.PromptBinding) er
 	return nil
 }
 
-// ListPrompts returns all prompts with their binding count.
+// ListPrompts returns all non-hidden prompts.
 func ListPrompts(db *sql.DB) ([]domain.Prompt, error) {
 	rows, err := db.Query(`
 		SELECT id, name, body, source, usage_count, created_at, updated_at
-		FROM prompts ORDER BY updated_at DESC
+		FROM prompts WHERE hidden = 0 ORDER BY updated_at DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -219,6 +219,18 @@ func SetBindingDefault(db *sql.DB, promptID, eventType string, isDefault bool) e
 		return err
 	}
 	return tx.Commit()
+}
+
+// HidePrompt soft-deletes a prompt by setting hidden = 1.
+func HidePrompt(db *sql.DB, id string) error {
+	_, err := db.Exec(`UPDATE prompts SET hidden = 1 WHERE id = ?`, id)
+	return err
+}
+
+// UnhidePrompt restores a hidden prompt.
+func UnhidePrompt(db *sql.DB, id string) error {
+	_, err := db.Exec(`UPDATE prompts SET hidden = 0 WHERE id = ?`, id)
+	return err
 }
 
 // IncrementPromptUsage bumps the usage_count for a prompt.
