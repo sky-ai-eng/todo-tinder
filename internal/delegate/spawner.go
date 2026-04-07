@@ -140,7 +140,7 @@ func (s *Spawner) runPRReview(runID string, task domain.Task, owner, repo string
 
 	// 2. Create worktree
 	s.updateStatus(runID, "worktree_created")
-	wtPath, err := worktree.Create(owner, repo, pr.CloneURL, pr.HeadSHA, runID)
+	wtPath, err := worktree.Create(owner, repo, pr.CloneURL, pr.HeadSHA, prNumber, runID)
 	if err != nil {
 		s.failRun(runID, "failed to create worktree: "+err.Error())
 		return

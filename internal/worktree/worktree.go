@@ -7,7 +7,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
+
+// Per-repo mutexes prevent concurrent fetches from racing on the same bare repo.
+var (
+	repoMu   sync.Mutex
+	repoLocks = map[string]*sync.Mutex{}
+)
+
+func lockRepo(owner, repo string) *sync.Mutex {
+	key := owner + "/" + repo
+	repoMu.Lock()
+	defer repoMu.Unlock()
+	mu, ok := repoLocks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		repoLocks[key] = mu
+	}
+	return mu
+}
 
 const (
 	reposDir = ".todotinder/repos" // bare clones: ~/.todotinder/repos/{owner}/{repo}.git
@@ -27,33 +47,39 @@ func runDir(runID string) string {
 }
 
 // Create sets up an isolated worktree for an agent run.
-// Ensures a bare clone exists, fetches latest, and creates a worktree at the given SHA.
+// Ensures a bare clone exists, fetches the target PR ref, and creates a worktree at the given SHA.
 // Returns the worktree path.
-func Create(owner, repo, cloneURL, sha, runID string) (string, error) {
+func Create(owner, repo, cloneURL, sha string, prNumber int, runID string) (string, error) {
+	// Serialize git operations per repo to avoid lock conflicts
+	mu := lockRepo(owner, repo)
+	mu.Lock()
+	defer mu.Unlock()
+
 	bareDir, err := repoDir(owner, repo)
 	if err != nil {
 		return "", fmt.Errorf("resolve repo dir: %w", err)
 	}
 
-	// Bare clone on first use
+	// Bare clone on first use (treeless: skip blobs until checkout needs them)
 	if _, err := os.Stat(bareDir); os.IsNotExist(err) {
-		log.Printf("[worktree] cloning %s/%s (first time, may take a moment)...", owner, repo)
+		log.Printf("[worktree] cloning %s/%s (first time)...", owner, repo)
 		if err := os.MkdirAll(filepath.Dir(bareDir), 0755); err != nil {
 			return "", fmt.Errorf("mkdir: %w", err)
 		}
-		if err := gitRun("", "clone", "--bare", cloneURL, bareDir); err != nil {
+		start := time.Now()
+		if err := gitRun("", "clone", "--bare", "--filter=blob:none", cloneURL, bareDir); err != nil {
 			return "", fmt.Errorf("bare clone: %w", err)
 		}
+		log.Printf("[worktree] clone %s/%s completed in %s", owner, repo, time.Since(start).Round(time.Millisecond))
 	}
 
-	// Fetch latest refs including PR heads
-	if err := gitRun(bareDir, "fetch", "origin", "--prune"); err != nil {
-		return "", fmt.Errorf("fetch: %w", err)
-	}
-	// Also fetch PR refs so we can check out PR head SHAs
-	if err := gitRun(bareDir, "fetch", "origin", "+refs/pull/*/head:refs/pull/*/head"); err != nil {
+	// Only fetch the specific PR ref we need — not all refs
+	prRef := fmt.Sprintf("+refs/pull/%d/head:refs/pull/%d/head", prNumber, prNumber)
+	start := time.Now()
+	if err := gitRun(bareDir, "fetch", "origin", prRef); err != nil {
 		return "", fmt.Errorf("fetch PR refs: %w", err)
 	}
+	log.Printf("[worktree] fetch PR #%d completed in %s", prNumber, time.Since(start).Round(time.Millisecond))
 
 	// Create worktree at target SHA
 	wtDir := runDir(runID)
