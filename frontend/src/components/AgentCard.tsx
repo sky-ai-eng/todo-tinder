@@ -5,9 +5,10 @@ interface Props {
   task: Task
   run: AgentRun
   messages: AgentMessage[]
+  onRequeue?: () => void
 }
 
-export default function AgentCard({ task, run, messages }: Props) {
+export default function AgentCard({ task, run, messages, onRequeue }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [elapsed, setElapsed] = useState('')
 
@@ -118,14 +119,24 @@ export default function AgentCard({ task, run, messages }: Props) {
           )}
         </div>
 
-        <a
-          href={task.source_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-[12px] text-accent hover:text-accent/70 font-medium transition-colors"
-        >
-          Open
-        </a>
+        <div className="flex items-center gap-3">
+          {(isFailed || isCancelled) && onRequeue && (
+            <button
+              onClick={onRequeue}
+              className="text-[12px] text-text-tertiary hover:text-text-primary font-medium transition-colors"
+            >
+              Return to queue
+            </button>
+          )}
+          <a
+            href={task.source_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-[12px] text-accent hover:text-accent/70 font-medium transition-colors"
+          >
+            Open
+          </a>
+        </div>
       </div>
 
     </div>

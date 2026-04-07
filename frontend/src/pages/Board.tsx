@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { Task, AgentRun, AgentMessage, WSEvent } from '../types'
 import { useWebSocket } from '../hooks/useWebSocket'
 import AgentCard from '../components/AgentCard'
 import TaskCard from '../components/TaskCard'
+import PromptPicker from '../components/PromptPicker'
 import {
   DndContext,
   DragOverlay,
@@ -40,6 +41,10 @@ export default function Board() {
   // Drag state
   const [activeId, setActiveId] = useState<string | null>(null)
   const [overColumn, setOverColumn] = useState<ColumnId | null>(null)
+
+  // Delegate/claim popup when dragging to in_progress
+  const [pendingInProgress, setPendingInProgress] = useState<Task | null>(null)
+  const [showPromptPicker, setShowPromptPicker] = useState(false)
 
   const fetchTasks = useCallback(async () => {
     try {
@@ -202,46 +207,69 @@ export default function Board() {
       return
     }
 
-    // Cross-column move — map to swipe action
-    const actionMap: Record<string, Record<string, string>> = {
-      queue: { in_progress: 'claim' },
-      in_progress: { queue: 'undo' },
-      done: { queue: 'undo', in_progress: 'claim' },
-    }
-
-    const action = actionMap[sourceCol]?.[targetCol]
-    if (!action) return
-
-    // Optimistic UI: move the task immediately
+    // Cross-column move
     const task = allTasks.get(taskId)
     if (!task) return
 
-    // Remove from source
-    if (sourceCol === 'queue') setQueued((prev) => prev.filter((t) => t.id !== taskId))
-    else if (sourceCol === 'in_progress') {
-      setClaimed((prev) => prev.filter((t) => t.id !== taskId))
-      setDelegated((prev) => prev.filter((t) => t.id !== taskId))
-    } else if (sourceCol === 'done') setDone((prev) => prev.filter((t) => t.id !== taskId))
-
-    // Add to target
-    if (targetCol === 'queue') setQueued((prev) => [task, ...prev])
-    else if (targetCol === 'in_progress') setClaimed((prev) => [task, ...prev])
-    else if (targetCol === 'done') setDone((prev) => [task, ...prev])
-
-    // Fire the API call
-    if (action === 'undo') {
-      await fetch(`/api/tasks/${taskId}/undo`, { method: 'POST' })
-    } else {
-      await fetch(`/api/tasks/${taskId}/swipe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, hesitation_ms: 0 }),
-      })
+    // Moving to in_progress: show claim/delegate popup
+    if (targetCol === 'in_progress' && sourceCol !== 'in_progress') {
+      setPendingInProgress(task)
+      return
     }
 
-    // Re-fetch to reconcile
-    fetchTasks()
+    // Moving back to queue: undo
+    if (targetCol === 'queue' && sourceCol !== 'queue') {
+      // Optimistic UI
+      if (sourceCol === 'in_progress') {
+        setClaimed((prev) => prev.filter((t) => t.id !== taskId))
+        setDelegated((prev) => prev.filter((t) => t.id !== taskId))
+      } else if (sourceCol === 'done') {
+        setDone((prev) => prev.filter((t) => t.id !== taskId))
+      }
+      setQueued((prev) => [task, ...prev])
+
+      await fetch(`/api/tasks/${taskId}/undo`, { method: 'POST' })
+      fetchTasks()
+      return
+    }
   }
+
+  const handleRequeue = useCallback(async (taskId: string) => {
+    await fetch(`/api/tasks/${taskId}/undo`, { method: 'POST' })
+    fetchTasks()
+  }, [fetchTasks])
+
+  const handleClaimFromPopup = useCallback(async (task: Task) => {
+    setPendingInProgress(null)
+    await fetch(`/api/tasks/${task.id}/swipe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'claim', hesitation_ms: 0 }),
+    })
+    fetchTasks()
+  }, [fetchTasks])
+
+  const handleDelegateFromPopup = useCallback((task: Task) => {
+    setPendingInProgress(null)
+    setShowPromptPicker(true)
+    // Store the task for when the picker resolves
+    pendingDelegateTask.current = task
+  }, [])
+
+  const pendingDelegateTask = useRef<Task | null>(null)
+
+  const handlePromptSelected = useCallback(async (promptId: string) => {
+    setShowPromptPicker(false)
+    const task = pendingDelegateTask.current
+    if (!task) return
+    pendingDelegateTask.current = null
+    await fetch(`/api/tasks/${task.id}/swipe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delegate', hesitation_ms: 0, prompt_id: promptId }),
+    })
+    fetchTasks()
+  }, [fetchTasks])
 
   const activeTask = activeId ? allTasks.get(activeId) : null
 
@@ -315,6 +343,7 @@ export default function Board() {
                     task={task}
                     run={agentRuns[task.id]}
                     messages={agentMessages[agentRuns[task.id].ID] || []}
+                    onRequeue={() => handleRequeue(task.id)}
                   />
                 ) : (
                   <SortableTaskCard key={task.id} task={task} />
@@ -342,6 +371,7 @@ export default function Board() {
                     task={task}
                     run={agentRuns[task.id]}
                     messages={agentMessages[agentRuns[task.id].ID] || []}
+                    onRequeue={() => handleRequeue(task.id)}
                   />
                 ) : (
                   <SortableTaskCard key={task.id} task={task} />
@@ -360,6 +390,41 @@ export default function Board() {
           </div>
         )}
       </DragOverlay>
+
+      {/* Claim vs Delegate popup */}
+      {pendingInProgress && (
+        <>
+          <div className="fixed inset-0 bg-black/10 backdrop-blur-sm z-40" onClick={() => setPendingInProgress(null)} />
+          <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-surface-raised border border-border-glass rounded-2xl shadow-xl shadow-black/10 p-5 w-[300px]">
+            <h3 className="text-[14px] font-semibold text-text-primary mb-1">Move to In Progress</h3>
+            <p className="text-[12px] text-text-tertiary mb-4 leading-relaxed">
+              How do you want to handle <span className="text-text-secondary font-medium">{pendingInProgress.title.length > 40 ? pendingInProgress.title.slice(0, 37) + '...' : pendingInProgress.title}</span>?
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => handleClaimFromPopup(pendingInProgress)}
+                className="flex-1 text-[13px] font-semibold text-claim bg-claim/10 hover:bg-claim/20 px-4 py-2 rounded-xl transition-colors"
+              >
+                Claim
+              </button>
+              <button
+                onClick={() => handleDelegateFromPopup(pendingInProgress)}
+                className="flex-1 text-[13px] font-semibold text-white bg-accent hover:bg-accent/90 px-4 py-2 rounded-xl transition-colors"
+              >
+                Delegate
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Prompt picker for delegation */}
+      <PromptPicker
+        open={showPromptPicker}
+        onSelect={handlePromptSelected}
+        onClose={() => { setShowPromptPicker(false); pendingDelegateTask.current = null }}
+        onEditPrompts={() => { setShowPromptPicker(false); pendingDelegateTask.current = null; window.location.href = '/prompts' }}
+      />
     </DndContext>
   )
 }
