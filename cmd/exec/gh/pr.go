@@ -171,6 +171,7 @@ func prStartReview(client *ghclient.Client, database *db.DB, args []string) {
 		Repo:      repo,
 		CommitSHA: pr.HeadSHA,
 		DiffLines: string(diffLinesJSON),
+		RunID:     os.Getenv("TODOTINDER_RUN_ID"),
 	})
 	exitOnErr(err)
 
@@ -287,6 +288,21 @@ func prSubmitReview(client *ghclient.Client, database *db.DB, args []string) {
 			StartLine: c.StartLine,
 			Body:      c.Body,
 		}
+	}
+
+	// In preview mode, store the raw body — the server injects header/footer
+	// with actual cost data at submit time.
+	if os.Getenv("TODOTINDER_REVIEW_PREVIEW") == "1" {
+		err = db.SetPendingReviewSubmission(database.Conn, reviewID, body, ghEvent)
+		exitOnErr(err)
+
+		printJSON(map[string]any{
+			"status":          "pending_approval",
+			"review_id":       reviewID,
+			"event":           ghEvent,
+			"comments_queued": len(ghComments),
+		})
+		return
 	}
 
 	// Inject header and footer with run metadata

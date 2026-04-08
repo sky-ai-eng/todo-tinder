@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/sky-ai-eng/todo-tinder/internal/delegate"
+	ghclient "github.com/sky-ai-eng/todo-tinder/internal/github"
 	"github.com/sky-ai-eng/todo-tinder/internal/jira"
 	"github.com/sky-ai-eng/todo-tinder/pkg/websocket"
 )
@@ -23,6 +24,7 @@ type Server struct {
 	static                fs.FS
 	ws                    *websocket.Hub
 	spawner               *delegate.Spawner
+	ghClient              *ghclient.Client
 	jiraClient            *jira.Client
 	jiraInProgressStatus  string
 	onCredentialsChanged  OnCredentialsChanged
@@ -77,6 +79,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/settings", s.handleSettingsPost)
 	s.mux.HandleFunc("POST /api/skills/import", s.handleSkillsImport)
 	s.mux.HandleFunc("GET /api/jira/statuses", s.handleJiraStatuses)
+
+	s.mux.HandleFunc("GET /api/reviews/{id}", s.handleReviewGet)
+	s.mux.HandleFunc("GET /api/reviews/{id}/diff", s.handleReviewDiff)
+	s.mux.HandleFunc("POST /api/reviews/{id}/submit", s.handleReviewSubmit)
+	s.mux.HandleFunc("PUT /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentUpdate)
+	s.mux.HandleFunc("DELETE /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentDelete)
+	s.mux.HandleFunc("GET /api/agent/runs/{runID}/review", s.handleRunReview)
 
 	s.mux.HandleFunc("GET /api/event-types", s.handleEventTypes)
 	s.mux.HandleFunc("PUT /api/event-types/{id}/toggle", s.handleEventTypeToggle)
@@ -136,6 +145,11 @@ func (s *Server) SetSpawner(sp *delegate.Spawner) {
 // SetOnCredentialsChanged registers a callback for when credentials are updated.
 func (s *Server) SetOnCredentialsChanged(fn OnCredentialsChanged) {
 	s.onCredentialsChanged = fn
+}
+
+// SetGitHubClient sets the GitHub client for review approval submissions.
+func (s *Server) SetGitHubClient(client *ghclient.Client) {
+	s.ghClient = client
 }
 
 // SetJiraClient sets the Jira client and in-progress status for claim actions.

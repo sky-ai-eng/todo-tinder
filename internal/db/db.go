@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS pending_reviews (
     repo TEXT NOT NULL,
     commit_sha TEXT NOT NULL,
     diff_lines TEXT,
+    run_id TEXT,
+    review_body TEXT,
+    review_event TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

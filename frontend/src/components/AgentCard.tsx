@@ -6,9 +6,10 @@ interface Props {
   run: AgentRun
   messages: AgentMessage[]
   onRequeue?: () => void
+  onReview?: () => void
 }
 
-export default function AgentCard({ task, run, messages, onRequeue }: Props) {
+export default function AgentCard({ task, run, messages, onRequeue, onReview }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [elapsed, setElapsed] = useState('')
 
@@ -38,14 +39,17 @@ export default function AgentCard({ task, run, messages, onRequeue }: Props) {
   const isActive = ['cloning', 'fetching', 'worktree_created', 'agent_starting', 'running'].includes(run.Status)
   const isFailed = run.Status === 'failed'
   const isCancelled = run.Status === 'cancelled'
+  const isPendingApproval = run.Status === 'pending_approval'
 
   const statusColor = isFailed || isCancelled
     ? 'text-dismiss'
+    : isPendingApproval
+    ? 'text-snooze'
     : isActive
     ? 'text-delegate'
     : 'text-claim'
 
-  const statusIcon = isFailed ? '✗' : isCancelled ? '◼' : isActive ? '●' : '✓'
+  const statusIcon = isFailed ? '✗' : isCancelled ? '◼' : isPendingApproval ? '◉' : isActive ? '●' : '✓'
   const statusLabel = formatStatus(run.Status)
 
   const stats = computeStats(messages, run)
@@ -126,6 +130,14 @@ export default function AgentCard({ task, run, messages, onRequeue }: Props) {
               className="text-[12px] text-text-tertiary hover:text-text-primary font-medium transition-colors"
             >
               Return to queue
+            </button>
+          )}
+          {isPendingApproval && onReview && (
+            <button
+              onClick={onReview}
+              className="text-[12px] font-semibold text-snooze bg-snooze/10 hover:bg-snooze/20 px-3 py-1 rounded-lg transition-colors"
+            >
+              Review
             </button>
           )}
           <a
@@ -289,6 +301,7 @@ function formatStatus(status: string): string {
     agent_starting: 'Starting Claude Code',
     running: 'Running',
     completed: 'Completed',
+    pending_approval: 'Pending Approval',
     cancelled: 'Cancelled',
     failed: 'Failed',
   }
