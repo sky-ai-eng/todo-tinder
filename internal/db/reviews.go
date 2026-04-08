@@ -100,6 +100,30 @@ func DeletePendingReview(database *sql.DB, reviewID string) error {
 	return tx.Commit()
 }
 
+// SetPendingReviewSubmission stores the deferred review body and event, marking
+// the review as ready for user approval rather than immediate GitHub submission.
+func SetPendingReviewSubmission(database *sql.DB, reviewID, body, event string) error {
+	_, err := database.Exec(
+		`UPDATE pending_reviews SET review_body = ?, review_event = ? WHERE id = ?`,
+		body, event, reviewID,
+	)
+	return err
+}
+
+// PendingReviewByRunID returns the pending review associated with a given agent
+// run that has a deferred submission (review_event is set). Returns nil if none.
+func PendingReviewByRunID(database *sql.DB, runID string) (*domain.PendingReview, error) {
+	row := database.QueryRow(
+		`SELECT id, pr_number, owner, repo, commit_sha, COALESCE(diff_lines, ''), COALESCE(run_id, ''), COALESCE(review_body, ''), COALESCE(review_event, '')
+		 FROM pending_reviews WHERE run_id = ? AND review_event IS NOT NULL AND review_event != ''`, runID)
+	var r domain.PendingReview
+	err := row.Scan(&r.ID, &r.PRNumber, &r.Owner, &r.Repo, &r.CommitSHA, &r.DiffLines, &r.RunID, &r.ReviewBody, &r.ReviewEvent)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &r, err
+}
+
 // IsPendingCommentID checks if a comment ID belongs to a local pending review.
 func IsPendingCommentID(database *sql.DB, commentID string) bool {
 	var count int
