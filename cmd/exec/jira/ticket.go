@@ -35,6 +35,8 @@ func handleTicket(client *jiraclient.Client, args []string) {
 		ticketSetParent(client, flags)
 	case "list-types":
 		ticketListTypes(client, flags)
+	case "list-children":
+		ticketListChildren(client, flags)
 	default:
 		exitErr(fmt.Sprintf("unknown ticket action: %s", action))
 	}
@@ -138,6 +140,18 @@ func ticketSetParent(client *jiraclient.Client, args []string) {
 	err := client.SetParent(key, parentKey)
 	exitOnErr(err)
 	printJSON(map[string]any{"ok": true, "key": key, "parent": parentKey})
+}
+
+func ticketListChildren(client *jiraclient.Client, args []string) {
+	if len(args) < 1 {
+		exitErr("usage: jira ticket list-children <key>")
+	}
+	children, err := client.GetChildIssues(args[0])
+	exitOnErr(err)
+	if children == nil {
+		children = []jiraclient.Issue{}
+	}
+	printJSON(children)
 }
 
 func ticketListTypes(client *jiraclient.Client, args []string) {

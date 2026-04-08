@@ -175,6 +175,69 @@ func (c *Client) GetIssue(issueKey string) (*Issue, error) {
 	return &issue, nil
 }
 
+// GetChildIssues returns all child issues of a parent (subtasks + epic children).
+// On Cloud, parent = KEY covers both. On Server/DC, we also query the Epic Link
+// custom field. Results are deduplicated by key.
+func (c *Client) GetChildIssues(parentKey string) ([]Issue, error) {
+	seen := map[string]bool{}
+	var result []Issue
+
+	// Query 1: direct parent relationship (Cloud + Server/DC subtasks)
+	issues, err := c.searchIssues(fmt.Sprintf("parent = %s ORDER BY created ASC", parentKey))
+	if err != nil {
+		return nil, err
+	}
+	for _, issue := range issues {
+		if !seen[issue.Key] {
+			seen[issue.Key] = true
+			result = append(result, issue)
+		}
+	}
+
+	// Query 2: Epic Link (Server/DC epic children)
+	epicField, err := c.epicLinkField()
+	if err == nil && epicField != "" {
+		epicIssues, err := c.searchIssues(fmt.Sprintf("cf[%s] = %s ORDER BY created ASC", extractFieldID(epicField), parentKey))
+		if err == nil {
+			for _, issue := range epicIssues {
+				if !seen[issue.Key] {
+					seen[issue.Key] = true
+					result = append(result, issue)
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// searchIssues runs a JQL query and returns matching issues.
+func (c *Client) searchIssues(jql string) ([]Issue, error) {
+	url := fmt.Sprintf("%s/rest/api/2/search", c.baseURL)
+	payload := map[string]any{
+		"jql":        jql,
+		"maxResults": 100,
+		"fields":     []string{"summary", "description", "status", "issuetype", "priority", "assignee", "parent", "labels"},
+	}
+	respBody, err := c.postJSON(url, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Issues []Issue `json:"issues"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("parse search results: %w", err)
+	}
+	return result.Issues, nil
+}
+
+// extractFieldID pulls the numeric ID from a custom field name like "customfield_10008".
+func extractFieldID(field string) string {
+	return strings.TrimPrefix(field, "customfield_")
+}
+
 // AddComment posts a comment on an issue.
 func (c *Client) AddComment(issueKey, body string) error {
 	url := fmt.Sprintf("%s/rest/api/2/issue/%s/comment", c.baseURL, issueKey)

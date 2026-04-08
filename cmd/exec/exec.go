@@ -107,6 +107,7 @@ Jira Ticket Commands:
   jira ticket create <project> --type <type> --summary <text> [--description <text>] [--parent <key>]
   jira ticket set-parent <key> --parent <parent_key>      Link issue under a parent
   jira ticket list-types <project>                        List available issue types
+  jira ticket list-children <key>                         List child issues (subtasks + epic children)
 
 All commands print JSON to stdout on success, errors to stderr.`)
 }
