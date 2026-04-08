@@ -66,13 +66,10 @@ export default function DiffFile({
 
   // Tokenize with word-level edit marks
   const tokens = useMemo(() => {
-    const options = {
-      hunks: file.hunks,
-      highlight: false,
-      enhancers: [markEdits(file.hunks, { type: "block" })],
-    };
     try {
-      return tokenize(options);
+      return tokenize(file.hunks, {
+        enhancers: [markEdits(file.hunks, { type: "block" })],
+      });
     } catch {
       return undefined;
     }

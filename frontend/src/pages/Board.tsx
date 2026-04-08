@@ -4,6 +4,7 @@ import { useWebSocket } from '../hooks/useWebSocket'
 import AgentCard from '../components/AgentCard'
 import TaskCard from '../components/TaskCard'
 import PromptPicker from '../components/PromptPicker'
+import ReviewOverlay from '../components/ReviewOverlay'
 import {
   DndContext,
   DragOverlay,
@@ -45,6 +46,9 @@ export default function Board() {
   // Delegate/claim popup when dragging to in_progress
   const [pendingInProgress, setPendingInProgress] = useState<Task | null>(null)
   const [showPromptPicker, setShowPromptPicker] = useState(false)
+
+  // Review overlay
+  const [reviewRunID, setReviewRunID] = useState<string | null>(null)
 
   const fetchTasks = useCallback(async () => {
     try {
@@ -109,7 +113,7 @@ export default function Board() {
         }
         return updated
       })
-      if (event.data.status === 'completed' || event.data.status === 'failed') {
+      if (['completed', 'failed', 'pending_approval'].includes(event.data.status)) {
         fetchTasks()
       }
     }
@@ -344,6 +348,7 @@ export default function Board() {
                     run={agentRuns[task.id]}
                     messages={agentMessages[agentRuns[task.id].ID] || []}
                     onRequeue={() => handleRequeue(task.id)}
+                    onReview={() => setReviewRunID(agentRuns[task.id].ID)}
                   />
                 ) : (
                   <SortableTaskCard key={task.id} task={task} />
@@ -372,6 +377,7 @@ export default function Board() {
                     run={agentRuns[task.id]}
                     messages={agentMessages[agentRuns[task.id].ID] || []}
                     onRequeue={() => handleRequeue(task.id)}
+                    onReview={() => setReviewRunID(agentRuns[task.id].ID)}
                   />
                 ) : (
                   <SortableTaskCard key={task.id} task={task} />
@@ -424,6 +430,13 @@ export default function Board() {
         onSelect={handlePromptSelected}
         onClose={() => { setShowPromptPicker(false); pendingDelegateTask.current = null }}
         onEditPrompts={() => { setShowPromptPicker(false); pendingDelegateTask.current = null; window.location.href = '/prompts' }}
+      />
+
+      {/* Review overlay for pending_approval runs */}
+      <ReviewOverlay
+        runID={reviewRunID ?? ''}
+        open={reviewRunID !== null}
+        onClose={() => { setReviewRunID(null); fetchTasks() }}
       />
     </DndContext>
   )
