@@ -5,15 +5,17 @@ import (
 	"os"
 
 	"github.com/sky-ai-eng/todo-tinder/cmd/exec/gh"
+	jiraexec "github.com/sky-ai-eng/todo-tinder/cmd/exec/jira"
 	"github.com/sky-ai-eng/todo-tinder/internal/auth"
 	"github.com/sky-ai-eng/todo-tinder/internal/config"
 	"github.com/sky-ai-eng/todo-tinder/internal/db"
 	ghclient "github.com/sky-ai-eng/todo-tinder/internal/github"
+	jiraclient "github.com/sky-ai-eng/todo-tinder/internal/jira"
 )
 
 // Handle dispatches exec subcommands.
 func Handle(args []string) {
-	if len(args) == 0 || args[0] == "--help" {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		printHelp()
 		return
 	}
@@ -42,6 +44,10 @@ func Handle(args []string) {
 
 	switch cmd {
 	case "gh":
+		if isHelp(cmdArgs) {
+			gh.Handle(nil, nil, cmdArgs)
+			return
+		}
 		if creds.GitHubPAT == "" {
 			fmt.Fprintln(os.Stderr, "GitHub not configured. Run todotinder and complete setup first.")
 			os.Exit(1)
@@ -54,8 +60,16 @@ func Handle(args []string) {
 		gh.Handle(client, database, cmdArgs)
 
 	case "jira":
-		fmt.Fprintln(os.Stderr, "jira exec commands not yet implemented")
-		os.Exit(1)
+		if isHelp(cmdArgs) {
+			jiraexec.Handle(nil, cmdArgs)
+			return
+		}
+		if creds.JiraPAT == "" || creds.JiraURL == "" {
+			fmt.Fprintln(os.Stderr, "Jira not configured. Run todotinder and complete setup first.")
+			os.Exit(1)
+		}
+		jClient := jiraclient.NewClient(creds.JiraURL, creds.JiraPAT)
+		jiraexec.Handle(jClient, cmdArgs)
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown exec command: %s\nRun 'todotinder exec --help' for usage.\n", cmd)
@@ -68,28 +82,10 @@ func HandleStatus(args []string) {
 	fmt.Fprintln(os.Stderr, "not implemented: status")
 }
 
+func isHelp(args []string) bool {
+	return len(args) == 0 || args[0] == "--help" || args[0] == "-h"
+}
+
 func printHelp() {
-	fmt.Println(`Usage: todotinder exec <service> <resource> <action> [flags]
-
-GitHub PR Commands:
-  gh pr view <number> [--repo o/r] [-v]                  PR details + reviews + comments
-  gh pr diff <number> [--repo o/r] [--file <path>]       Raw diff (optionally per-file)
-  gh pr files <number> [--repo o/r]                       List changed files
-  gh pr thread-view <number> <comment_id> [--page N]      Comment thread with replies
-  gh pr review-view <review_id> --pr <N> [--repo o/r] [-v]  Expand a review + inline comments
-
-Review Lifecycle (managed locally, submitted atomically):
-  gh pr start-review <number> [--repo o/r]                Start a local pending review
-  gh pr add-review-comment <review_id> --file <path> --line <N> --body <text> [--start-line <N>]
-  gh pr comment-list-pending <review_id>                  List pending review comments
-  gh pr submit-review <review_id> --event <approve|comment|request_changes> --body <text>
-
-Direct Comments (hit GitHub API immediately):
-  gh pr add-comment <number> --body <text>                Add top-level comment
-  gh pr comment-reply <comment_id> --pr <N> --body <text> Reply to a thread
-  gh pr comment-react <comment_id> --repo o/r --emoji <e> React to a comment
-  gh pr comment-update <comment_id> --body <text>         Edit (local pending or remote)
-  gh pr comment-delete <comment_id>                       Delete (local pending or remote)
-
-All commands print JSON to stdout on success, errors to stderr.`)
+	fmt.Printf("Usage: todotinder exec <service> <resource> <action> [flags]\n\n%s\n\n%s\n\nAll commands print JSON to stdout on success, errors to stderr.\n", gh.HelpText, jiraexec.HelpText)
 }
