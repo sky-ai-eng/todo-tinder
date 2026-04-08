@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import RepoPickerModal from '../components/RepoPickerModal'
+import { useWebSocket } from '../hooks/useWebSocket'
 
 interface RepoProfile {
   id: string
@@ -39,6 +40,22 @@ export default function Repos() {
   useEffect(() => {
     fetchData()
   }, [])
+
+  // Live updates from profiling pipeline
+  useWebSocket((event) => {
+    if (event.type === 'repo_docs_updated') {
+      const d = event.data as { id: string; has_readme: boolean; has_claude_md: boolean; has_agents_md: boolean }
+      setProfiles((prev) => prev.map((p) =>
+        p.id === d.id ? { ...p, has_readme: d.has_readme, has_claude_md: d.has_claude_md, has_agents_md: d.has_agents_md } : p
+      ))
+    }
+    if (event.type === 'repo_profile_updated') {
+      const d = event.data as { id: string; profile_text: string }
+      setProfiles((prev) => prev.map((p) =>
+        p.id === d.id ? { ...p, profile_text: d.profile_text } : p
+      ))
+    }
+  })
 
   const handleSaveRepos = async (repos: string[]) => {
     setSaving(true)
@@ -174,9 +191,15 @@ export default function Repos() {
                     <p className="text-[12px] text-text-secondary leading-relaxed">
                       {profile.profile_text}
                     </p>
+                  ) : (profile.has_readme || profile.has_claude_md || profile.has_agents_md) ? (
+                    <div className="space-y-1.5 mt-1">
+                      <div className="h-3 bg-black/[0.04] rounded-full w-full animate-pulse" />
+                      <div className="h-3 bg-black/[0.04] rounded-full w-5/6 animate-pulse" />
+                      <div className="h-3 bg-black/[0.04] rounded-full w-4/6 animate-pulse" />
+                    </div>
                   ) : (
                     <p className="text-[12px] text-text-tertiary italic">
-                      No profile generated — repo may lack documentation files.
+                      No documentation files found — profile cannot be generated.
                     </p>
                   )}
                 </div>

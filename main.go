@@ -176,7 +176,7 @@ func main() {
 
 			// Re-profile, then signal ready and restart all pollers
 			go func() {
-				profiler := repoprofile.NewProfiler(ghClient, database)
+				profiler := repoprofile.NewProfiler(ghClient, database, wsHub)
 				repos, _ := db.GetConfiguredRepoNames(database)
 				if err := profiler.Run(context.Background(), repos); err != nil {
 					log.Printf("[repoprofile] profiling failed: %v", err)
@@ -228,7 +228,7 @@ func main() {
 
 		// Profile repos, then signal ready, start pollers, and trigger scoring
 		go func() {
-			profiler := repoprofile.NewProfiler(ghClient, database)
+			profiler := repoprofile.NewProfiler(ghClient, database, wsHub)
 			repos, _ := db.GetConfiguredRepoNames(database)
 			if err := profiler.Run(context.Background(), repos); err != nil {
 				log.Printf("[repoprofile] initial profiling failed: %v", err)

@@ -15,6 +15,7 @@ import (
 	"github.com/sky-ai-eng/todo-tinder/internal/db"
 	"github.com/sky-ai-eng/todo-tinder/internal/domain"
 	"github.com/sky-ai-eng/todo-tinder/internal/github"
+	"github.com/sky-ai-eng/todo-tinder/pkg/websocket"
 )
 
 const (
@@ -27,11 +28,12 @@ const (
 type Profiler struct {
 	gh       *github.Client
 	database *sql.DB
+	ws       *websocket.Hub
 }
 
-// NewProfiler creates a Profiler with the given GitHub client and DB handle.
-func NewProfiler(gh *github.Client, database *sql.DB) *Profiler {
-	return &Profiler{gh: gh, database: database}
+// NewProfiler creates a Profiler with the given GitHub client, DB handle, and WS hub.
+func NewProfiler(gh *github.Client, database *sql.DB, ws *websocket.Hub) *Profiler {
+	return &Profiler{gh: gh, database: database, ws: ws}
 }
 
 // repoWithDocs groups a repo profile with the documentation text to send to the LLM.
@@ -89,6 +91,22 @@ func (p *Profiler) Run(ctx context.Context, repos []string) error {
 			HasAgentsMd: agentsMd != "",
 		}
 
+		// Persist docs flags immediately so the UI can show them before profiling completes
+		if err := db.UpsertRepoProfile(p.database, prof); err != nil {
+			log.Printf("[repoprofile] upsert %s (docs flags): %v", name, err)
+		}
+		if p.ws != nil {
+			p.ws.Broadcast(websocket.Event{
+				Type: "repo_docs_updated",
+				Data: map[string]any{
+					"id":           name,
+					"has_readme":   prof.HasReadme,
+					"has_claude_md": prof.HasClaudeMd,
+					"has_agents_md": prof.HasAgentsMd,
+				},
+			})
+		}
+
 		docs := buildDocText(readme, claudeMd, agentsMd)
 		if docs == "" {
 			withoutDocs = append(withoutDocs, prof)
@@ -98,13 +116,6 @@ func (p *Profiler) Run(ctx context.Context, repos []string) error {
 	}
 
 	log.Printf("[repoprofile] %d repos with docs, %d without", len(withDocs), len(withoutDocs))
-
-	// Upsert repos with no docs immediately — profile_text stays NULL.
-	for _, prof := range withoutDocs {
-		if err := db.UpsertRepoProfile(p.database, prof); err != nil {
-			log.Printf("[repoprofile] upsert %s: %v", prof.ID, err)
-		}
-	}
 
 	// Batch-profile repos that have docs through Haiku.
 	profiled := 0
@@ -149,6 +160,15 @@ func (p *Profiler) Run(ctx context.Context, repos []string) error {
 			}
 			if prof.ProfileText != "" {
 				profiled++
+				if p.ws != nil {
+					p.ws.Broadcast(websocket.Event{
+						Type: "repo_profile_updated",
+						Data: map[string]any{
+							"id":           prof.ID,
+							"profile_text": prof.ProfileText,
+						},
+					})
+				}
 			}
 		}
 	}
