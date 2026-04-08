@@ -21,6 +21,9 @@ var EnvelopeTemplate string
 //go:embed prompts/pr-review.txt
 var PRReviewPromptTemplate string
 
+//go:embed prompts/repo-profile.txt
+var RepoProfilePrompt string
+
 const batchSize = 20
 
 // TaskInput is the minimal info we send to the LLM for scoring.
