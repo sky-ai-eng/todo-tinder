@@ -10,16 +10,16 @@ import (
 
 func CreatePendingReview(database *sql.DB, r domain.PendingReview) error {
 	_, err := database.Exec(
-		`INSERT INTO pending_reviews (id, pr_number, owner, repo, commit_sha, diff_lines) VALUES (?, ?, ?, ?, ?, ?)`,
-		r.ID, r.PRNumber, r.Owner, r.Repo, r.CommitSHA, r.DiffLines,
+		`INSERT INTO pending_reviews (id, pr_number, owner, repo, commit_sha, diff_lines, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.PRNumber, r.Owner, r.Repo, r.CommitSHA, r.DiffLines, r.RunID,
 	)
 	return err
 }
 
 func GetPendingReview(database *sql.DB, reviewID string) (*domain.PendingReview, error) {
-	row := database.QueryRow(`SELECT id, pr_number, owner, repo, commit_sha, COALESCE(diff_lines, '') FROM pending_reviews WHERE id = ?`, reviewID)
+	row := database.QueryRow(`SELECT id, pr_number, owner, repo, commit_sha, COALESCE(diff_lines, ''), COALESCE(run_id, ''), COALESCE(review_body, ''), COALESCE(review_event, '') FROM pending_reviews WHERE id = ?`, reviewID)
 	var r domain.PendingReview
-	err := row.Scan(&r.ID, &r.PRNumber, &r.Owner, &r.Repo, &r.CommitSHA, &r.DiffLines)
+	err := row.Scan(&r.ID, &r.PRNumber, &r.Owner, &r.Repo, &r.CommitSHA, &r.DiffLines, &r.RunID, &r.ReviewBody, &r.ReviewEvent)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
