@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import RepoPickerModal from '../components/RepoPickerModal'
 
 interface JiraStatus {
   id: string
   name: string
 }
 
-type Step = 'auth' | 'jira_config'
+type Step = 'auth' | 'repo_select' | 'jira_config'
 
 export default function Setup() {
   const navigate = useNavigate()
@@ -61,7 +62,40 @@ export default function Setup() {
         return
       }
 
-      // If Jira is enabled, go to project/status config step
+      // Next step: repo selection if GitHub enabled, then Jira config if Jira enabled
+      if (githubEnabled) {
+        setStep('repo_select')
+      } else if (jiraEnabled) {
+        setStep('jira_config')
+      } else {
+        navigate('/')
+      }
+    } catch {
+      setError('Could not connect to server')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const saveRepos = async (repos: string[]) => {
+    setLoading(true)
+    setError('')
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          github_enabled: true,
+          github_repos: repos,
+        }),
+      })
+      if (!res.ok) {
+        const data = await res.json()
+        setError(data.error || 'Failed to save repos')
+        setLoading(false)
+        return
+      }
+
       if (jiraEnabled) {
         setStep('jira_config')
       } else {
@@ -124,7 +158,7 @@ export default function Setup() {
 
   return (
     <div className="min-h-screen bg-surface flex items-center justify-center p-4">
-      {step === 'auth' ? (
+      {step === 'auth' && (
         <form
           onSubmit={submitAuth}
           className="w-full max-w-lg backdrop-blur-xl bg-surface-raised border border-border-glass rounded-2xl p-8 space-y-6 shadow-lg shadow-black/[0.04]"
@@ -204,10 +238,21 @@ export default function Setup() {
             disabled={loading || !canSubmit}
             className="w-full bg-accent hover:bg-accent/90 disabled:opacity-40 text-white font-medium rounded-xl px-4 py-2.5 text-[13px] transition-colors"
           >
-            {loading ? 'Validating...' : jiraEnabled ? 'Connect & Configure Jira' : 'Connect & Start'}
+            {loading ? 'Validating...' : 'Connect & Continue'}
           </button>
         </form>
-      ) : (
+      )}
+
+      {step === 'repo_select' && (
+        <RepoPickerModal
+          selected={[]}
+          onSave={saveRepos}
+          onClose={() => {/* no-op: can't skip repo selection */}}
+          inline
+        />
+      )}
+
+      {step === 'jira_config' && (
         <div className="w-full max-w-lg backdrop-blur-xl bg-surface-raised border border-border-glass rounded-2xl p-8 space-y-6 shadow-lg shadow-black/[0.04]">
           <div>
             <h1 className="text-[22px] font-semibold text-text-primary tracking-tight">Configure Jira</h1>

@@ -5,82 +5,42 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 )
 
-// userEvent is the GitHub API response shape for a single user event.
-type userEvent struct {
-	Repo struct {
-		Name string `json:"name"` // "owner/repo"
-	} `json:"repo"`
-	CreatedAt time.Time `json:"created_at"`
+// UserRepo is the minimal info we need from the GitHub repos endpoint.
+type UserRepo struct {
+	FullName    string `json:"full_name"`
+	HTMLURL     string `json:"html_url"`
+	Description string `json:"description"`
+	Language    string `json:"language"`
+	PushedAt    string `json:"pushed_at"`
+	Private     bool   `json:"private"`
 }
 
-// ListUserEvents returns the unique "owner/repo" names where the user was
-// active at or after the given cutoff time.
-//
-// NOTE: The GitHub Events API is capped at 300 events (10 pages of 30).
-// Activity older than this window may be missed.
-func (c *Client) ListUserEvents(username string, since time.Time) ([]string, error) {
-	seen := make(map[string]bool)
-	var repos []string
+// ListUserRepos returns all repositories the authenticated user has access to,
+// sorted by most recently pushed. Paginates until all repos are fetched.
+func (c *Client) ListUserRepos() ([]UserRepo, error) {
+	var all []UserRepo
 
-	for page := 1; page <= 10; page++ {
-		path := fmt.Sprintf("/users/%s/events?per_page=30&page=%d", username, page)
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/user/repos?sort=pushed&direction=desc&per_page=100&page=%d", page)
 		data, err := c.Get(path)
 		if err != nil {
-			return nil, fmt.Errorf("fetch events page %d: %w", page, err)
+			return nil, fmt.Errorf("fetch repos page %d: %w", page, err)
 		}
 
-		var events []userEvent
-		if err := json.Unmarshal(data, &events); err != nil {
-			return nil, fmt.Errorf("parse events page %d: %w", page, err)
+		var repos []UserRepo
+		if err := json.Unmarshal(data, &repos); err != nil {
+			return nil, fmt.Errorf("parse repos page %d: %w", page, err)
 		}
 
-		if len(events) == 0 {
+		if len(repos) == 0 {
 			break
 		}
-
-		// Events are returned newest-first. Once every event on a page
-		// predates the cutoff, there's nothing newer left to page through.
-		allOld := true
-		for _, e := range events {
-			if e.CreatedAt.Before(since) {
-				continue
-			}
-			allOld = false
-			if e.Repo.Name != "" && !seen[e.Repo.Name] {
-				seen[e.Repo.Name] = true
-				repos = append(repos, e.Repo.Name)
-			}
-		}
-		if allOld {
-			break
-		}
+		all = append(all, repos...)
 	}
 
-	return repos, nil
-}
-
-// repoMeta is the minimal GitHub repo API response we need.
-type repoMeta struct {
-	Description string `json:"description"`
-}
-
-// GetRepoDescription returns the description for owner/repo.
-// Returns an empty string if the repo has no description set.
-func (c *Client) GetRepoDescription(owner, repo string) (string, error) {
-	data, err := c.Get(fmt.Sprintf("/repos/%s/%s", owner, repo))
-	if err != nil {
-		return "", fmt.Errorf("get repo %s/%s: %w", owner, repo, err)
-	}
-
-	var r repoMeta
-	if err := json.Unmarshal(data, &r); err != nil {
-		return "", fmt.Errorf("parse repo %s/%s: %w", owner, repo, err)
-	}
-
-	return r.Description, nil
+	return all, nil
 }
 
 // fileContent is the GitHub API response for a repository file.

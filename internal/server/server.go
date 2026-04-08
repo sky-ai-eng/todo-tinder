@@ -78,6 +78,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
 	s.mux.HandleFunc("POST /api/settings", s.handleSettingsPost)
 	s.mux.HandleFunc("POST /api/skills/import", s.handleSkillsImport)
+	s.mux.HandleFunc("GET /api/github/repos", s.handleGitHubRepos)
 	s.mux.HandleFunc("GET /api/jira/statuses", s.handleJiraStatuses)
 
 	s.mux.HandleFunc("GET /api/reviews/{id}", s.handleReviewGet)

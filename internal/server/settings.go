@@ -7,6 +7,7 @@ import (
 
 	"github.com/sky-ai-eng/todo-tinder/internal/auth"
 	"github.com/sky-ai-eng/todo-tinder/internal/config"
+	ghclient "github.com/sky-ai-eng/todo-tinder/internal/github"
 	"github.com/sky-ai-eng/todo-tinder/internal/jira"
 )
 
@@ -20,10 +21,11 @@ type settingsResponse struct {
 }
 
 type githubSettings struct {
-	Enabled      bool   `json:"enabled"`
-	BaseURL      string `json:"base_url"`
-	HasToken     bool   `json:"has_token"`
-	PollInterval string `json:"poll_interval"`
+	Enabled      bool     `json:"enabled"`
+	BaseURL      string   `json:"base_url"`
+	HasToken     bool     `json:"has_token"`
+	PollInterval string   `json:"poll_interval"`
+	Repos        []string `json:"repos"`
 }
 
 type jiraSettings struct {
@@ -60,6 +62,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 			BaseURL:      cfg.GitHub.BaseURL,
 			HasToken:     creds.GitHubPAT != "",
 			PollInterval: cfg.GitHub.PollInterval.String(),
+			Repos:        cfg.GitHub.Repos,
 		},
 		Jira: jiraSettings{
 			Enabled:          creds.JiraPAT != "",
@@ -80,6 +83,9 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	if resp.GitHub.Repos == nil {
+		resp.GitHub.Repos = []string{}
+	}
 	if resp.Jira.Projects == nil {
 		resp.Jira.Projects = []string{}
 	}
@@ -100,6 +106,7 @@ type settingsUpdateRequest struct {
 	JiraPAT       string `json:"jira_pat"` // empty means "keep existing"
 
 	// Config
+	GitHubRepos          []string `json:"github_repos"`
 	GitHubPollInterval   string   `json:"github_poll_interval"`
 	JiraPollInterval     string   `json:"jira_poll_interval"`
 	JiraProjects         []string `json:"jira_projects"`
@@ -199,6 +206,9 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			cfg.Jira.PollInterval = d
 		}
 	}
+	if req.GitHubRepos != nil {
+		cfg.GitHub.Repos = req.GitHubRepos
+	}
 	if req.JiraProjects != nil {
 		cfg.Jira.Projects = req.JiraProjects
 	}
@@ -272,4 +282,28 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, statuses)
+}
+
+// handleGitHubRepos returns all repositories the authenticated user has access to.
+func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
+	creds, _ := auth.Load()
+	if creds.GitHubPAT == "" || creds.GitHubURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GitHub not configured"})
+		return
+	}
+
+	cfg, _ := config.Load()
+	baseURL := cfg.GitHub.BaseURL
+	if baseURL == "" {
+		baseURL = creds.GitHubURL
+	}
+
+	client := ghclient.NewClient(baseURL, creds.GitHubPAT)
+	repos, err := client.ListUserRepos()
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to fetch repos: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, repos)
 }

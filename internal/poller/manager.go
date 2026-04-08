@@ -61,7 +61,7 @@ func (m *Manager) Restart() {
 			if interval < 10*time.Second {
 				interval = time.Minute
 			}
-			m.github = NewGitHubPoller(creds.GitHubURL, creds.GitHubPAT, ghUser.Login, m.database, interval, m.bus)
+			m.github = NewGitHubPoller(creds.GitHubURL, creds.GitHubPAT, ghUser.Login, cfg.GitHub.Repos, m.database, interval, m.bus)
 			m.github.Start()
 			log.Printf("[github] poller started (interval: %s, user: %s)", interval, ghUser.Login)
 		}

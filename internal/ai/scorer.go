@@ -173,7 +173,7 @@ func scoreBatch(tasks []TaskInput, repoContext string) ([]TaskScore, error) {
 	}
 
 	// The result might contain markdown fences despite the prompt — strip them
-	raw = stripCodeFences(raw)
+	raw = StripCodeFences(raw)
 
 	var scores []TaskScore
 	if err := json.Unmarshal(raw, &scores); err != nil {
@@ -195,7 +195,8 @@ func formatRepoProfiles(profiles []domain.RepoProfile) string {
 	return strings.TrimSpace(sb.String())
 }
 
-func stripCodeFences(b []byte) []byte {
+// StripCodeFences removes markdown code fences from LLM output.
+func StripCodeFences(b []byte) []byte {
 	s := bytes.TrimSpace(b)
 	// Strip ```json ... ``` or ``` ... ```
 	if bytes.HasPrefix(s, []byte("```")) {

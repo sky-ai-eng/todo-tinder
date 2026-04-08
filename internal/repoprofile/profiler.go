@@ -18,14 +18,12 @@ import (
 )
 
 const (
-	profileBatchSize    = 5
-	repoPolitenessDelay = 100 * time.Millisecond
-	profilingModel      = "haiku"
-	maxDocChars         = 3000
+	profileBatchSize = 5
+	profilingModel   = "haiku"
+	maxDocChars      = 10000
 )
 
-// Profiler builds and persists AI-generated profiles for GitHub repositories
-// based on a user's recent activity.
+// Profiler builds and persists AI-generated profiles for GitHub repositories.
 type Profiler struct {
 	gh       *github.Client
 	database *sql.DB
@@ -42,28 +40,20 @@ type repoWithDocs struct {
 	docs    string
 }
 
-// Run profiles all repos the user was active in during the last activeDays days.
-// It pages through the GitHub Events API (capped at 300 events / 10 pages),
-// fetches per-repo metadata and docs, generates AI profiles for repos with
-// documentation via Haiku, and upserts everything into repo_profiles.
-func (p *Profiler) Run(ctx context.Context, githubUsername string, activeDays int) error {
-	since := time.Now().Add(-time.Duration(activeDays) * 24 * time.Hour)
-
-	repoNames, err := p.gh.ListUserEvents(githubUsername, since)
-	if err != nil {
-		return fmt.Errorf("list user events: %w", err)
-	}
-
-	log.Printf("[repoprofile] found %d active repos for %s in the last %d days", len(repoNames), githubUsername, activeDays)
-
-	if len(repoNames) == 0 {
+// Run profiles the given repos (from config). For each, it fetches docs
+// (README.md, CLAUDE.md, AGENTS.md), then batches through Haiku for profiling.
+func (p *Profiler) Run(ctx context.Context, repos []string) error {
+	if len(repos) == 0 {
+		log.Printf("[repoprofile] no repos configured, skipping")
 		return nil
 	}
+
+	log.Printf("[repoprofile] profiling %d configured repos", len(repos))
 
 	var withDocs []repoWithDocs
 	var withoutDocs []domain.RepoProfile
 
-	for i, name := range repoNames {
+	for _, name := range repos {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -74,11 +64,6 @@ func (p *Profiler) Run(ctx context.Context, githubUsername string, activeDays in
 			continue
 		}
 		owner, repo := parts[0], parts[1]
-
-		desc, err := p.gh.GetRepoDescription(owner, repo)
-		if err != nil {
-			log.Printf("[repoprofile] %s: get description: %v", name, err)
-		}
 
 		readme, err := p.gh.GetFileContent(owner, repo, "README.md")
 		if err != nil {
@@ -99,7 +84,6 @@ func (p *Profiler) Run(ctx context.Context, githubUsername string, activeDays in
 			ID:          name,
 			Owner:       owner,
 			Repo:        repo,
-			Description: desc,
 			HasReadme:   readme != "",
 			HasClaudeMd: claudeMd != "",
 			HasAgentsMd: agentsMd != "",
@@ -110,11 +94,6 @@ func (p *Profiler) Run(ctx context.Context, githubUsername string, activeDays in
 			withoutDocs = append(withoutDocs, prof)
 		} else {
 			withDocs = append(withDocs, repoWithDocs{profile: prof, docs: docs})
-		}
-
-		// Politeness delay between repo fetches — skip after the last one.
-		if i < len(repoNames)-1 {
-			time.Sleep(repoPolitenessDelay)
 		}
 	}
 
@@ -180,9 +159,8 @@ func (p *Profiler) Run(ctx context.Context, githubUsername string, activeDays in
 
 // repoProfileInput is the per-repo JSON sent to the LLM.
 type repoProfileInput struct {
-	Repo        string `json:"repo"`
-	Description string `json:"description,omitempty"`
-	Docs        string `json:"docs"`
+	Repo string `json:"repo"`
+	Docs string `json:"docs"`
 }
 
 // repoProfileResult is one entry in the LLM's JSON array response.
@@ -195,9 +173,8 @@ func profileBatch(batch []repoWithDocs) ([]repoProfileResult, error) {
 	inputs := make([]repoProfileInput, len(batch))
 	for i, d := range batch {
 		inputs[i] = repoProfileInput{
-			Repo:        d.profile.ID,
-			Description: d.profile.Description,
-			Docs:        d.docs,
+			Repo: d.profile.ID,
+			Docs: d.docs,
 		}
 	}
 
@@ -232,7 +209,7 @@ func profileBatch(batch []repoWithDocs) ([]repoProfileResult, error) {
 		raw = []byte(envelope.Result)
 	}
 
-	raw = stripCodeFences(raw)
+	raw = ai.StripCodeFences(raw)
 
 	var results []repoProfileResult
 	if err := json.Unmarshal(raw, &results); err != nil {
@@ -256,19 +233,6 @@ func buildDocText(readme, claudeMd, agentsMd string) string {
 		parts = append(parts, "AGENTS.md:\n"+truncateStr(agentsMd, maxDocChars))
 	}
 	return strings.Join(parts, "\n\n---\n\n")
-}
-
-func stripCodeFences(b []byte) []byte {
-	s := bytes.TrimSpace(b)
-	if bytes.HasPrefix(s, []byte("```")) {
-		if idx := bytes.Index(s[3:], []byte("\n")); idx >= 0 {
-			s = s[3+idx+1:]
-		}
-		if idx := bytes.LastIndex(s, []byte("```")); idx >= 0 {
-			s = s[:idx]
-		}
-	}
-	return bytes.TrimSpace(s)
 }
 
 func truncateStr(s string, maxLen int) string {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -16,6 +17,7 @@ import (
 	ghclient "github.com/sky-ai-eng/todo-tinder/internal/github"
 	"github.com/sky-ai-eng/todo-tinder/internal/jira"
 	"github.com/sky-ai-eng/todo-tinder/internal/poller"
+	"github.com/sky-ai-eng/todo-tinder/internal/repoprofile"
 	"github.com/sky-ai-eng/todo-tinder/internal/skills"
 	"github.com/sky-ai-eng/todo-tinder/internal/server"
 	"github.com/sky-ai-eng/todo-tinder/internal/worktree"
@@ -167,6 +169,16 @@ func main() {
 			spawner.UpdateCredentials(ghClient, cfg.AI.Model)
 			srv.SetGitHubClient(ghClient)
 			log.Println("[delegate] spawner credentials updated")
+
+			// Trigger repo profiling if repos are configured
+			if len(cfg.GitHub.Repos) > 0 {
+				go func() {
+					profiler := repoprofile.NewProfiler(ghClient, database)
+					if err := profiler.Run(context.Background(), cfg.GitHub.Repos); err != nil {
+						log.Printf("[repoprofile] profiling failed: %v", err)
+					}
+				}()
+			}
 		} else {
 			spawner.UpdateCredentials(nil, "")
 			srv.SetGitHubClient(nil)
@@ -189,6 +201,16 @@ func main() {
 		spawner.UpdateCredentials(ghClient, cfg.AI.Model)
 		srv.SetGitHubClient(ghClient)
 		log.Println("[delegate] spawner ready")
+
+		// Profile repos on startup if configured
+		if len(cfg.GitHub.Repos) > 0 {
+			go func() {
+				profiler := repoprofile.NewProfiler(ghClient, database)
+				if err := profiler.Run(context.Background(), cfg.GitHub.Repos); err != nil {
+					log.Printf("[repoprofile] initial profiling failed: %v", err)
+				}
+			}()
+		}
 	}
 	if creds.JiraPAT != "" && creds.JiraURL != "" {
 		srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgressStatus)
