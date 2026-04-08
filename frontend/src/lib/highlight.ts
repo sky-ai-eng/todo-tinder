@@ -1,32 +1,32 @@
-import { refractor } from "refractor/lib/core.js";
+import { refractor } from "refractor/core";
 
 // Register languages we'll commonly see in code reviews.
 // Import individually to avoid pulling in the full ~300-language bundle.
-import go from "refractor/lang/go.js";
-import typescript from "refractor/lang/typescript.js";
-import javascript from "refractor/lang/javascript.js";
-import tsx from "refractor/lang/tsx.js";
-import jsx from "refractor/lang/jsx.js";
-import python from "refractor/lang/python.js";
-import rust from "refractor/lang/rust.js";
-import java from "refractor/lang/java.js";
-import kotlin from "refractor/lang/kotlin.js";
-import swift from "refractor/lang/swift.js";
-import css from "refractor/lang/css.js";
-import scss from "refractor/lang/scss.js";
-import json from "refractor/lang/json.js";
-import yaml from "refractor/lang/yaml.js";
-import toml from "refractor/lang/toml.js";
-import bash from "refractor/lang/bash.js";
-import sql from "refractor/lang/sql.js";
-import markdown from "refractor/lang/markdown.js";
-import docker from "refractor/lang/docker.js";
-import protobuf from "refractor/lang/protobuf.js";
-import makefile from "refractor/lang/makefile.js";
-import ruby from "refractor/lang/ruby.js";
-import csharp from "refractor/lang/csharp.js";
-import cpp from "refractor/lang/cpp.js";
-import c from "refractor/lang/c.js";
+import go from "refractor/go";
+import typescript from "refractor/typescript";
+import javascript from "refractor/javascript";
+import tsx from "refractor/tsx";
+import jsx from "refractor/jsx";
+import python from "refractor/python";
+import rust from "refractor/rust";
+import java from "refractor/java";
+import kotlin from "refractor/kotlin";
+import swift from "refractor/swift";
+import css from "refractor/css";
+import scss from "refractor/scss";
+import json from "refractor/json";
+import yaml from "refractor/yaml";
+import toml from "refractor/toml";
+import bash from "refractor/bash";
+import sql from "refractor/sql";
+import markdown from "refractor/markdown";
+import docker from "refractor/docker";
+import protobuf from "refractor/protobuf";
+import makefile from "refractor/makefile";
+import ruby from "refractor/ruby";
+import csharp from "refractor/csharp";
+import cpp from "refractor/cpp";
+import c from "refractor/c";
 
 refractor.register(go);
 refractor.register(typescript);
