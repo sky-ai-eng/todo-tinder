@@ -136,22 +136,23 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 	return eventsEmitted, nil
 }
 
+// maxSearchQueryLen is GitHub's limit for the q= search parameter.
+const maxSearchQueryLen = 256
+
 // discoverGitHub runs search queries to find new PRs.
+// If repos are configured, scopes queries with repo: qualifiers, batching
+// to stay under GitHub's 256-char query limit.
 func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos []string) ([]ghclient.DiscoveredPR, error) {
-	// Build repo scope for queries
-	repoScope := ""
-	if len(repos) > 0 {
-		parts := make([]string, len(repos))
-		for i, r := range repos {
-			parts[i] = "repo:" + r
-		}
-		repoScope = " " + strings.Join(parts, " ")
+	bases := []string{
+		fmt.Sprintf("is:pr is:open review-requested:%s", username),
+		fmt.Sprintf("is:pr is:open author:%s", username),
+		fmt.Sprintf("is:pr is:open mentions:%s", username),
 	}
 
-	queries := []string{
-		fmt.Sprintf("is:pr is:open review-requested:%s%s", username, repoScope),
-		fmt.Sprintf("is:pr is:open author:%s%s", username, repoScope),
-		fmt.Sprintf("is:pr is:open mentions:%s%s", username, repoScope),
+	// Expand each base query with repo scoping, batching if needed
+	var queries []string
+	for _, base := range bases {
+		queries = append(queries, scopedQueries(base, repos)...)
 	}
 
 	seen := map[int]bool{}
