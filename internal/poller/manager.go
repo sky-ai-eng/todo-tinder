@@ -32,55 +32,48 @@ func NewManager(database *sql.DB, bus *eventbus.Bus) *Manager {
 
 // RestartAll stops all pollers and restarts any that are fully configured.
 func (m *Manager) RestartAll() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.stopAllLocked()
+	m.stopAll()
 
 	cfg, _ := config.Load()
 	creds, _ := auth.Load()
 
-	m.startGitHubLocked(cfg, creds)
-	m.startJiraLocked(cfg, creds)
+	m.startGitHub(cfg, creds)
+	m.startJira(cfg, creds)
 }
 
 // RestartGitHub stops and restarts only the GitHub poller.
 func (m *Manager) RestartGitHub() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.github != nil {
 		m.github.Stop()
 		m.github = nil
 		log.Println("[github] poller stopped")
 	}
+	m.mu.Unlock()
 
 	cfg, _ := config.Load()
 	creds, _ := auth.Load()
-	m.startGitHubLocked(cfg, creds)
+	m.startGitHub(cfg, creds)
 }
 
 // RestartJira stops and restarts only the Jira poller.
 func (m *Manager) RestartJira() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.jira != nil {
 		m.jira.Stop()
 		m.jira = nil
 		log.Println("[jira] poller stopped")
 	}
+	m.mu.Unlock()
 
 	cfg, _ := config.Load()
 	creds, _ := auth.Load()
-	m.startJiraLocked(cfg, creds)
+	m.startJira(cfg, creds)
 }
 
 // StopAll stops all running pollers without restarting.
 func (m *Manager) StopAll() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopAllLocked()
+	m.stopAll()
 }
 
 // Restart is a convenience alias for RestartAll (backwards compat).
@@ -88,7 +81,10 @@ func (m *Manager) Restart() {
 	m.RestartAll()
 }
 
-func (m *Manager) stopAllLocked() {
+func (m *Manager) stopAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if m.github != nil {
 		m.github.Stop()
 		m.github = nil
@@ -101,7 +97,9 @@ func (m *Manager) stopAllLocked() {
 	}
 }
 
-func (m *Manager) startGitHubLocked(cfg config.Config, creds auth.Credentials) {
+// startGitHub does all I/O (DB query, auth validation) outside the lock,
+// then locks only to assign the poller pointer.
+func (m *Manager) startGitHub(cfg config.Config, creds auth.Credentials) {
 	if !cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) {
 		log.Println("[github] credentials not configured, skipping poller")
 		return
@@ -127,12 +125,19 @@ func (m *Manager) startGitHubLocked(cfg config.Config, creds auth.Credentials) {
 	if interval < 10*time.Second {
 		interval = time.Minute
 	}
-	m.github = NewGitHubPoller(creds.GitHubURL, creds.GitHubPAT, ghUser.Login, repos, m.database, interval, m.bus)
-	m.github.Start()
+
+	poller := NewGitHubPoller(creds.GitHubURL, creds.GitHubPAT, ghUser.Login, repos, m.database, interval, m.bus)
+
+	m.mu.Lock()
+	m.github = poller
+	m.mu.Unlock()
+
+	poller.Start()
 	log.Printf("[github] poller started (interval: %s, user: %s, repos: %d)", interval, ghUser.Login, len(repos))
 }
 
-func (m *Manager) startJiraLocked(cfg config.Config, creds auth.Credentials) {
+// startJira does validation outside the lock, then locks only to assign.
+func (m *Manager) startJira(cfg config.Config, creds auth.Credentials) {
 	if !cfg.Jira.Ready(creds.JiraPAT, creds.JiraURL) {
 		log.Println("[jira] not fully configured, skipping poller")
 		return
@@ -142,7 +147,13 @@ func (m *Manager) startJiraLocked(cfg config.Config, creds auth.Credentials) {
 	if interval < 10*time.Second {
 		interval = time.Minute
 	}
-	m.jira = NewJiraPoller(creds.JiraURL, creds.JiraPAT, cfg.Jira.Projects, cfg.Jira.PickupStatuses, m.database, interval, m.bus)
-	m.jira.Start()
+
+	poller := NewJiraPoller(creds.JiraURL, creds.JiraPAT, cfg.Jira.Projects, cfg.Jira.PickupStatuses, m.database, interval, m.bus)
+
+	m.mu.Lock()
+	m.jira = poller
+	m.mu.Unlock()
+
+	poller.Start()
 	log.Printf("[jira] poller started (interval: %s, projects: %v)", interval, cfg.Jira.Projects)
 }
