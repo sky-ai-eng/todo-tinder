@@ -207,6 +207,46 @@ func (s *Server) handleRunReview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// handleReviewUpdate updates the review body and/or event type.
+func (s *Server) handleReviewUpdate(w http.ResponseWriter, r *http.Request) {
+	reviewID := r.PathValue("id")
+
+	var req struct {
+		ReviewBody  *string `json:"review_body"`
+		ReviewEvent *string `json:"review_event"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+
+	review, err := db.GetPendingReview(s.db, reviewID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if review == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "review not found"})
+		return
+	}
+
+	body := review.ReviewBody
+	event := review.ReviewEvent
+	if req.ReviewBody != nil {
+		body = *req.ReviewBody
+	}
+	if req.ReviewEvent != nil {
+		event = *req.ReviewEvent
+	}
+
+	if err := db.SetPendingReviewSubmission(s.db, reviewID, body, event); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // handleReviewCommentUpdate edits the body of a pending review comment.
 func (s *Server) handleReviewCommentUpdate(w http.ResponseWriter, r *http.Request) {
 	commentID := r.PathValue("commentId")

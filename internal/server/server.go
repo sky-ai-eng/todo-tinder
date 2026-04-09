@@ -81,6 +81,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/jira/statuses", s.handleJiraStatuses)
 
 	s.mux.HandleFunc("GET /api/reviews/{id}", s.handleReviewGet)
+	s.mux.HandleFunc("PATCH /api/reviews/{id}", s.handleReviewUpdate)
 	s.mux.HandleFunc("GET /api/reviews/{id}/diff", s.handleReviewDiff)
 	s.mux.HandleFunc("POST /api/reviews/{id}/submit", s.handleReviewSubmit)
 	s.mux.HandleFunc("PUT /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentUpdate)
