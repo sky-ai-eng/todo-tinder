@@ -121,7 +121,7 @@ function BranchInput({
         className="w-40 text-[12px] bg-transparent border border-border-subtle rounded-lg px-2.5 py-1.5 text-text-primary placeholder:text-text-tertiary/50 focus:outline-none focus:border-accent/40 transition-colors"
       />
       {open && (
-        <div className="absolute z-10 top-full mt-1 w-56 max-h-48 overflow-y-auto backdrop-blur-xl bg-surface-raised border border-border-glass rounded-xl shadow-lg shadow-black/[0.08]">
+        <div className="absolute z-50 top-full mt-1 w-56 max-h-48 overflow-y-auto backdrop-blur-xl bg-surface-raised border border-border-glass rounded-xl shadow-lg shadow-black/[0.08]">
           {loading && branches.length === 0 ? (
             <div className="px-3 py-2 text-[11px] text-text-tertiary">
               Loading...
