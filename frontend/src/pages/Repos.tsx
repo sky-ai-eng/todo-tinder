@@ -25,6 +25,11 @@ function BranchInput({
 }) {
   const [value, setValue] = useState(profile.base_branch || "");
   const [open, setOpen] = useState(false);
+
+  // Sync local state when the profile prop changes (e.g. after re-fetch or WS update)
+  useEffect(() => {
+    setValue(profile.base_branch || "");
+  }, [profile.base_branch]);
   const [branches, setBranches] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const ref = useRef<HTMLDivElement>(null);

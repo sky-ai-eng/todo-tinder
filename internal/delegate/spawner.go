@@ -110,6 +110,7 @@ func (s *Spawner) Delegate(task domain.Task, explicitPromptID string) (string, e
 	s.mu.Unlock()
 
 	go func() {
+		startTime := time.Now()
 		defer func() {
 			s.mu.Lock()
 			delete(s.cancels, runID)
@@ -132,7 +133,7 @@ func (s *Spawner) Delegate(task domain.Task, explicitPromptID string) (string, e
 
 		if setupErr != nil {
 			if ctx.Err() != nil {
-				s.handleCancelled(runID, time.Now())
+				s.handleCancelled(runID, startTime, cfg.hasWT)
 				return
 			}
 			s.failRun(runID, setupErr.Error())
@@ -140,7 +141,7 @@ func (s *Spawner) Delegate(task domain.Task, explicitPromptID string) (string, e
 		}
 
 		// Phase 2: run the agent
-		s.runAgent(ctx, runID, task, mission, cfg, model)
+		s.runAgent(ctx, runID, task, mission, cfg, startTime, model)
 	}()
 
 	return runID, nil
@@ -252,9 +253,7 @@ func (s *Spawner) setupJira(ctx context.Context, runID string, task domain.Task,
 }
 
 // runAgent is the generic agent execution loop. Works for any task type.
-func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, mission string, cfg runConfig, model string) {
-	startTime := time.Now()
-
+func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, mission string, cfg runConfig, startTime time.Time, model string) {
 	if cfg.hasWT {
 		defer worktree.Remove(runID)
 	}
@@ -269,7 +268,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	s.updateStatus(runID, "agent_starting")
 	if ctx.Err() != nil {
-		s.handleCancelled(runID, startTime)
+		s.handleCancelled(runID, startTime, cfg.hasWT)
 		return
 	}
 
@@ -378,7 +377,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() != nil {
-			s.handleCancelled(runID, startTime)
+			s.handleCancelled(runID, startTime, cfg.hasWT)
 			return
 		}
 		stderr := stderrBuf.String()
@@ -416,11 +415,13 @@ func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID string) (stri
 	return "", "", fmt.Errorf("no prompt available for event type %q — configure one on the Prompts page", task.EventType)
 }
 
-func (s *Spawner) handleCancelled(runID string, startTime time.Time) {
+func (s *Spawner) handleCancelled(runID string, startTime time.Time, hasWT bool) {
 	elapsed := int(time.Since(startTime).Milliseconds())
 	db.CompleteAgentRun(s.database, runID, "cancelled", 0, elapsed, 0, "cancelled", "", "Cancelled by user")
 	s.broadcastRunUpdate(runID, "cancelled")
-	worktree.Remove(runID)
+	if hasWT {
+		worktree.Remove(runID)
+	}
 }
 
 func (s *Spawner) updateStatus(runID, status string) {

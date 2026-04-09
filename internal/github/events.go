@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 )
 
@@ -69,24 +68,40 @@ type Branch struct {
 }
 
 // ListBranches returns branches for a repo, optionally filtered by prefix.
-// Uses GitHub's server-side filtering to avoid fetching all branches.
+// The GitHub REST branches endpoint doesn't support server-side search,
+// so we fetch up to 100 branches and filter client-side.
 func (c *Client) ListBranches(owner, repo, query string, limit int) ([]Branch, error) {
 	if limit <= 0 {
 		limit = 30
 	}
-	path := fmt.Sprintf("/repos/%s/%s/branches?per_page=%d", owner, repo, limit)
-	if query != "" {
-		path += "&query=" + url.QueryEscape(query)
-	}
+	// Fetch more than we need to allow for filtering
+	fetchSize := 100
+	path := fmt.Sprintf("/repos/%s/%s/branches?per_page=%d", owner, repo, fetchSize)
 	data, err := c.Get(path)
 	if err != nil {
 		return nil, err
 	}
-	var branches []Branch
-	if err := json.Unmarshal(data, &branches); err != nil {
+	var all []Branch
+	if err := json.Unmarshal(data, &all); err != nil {
 		return nil, fmt.Errorf("parse branches: %w", err)
 	}
-	return branches, nil
+	if query == "" {
+		if len(all) > limit {
+			return all[:limit], nil
+		}
+		return all, nil
+	}
+	q := strings.ToLower(query)
+	var filtered []Branch
+	for _, b := range all {
+		if strings.Contains(strings.ToLower(b.Name), q) {
+			filtered = append(filtered, b)
+			if len(filtered) >= limit {
+				break
+			}
+		}
+	}
+	return filtered, nil
 }
 
 // fileContent is the GitHub API response for a repository file.

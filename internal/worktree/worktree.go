@@ -141,13 +141,27 @@ func CreateForBranch(ctx context.Context, owner, repo, cloneURL, baseBranch, fea
 		return "", err
 	}
 
-	// Create worktree with a new branch off the base
-	if err := gitRunCtx(ctx, bareDir, "worktree", "add", "-b", featureBranch, wtDir, "refs/heads/"+baseBranch); err != nil {
-		return "", fmt.Errorf("worktree add branch: %w", err)
+	// Create worktree — reuse the branch if it already exists (re-delegation),
+	// otherwise create a new one off the base.
+	if branchExists(bareDir, featureBranch) {
+		// Branch exists from a previous run — check it out
+		if err := gitRunCtx(ctx, bareDir, "worktree", "add", wtDir, featureBranch); err != nil {
+			return "", fmt.Errorf("worktree add existing branch: %w", err)
+		}
+	} else {
+		if err := gitRunCtx(ctx, bareDir, "worktree", "add", "-b", featureBranch, wtDir, "refs/heads/"+baseBranch); err != nil {
+			return "", fmt.Errorf("worktree add new branch: %w", err)
+		}
 	}
 
 	log.Printf("[worktree] branch worktree at %s (%s from %s)", wtDir, featureBranch, baseBranch)
 	return wtDir, nil
+}
+
+// branchExists checks whether a branch ref exists in the bare repo.
+func branchExists(bareDir, branch string) bool {
+	err := gitRun(bareDir, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
 }
 
 // detectDefaultBranch reads HEAD from the bare repo to find the default branch.
