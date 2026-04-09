@@ -23,6 +23,19 @@ func seedDefaultPrompts(database *sql.DB) {
 		log.Printf("[seed] warning: failed to seed PR review prompt: %v", err)
 	}
 
+	// Merge conflict resolution prompt — bound to conflicts event (not yet emitted by poller)
+	err = db.SeedPrompt(database, domain.Prompt{
+		ID:     "system-conflict-resolution",
+		Name:   "Merge Conflict Resolution",
+		Body:   ai.ConflictResolutionPromptTemplate,
+		Source: "system",
+	}, []domain.PromptBinding{
+		{PromptID: "system-conflict-resolution", EventType: "github:pr:conflicts", IsDefault: true},
+	})
+	if err != nil {
+		log.Printf("[seed] warning: failed to seed conflict resolution prompt: %v", err)
+	}
+
 	// Default Jira implementation prompt — bound to assigned issues
 	err = db.SeedPrompt(database, domain.Prompt{
 		ID:     "system-jira-implement",

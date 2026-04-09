@@ -33,6 +33,9 @@ var PRReviewPromptTemplate string
 //go:embed prompts/jira-implement.txt
 var JiraImplementPromptTemplate string
 
+//go:embed prompts/conflict-resolution.txt
+var ConflictResolutionPromptTemplate string
+
 //go:embed prompts/repo-profile.txt
 var RepoProfilePrompt string
 
