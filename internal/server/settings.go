@@ -291,6 +291,52 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
 
+// handleJiraConnect validates and stores Jira credentials without saving
+// the rest of the settings. This powers the two-stage settings flow: connect
+// first, then configure projects and statuses.
+func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL string `json:"url"`
+		PAT string `json:"pat"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.URL == "" || req.PAT == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url and pat are required"})
+		return
+	}
+
+	jiraUser, err := auth.ValidateJira(req.URL, req.PAT)
+	if err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Store credentials
+	creds, _ := auth.Load()
+	creds.JiraURL = req.URL
+	creds.JiraPAT = req.PAT
+	if err := auth.Store(creds); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
+		return
+	}
+
+	// Persist URL in config too
+	cfg, _ := config.Load()
+	cfg.Jira.BaseURL = req.URL
+	if err := config.Save(cfg); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save config: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":       "connected",
+		"display_name": jiraUser.DisplayName,
+	})
+}
+
 // handleJiraStatuses returns available statuses for given Jira projects.
 // Query params: ?project=PROJ1&project=PROJ2 (or uses configured projects if omitted).
 func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
