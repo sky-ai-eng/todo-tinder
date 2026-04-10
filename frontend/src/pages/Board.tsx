@@ -215,6 +215,10 @@ export default function Board() {
     const task = allTasks.get(taskId)
     if (!task) return
 
+    // Block cross-column moves for externally terminal tasks (merged/closed PRs)
+    const terminalEvents = ['github:pr:merged', 'github:pr:closed']
+    if (terminalEvents.includes(task.event_type || '')) return
+
     // Moving to in_progress: show claim/delegate popup
     if (targetCol === 'in_progress' && sourceCol !== 'in_progress') {
       setPendingInProgress(task)

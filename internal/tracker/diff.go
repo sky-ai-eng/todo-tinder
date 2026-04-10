@@ -190,7 +190,7 @@ func initialPREvents(snap domain.PRSnapshot, sourceID, username string, now time
 	}
 
 	if snap.State == "CLOSED" {
-		// Closed-unmerged PRs are backfill for dashboard stats only — no triage event.
+		add(domain.EventGitHubPRClosed)
 		return events
 	}
 
