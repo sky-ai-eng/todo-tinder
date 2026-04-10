@@ -117,7 +117,13 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 		// Parse previous snapshot and diff
 		var prevSnap domain.PRSnapshot
 		if item.Snapshot != "" && item.Snapshot != "{}" {
-			json.Unmarshal([]byte(item.Snapshot), &prevSnap)
+			if err := json.Unmarshal([]byte(item.Snapshot), &prevSnap); err != nil {
+				log.Printf("[tracker] corrupt snapshot for %s, skipping diff: %v", item.SourceID, err)
+				// Overwrite with fresh state so next cycle can diff cleanly
+				snapJSON, _ := json.Marshal(newSnap)
+				db.UpdateTrackedSnapshot(t.database, "github", item.SourceID, string(snapJSON))
+				continue
+			}
 		}
 
 		events := DiffPRSnapshots(prevSnap, newSnap, item.SourceID, username)
@@ -289,7 +295,12 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 
 		var prevSnap domain.JiraSnapshot
 		if item.Snapshot != "" && item.Snapshot != "{}" {
-			json.Unmarshal([]byte(item.Snapshot), &prevSnap)
+			if err := json.Unmarshal([]byte(item.Snapshot), &prevSnap); err != nil {
+				log.Printf("[tracker] corrupt snapshot for %s, skipping diff: %v", item.SourceID, err)
+				snapJSON, _ := json.Marshal(newSnap)
+				db.UpdateTrackedSnapshot(t.database, "jira", item.SourceID, string(snapJSON))
+				continue
+			}
 		}
 
 		events := DiffJiraSnapshots(prevSnap, newSnap, item.SourceID)
