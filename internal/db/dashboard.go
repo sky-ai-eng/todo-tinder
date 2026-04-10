@@ -80,7 +80,11 @@ func GetDashboardStats(database *sql.DB, username string, sinceDays int) (*Dashb
 			}
 
 		case snap.State == "CLOSED":
-			stats.Closed++
+			if terminalAt.Valid && terminalAt.Time.After(since) {
+				stats.Closed++
+			} else if !terminalAt.Valid {
+				stats.Closed++
+			}
 
 		case snap.State == "OPEN" && snap.IsDraft:
 			stats.Draft++
