@@ -71,9 +71,15 @@ func (p *Profiler) Run(ctx context.Context, repos []string, force bool) error {
 
 		// Skip repos that were recently profiled (unless forced)
 		if !force {
-			if existing, err := db.GetRepoProfile(p.database, name); err == nil && existing != nil {
-				if existing.ProfiledAt != nil && time.Since(*existing.ProfiledAt) < reprofileTTL {
-					log.Printf("[repoprofile] %s: profiled %s ago, skipping (TTL %s)", name, time.Since(*existing.ProfiledAt).Round(time.Hour), reprofileTTL)
+			existing, err := db.GetRepoProfile(p.database, name)
+			if err != nil {
+				log.Printf("[repoprofile] %s: failed to check profile: %v", name, err)
+				continue
+			}
+			if existing != nil && existing.ProfiledAt != nil {
+				age := time.Since(*existing.ProfiledAt)
+				if age < reprofileTTL {
+					log.Printf("[repoprofile] %s: profiled %s ago, skipping (TTL %s)", name, age.Round(time.Hour), reprofileTTL)
 					continue
 				}
 			}
