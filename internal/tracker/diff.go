@@ -189,6 +189,11 @@ func initialPREvents(snap domain.PRSnapshot, sourceID, username string, now time
 		return events
 	}
 
+	if snap.State == "CLOSED" {
+		// Closed-unmerged PRs are backfill for dashboard stats only — no triage event.
+		return events
+	}
+
 	// Emit the most specific event for why we discovered this PR
 	for _, rr := range snap.ReviewRequests {
 		if rr == username {

@@ -167,11 +167,13 @@ func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos
 		fmt.Sprintf("is:pr is:open review-requested:%s", username),
 		fmt.Sprintf("is:pr is:open author:%s", username),
 		fmt.Sprintf("is:pr is:open mentions:%s", username),
-		// Backfill for dashboard — reviewed and merged/closed in last 30 days
+		// Active PRs you've reviewed (may still need attention)
 		fmt.Sprintf("is:pr is:open reviewed-by:%s", username),
+		// Backfill for dashboard — merged/closed in last 30 days
 		fmt.Sprintf("is:pr is:merged author:%s merged:>=%s", username, since),
 		fmt.Sprintf("is:pr is:merged reviewed-by:%s merged:>=%s", username, since),
 		fmt.Sprintf("is:pr is:closed is:unmerged author:%s closed:>=%s", username, since),
+		fmt.Sprintf("is:pr is:closed is:unmerged reviewed-by:%s closed:>=%s", username, since),
 	}
 
 	var queries []string
