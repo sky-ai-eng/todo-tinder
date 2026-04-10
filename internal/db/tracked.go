@@ -15,7 +15,8 @@ func UpsertTrackedItem(database *sql.DB, item domain.TrackedItem) error {
 		VALUES (?, ?, ?, ?, '{}', datetime('now'), datetime('now'))
 		ON CONFLICT(source, source_id) DO UPDATE SET
 			task_id = excluded.task_id,
-			node_id = COALESCE(excluded.node_id, tracked_items.node_id)
+			node_id = COALESCE(excluded.node_id, tracked_items.node_id),
+			terminal_at = NULL
 	`, item.Source, item.SourceID, nullIfEmpty(item.TaskID), nullIfEmpty(item.NodeID))
 	return err
 }
