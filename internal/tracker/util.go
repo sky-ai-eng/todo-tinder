@@ -1,10 +1,19 @@
 package tracker
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 func mustJSON(v any) string {
 	data, _ := json.Marshal(v)
 	return string(data)
+}
+
+// ghSourceID returns a globally unique source_id for a GitHub PR.
+// PR numbers are only unique within a repo, so we prefix with "owner/repo#".
+func ghSourceID(repo string, number int) string {
+	return fmt.Sprintf("%s#%d", repo, number)
 }
 
 // scopedQueries takes a base search query and returns one or more queries

@@ -49,21 +49,19 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 			log.Printf("[tracker] error upserting task for PR #%d: %v", d.Snapshot.Number, err)
 			continue
 		}
-		// Resolve the task ID (upsert may have used an existing row)
-		taskID := t.resolveTaskID("github", fmt.Sprintf("%d", d.Snapshot.Number))
+		sid := ghSourceID(d.Snapshot.Repo, d.Snapshot.Number)
+		taskID := t.resolveTaskID("github", sid)
 
 		snapJSON, _ := json.Marshal(d.Snapshot)
 		item := domain.TrackedItem{
-			ID:       fmt.Sprintf("github:pr:%s#%d", d.Snapshot.Repo, d.Snapshot.Number),
 			Source:   "github",
-			SourceID: fmt.Sprintf("%d", d.Snapshot.Number),
-			Repo:     d.Snapshot.Repo,
+			SourceID: sid,
 			TaskID:   taskID,
 			NodeID:   d.NodeID,
 			Snapshot: string(snapJSON),
 		}
 		if err := db.UpsertTrackedItem(t.database, item); err != nil {
-			log.Printf("[tracker] error registering tracked item %s: %v", item.ID, err)
+			log.Printf("[tracker] error registering tracked item %s: %v", sid, err)
 		}
 	}
 
@@ -95,7 +93,7 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 
 		newSnap, ok := refreshed[item.NodeID]
 		if !ok {
-			log.Printf("[tracker] tracked item %s not returned by refresh, skipping", item.ID)
+			log.Printf("[tracker] tracked item %s not returned by refresh, skipping", item.SourceID)
 			continue
 		}
 
@@ -121,7 +119,7 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 		// Persist new snapshot
 		snapJSON, _ := json.Marshal(newSnap)
 		if err := db.UpdateTrackedSnapshot(t.database, "github", item.SourceID, string(snapJSON)); err != nil {
-			log.Printf("[tracker] error updating snapshot for %s: %v", item.ID, err)
+			log.Printf("[tracker] error updating snapshot for %s: %v", item.SourceID, err)
 		}
 
 		// Record and publish events
@@ -184,7 +182,7 @@ func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos
 		queries = append(queries, scopedQueries(base, repos)...)
 	}
 
-	seen := map[int]bool{}
+	seen := map[string]bool{}
 	var all []ghclient.DiscoveredPR
 
 	for _, q := range queries {
@@ -194,8 +192,9 @@ func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos
 			continue
 		}
 		for _, pr := range prs {
-			if !seen[pr.Snapshot.Number] {
-				seen[pr.Snapshot.Number] = true
+			sid := ghSourceID(pr.Snapshot.Repo, pr.Snapshot.Number)
+			if !seen[sid] {
+				seen[sid] = true
 				all = append(all, pr)
 			}
 		}
@@ -225,14 +224,13 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 
 		snapJSON, _ := json.Marshal(snap)
 		item := domain.TrackedItem{
-			ID:       "jira:" + snap.Key,
 			Source:   "jira",
 			SourceID: snap.Key,
 			TaskID:   taskID,
 			Snapshot: string(snapJSON),
 		}
 		if err := db.UpsertTrackedItem(t.database, item); err != nil {
-			log.Printf("[tracker] error registering tracked item %s: %v", item.ID, err)
+			log.Printf("[tracker] error registering tracked item %s: %v", snap.Key, err)
 		}
 	}
 
@@ -260,7 +258,7 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 	for _, item := range tracked {
 		newSnap, ok := refreshed[item.SourceID]
 		if !ok {
-			log.Printf("[tracker] tracked Jira item %s not returned by refresh, skipping", item.ID)
+			log.Printf("[tracker] tracked Jira item %s not returned by refresh, skipping", item.SourceID)
 			continue
 		}
 
@@ -289,7 +287,7 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 
 		snapJSON, _ := json.Marshal(newSnap)
 		if err := db.UpdateTrackedSnapshot(t.database, "jira", item.SourceID, string(snapJSON)); err != nil {
-			log.Printf("[tracker] error updating snapshot for %s: %v", item.ID, err)
+			log.Printf("[tracker] error updating snapshot for %s: %v", item.SourceID, err)
 		}
 
 		for _, evt := range events {
@@ -424,7 +422,7 @@ func prSnapshotToTask(snap domain.PRSnapshot, username string) domain.Task {
 	return domain.Task{
 		ID:              uuid.New().String(),
 		Source:          "github",
-		SourceID:        fmt.Sprintf("%d", snap.Number),
+		SourceID:        ghSourceID(snap.Repo, snap.Number),
 		SourceURL:       snap.URL,
 		Title:           snap.Title,
 		Repo:            snap.Repo,

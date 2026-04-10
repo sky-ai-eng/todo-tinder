@@ -4,10 +4,8 @@ import "time"
 
 // TrackedItem represents a GitHub PR or Jira issue we're actively monitoring for state changes.
 type TrackedItem struct {
-	ID           string     // composite key: "github:pr:owner/repo#123" or "jira:SKY-45"
 	Source       string     // "github" | "jira"
-	SourceID     string     // "123" or "SKY-45"
-	Repo         string     // "owner/repo" (empty for repo-less Jira tasks)
+	SourceID     string     // "owner/repo#42" (GitHub) or "SKY-45" (Jira)
 	TaskID       string     // FK to tasks table
 	NodeID       string     // GitHub GraphQL node ID (empty for Jira)
 	Snapshot     string     // JSON-serialized snapshot
