@@ -479,7 +479,7 @@ export default function Board() {
                 <EmptyColumn>Nothing claimed</EmptyColumn>
               ) : (
                 claimed.map((task) => (
-                  <SortableTaskCard key={task.id} task={task} />
+                  <SortableTaskCard key={task.id} task={task} onRequeue={() => handleRequeue(task.id)} />
                 ))
               )}
             </SortableContext>
@@ -616,7 +616,7 @@ function SidebarTaskCard({ task }: { task: Task }) {
   )
 }
 
-function SortableTaskCard({ task }: { task: Task }) {
+function SortableTaskCard({ task, onRequeue }: { task: Task; onRequeue?: () => void }) {
   const {
     attributes,
     listeners,
@@ -638,6 +638,7 @@ function SortableTaskCard({ task }: { task: Task }) {
       task={task}
       style={style}
       isDragging={false}
+      onRequeue={onRequeue}
       {...attributes}
       {...listeners}
     />
