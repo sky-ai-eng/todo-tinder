@@ -6,17 +6,16 @@ import (
 	"github.com/sky-ai-eng/todo-tinder/internal/domain"
 )
 
-// UpsertTrackedItem inserts or updates a tracked item.
-// On conflict (same source+source_id), updates snapshot and last_polled.
+// UpsertTrackedItem registers a tracked item. On conflict, updates task_id and
+// node_id but preserves the existing snapshot so the refresh→diff phase can
+// detect transitions since the last cycle.
 func UpsertTrackedItem(database *sql.DB, item domain.TrackedItem) error {
 	_, err := database.Exec(`
 		INSERT INTO tracked_items (source, source_id, task_id, node_id, snapshot, tracked_since, last_polled)
 		VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
 		ON CONFLICT(source, source_id) DO UPDATE SET
-			task_id    = excluded.task_id,
-			node_id    = COALESCE(excluded.node_id, tracked_items.node_id),
-			snapshot   = excluded.snapshot,
-			last_polled = datetime('now')
+			task_id = excluded.task_id,
+			node_id = COALESCE(excluded.node_id, tracked_items.node_id)
 	`, item.Source, item.SourceID, nullIfEmpty(item.TaskID), nullIfEmpty(item.NodeID), item.Snapshot)
 	return err
 }
