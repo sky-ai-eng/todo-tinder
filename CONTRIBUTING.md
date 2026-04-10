@@ -8,7 +8,7 @@ By contributing to this repository, you agree that your contributions will be
 licensed and distributed under the repository's `LICENSE` terms.
 
 All contributions must also be covered by the project's contributor license
-agreement in `CLA.md`.
+agreement in [`docs/CLA.md`](docs/CLA.md).
 
 ## Contributor License Agreement
 
@@ -19,12 +19,12 @@ relicense, and distribute contributions as part of the project.
 For pull requests submitted through GitHub, the expected workflow is:
 
 1. Open a pull request.
-2. If prompted by CLA Assistant, review `CLA.md` and sign the agreement in the
+2. If prompted by CLA Assistant, review [`docs/CLA.md`](docs/CLA.md) and sign the agreement in the
 PR flow.
 3. Wait for the CLA status check to pass before requesting review or merge.
 
 If you are contributing on behalf of an employer or client, make sure you have
-permission to submit the work under the terms in `CLA.md`.
+permission to submit the work under the terms in [`docs/CLA.md`](docs/CLA.md).
 
 ## Pull Requests
 
