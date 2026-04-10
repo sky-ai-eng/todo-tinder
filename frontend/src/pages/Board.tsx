@@ -340,6 +340,7 @@ export default function Board() {
           {!sidebarOpen && (
             <motion.button
               key="collapsed"
+              aria-label="Open queue sidebar"
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: -20 }}
@@ -507,7 +508,7 @@ export default function Board() {
                       onReview={() => setReviewRunID(agentRuns[task.id].ID)}
                     />
                   ) : (
-                    <SortableTaskCard key={task.id} task={task} />
+                    <SortableTaskCard key={task.id} task={task} onRequeue={() => handleRequeue(task.id)} />
                   )
                 )
               )}

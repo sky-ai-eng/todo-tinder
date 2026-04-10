@@ -314,23 +314,32 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store credentials
-	creds, _ := auth.Load()
-	creds.JiraURL = req.URL
-	creds.JiraPAT = req.PAT
-	if err := auth.Store(creds); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
+	// Load existing state before writing anything (fail early)
+	creds, err := auth.Load()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load credentials: " + err.Error()})
 		return
 	}
-
-	// Persist URL in config too
 	cfg, err := config.Load()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
 	}
+
+	// Persist credentials and config
+	creds.JiraURL = req.URL
+	creds.JiraPAT = req.PAT
 	cfg.Jira.BaseURL = req.URL
+
+	if err := auth.Store(creds); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
+		return
+	}
 	if err := config.Save(cfg); err != nil {
+		// Roll back keychain to avoid creds/config desync
+		creds.JiraURL = ""
+		creds.JiraPAT = ""
+		auth.Store(creds) //nolint:errcheck
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save config: " + err.Error()})
 		return
 	}
