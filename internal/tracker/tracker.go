@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sky-ai-eng/todo-tinder/internal/db"
 	"github.com/sky-ai-eng/todo-tinder/internal/domain"
 	"github.com/sky-ai-eng/todo-tinder/internal/eventbus"
@@ -16,8 +17,8 @@ import (
 )
 
 const (
-	jiraBatchSize       = 100 // max issues per JQL key IN (...) query
-	terminalPruneDays   = 30  // remove terminal items after this many days
+	jiraBatchSize     = 100 // max issues per JQL key IN (...) query
+	terminalPruneDays = 30  // remove terminal items after this many days
 )
 
 // Tracker manages the discover → refresh → diff → emit cycle for both GitHub and Jira.
@@ -34,27 +35,32 @@ func New(database *sql.DB, bus *eventbus.Bus) *Tracker {
 // --- GitHub ---
 
 // RefreshGitHub runs the full tracking cycle for GitHub PRs.
-// 1. Discover new PRs via search queries
-// 2. Refresh all tracked PRs via batched GraphQL
-// 3. Diff snapshots and emit events
 func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos []string) (int, error) {
-	// Phase 1: Discovery — find new PRs to track
+	// Phase 1: Discovery
 	discovered, err := t.discoverGitHub(client, username, repos)
 	if err != nil {
 		log.Printf("[tracker] GitHub discovery error: %v", err)
-		// Continue to refresh — discovery failure shouldn't block tracked item updates
 	}
 
-	// Register newly discovered items
+	// Register newly discovered items and upsert tasks
 	for _, d := range discovered {
-		snap, _ := json.Marshal(d.Snapshot)
+		task := prSnapshotToTask(d.Snapshot, username)
+		if err := db.UpsertTask(t.database, task); err != nil {
+			log.Printf("[tracker] error upserting task for PR #%d: %v", d.Snapshot.Number, err)
+			continue
+		}
+		// Resolve the task ID (upsert may have used an existing row)
+		taskID := t.resolveTaskID("github", fmt.Sprintf("%d", d.Snapshot.Number))
+
+		snapJSON, _ := json.Marshal(d.Snapshot)
 		item := domain.TrackedItem{
 			ID:       fmt.Sprintf("github:pr:%s#%d", d.Snapshot.Repo, d.Snapshot.Number),
 			Source:   "github",
 			SourceID: fmt.Sprintf("%d", d.Snapshot.Number),
 			Repo:     d.Snapshot.Repo,
+			TaskID:   taskID,
 			NodeID:   d.NodeID,
-			Snapshot: string(snap),
+			Snapshot: string(snapJSON),
 		}
 		if err := db.UpsertTrackedItem(t.database, item); err != nil {
 			log.Printf("[tracker] error registering tracked item %s: %v", item.ID, err)
@@ -75,7 +81,7 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 		return 0, fmt.Errorf("refresh PRs: %w", err)
 	}
 
-	// Phase 3: Diff and emit
+	// Phase 3: Diff, upsert tasks, and emit events
 	tracked, err := db.ListActiveTrackedItems(t.database, "github")
 	if err != nil {
 		return 0, fmt.Errorf("list tracked items: %w", err)
@@ -89,18 +95,27 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 
 		newSnap, ok := refreshed[item.NodeID]
 		if !ok {
-			// Item no longer accessible — might be deleted or permissions changed
 			log.Printf("[tracker] tracked item %s not returned by refresh, skipping", item.ID)
 			continue
 		}
 
-		// Parse previous snapshot
+		// Update the task with fresh snapshot data
+		task := prSnapshotToTask(newSnap, username)
+		if err := db.UpsertTask(t.database, task); err != nil {
+			log.Printf("[tracker] error upserting task for PR #%d: %v", newSnap.Number, err)
+		}
+
+		// Ensure task_id is linked
+		if item.TaskID == "" {
+			item.TaskID = t.resolveTaskID("github", item.SourceID)
+		}
+
+		// Parse previous snapshot and diff
 		var prevSnap domain.PRSnapshot
 		if item.Snapshot != "" && item.Snapshot != "{}" {
 			json.Unmarshal([]byte(item.Snapshot), &prevSnap)
 		}
 
-		// Diff
 		events := DiffPRSnapshots(prevSnap, newSnap, item.SourceID)
 
 		// Persist new snapshot
@@ -124,14 +139,22 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 			eventsEmitted++
 		}
 
-		// Mark terminal if merged or closed
+		// Update task status for terminal PRs
 		if newSnap.Merged || newSnap.State == "CLOSED" {
 			db.MarkTerminal(t.database, "github", item.SourceID)
+			if item.TaskID != "" {
+				t.database.Exec(`UPDATE tasks SET status = 'done' WHERE id = ? AND status != 'done'`, item.TaskID)
+			}
 		}
 	}
 
 	log.Printf("[tracker] GitHub refresh: %d discovered, %d tracked, %d refreshed, %d events",
 		len(discovered), len(tracked), len(refreshed), eventsEmitted)
+
+	// Emit poll-complete sentinel
+	if len(tracked) > 0 {
+		t.EmitPollComplete("github", len(tracked), eventsEmitted)
+	}
 
 	return eventsEmitted, nil
 }
@@ -140,8 +163,6 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 const maxSearchQueryLen = 256
 
 // discoverGitHub runs search queries to find new PRs.
-// If repos are configured, scopes queries with repo: qualifiers, batching
-// to stay under GitHub's 256-char query limit.
 func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos []string) ([]ghclient.DiscoveredPR, error) {
 	since := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
 	bases := []string{
@@ -156,7 +177,6 @@ func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos
 		fmt.Sprintf("is:pr is:closed is:unmerged author:%s closed:>=%s", username, since),
 	}
 
-	// Expand each base query with repo scoping, batching if needed
 	var queries []string
 	for _, base := range bases {
 		queries = append(queries, scopedQueries(base, repos)...)
@@ -185,9 +205,6 @@ func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos
 // --- Jira ---
 
 // RefreshJira runs the full tracking cycle for Jira issues.
-// 1. Discover new issues via JQL searches
-// 2. Refresh all tracked issues via batched JQL key IN (...)
-// 3. Diff snapshots and emit events
 func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, projects, pickupStatuses []string) (int, error) {
 	// Phase 1: Discovery
 	discovered, err := t.discoverJira(client, baseURL, projects, pickupStatuses)
@@ -195,13 +212,21 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 		log.Printf("[tracker] Jira discovery error: %v", err)
 	}
 
-	// Register newly discovered items
+	// Register newly discovered items and upsert tasks
 	for _, snap := range discovered {
+		task := jiraSnapshotToTask(snap, baseURL)
+		if err := db.UpsertTask(t.database, task); err != nil {
+			log.Printf("[tracker] error upserting task for %s: %v", snap.Key, err)
+			continue
+		}
+		taskID := t.resolveTaskID("jira", snap.Key)
+
 		snapJSON, _ := json.Marshal(snap)
 		item := domain.TrackedItem{
 			ID:       "jira:" + snap.Key,
 			Source:   "jira",
 			SourceID: snap.Key,
+			TaskID:   taskID,
 			Snapshot: string(snapJSON),
 		}
 		if err := db.UpsertTrackedItem(t.database, item); err != nil {
@@ -209,7 +234,7 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 		}
 	}
 
-	// Phase 2: Refresh all tracked items via batched JQL
+	// Phase 2: Refresh
 	tracked, err := db.ListActiveTrackedItems(t.database, "jira")
 	if err != nil {
 		return 0, fmt.Errorf("list tracked jira items: %w", err)
@@ -218,7 +243,6 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 		return len(discovered), nil
 	}
 
-	// Collect keys and batch-fetch
 	keys := make([]string, len(tracked))
 	for i, item := range tracked {
 		keys[i] = item.SourceID
@@ -229,13 +253,23 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 		return 0, fmt.Errorf("batch fetch jira: %w", err)
 	}
 
-	// Phase 3: Diff and emit
+	// Phase 3: Diff, upsert tasks, and emit events
 	eventsEmitted := 0
 	for _, item := range tracked {
 		newSnap, ok := refreshed[item.SourceID]
 		if !ok {
 			log.Printf("[tracker] tracked Jira item %s not returned by refresh, skipping", item.ID)
 			continue
+		}
+
+		// Update task with fresh data
+		task := jiraSnapshotToTask(newSnap, baseURL)
+		if err := db.UpsertTask(t.database, task); err != nil {
+			log.Printf("[tracker] error upserting task for %s: %v", newSnap.Key, err)
+		}
+
+		if item.TaskID == "" {
+			item.TaskID = t.resolveTaskID("jira", item.SourceID)
 		}
 
 		var prevSnap domain.JiraSnapshot
@@ -266,11 +300,18 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 
 		if isJiraTerminal(newSnap.Status) {
 			db.MarkTerminal(t.database, "jira", item.SourceID)
+			if item.TaskID != "" {
+				t.database.Exec(`UPDATE tasks SET status = 'done' WHERE id = ? AND status != 'done'`, item.TaskID)
+			}
 		}
 	}
 
 	log.Printf("[tracker] Jira refresh: %d discovered, %d tracked, %d refreshed, %d events",
 		len(discovered), len(tracked), len(refreshed), eventsEmitted)
+
+	if len(tracked) > 0 {
+		t.EmitPollComplete("jira", len(tracked), eventsEmitted)
+	}
 
 	return eventsEmitted, nil
 }
@@ -284,7 +325,6 @@ func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projec
 	projectList := strings.Join(projects, ", ")
 	var queries []string
 
-	// Unassigned pickup
 	if len(pickupStatuses) > 0 {
 		quoted := make([]string, len(pickupStatuses))
 		for i, s := range pickupStatuses {
@@ -294,7 +334,6 @@ func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projec
 			`project IN (%s) AND status IN (%s) AND assignee IS EMPTY`, projectList, strings.Join(quoted, ", ")))
 	}
 
-	// Assigned to me
 	queries = append(queries, fmt.Sprintf(
 		`project IN (%s) AND assignee = currentUser() AND status NOT IN (Done, Closed, Resolved)`, projectList))
 
@@ -320,8 +359,7 @@ func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projec
 	return all, nil
 }
 
-// batchFetchJira fetches current state for tracked Jira issues via key IN (...) queries.
-// Batches in groups of jiraBatchSize to stay under JQL length limits.
+// batchFetchJira fetches current state for tracked Jira issues.
 func (t *Tracker) batchFetchJira(client *jiraclient.Client, baseURL string, keys []string) (map[string]domain.JiraSnapshot, error) {
 	results := make(map[string]domain.JiraSnapshot, len(keys))
 	fields := []string{"summary", "status", "assignee", "priority", "labels", "issuetype", "parent", "comment"}
@@ -345,6 +383,86 @@ func (t *Tracker) batchFetchJira(client *jiraclient.Client, baseURL string, keys
 	}
 
 	return results, nil
+}
+
+// --- Snapshot → Task converters ---
+
+// prSnapshotToTask builds a Task from a PR snapshot.
+func prSnapshotToTask(snap domain.PRSnapshot, username string) domain.Task {
+	status := "queued"
+	if snap.Merged || snap.State == "CLOSED" {
+		status = "done"
+	}
+
+	// Determine relevance reason
+	reason := "authored"
+	if snap.Author != username {
+		reason = "review_requested"
+		for _, rr := range snap.ReviewRequests {
+			if rr == username {
+				reason = "review_requested"
+				break
+			}
+		}
+	}
+
+	ciStatus := ""
+	switch snap.CIState {
+	case "SUCCESS":
+		ciStatus = "success"
+	case "FAILURE", "ERROR":
+		ciStatus = "failure"
+	case "PENDING", "EXPECTED":
+		ciStatus = "pending"
+	}
+
+	return domain.Task{
+		ID:              uuid.New().String(),
+		Source:          "github",
+		SourceID:        fmt.Sprintf("%d", snap.Number),
+		SourceURL:       snap.URL,
+		Title:           snap.Title,
+		Repo:            snap.Repo,
+		Author:          snap.Author,
+		Labels:          snap.Labels,
+		DiffAdditions:   snap.Additions,
+		DiffDeletions:   snap.Deletions,
+		FilesChanged:    snap.ChangedFiles,
+		CIStatus:        ciStatus,
+		RelevanceReason: reason,
+		CreatedAt:       time.Now(),
+		FetchedAt:       time.Now(),
+		Status:          status,
+	}
+}
+
+// jiraSnapshotToTask builds a Task from a Jira snapshot.
+func jiraSnapshotToTask(snap domain.JiraSnapshot, baseURL string) domain.Task {
+	status := "queued"
+	reason := "available"
+	if snap.Assignee != "" {
+		status = "claimed"
+		reason = "assigned"
+	}
+	if isJiraTerminal(snap.Status) {
+		status = "done"
+	}
+
+	return domain.Task{
+		ID:              uuid.New().String(),
+		Source:          "jira",
+		SourceID:        snap.Key,
+		SourceURL:       snap.URL,
+		Title:           snap.Summary,
+		Author:          snap.Assignee,
+		Labels:          snap.Labels,
+		Severity:        snap.Priority,
+		SourceStatus:    snap.Status,
+		RelevanceReason: reason,
+		CreatedAt:       time.Now(),
+		FetchedAt:       time.Now(),
+		Status:          status,
+	}
 }
 
 // issueToSnapshot converts a Jira API Issue to our snapshot type.
@@ -374,6 +492,15 @@ func issueToSnapshot(issue jiraclient.Issue, baseURL string) domain.JiraSnapshot
 	}
 	snap.Labels = issue.Fields.Labels
 	return snap
+}
+
+// --- Helpers ---
+
+// resolveTaskID looks up the task ID for a source+sourceID pair.
+func (t *Tracker) resolveTaskID(source, sourceID string) string {
+	var id string
+	t.database.QueryRow(`SELECT id FROM tasks WHERE source = ? AND source_id = ?`, source, sourceID).Scan(&id)
+	return id
 }
 
 // Prune removes terminal items older than the configured threshold.
