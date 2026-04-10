@@ -32,7 +32,7 @@ func (s *Server) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 // handleDashboardPRs returns open PRs from tracked items.
 func (s *Server) handleDashboardPRs(w http.ResponseWriter, r *http.Request) {
 	creds, err := auth.Load()
-	if err != nil || creds.GitHubPAT == "" {
+	if err != nil || creds.GitHubPAT == "" || creds.GitHubUsername == "" {
 		writeJSON(w, http.StatusOK, []db.PRSummaryRow{})
 		return
 	}
