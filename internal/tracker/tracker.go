@@ -396,11 +396,19 @@ func prSnapshotToTask(snap domain.PRSnapshot, username string) domain.Task {
 	// Determine relevance reason
 	reason := "authored"
 	if snap.Author != username {
-		reason = "review_requested"
+		reason = "mentioned"
 		for _, rr := range snap.ReviewRequests {
 			if rr == username {
 				reason = "review_requested"
 				break
+			}
+		}
+		if reason == "mentioned" {
+			for _, r := range snap.Reviews {
+				if r.Author == username {
+					reason = "reviewed"
+					break
+				}
 			}
 		}
 	}
