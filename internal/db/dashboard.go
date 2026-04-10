@@ -122,7 +122,7 @@ func GetDashboardStats(database *sql.DB, username string, sinceDays int) (*Dashb
 func GetDashboardPRs(database *sql.DB) ([]PRSummaryRow, error) {
 	rows, err := database.Query(`
 		SELECT snapshot FROM tracked_items
-		WHERE source = 'github' AND (terminal_at IS NULL OR snapshot LIKE '%"state":"OPEN"%')
+		WHERE source = 'github' AND terminal_at IS NULL
 		ORDER BY last_polled DESC
 	`)
 	if err != nil {
