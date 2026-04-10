@@ -121,6 +121,12 @@ func MarkTerminal(database *sql.DB, source, sourceID string) error {
 	return err
 }
 
+// ClearTrackedItems removes all tracked items for a source (e.g., when credentials are disabled).
+func ClearTrackedItems(database *sql.DB, source string) error {
+	_, err := database.Exec(`DELETE FROM tracked_items WHERE source = ?`, source)
+	return err
+}
+
 // PruneTerminalItems removes tracked items that have been terminal for longer than the given duration.
 func PruneTerminalItems(database *sql.DB, olderThanDays int) (int64, error) {
 	result, err := database.Exec(`

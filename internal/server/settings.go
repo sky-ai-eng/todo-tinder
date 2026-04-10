@@ -8,6 +8,7 @@ import (
 
 	"github.com/sky-ai-eng/todo-tinder/internal/auth"
 	"github.com/sky-ai-eng/todo-tinder/internal/config"
+	"github.com/sky-ai-eng/todo-tinder/internal/db"
 	"github.com/sky-ai-eng/todo-tinder/internal/jira"
 )
 
@@ -164,11 +165,12 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			creds.GitHubUsername = ghUser.Login
 		}
 	} else {
-		// Disabled — clear GitHub credentials
+		// Disabled — clear GitHub credentials and tracked data
 		creds.GitHubURL = ""
 		creds.GitHubPAT = ""
 		creds.GitHubUsername = ""
 		cfg.GitHub.BaseURL = ""
+		db.ClearTrackedItems(s.db, "github")
 	}
 
 	// --- Handle Jira ---
@@ -200,6 +202,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		creds.JiraURL = ""
 		creds.JiraPAT = ""
 		cfg.Jira.BaseURL = ""
+		db.ClearTrackedItems(s.db, "jira")
 	}
 
 	// --- Update config fields ---
