@@ -1,0 +1,226 @@
+package gh
+
+import (
+	"archive/zip"
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// buildZip creates an in-memory zip archive from a map of path → contents.
+// Used to generate fixtures for the extraction tests without committing
+// binary files. Entries ending in "/" are created as directories.
+func buildZip(t *testing.T, entries map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := zip.NewWriter(&buf)
+	for name, content := range entries {
+		header := &zip.FileHeader{
+			Name:   name,
+			Method: zip.Deflate,
+		}
+		if strings.HasSuffix(name, "/") {
+			header.SetMode(0755 | os.ModeDir)
+		} else {
+			header.SetMode(0644)
+		}
+		f, err := w.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("zip create %q: %v", name, err)
+		}
+		if !strings.HasSuffix(name, "/") {
+			if _, err := f.Write([]byte(content)); err != nil {
+				t.Fatalf("zip write %q: %v", name, err)
+			}
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// writeZipFile writes bytes to a temp .zip file and returns its path.
+// Cleanup is registered with t.
+func writeZipFile(t *testing.T, data []byte) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "fixture-*.zip")
+	if err != nil {
+		t.Fatalf("create temp zip: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		t.Fatalf("write temp zip: %v", err)
+	}
+	return f.Name()
+}
+
+func TestExtractZip_SafeArchive(t *testing.T) {
+	data := buildZip(t, map[string]string{
+		"build (ubuntu-latest)/":               "",
+		"build (ubuntu-latest)/1_Checkout.txt": "checkout log content\n",
+		"build (ubuntu-latest)/2_Build.txt":    "build log content\n",
+		"test/":                                "",
+		"test/1_Run.txt":                       "test log content\n",
+	})
+	zipPath := writeZipFile(t, data)
+
+	destDir := t.TempDir()
+	if err := extractZip(zipPath, destDir, maxPerFileBytes); err != nil {
+		t.Fatalf("extractZip: %v", err)
+	}
+
+	// Verify every expected file is present with correct content.
+	wantFiles := map[string]string{
+		"build (ubuntu-latest)/1_Checkout.txt": "checkout log content\n",
+		"build (ubuntu-latest)/2_Build.txt":    "build log content\n",
+		"test/1_Run.txt":                       "test log content\n",
+	}
+	for rel, wantContent := range wantFiles {
+		got, err := os.ReadFile(filepath.Join(destDir, rel))
+		if err != nil {
+			t.Errorf("read %q: %v", rel, err)
+			continue
+		}
+		if string(got) != wantContent {
+			t.Errorf("%q content = %q, want %q", rel, string(got), wantContent)
+		}
+	}
+}
+
+// TestExtractZip_PathTraversalRejected is the most important test in this
+// file. A zip entry with a name containing "../" is a real attack vector —
+// an extractor that naively joins the entry name onto the destination dir
+// will write files wherever the attacker specifies. This must fail with a
+// clear error and refuse to write anything outside destDir.
+func TestExtractZip_PathTraversalRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		entries map[string]string
+	}{
+		{
+			"parent escape via ../",
+			map[string]string{"../pwned.txt": "gotcha"},
+		},
+		{
+			"multi-level parent escape",
+			map[string]string{"../../../etc/passwd": "gotcha"},
+		},
+		{
+			"nested legit path with escape",
+			map[string]string{
+				"legit/file.txt":         "ok",
+				"legit/../../escape.txt": "gotcha",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := buildZip(t, tc.entries)
+			zipPath := writeZipFile(t, data)
+
+			destDir := t.TempDir()
+			err := extractZip(zipPath, destDir, maxPerFileBytes)
+			if err == nil {
+				t.Fatal("expected extraction to fail on path-traversal entry, got nil error")
+			}
+			if !strings.Contains(err.Error(), "unsafe archive entry") {
+				t.Errorf("error message should mention unsafe entry, got: %v", err)
+			}
+
+			// Verify no file escaped the destination. The parent directory
+			// (which is the tempdir root) must not contain any file that
+			// only the zip would have put there.
+			parent := filepath.Dir(destDir)
+			if _, err := os.Stat(filepath.Join(parent, "pwned.txt")); err == nil {
+				t.Error("path-traversal file escaped destination")
+			}
+			if _, err := os.Stat(filepath.Join(parent, "escape.txt")); err == nil {
+				t.Error("path-traversal file escaped destination")
+			}
+		})
+	}
+}
+
+// TestExtractZip_PerFileSizeCapRejected verifies the per-entry size guard
+// fires when real content exceeds the cap. Uses a small cap (1 KB) against
+// a 2 KB payload so the test stays cheap — the guard is parameterized so
+// production uses maxPerFileBytes while tests can pass anything.
+//
+// We exercise the runtime io.LimitReader path here, not the header pre-check:
+// Go's zip.NewWriter overwrites FileHeader.UncompressedSize64 with the real
+// size when writing, so you can't fake an oversized header via the standard
+// writer API. The header check exists to fast-reject hand-crafted adversarial
+// zips; the runtime check is what catches everything else, and it's the one
+// that matters for real zip inputs.
+func TestExtractZip_PerFileSizeCapRejected(t *testing.T) {
+	const testCap int64 = 1024 // 1 KB
+	oversized := strings.Repeat("A", int(testCap)*2)
+
+	data := buildZip(t, map[string]string{
+		"huge.log": oversized,
+	})
+	zipPath := writeZipFile(t, data)
+	destDir := t.TempDir()
+
+	err := extractZip(zipPath, destDir, testCap)
+	if err == nil {
+		t.Fatal("expected extraction to fail on oversized entry, got nil error")
+	}
+	if !strings.Contains(err.Error(), "per-file size cap") {
+		t.Errorf("error should mention size cap, got: %v", err)
+	}
+}
+
+func TestTopLevelEntries_SortedAndAnnotated(t *testing.T) {
+	dir := t.TempDir()
+
+	// Mix of files and directories, created in non-alphabetical order
+	// so the sort guarantee is actually tested.
+	mustMkdir(t, filepath.Join(dir, "zebra"))
+	mustMkdir(t, filepath.Join(dir, "alpha"))
+	mustWrite(t, filepath.Join(dir, "readme.txt"), "hi")
+	mustMkdir(t, filepath.Join(dir, "mid"))
+
+	got, err := topLevelEntries(dir)
+	if err != nil {
+		t.Fatalf("topLevelEntries: %v", err)
+	}
+	want := []string{"alpha/", "mid/", "readme.txt", "zebra/"}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d (got %v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestTopLevelEntries_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	got, err := topLevelEntries(dir)
+	if err != nil {
+		t.Fatalf("topLevelEntries: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty, got %v", got)
+	}
+}
+
+func mustMkdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatalf("mkdir %q: %v", path, err)
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write %q: %v", path, err)
+	}
+}

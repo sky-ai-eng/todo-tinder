@@ -2,6 +2,7 @@ package github
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,12 @@ import (
 	"strings"
 	"time"
 )
+
+// downloadTimeout is the cap for streaming artifact downloads (log archives
+// and similar large blobs). Deliberately way longer than the 30s shared-client
+// timeout on c.http — a 400 MB log archive on a slow link can take several
+// minutes, and we'd rather wait than cancel mid-stream.
+const downloadTimeout = 15 * time.Minute
 
 // Client is a GitHub API client that handles auth and base URL routing.
 type Client struct {
@@ -55,6 +62,66 @@ func (c *Client) Patch(path string, body any) ([]byte, error) {
 // Delete performs an authenticated DELETE request.
 func (c *Client) Delete(path string) ([]byte, error) {
 	return c.do("DELETE", path, nil)
+}
+
+// DownloadArtifact performs an authenticated streaming GET against a GitHub
+// endpoint that serves large binary blobs via a 302 redirect to a signed URL
+// — e.g. /repos/{owner}/{repo}/actions/runs/{run_id}/logs, which redirects to
+// a short-lived pipelines.actions.githubusercontent.com URL.
+//
+// The response body is streamed directly to dst without buffering in memory,
+// capped at maxBytes total. The cap is enforced two ways: Content-Length is
+// checked up front when GitHub provides it, and io.LimitReader wraps the
+// copy as a belt-and-suspenders guard in case the header is missing or wrong.
+//
+// This method uses its own http.Client with a 15-minute timeout because the
+// shared c.http (30s) is unusable for multi-hundred-MB downloads. Redirects
+// are followed automatically; Go's stdlib strips the Authorization header on
+// cross-origin redirects, which is the right behavior here — the signed S3
+// URL would reject our Bearer token anyway.
+//
+// Returns the number of bytes written to dst.
+func (c *Client) DownloadArtifact(ctx context.Context, path string, dst io.Writer, maxBytes int64) (int64, error) {
+	url := c.baseURL + path
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.pat)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	client := &http.Client{Timeout: downloadTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("download request %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		// Drain a modest amount of the error body for context — these are
+		// usually small JSON messages.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return 0, fmt.Errorf("GET %s returned %d: %s", path, resp.StatusCode, string(body))
+	}
+
+	// Pre-flight size cap. GitHub's signed-URL redirect returns an honest
+	// Content-Length for workflow log archives.
+	if resp.ContentLength > 0 && resp.ContentLength > maxBytes {
+		return 0, fmt.Errorf("artifact too large: %d bytes exceeds cap of %d", resp.ContentLength, maxBytes)
+	}
+
+	// io.LimitReader as a second guard. +1 so we can detect the cap was hit
+	// even when Content-Length was missing and the body actually ran over.
+	limited := io.LimitReader(resp.Body, maxBytes+1)
+	n, err := io.Copy(dst, limited)
+	if err != nil {
+		return n, fmt.Errorf("stream artifact body: %w", err)
+	}
+	if n > maxBytes {
+		return n, fmt.Errorf("artifact too large: received more than the cap of %d bytes (no Content-Length header)", maxBytes)
+	}
+	return n, nil
 }
 
 // GetRaw performs an authenticated GET with a custom Accept header and returns raw bytes.

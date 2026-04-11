@@ -174,6 +174,10 @@ func CreateForPR(ctx context.Context, owner, repo, cloneURL, headBranch string, 
 		return "", fmt.Errorf("worktree add: %w", err)
 	}
 
+	if err := writeLocalExcludes(wtDir); err != nil {
+		return "", fmt.Errorf("write local git excludes: %w", err)
+	}
+
 	log.Printf("[worktree] PR worktree at %s (branch: %s)", wtDir, headBranch)
 	return wtDir, nil
 }
@@ -219,8 +223,70 @@ func CreateForBranch(ctx context.Context, owner, repo, cloneURL, baseBranch, fea
 		}
 	}
 
+	if err := writeLocalExcludes(wtDir); err != nil {
+		return "", fmt.Errorf("write local git excludes: %w", err)
+	}
+
 	log.Printf("[worktree] branch worktree at %s (%s from %s)", wtDir, featureBranch, baseBranch)
 	return wtDir, nil
+}
+
+// writeLocalExcludes installs local (non-committed) gitignore patterns into
+// the worktree's .git/info/exclude so agents can't accidentally commit the
+// scratch and memory directories the delegation system uses.
+//
+// - _scratch/    — CI log archives, other ephemeral download targets (SKY-146)
+// - task_memory/ — cross-run structured audit entries (SKY-141)
+//
+// Uses .git/info/exclude rather than a committed .gitignore because these
+// paths are infrastructure concerns, not something the tracked repo should
+// know or care about.
+//
+// Fails closed: if the write fails we return the error and let worktree
+// creation fail. A worktree without the excludes is a footgun (agents could
+// commit hundreds of log files), so rolling back the worktree on error is
+// the safer behavior than silently proceeding.
+//
+// Worktrees in git use a per-worktree info directory — for a linked worktree,
+// `.git` is a file containing `gitdir: <path>`, and `info/exclude` lives
+// under that gitdir. We resolve it by reading `.git` and appending
+// `info/exclude`.
+func writeLocalExcludes(wtDir string) error {
+	const excludeContents = "# Managed by todotriage — do not commit local scratch/memory state\n_scratch/\ntask_memory/\n"
+
+	gitFile := filepath.Join(wtDir, ".git")
+	info, err := os.Stat(gitFile)
+	if err != nil {
+		return fmt.Errorf("stat .git: %w", err)
+	}
+
+	var excludePath string
+	if info.IsDir() {
+		// Non-worktree checkout (shouldn't happen in our flow, but handle it)
+		excludePath = filepath.Join(gitFile, "info", "exclude")
+	} else {
+		// Linked worktree: .git is a pointer file like "gitdir: /path/to/worktrees/<name>"
+		data, err := os.ReadFile(gitFile)
+		if err != nil {
+			return fmt.Errorf("read .git pointer: %w", err)
+		}
+		gitdir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "gitdir:"))
+		if gitdir == "" {
+			return fmt.Errorf(".git pointer missing gitdir: %q", string(data))
+		}
+		if !filepath.IsAbs(gitdir) {
+			gitdir = filepath.Join(wtDir, gitdir)
+		}
+		excludePath = filepath.Join(gitdir, "info", "exclude")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0755); err != nil {
+		return fmt.Errorf("mkdir info dir: %w", err)
+	}
+	if err := os.WriteFile(excludePath, []byte(excludeContents), 0644); err != nil {
+		return fmt.Errorf("write exclude file: %w", err)
+	}
+	return nil
 }
 
 // branchExists checks whether a branch ref exists in the bare repo.
