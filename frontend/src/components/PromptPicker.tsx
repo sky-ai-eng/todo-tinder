@@ -11,9 +11,13 @@ interface Props {
 
 export default function PromptPicker({ open, onSelect, onClose, onEditPrompts }: Props) {
   const [prompts, setPrompts] = useState<Prompt[]>([])
-  // Derived: we're "loading" until the first fetch populates prompts.
-  // After that, subsequent opens show cached prompts instantly.
-  const loading = open && prompts.length === 0
+  const [fetchFailed, setFetchFailed] = useState(false)
+  // Derived: "loading" means open, no prompts cached yet, AND the last fetch
+  // hasn't failed. The fetchFailed flag is what breaks us out of the skeleton
+  // on error — without it, a failed fetch leaves prompts=[] and loading=true
+  // forever. After a successful fetch, subsequent opens show cached prompts
+  // instantly (intentional).
+  const loading = open && prompts.length === 0 && !fetchFailed
 
   useEffect(() => {
     if (!open) return
@@ -21,10 +25,13 @@ export default function PromptPicker({ open, onSelect, onClose, onEditPrompts }:
     fetch('/api/prompts')
       .then((res) => res.json())
       .then((data: Prompt[]) => {
-        if (!cancelled) setPrompts(data)
+        if (!cancelled) {
+          setPrompts(data)
+          setFetchFailed(false)
+        }
       })
       .catch(() => {
-        // ignore — empty prompt list will render
+        if (!cancelled) setFetchFailed(true)
       })
     return () => {
       cancelled = true

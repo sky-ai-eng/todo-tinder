@@ -13,10 +13,13 @@ interface PRStatusData {
 
 export default function PRCard({ pr }: { pr: PRSummary }) {
   const [status, setStatus] = useState<PRStatusData | null>(null)
+  const [fetchFailed, setFetchFailed] = useState(false)
   const [expanded, setExpanded] = useState(false)
-  // Derived: we're "loading" whenever the row is expanded but we haven't
-  // received status data yet. Replaces a separate setLoading call.
-  const loading = expanded && status === null
+  // Derived: "loading" means expanded, no status received yet, AND the last
+  // fetch attempt hasn't failed. Without the fetchFailed flag, a failed
+  // fetch would leave `status` null forever and the "Failed to load status"
+  // branch below would be unreachable.
+  const loading = expanded && status === null && !fetchFailed
 
   useEffect(() => {
     if (!expanded) return
@@ -24,10 +27,13 @@ export default function PRCard({ pr }: { pr: PRSummary }) {
     fetch(`/api/dashboard/prs/${pr.number}/status?repo=${pr.repo}`)
       .then((r) => r.json())
       .then((d) => {
-        if (!cancelled) setStatus(d)
+        if (!cancelled) {
+          setStatus(d)
+          setFetchFailed(false)
+        }
       })
       .catch(() => {
-        // ignore — status badge just won't render
+        if (!cancelled) setFetchFailed(true)
       })
     return () => {
       cancelled = true
