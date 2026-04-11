@@ -579,9 +579,14 @@ func jiraStatusToTaskStatus(snap domain.JiraSnapshot) string {
 // resolveTaskID looks up the task ID for a source+sourceID pair.
 func (t *Tracker) resolveTaskID(source, sourceID string) string {
 	var id string
-	// sql.ErrNoRows is expected here for un-tracked items; any other error
-	// leaves id empty which the caller handles the same way.
-	_ = t.database.QueryRow(`SELECT id FROM tasks WHERE source = ? AND source_id = ?`, source, sourceID).Scan(&id)
+	// sql.ErrNoRows is expected for un-tracked items and passes silently.
+	// Any other error (connection drop, schema drift) is a real problem
+	// we want visible in the logs — otherwise it looks identical to
+	// "genuinely untracked" at the call site.
+	err := t.database.QueryRow(`SELECT id FROM tasks WHERE source = ? AND source_id = ?`, source, sourceID).Scan(&id)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("[tracker] resolveTaskID %s/%s: %v", source, sourceID, err)
+	}
 	return id
 }
 

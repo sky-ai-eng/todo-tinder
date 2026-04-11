@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"log"
 	"time"
 )
 
@@ -54,10 +55,15 @@ func GetPromptStats(db *sql.DB, promptID string) (*PromptStats, error) {
 		stats.SuccessRate = float64(stats.CompletedRuns) / float64(stats.TotalRuns)
 	}
 
-	// Last used — sql.ErrNoRows is expected for prompts that have never run.
-	// Any other error leaves lastUsed invalid, which we handle identically.
+	// Last used — MAX() on an aggregate query always returns exactly one
+	// row (NULL if no matches), so sql.ErrNoRows can't happen here. Any
+	// Scan error is a real DB problem worth surfacing; we still fall
+	// through with lastUsed.Valid=false so the page renders "never used"
+	// rather than breaking the whole stats response.
 	var lastUsed sql.NullTime
-	_ = db.QueryRow(`SELECT MAX(started_at) FROM agent_runs WHERE prompt_id = ?`, promptID).Scan(&lastUsed)
+	if err := db.QueryRow(`SELECT MAX(started_at) FROM agent_runs WHERE prompt_id = ?`, promptID).Scan(&lastUsed); err != nil {
+		log.Printf("[prompt_stats] failed to scan MAX(started_at) for %s: %v", promptID, err)
+	}
 	if lastUsed.Valid {
 		s := lastUsed.Time.Format(time.RFC3339)
 		stats.LastUsedAt = &s
@@ -81,9 +87,15 @@ func GetPromptStats(db *sql.DB, promptID string) (*PromptStats, error) {
 		var day string
 		var cnt int
 		if err := rows.Scan(&day, &cnt); err != nil {
+			log.Printf("[prompt_stats] failed to scan runs-per-day row for %s: %v", promptID, err)
 			continue
 		}
 		dayMap[day] = cnt
+	}
+	// Surface mid-iteration errors (e.g., connection drops) that rows.Next()
+	// would otherwise swallow by returning false without signaling why.
+	if err := rows.Err(); err != nil {
+		log.Printf("[prompt_stats] runs-per-day iteration error for %s: %v", promptID, err)
 	}
 
 	// Fill in all 30 days
