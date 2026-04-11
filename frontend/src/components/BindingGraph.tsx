@@ -219,11 +219,15 @@ function BindingGraphInner({ onPromptClick }: GraphProps) {
   onPromptClickRef.current = onPromptClick
 
   const fetchAll = useCallback(async () => {
+    const parseOrThrow = async (r: Response, label: string) => {
+      if (!r.ok) throw new Error(`${label}: HTTP ${r.status}`)
+      return r.json()
+    }
     try {
       const [etRes, pRes, bRes] = await Promise.all([
-        fetch('/api/event-types').then((r) => r.json()),
-        fetch('/api/prompts').then((r) => r.json()),
-        fetch('/api/bindings').then((r) => r.json()),
+        fetch('/api/event-types').then((r) => parseOrThrow(r, 'event-types')),
+        fetch('/api/prompts').then((r) => parseOrThrow(r, 'prompts')),
+        fetch('/api/bindings').then((r) => parseOrThrow(r, 'bindings')),
       ])
       setEventTypes(etRes)
       setPrompts(pRes)
@@ -235,6 +239,10 @@ function BindingGraphInner({ onPromptClick }: GraphProps) {
       for (const id of Object.keys(saved.eventPositions)) active.add(id)
       for (const id of boundIds) active.add(id)
       setActiveEventIds(active)
+    } catch (err) {
+      // Surface to the console so devs see it; user sees an empty graph.
+      // TODO: proper error banner in the graph canvas (Linear tracked).
+      console.error('BindingGraph fetchAll failed:', err)
     } finally {
       setLoading(false)
     }

@@ -25,13 +25,23 @@ interface Props {
 
 export default function EventFilterPanel({ open, onToggle, onChange }: Props) {
   const [eventTypes, setEventTypes] = useState<EventType[]>([])
+  const [loadError, setLoadError] = useState(false)
 
   useEffect(() => {
     let cancelled = false
     fetch('/api/event-types')
-      .then((res) => (res.ok ? res.json() : []))
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
       .then((data: EventType[]) => {
-        if (!cancelled) setEventTypes(data.filter((et) => et.source !== 'system'))
+        if (!cancelled) {
+          setEventTypes(data.filter((et) => et.source !== 'system'))
+          setLoadError(false)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError(true)
       })
     return () => {
       cancelled = true
@@ -127,6 +137,11 @@ export default function EventFilterPanel({ open, onToggle, onChange }: Props) {
                 </button>
               </div>
               <div className="flex-1 overflow-y-auto px-3 py-3">
+                {loadError && (
+                  <div className="mb-2 px-2 py-1.5 rounded text-[11px] text-dismiss bg-dismiss/[0.06] border border-dismiss/20">
+                    Failed to load event types
+                  </div>
+                )}
                 <div className="flex items-center justify-between mb-2 px-1">
                   <span className="text-[10px] text-text-tertiary">
                     {enabledCount} of {eventTypes.length} enabled

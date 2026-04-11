@@ -80,16 +80,24 @@ export default function PRDashboard() {
   const hasLoadedOnce = useRef(false)
   const fetchAll = useCallback(async () => {
     if (!hasLoadedOnce.current) setLoading(true)
+    const parseOrThrow = async (r: Response, label: string) => {
+      if (!r.ok) throw new Error(`${label}: HTTP ${r.status}`)
+      return r.json()
+    }
     try {
       const [prsRes, statsRes] = await Promise.all([
-        fetch('/api/dashboard/prs').then((r) => r.json()),
-        fetch('/api/dashboard/stats').then((r) => r.json()),
+        fetch('/api/dashboard/prs').then((r) => parseOrThrow(r, 'prs')),
+        fetch('/api/dashboard/stats').then((r) => parseOrThrow(r, 'stats')),
       ])
       setPrs(prsRes)
       setStats(statsRes)
       saveCache('pr-dash-prs', prsRes)
       saveCache('pr-dash-stats', statsRes)
       hasLoadedOnce.current = true
+    } catch (err) {
+      // Surface to console so errors aren't silently swallowed.
+      // Existing cached data (if any) stays on screen.
+      console.error('PRDashboard fetchAll failed:', err)
     } finally {
       setLoading(false)
     }

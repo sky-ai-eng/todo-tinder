@@ -69,20 +69,38 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
       return
     }
     if (!promptId) return
+    let cancelled = false
     fetch(`/api/prompts/${promptId}`)
-      .then((res) => res.json())
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
       .then((data) => {
+        if (cancelled) return
         setName(data.prompt.name)
         setBody(data.prompt.body)
         setSource(data.prompt.source)
         setError('')
       })
-      .catch(() => setError('Failed to load prompt'))
+      .catch(() => {
+        if (!cancelled) setError('Failed to load prompt')
+      })
 
     fetch(`/api/prompts/${promptId}/stats`)
-      .then((res) => res.json())
-      .then(setStats)
-      .catch(() => setStats(null))
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then((data) => {
+        if (!cancelled) setStats(data)
+      })
+      .catch(() => {
+        if (!cancelled) setStats(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
   }, [promptId, isNew])
 
   // Resize drag handlers
