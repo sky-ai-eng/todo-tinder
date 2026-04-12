@@ -150,6 +150,19 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Block deletion if the prompt is referenced by any auto-triggers
+	triggers, err := db.ListTriggersForPrompt(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(triggers) > 0 {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "This prompt is used by an auto-delegation trigger. Remove the trigger first.",
+		})
+		return
+	}
+
 	// System and imported prompts are soft-deleted (hidden), user prompts are hard-deleted
 	if prompt.Source == "system" || prompt.Source == "imported" {
 		if err := db.HidePrompt(s.db, id); err != nil {
