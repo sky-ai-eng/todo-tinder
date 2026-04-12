@@ -821,8 +821,8 @@ func mergeCompletion(base, resume *runCompletion) *runCompletion {
 // write failures are logged but do not fail the run. An agent running
 // without materialized priors is still useful, just without the
 // cross-run memory benefit. This "advisory" posture only holds for
-// the read side — the write-before-finish gate in the next ticket is
-// strict about NEW memories being produced.
+// the read side — the write-before-finish gate is enforced separately
+// for NEW memories produced during the run.
 func materializePriorMemories(database *sql.DB, cwd, taskID string) {
 	memories, err := db.GetTaskMemoriesForTask(database, taskID)
 	if err != nil {
