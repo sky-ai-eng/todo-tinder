@@ -47,6 +47,7 @@ type aiSettings struct {
 	Model                    string `json:"model"`
 	ReprioritizeThreshold    int    `json:"reprioritize_threshold"`
 	PreferenceUpdateInterval int    `json:"preference_update_interval"`
+	AutoDelegateEnabled      bool   `json:"auto_delegate_enabled"`
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +81,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 			Model:                    cfg.AI.Model,
 			ReprioritizeThreshold:    cfg.AI.ReprioritizeThreshold,
 			PreferenceUpdateInterval: cfg.AI.PreferenceUpdateInterval,
+			AutoDelegateEnabled:      cfg.AI.AutoDelegateEnabled,
 		},
 	}
 
@@ -109,6 +111,7 @@ type settingsUpdateRequest struct {
 	JiraPickupStatuses   []string `json:"jira_pickup_statuses"`
 	JiraInProgressStatus string   `json:"jira_in_progress_status"`
 	AIModel              string   `json:"ai_model"`
+	AIAutoDelegate       *bool    `json:"ai_auto_delegate_enabled"` // pointer to distinguish absent from false
 	ServerPort           int      `json:"server_port"`
 }
 
@@ -258,6 +261,9 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AIModel != "" {
 		cfg.AI.Model = req.AIModel
+	}
+	if req.AIAutoDelegate != nil {
+		cfg.AI.AutoDelegateEnabled = *req.AIAutoDelegate
 	}
 	if req.ServerPort > 0 {
 		cfg.Server.Port = req.ServerPort

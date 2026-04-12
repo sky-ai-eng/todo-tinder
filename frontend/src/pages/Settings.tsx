@@ -26,6 +26,7 @@ interface SettingsData {
     model: string
     reprioritize_threshold: number
     preference_update_interval: number
+    auto_delegate_enabled: boolean
   }
 }
 
@@ -44,6 +45,7 @@ export default function Settings() {
     jira_pickup_statuses: [] as string[],
     jira_in_progress_status: '',
     ai_model: 'sonnet',
+    ai_auto_delegate_enabled: true,
     server_port: 3000,
   })
   const [saving, setSaving] = useState(false)
@@ -72,6 +74,7 @@ export default function Settings() {
           jira_pickup_statuses: d.jira.pickup_statuses || [],
           jira_in_progress_status: d.jira.in_progress_status || '',
           ai_model: d.ai.model,
+          ai_auto_delegate_enabled: d.ai.auto_delegate_enabled,
           server_port: d.server.port,
         })
         if (d.jira.has_token && d.jira.base_url) {
@@ -156,6 +159,7 @@ export default function Settings() {
           github_poll_interval: form.github_poll_interval,
           jira_enabled: false,
           ai_model: form.ai_model,
+          ai_auto_delegate_enabled: form.ai_auto_delegate_enabled,
           server_port: form.server_port,
         }),
       })
@@ -206,6 +210,7 @@ export default function Settings() {
           jira_pickup_statuses: form.jira_pickup_statuses,
           jira_in_progress_status: form.jira_in_progress_status,
           ai_model: form.ai_model,
+          ai_auto_delegate_enabled: form.ai_auto_delegate_enabled,
           server_port: form.server_port,
         }),
       })
@@ -431,6 +436,31 @@ export default function Settings() {
                 <option value="opus">Opus (most capable)</option>
               </select>
             </Field>
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-[13px] text-text-primary">Auto-delegation</p>
+                <p className="text-[11px] text-text-tertiary mt-0.5">
+                  Automatically delegate tasks when matching triggers fire
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={form.ai_auto_delegate_enabled}
+                onClick={() =>
+                  setForm((f) => ({ ...f, ai_auto_delegate_enabled: !f.ai_auto_delegate_enabled }))
+                }
+                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
+                  form.ai_auto_delegate_enabled ? 'bg-accent' : 'bg-black/[0.08]'
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transform transition-transform ${
+                    form.ai_auto_delegate_enabled ? 'translate-x-4' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
           </div>
         </Section>
 
