@@ -700,7 +700,7 @@ func ingestAgentMemory(database *sql.DB, cwd, runID, taskID string) error {
 		RunID:     runID,
 		Content:   string(data),
 		Source:    "agent",
-		CreatedAt: time.Now(),
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.SaveTaskMemory(database, mem); err != nil {
 		return fmt.Errorf("save memory row: %w", err)
