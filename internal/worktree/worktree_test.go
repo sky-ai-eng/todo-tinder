@@ -432,6 +432,82 @@ func TestWriteLocalExcludes_StrayEndMarkerBeforeBlock(t *testing.T) {
 	}
 }
 
+// TestWriteLocalExcludes_StrayBeginBeforeBlock is the regression guard
+// for the stray-begin / "user content clobber" case. If the file has an
+// orphaned begin marker earlier (truncated block whose end was removed,
+// stale fragment from a broken previous run), matching the *first*
+// begin with the real end marker would treat everything in between as
+// "our content" and overwrite it — including legitimate user lines.
+//
+// Using LastIndex for begin locks onto the most recent occurrence so
+// any earlier stray markers and the user content around them stay
+// untouched.
+func TestWriteLocalExcludes_StrayBeginBeforeBlock(t *testing.T) {
+	wtDir, excludePath := setupPlainCheckout(t)
+
+	// File state that would trigger the bug pre-fix:
+	//   1. A standalone (orphaned) begin marker with no matching end
+	//   2. User content between the orphan and the real block
+	//   3. A valid begin+end pair (the real managed block)
+	//
+	// Before the LastIndex fix, strings.Index(existing, begin) would
+	// return the orphan's position, the end search would find the real
+	// end, and the replace would wipe out the user content between.
+	stale := managedExcludeBegin + "\n" + // orphaned begin, no end
+		"node_modules/\n" +
+		"*.swp\n" +
+		"\n" +
+		managedExcludeBegin + "\n" + // real begin
+		"_scratch/\n" +
+		managedExcludeEnd + "\n"
+	if err := os.WriteFile(excludePath, []byte(stale), 0644); err != nil {
+		t.Fatalf("pre-populate: %v", err)
+	}
+
+	if err := writeLocalExcludes(wtDir); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, err := os.ReadFile(excludePath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(content)
+
+	// User content between the orphan and the real block must survive.
+	// This is the core assertion — the old first-begin behavior would
+	// have eaten both lines.
+	for _, line := range []string{"node_modules/", "*.swp"} {
+		foundLine := false
+		for _, l := range strings.Split(s, "\n") {
+			if l == line {
+				foundLine = true
+				break
+			}
+		}
+		if !foundLine {
+			t.Errorf("user line %q was clobbered; file:\n%s", line, s)
+		}
+	}
+
+	// The real managed block has been expanded in place (task_memory/
+	// is now present alongside _scratch/). The orphaned begin earlier
+	// in the file is left alone — we'd need a bigger cleanup pass to
+	// remove orphaned markers, and that's out of scope for this fix.
+	beginIdx := strings.LastIndex(s, managedExcludeBegin)
+	searchFrom := beginIdx + len(managedExcludeBegin)
+	relEnd := strings.Index(s[searchFrom:], managedExcludeEnd)
+	if relEnd < 0 {
+		t.Fatalf("end marker not found after the last begin; file:\n%s", s)
+	}
+	managedSection := s[beginIdx : searchFrom+relEnd]
+	for _, p := range managedExcludePatterns {
+		if !strings.Contains(managedSection, p) {
+			t.Errorf("managed block missing %q; section:\n%s", p, managedSection)
+		}
+	}
+}
+
 func TestWriteLocalExcludes_AppendsTrailingNewlineWhenMissing(t *testing.T) {
 	wtDir, excludePath := setupPlainCheckout(t)
 

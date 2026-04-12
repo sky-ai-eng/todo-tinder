@@ -73,7 +73,7 @@ func TestExtractZip_SafeArchive(t *testing.T) {
 	zipPath := writeZipFile(t, data)
 
 	destDir := t.TempDir()
-	if err := extractZip(zipPath, destDir, maxPerFileBytes); err != nil {
+	if err := extractZip(zipPath, destDir, maxPerFileBytes, maxTotalUncompressedBytes); err != nil {
 		t.Fatalf("extractZip: %v", err)
 	}
 
@@ -128,7 +128,7 @@ func TestExtractZip_PathTraversalRejected(t *testing.T) {
 			zipPath := writeZipFile(t, data)
 
 			destDir := t.TempDir()
-			err := extractZip(zipPath, destDir, maxPerFileBytes)
+			err := extractZip(zipPath, destDir, maxPerFileBytes, maxTotalUncompressedBytes)
 			if err == nil {
 				t.Fatal("expected extraction to fail on path-traversal entry, got nil error")
 			}
@@ -164,14 +164,27 @@ func TestExtractZip_RejectsNonPositiveCap(t *testing.T) {
 	zipPath := writeZipFile(t, data)
 	destDir := t.TempDir()
 
+	// maxFileBytes non-positive — precondition failure
 	for _, cap := range []int64{-1, 0} {
-		err := extractZip(zipPath, destDir, cap)
+		err := extractZip(zipPath, destDir, cap, maxTotalUncompressedBytes)
 		if err == nil {
-			t.Errorf("cap=%d: expected precondition error, got nil", cap)
+			t.Errorf("maxFileBytes=%d: expected precondition error, got nil", cap)
 			continue
 		}
 		if !strings.Contains(err.Error(), "maxFileBytes must be positive") {
-			t.Errorf("cap=%d: error should mention precondition, got: %v", cap, err)
+			t.Errorf("maxFileBytes=%d: error should mention precondition, got: %v", cap, err)
+		}
+	}
+
+	// maxTotalBytes non-positive — also precondition failure
+	for _, cap := range []int64{-1, 0} {
+		err := extractZip(zipPath, destDir, maxPerFileBytes, cap)
+		if err == nil {
+			t.Errorf("maxTotalBytes=%d: expected precondition error, got nil", cap)
+			continue
+		}
+		if !strings.Contains(err.Error(), "maxTotalBytes must be positive") {
+			t.Errorf("maxTotalBytes=%d: error should mention precondition, got: %v", cap, err)
 		}
 	}
 }
@@ -197,12 +210,48 @@ func TestExtractZip_PerFileSizeCapRejected(t *testing.T) {
 	zipPath := writeZipFile(t, data)
 	destDir := t.TempDir()
 
-	err := extractZip(zipPath, destDir, testCap)
+	err := extractZip(zipPath, destDir, testCap, maxTotalUncompressedBytes)
 	if err == nil {
 		t.Fatal("expected extraction to fail on oversized entry, got nil error")
 	}
 	if !strings.Contains(err.Error(), "per-file size cap") {
 		t.Errorf("error should mention size cap, got: %v", err)
+	}
+}
+
+// TestExtractZip_TotalUncompressedCapRejected verifies the cumulative-
+// bytes guard: a zip archive whose individual entries each fit under the
+// per-file cap but whose total uncompressed size exceeds the total cap
+// must be rejected. This is the layer that catches highly-compressible
+// many-entry archives (the classic "zip bomb" shape) that slip past the
+// compressed-download cap AND the per-file cap.
+//
+// Uses a small testTotal (5 KB) against 10 entries of 1 KB each (10 KB
+// total) so the test stays cheap. The per-file cap is set loose (10 KB)
+// so this test exercises the total cap specifically, not the per-file
+// cap.
+func TestExtractZip_TotalUncompressedCapRejected(t *testing.T) {
+	const (
+		perFileCap int64 = 10 * 1024 // 10 KB per entry
+		totalCap   int64 = 5 * 1024  // 5 KB total — less than 10 × 1 KB
+	)
+
+	entries := map[string]string{}
+	chunk := strings.Repeat("A", 1024) // 1 KB of content per entry
+	for i := 0; i < 10; i++ {
+		entries[fmt.Sprintf("log-%02d.txt", i)] = chunk
+	}
+
+	data := buildZip(t, entries)
+	zipPath := writeZipFile(t, data)
+	destDir := t.TempDir()
+
+	err := extractZip(zipPath, destDir, perFileCap, totalCap)
+	if err == nil {
+		t.Fatal("expected extraction to fail on total-cap exceed, got nil error")
+	}
+	if !strings.Contains(err.Error(), "total uncompressed size") {
+		t.Errorf("error should mention total uncompressed, got: %v", err)
 	}
 }
 

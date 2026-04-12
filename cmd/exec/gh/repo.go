@@ -7,24 +7,34 @@ import (
 	"strings"
 )
 
-// resolveRepo determines the target (owner, repo) for a gh subcommand.
+// resolveRepo determines the target (owner, repo) for a gh subcommand
+// by inspecting the full args slice plus ambient state.
 //
 // Resolution order, highest priority first:
 //
-//  1. Explicit --repo owner/repo flag (caller passes the value already
-//     extracted from args via flagVal)
-//  2. TODOTRIAGE_REPO env var (set by the spawner for delegated runs; never
-//     has a value for Jira-without-repo runs)
+//  1. --repo owner/repo flag. If --repo is present in args but has no
+//     value (e.g. it's the last token), we error immediately — the user
+//     expressed explicit intent and the safe behavior is to fail loudly
+//     rather than silently fall through to env/git resolution and
+//     possibly target the wrong repo.
+//  2. TODOTRIAGE_REPO env var (set by the spawner for delegated runs;
+//     never has a value for Jira-without-repo runs).
 //  3. git config remote.origin.url of the current working directory
-//     (fallback for manual invocation from a checkout)
+//     (fallback for manual invocation from a checkout).
 //
-// Returns a clear error if none of the above resolve. Never falls back to
-// a hardcoded default — running a gh command against the wrong repo (log
-// downloads, comments, reviews) is costly enough to warrant a hard error
-// over a silent misfire.
-func resolveRepo(flagValue string) (owner, repo string, err error) {
-	// 1. Explicit flag
-	if flagValue != "" {
+// Returns a clear error if none of the above resolve. Never falls back
+// to a hardcoded default — running a gh command against the wrong repo
+// (log downloads, comments, reviews) is costly enough to warrant a hard
+// error over a silent misfire.
+func resolveRepo(args []string) (owner, repo string, err error) {
+	// 1. Explicit flag. hasFlag + flagVal together disambiguate "flag
+	// not present" from "flag present but empty" — the latter is
+	// user error, the former is a normal fallthrough to env/git.
+	if hasFlag(args, "--repo") {
+		flagValue := flagVal(args, "--repo")
+		if flagValue == "" {
+			return "", "", fmt.Errorf("--repo requires a value in the form owner/repo")
+		}
 		return splitOwnerRepoStr(flagValue, "--repo flag")
 	}
 

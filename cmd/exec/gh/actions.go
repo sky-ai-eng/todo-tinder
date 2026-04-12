@@ -14,21 +14,32 @@ import (
 	"github.com/sky-ai-eng/todo-triage/internal/github"
 )
 
-// Size caps for GitHub Actions log archive downloads.
+// Size caps for GitHub Actions log archive downloads. Three layers of
+// defense because zip compression ratios can be extreme and any single
+// cap in isolation is bypassable.
 //
-// maxArchiveBytes is the total compressed download cap — above this, refuse
-// to download at all. 500 MB is deliberately generous; realistic log archives
-// are a few MB at most, and a PR with 500 MB of CI logs has bigger problems
-// than this command. Pathological size is the exception we're guarding, not
-// the rule.
+// maxArchiveBytes is the compressed-download cap — above this, refuse to
+// download at all. 500 MB is deliberately generous; realistic log
+// archives are a few MB at most, and a PR with 500 MB of compressed CI
+// logs has bigger problems than this command.
 //
-// maxPerFileBytes is a second layer against zip bombs — even if the total
-// archive is under the cap, reject any single entry that decompresses to
-// more than this. 100 MB per file is absurdly generous for log files but
-// low enough to bound damage from a decompression attack.
+// maxPerFileBytes is the per-entry uncompressed cap. Even a modestly-
+// sized archive containing one huge entry (e.g., a 10 GB single file
+// padded with zeros) is rejected at the entry level. 100 MB per file is
+// generous for log files.
+//
+// maxTotalUncompressedBytes is the total-uncompressed cap across every
+// extracted entry. Without this layer, a highly-compressible archive
+// containing many small entries (1000 × 1 MB each = 1 GB uncompressed,
+// maybe 10 MB compressed after DEFLATE) could stay under both of the
+// other caps yet still expand to multiple gigabytes on disk. 2 GB here
+// is enough for any realistic log archive — a matrix build with 20
+// jobs × 50 MB of verbose logs each is only 1 GB — and catches
+// pathological zip bombs before they fill the disk.
 const (
-	maxArchiveBytes int64 = 500 * 1024 * 1024 // 500 MB
-	maxPerFileBytes int64 = 100 * 1024 * 1024 // 100 MB
+	maxArchiveBytes           int64 = 500 * 1024 * 1024      // 500 MB
+	maxPerFileBytes           int64 = 100 * 1024 * 1024      // 100 MB
+	maxTotalUncompressedBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GB
 )
 
 // handleActions dispatches gh actions subcommands.
@@ -74,7 +85,7 @@ type downloadLogsResult struct {
 // os.Exit, which skips defers, so inlining the logic here would leak the
 // temp zip (and leave a half-extracted destDir) on every failure path.
 func actionsDownloadLogs(client *github.Client, args []string) {
-	owner, repo, err := resolveRepo(flagVal(args, "--repo"))
+	owner, repo, err := resolveRepo(args)
 	if err != nil {
 		exitErr(err.Error())
 	}
@@ -200,7 +211,7 @@ func downloadAndExtractLogs(client *github.Client, owner, repo string, runID int
 		return 0, fmt.Errorf("close temp file: %w", err)
 	}
 
-	if err := extractZip(tmpPath, destDir, maxPerFileBytes); err != nil {
+	if err := extractZip(tmpPath, destDir, maxPerFileBytes, maxTotalUncompressedBytes); err != nil {
 		return 0, fmt.Errorf("extract archive: %w", err)
 	}
 
@@ -265,9 +276,12 @@ func safeDestDirForRun(cwd string, runID int64) (string, error) {
 // destDir must already exist. Returns the first error encountered, which
 // aborts the rest of the extraction — partial extraction left on disk is
 // expected and fine, the caller (downloadLogs) fails the whole command.
-func extractZip(zipPath, destDir string, maxFileBytes int64) error {
+func extractZip(zipPath, destDir string, maxFileBytes, maxTotalBytes int64) error {
 	if maxFileBytes <= 0 {
 		return fmt.Errorf("extractZip: maxFileBytes must be positive, got %d", maxFileBytes)
+	}
+	if maxTotalBytes <= 0 {
+		return fmt.Errorf("extractZip: maxTotalBytes must be positive, got %d", maxTotalBytes)
 	}
 
 	reader, err := zip.OpenReader(zipPath)
@@ -284,9 +298,22 @@ func extractZip(zipPath, destDir string, maxFileBytes int64) error {
 	// Trailing separator so "/tmp/foo" doesn't prefix-match "/tmp/foobar".
 	absDestWithSep := absDest + string(os.PathSeparator)
 
+	// Track cumulative uncompressed bytes across all entries so a
+	// highly-compressible archive with many small entries — each under
+	// maxFileBytes but collectively expanding to multiple gigabytes —
+	// can't slip past the defenses. Checked after each entry because
+	// stopping mid-copy would require threading the remaining budget
+	// through extractZipEntry, and the overshoot is bounded by
+	// maxFileBytes per entry (negligible compared to maxTotalBytes).
+	var totalWritten int64
 	for _, entry := range reader.File {
-		if err := extractZipEntry(entry, absDest, absDestWithSep, maxFileBytes); err != nil {
+		n, err := extractZipEntry(entry, absDest, absDestWithSep, maxFileBytes)
+		if err != nil {
 			return err
+		}
+		totalWritten += n
+		if totalWritten > maxTotalBytes {
+			return fmt.Errorf("archive total uncompressed size exceeds cap of %d bytes (written %d so far — likely zip bomb)", maxTotalBytes, totalWritten)
 		}
 	}
 	return nil
@@ -296,18 +323,22 @@ func extractZip(zipPath, destDir string, maxFileBytes int64) error {
 // Split out from extractZip so the defers on the entry reader and the
 // output file fire per-entry rather than accumulating across the whole
 // archive.
-func extractZipEntry(entry *zip.File, absDest, absDestWithSep string, maxFileBytes int64) error {
+//
+// Returns the number of uncompressed bytes written to disk — zero for
+// directory entries, at most maxFileBytes for files — so the caller can
+// accumulate against a total-uncompressed-bytes cap.
+func extractZipEntry(entry *zip.File, absDest, absDestWithSep string, maxFileBytes int64) (int64, error) {
 	// Path-traversal rejection. filepath.Join + Clean collapses any
 	// "../../" segments in the entry name; we then verify the result still
 	// lives under destDir. This is the guard that makes arbitrary zip
 	// files safe to extract.
 	targetPath := filepath.Join(absDest, entry.Name)
 	if targetPath != absDest && !strings.HasPrefix(targetPath, absDestWithSep) {
-		return fmt.Errorf("unsafe archive entry %q: resolves outside destination", entry.Name)
+		return 0, fmt.Errorf("unsafe archive entry %q: resolves outside destination", entry.Name)
 	}
 
 	if entry.FileInfo().IsDir() {
-		return os.MkdirAll(targetPath, 0755)
+		return 0, os.MkdirAll(targetPath, 0755)
 	}
 
 	// Header size pre-check. This fires on hand-crafted zips with a lying
@@ -317,24 +348,24 @@ func extractZipEntry(entry *zip.File, absDest, absDestWithSep string, maxFileByt
 	// extractZip guarantees maxFileBytes > 0, so the comparison is always
 	// meaningful here.
 	if int64(entry.UncompressedSize64) > maxFileBytes {
-		return fmt.Errorf("archive entry %q exceeds per-file size cap: %d bytes", entry.Name, entry.UncompressedSize64)
+		return 0, fmt.Errorf("archive entry %q exceeds per-file size cap: %d bytes", entry.Name, entry.UncompressedSize64)
 	}
 
 	// Ensure parent directory exists — zip archives don't always include
 	// explicit directory entries.
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return fmt.Errorf("mkdir parent for %q: %w", entry.Name, err)
+		return 0, fmt.Errorf("mkdir parent for %q: %w", entry.Name, err)
 	}
 
 	src, err := entry.Open()
 	if err != nil {
-		return fmt.Errorf("open entry %q: %w", entry.Name, err)
+		return 0, fmt.Errorf("open entry %q: %w", entry.Name, err)
 	}
 	defer src.Close()
 
 	dst, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("create output file %q: %w", entry.Name, err)
+		return 0, fmt.Errorf("create output file %q: %w", entry.Name, err)
 	}
 	defer dst.Close()
 
@@ -344,12 +375,12 @@ func extractZipEntry(entry *zip.File, absDest, absDestWithSep string, maxFileByt
 	limited := io.LimitReader(src, maxFileBytes+1)
 	n, err := io.Copy(dst, limited)
 	if err != nil {
-		return fmt.Errorf("write entry %q: %w", entry.Name, err)
+		return n, fmt.Errorf("write entry %q: %w", entry.Name, err)
 	}
 	if n > maxFileBytes {
-		return fmt.Errorf("archive entry %q exceeded per-file size cap during extraction (content larger than %d bytes)", entry.Name, maxFileBytes)
+		return n, fmt.Errorf("archive entry %q exceeded per-file size cap during extraction (content larger than %d bytes)", entry.Name, maxFileBytes)
 	}
-	return nil
+	return n, nil
 }
 
 // topLevelEntries returns the names of entries directly inside dir, sorted

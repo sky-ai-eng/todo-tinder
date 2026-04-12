@@ -2,6 +2,8 @@ package gh
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -107,7 +109,7 @@ func TestSplitOwnerRepoStr(t *testing.T) {
 func TestResolveRepo_FlagWins(t *testing.T) {
 	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
 
-	owner, repo, err := resolveRepo("flag-owner/flag-repo")
+	owner, repo, err := resolveRepo([]string{"--repo", "flag-owner/flag-repo"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -119,7 +121,7 @@ func TestResolveRepo_FlagWins(t *testing.T) {
 func TestResolveRepo_EnvWhenNoFlag(t *testing.T) {
 	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
 
-	owner, repo, err := resolveRepo("")
+	owner, repo, err := resolveRepo(nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -144,7 +146,7 @@ func TestResolveRepo_HardErrorWhenNothingResolves(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(origWd) })
 
-	_, _, err = resolveRepo("")
+	_, _, err = resolveRepo(nil)
 	if err == nil {
 		t.Fatal("expected error when no resolution path succeeds, got nil")
 	}
@@ -155,8 +157,96 @@ func TestResolveRepo_HardErrorWhenNothingResolves(t *testing.T) {
 func TestResolveRepo_InvalidFlagFormat(t *testing.T) {
 	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
 
-	_, _, err := resolveRepo("not-a-valid-format")
+	_, _, err := resolveRepo([]string{"--repo", "not-a-valid-format"})
 	if err == nil {
 		t.Fatal("expected error on invalid flag value, got nil")
+	}
+}
+
+// TestResolveRepo_EmptyFlagValue is the regression guard for the
+// "--repo without a value" case. flagVal returns "" both when --repo
+// isn't present AND when --repo is the last token in args (no value to
+// consume). The old resolveRepo(flagValue string) signature couldn't
+// tell these apart and silently fell through to env/git resolution,
+// potentially targeting the wrong repository despite the user's
+// explicit --repo intent. The fix disambiguates via hasFlag.
+func TestResolveRepo_EmptyFlagValue(t *testing.T) {
+	// Set env so there IS a fallback available — the test is that we
+	// error instead of quietly using it.
+	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
+
+	cases := [][]string{
+		{"--repo"},                      // last arg, no value
+		{"--repo", "--some-other-flag"}, // value looks like another flag — ambiguous, but user clearly forgot to supply one
+		{"pos-arg", "--repo"},           // --repo at the end after positional
+	}
+
+	for _, args := range cases {
+		t.Run("", func(t *testing.T) {
+			// The "--some-other-flag" case is a known soft spot: flagVal
+			// returns "--some-other-flag" as the value, and splitOwnerRepoStr
+			// rejects it as malformed. Either way it errors, which is the
+			// behavior we want.
+			_, _, err := resolveRepo(args)
+			if err == nil {
+				t.Errorf("args %v: expected error on empty/invalid --repo, got nil", args)
+			}
+		})
+	}
+}
+
+// TestResolveRepo_GitConfigFallback exercises the third resolution path:
+// read remote.origin.url via `git config --get`. The first two paths
+// (flag, env var) are table-tested above, but the git-config fallback
+// is the one that actually runs when users invoke the CLI manually from
+// a real checkout. Without a test, a regression here would only surface
+// in production. Uses real git commands rather than hand-crafting the
+// git config format, because the config path goes through `git config`
+// at runtime and a synthetic fixture would miss parser quirks.
+//
+// Skipped if git isn't on PATH — in any realistic dev environment it is,
+// and CI environments installing the test suite should have it too.
+func TestResolveRepo_GitConfigFallback(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not in PATH")
+	}
+
+	t.Setenv("TODOTRIAGE_REPO", "")
+
+	// Use a fresh HOME so the user's global git config can't influence
+	// the test (e.g., a templateDir that pre-populates remotes).
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(fakeHome, ".config"))
+
+	workDir := t.TempDir()
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(workDir); err != nil {
+		t.Fatalf("chdir workDir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWd) })
+
+	// git init + remote add origin. Neither requires a user identity
+	// (unlike commits), so no additional config needed.
+	for _, argv := range [][]string{
+		{"git", "init"},
+		{"git", "remote", "add", "origin", "https://github.com/test-owner/test-repo.git"},
+	} {
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Dir = workDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\noutput: %s", argv, err, out)
+		}
+	}
+
+	owner, repo, err := resolveRepo(nil)
+	if err != nil {
+		t.Fatalf("resolveRepo via git config: %v", err)
+	}
+	if owner != "test-owner" || repo != "test-repo" {
+		t.Errorf("got (%q, %q), want (test-owner, test-repo)", owner, repo)
 	}
 }

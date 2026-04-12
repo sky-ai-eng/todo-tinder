@@ -478,9 +478,12 @@ func firstPositional(args []string) string {
 
 // ownerRepo resolves the target repo for a PR subcommand. Delegates to the
 // shared resolveRepo so --repo flag, TODOTRIAGE_REPO env, and .git/config
-// fallback all behave consistently across every gh command.
+// fallback all behave consistently across every gh command. Passes the
+// full args slice (not just the flag value) so resolveRepo can detect
+// "--repo present but empty" and fail loudly instead of silently falling
+// back to env/git resolution.
 func ownerRepo(args []string) (string, string) {
-	owner, repo, err := resolveRepo(flagVal(args, "--repo"))
+	owner, repo, err := resolveRepo(args)
 	if err != nil {
 		exitErr(err.Error())
 	}

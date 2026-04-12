@@ -338,22 +338,37 @@ func writeLocalExcludes(wtDir string) error {
 // (used for idempotency — we skip the rewrite if the file is already
 // what we want).
 //
-// Marker search is direction-aware: we find the begin marker first, then
-// search for the end marker *after* the begin position. Searching the
-// whole file for end with strings.Index would pick up the first
-// occurrence, which could sit before the begin marker in unrelated
-// content (a user comment that happens to paste our end string, a
-// previously-rewritten file with stray fragments, etc.). That earlier-
-// end + later-begin pair would look malformed, causing us to append a
-// duplicate managed block every run. Constraining the end search to
-// positions after begin makes the scan robust against stray mentions.
+// Marker search is direction-aware in two ways:
+//
+//  1. We find the begin marker via LastIndex, not Index. If the file has
+//     an earlier stray or orphaned begin marker (a truncated block whose
+//     end was hand-deleted, a quoted reference in a user comment, stale
+//     content from a broken previous run), matching the *first* begin
+//     would pair it with the real end marker later in the file and
+//     clobber every line in between — violating the "content outside our
+//     marked section is never touched" guarantee. LastIndex locks onto
+//     the most recent begin, leaving any stray earlier markers and the
+//     user content around them untouched.
+//
+//  2. We find the end marker via Index on the slice *after* the begin
+//     position. Searching the whole file for end would pick up the first
+//     occurrence, which could sit before begin in unrelated content. The
+//     earlier-end + later-begin pair would look malformed, causing us to
+//     append a duplicate managed block every run.
 //
 // If a valid begin...end pair is found, the bytes between them (plus the
 // trailing newline after end) are replaced with managedBlock. Everything
 // outside the markers is preserved byte-for-byte. If no valid pair
 // exists, managedBlock is appended at EOF with a blank-line separator.
+//
+// Known limitation: a file with a genuinely duplicate valid managed
+// block (two complete begin...end pairs) has only its last pair rewritten
+// on each run. Earlier blocks remain as orphaned duplicates, which git
+// dedupes internally for gitignore purposes but looks ugly to a human
+// reader. We don't expect to produce this state ourselves — only hand
+// editing could cause it, and the cleanup is a manual edit.
 func mergeManagedBlock(existing, managedBlock string) (string, bool) {
-	beginIdx := strings.Index(existing, managedExcludeBegin)
+	beginIdx := strings.LastIndex(existing, managedExcludeBegin)
 	if beginIdx >= 0 {
 		searchFrom := beginIdx + len(managedExcludeBegin)
 		if relEnd := strings.Index(existing[searchFrom:], managedExcludeEnd); relEnd >= 0 {
