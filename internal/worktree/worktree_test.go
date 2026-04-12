@@ -262,6 +262,100 @@ func TestWriteLocalExcludes_GrowthReusesBlock(t *testing.T) {
 	}
 }
 
+// TestWriteLocalExcludes_RejectsMissingGitdir is the regression guard
+// for the "valid prefix but bogus target" case. A .git pointer file that
+// starts with "gitdir:" but references a path that doesn't exist (or
+// isn't a directory) would previously pass the textual prefix check and
+// then silently get its info/ parent created by the write path's
+// MkdirAll, writing to an arbitrary location. The fix stats the
+// resolved gitdir before returning and rejects if it's missing or not a
+// directory.
+func TestWriteLocalExcludes_RejectsMissingGitdir(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, wtDir string)
+	}{
+		{
+			"gitdir path does not exist",
+			func(t *testing.T, wtDir string) {
+				bogus := filepath.Join(t.TempDir(), "does-not-exist")
+				if err := os.WriteFile(filepath.Join(wtDir, ".git"), []byte("gitdir: "+bogus+"\n"), 0644); err != nil {
+					t.Fatalf("write .git: %v", err)
+				}
+			},
+		},
+		{
+			"gitdir path is a file, not a directory",
+			func(t *testing.T, wtDir string) {
+				fileTarget := filepath.Join(t.TempDir(), "not-a-dir")
+				if err := os.WriteFile(fileTarget, []byte("regular file"), 0644); err != nil {
+					t.Fatalf("write target file: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(wtDir, ".git"), []byte("gitdir: "+fileTarget+"\n"), 0644); err != nil {
+					t.Fatalf("write .git: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wtDir := t.TempDir()
+			tc.setup(t, wtDir)
+
+			err := writeLocalExcludes(wtDir)
+			if err == nil {
+				t.Fatal("expected error on bogus gitdir, got nil")
+			}
+			// Error should make the cause diagnosable — mention either
+			// "missing gitdir" or "not a directory".
+			msg := err.Error()
+			if !strings.Contains(msg, "missing gitdir") && !strings.Contains(msg, "not a directory") {
+				t.Errorf("error should mention missing/invalid gitdir, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestWriteLocalExcludes_IgnoresExtraLinesInPointer verifies that a .git
+// pointer file with content past the first newline still parses
+// correctly — git's canonical format is one line, but some tools append
+// extra config to the same file, and we should read only the first line.
+func TestWriteLocalExcludes_IgnoresExtraLinesInPointer(t *testing.T) {
+	root := t.TempDir()
+	wtDir := filepath.Join(root, "worktree")
+	extGitDir := filepath.Join(root, "bare.git", "worktrees", "wt-xyz")
+	if err := os.MkdirAll(wtDir, 0755); err != nil {
+		t.Fatalf("mkdir wtDir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(extGitDir, "info"), 0755); err != nil {
+		t.Fatalf("mkdir ext gitdir: %v", err)
+	}
+	// Pointer with garbage after the first newline — should be ignored.
+	pointerContent := "gitdir: " + extGitDir + "\n" +
+		"# this line is not part of the pointer\n" +
+		"corrupted garbage " + strings.Repeat("X", 200) + "\n"
+	if err := os.WriteFile(filepath.Join(wtDir, ".git"), []byte(pointerContent), 0644); err != nil {
+		t.Fatalf("write .git: %v", err)
+	}
+
+	if err := writeLocalExcludes(wtDir); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The managed patterns should land in the correct external info/exclude.
+	content, err := os.ReadFile(filepath.Join(extGitDir, "info", "exclude"))
+	if err != nil {
+		t.Fatalf("read exclude: %v", err)
+	}
+	s := string(content)
+	for _, p := range managedExcludePatterns {
+		if !strings.Contains(s, p) {
+			t.Errorf("managed pattern %q missing; file:\n%s", p, s)
+		}
+	}
+}
+
 func TestWriteLocalExcludes_LinkedWorktreePointer(t *testing.T) {
 	wtDir, excludePath := setupLinkedWorktree(t)
 

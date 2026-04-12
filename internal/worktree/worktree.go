@@ -407,12 +407,18 @@ func mergeManagedBlock(existing, managedBlock string) (string, bool) {
 // a worktree, handling both the linked-worktree case (where .git is a
 // pointer file) and the plain-checkout case (where .git is a directory).
 //
-// The linked-worktree branch validates the pointer format explicitly. A
-// malformed .git file — truncated, corrupted, or simply not a git pointer
-// at all — would otherwise get interpreted as a relative gitdir path and
-// cause us to write to an arbitrary location on disk. We require the
-// trimmed content to actually start with "gitdir:" and return a clear
-// error if it doesn't.
+// The linked-worktree branch parses only the first line of the pointer
+// file (git's canonical format is exactly `gitdir: <path>\n`, but some
+// third-party tools append extra config to the same file — we ignore
+// anything past the first newline). It then validates:
+//
+//  1. The first line starts with "gitdir:". Without this check a
+//     corrupted or non-pointer file would have its content interpreted
+//     as a literal path and we'd write to an arbitrary disk location.
+//  2. The parsed gitdir already exists as a directory. An otherwise-
+//     valid-looking pointer referencing a missing or file-shaped
+//     target would silently get its parent created by MkdirAll on the
+//     write path — rejecting here prevents that.
 func resolveExcludePath(wtDir string) (string, error) {
 	gitFile := filepath.Join(wtDir, ".git")
 	info, err := os.Stat(gitFile)
@@ -428,17 +434,37 @@ func resolveExcludePath(wtDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read .git pointer: %w", err)
 	}
-	trimmed := strings.TrimSpace(string(data))
-	const prefix = "gitdir:"
-	if !strings.HasPrefix(trimmed, prefix) {
-		return "", fmt.Errorf(".git file is not a valid worktree pointer (missing %q prefix): %q", prefix, trimmed)
+	// Only the first line is part of the gitdir pointer. Anything past
+	// the first newline is unrelated content (extra config some tools
+	// write) and we ignore it.
+	firstLine := string(data)
+	if nl := strings.IndexByte(firstLine, '\n'); nl >= 0 {
+		firstLine = firstLine[:nl]
 	}
-	gitdir := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+	firstLine = strings.TrimSpace(firstLine)
+	const prefix = "gitdir:"
+	if !strings.HasPrefix(firstLine, prefix) {
+		return "", fmt.Errorf(".git file is not a valid worktree pointer (missing %q prefix): %q", prefix, firstLine)
+	}
+	gitdir := strings.TrimSpace(strings.TrimPrefix(firstLine, prefix))
 	if gitdir == "" {
 		return "", fmt.Errorf(".git pointer has empty gitdir path")
 	}
 	if !filepath.IsAbs(gitdir) {
 		gitdir = filepath.Join(wtDir, gitdir)
+	}
+	// Validate the referenced gitdir actually exists as a directory
+	// before we return a path inside it. Without this, a pointer file
+	// with a bogus (but prefix-valid) target would pass the textual
+	// checks above and silently get its info/ parent created via
+	// MkdirAll on the write path — writing to an arbitrary location
+	// under that target.
+	gitdirInfo, err := os.Stat(gitdir)
+	if err != nil {
+		return "", fmt.Errorf(".git pointer references missing gitdir %q: %w", gitdir, err)
+	}
+	if !gitdirInfo.IsDir() {
+		return "", fmt.Errorf(".git pointer references %q which is not a directory", gitdir)
 	}
 	return filepath.Join(gitdir, "info", "exclude"), nil
 }

@@ -85,11 +85,11 @@ type downloadLogsResult struct {
 // os.Exit, which skips defers, so inlining the logic here would leak the
 // temp zip (and leave a half-extracted destDir) on every failure path.
 func actionsDownloadLogs(client *github.Client, args []string) {
-	owner, repo, err := resolveRepo(args)
-	if err != nil {
-		exitErr(err.Error())
-	}
-
+	// Validate the positional arg first. If the user forgot <run_id>
+	// entirely, we want the usage message, not a confusing "could not
+	// resolve repo" error that happens to surface because they're
+	// running from a non-checkout dir. Usage errors take precedence
+	// over resolution errors.
 	runIDStr := firstPositional(args)
 	if runIDStr == "" {
 		exitErr("usage: todotriage exec gh actions download-logs <run_id> [--repo owner/repo]")
@@ -97,6 +97,11 @@ func actionsDownloadLogs(client *github.Client, args []string) {
 	runID, err := strconv.ParseInt(runIDStr, 10, 64)
 	if err != nil || runID <= 0 {
 		exitErr(fmt.Sprintf("invalid run_id %q: expected a positive integer", runIDStr))
+	}
+
+	owner, repo, err := resolveRepo(args)
+	if err != nil {
+		exitErr(err.Error())
 	}
 
 	// Destination: <cwd>/_scratch/ci-logs/<run_id>/. Resolving to absolute
