@@ -302,7 +302,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 		return
 	}
 
-	prompt := buildPrompt(mission, cfg.scope, cfg.toolsRef, selfBin)
+	prompt := buildPrompt(mission, cfg.scope, cfg.toolsRef, selfBin, runID)
 
 	s.updateStatus(runID, "agent_starting")
 	if ctx.Err() != nil {
@@ -366,6 +366,29 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	}
 
 	if completion != nil {
+		// Enforce the pre-complete task_memory write gate. If the agent
+		// returned a completion JSON without writing ./task_memory/<runID>.md,
+		// resume the session with a correction message (up to 2 retries).
+		// Retries that produce new completions are merged into the totals
+		// so cost/duration accounting reflects the full invocation, not
+		// just the initial call.
+		completion = s.runMemoryGate(ctx, runID, task.ID, claudeCwd, completion, stream.SessionID())
+
+		// Ingest the agent-written memory file (if present) or flag the
+		// run as memory_missing. Either way the run still counts as
+		// completed — we don't fail a run just because the agent skipped
+		// the memory write, but we DO surface the gap.
+		if memoryFileExists(claudeCwd, runID) {
+			if err := ingestAgentMemory(s.database, claudeCwd, runID, task.ID); err != nil {
+				log.Printf("[delegate] warning: failed to ingest memory file for run %s: %v", runID, err)
+			}
+		} else {
+			log.Printf("[delegate] run %s: memory file missing after gate retries, flagging memory_missing", runID)
+			if err := db.MarkAgentRunMemoryMissing(s.database, runID); err != nil {
+				log.Printf("[delegate] warning: failed to mark memory_missing for run %s: %v", runID, err)
+			}
+		}
+
 		resultLink, resultSummary := "", ""
 		status := "completed"
 		if completion.IsError {
@@ -615,6 +638,174 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, runID, sessionID, cwd, 
 	return outcome, nil
 }
 
+// maxMemoryRetries is the hard cap on how many times the write-gate
+// will resume a run to ask the agent to write its memory file. Chosen
+// in the SKY-141 design: 0 retries is too strict (one missed write
+// shouldn't discard work), 3+ is overkill (if the agent ignored the
+// first correction, a third attempt is almost never the one that
+// works). Not a config knob because no one needs to tune it per-run.
+const maxMemoryRetries = 2
+
+// memoryFileExists returns true iff the agent wrote ./task_memory/<runID>.md
+// during the run. Used by the write-gate both before retrying (is another
+// attempt needed?) and after (did the retry succeed?).
+func memoryFileExists(cwd, runID string) bool {
+	_, err := os.Stat(filepath.Join(cwd, "task_memory", runID+".md"))
+	return err == nil
+}
+
+// ingestAgentMemory reads an agent-written memory file from the worktree
+// and saves it as a task_memory row. Called after the write-gate has
+// verified the file is present. Returns an error only on read/DB failure —
+// "file missing" is not an error here because the caller already checked.
+func ingestAgentMemory(database *sql.DB, cwd, runID, taskID string) error {
+	path := filepath.Join(cwd, "task_memory", runID+".md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read memory file %s: %w", path, err)
+	}
+	mem := domain.TaskMemory{
+		ID:        uuid.New().String(),
+		TaskID:    taskID,
+		RunID:     runID,
+		Content:   string(data),
+		Source:    "agent",
+		CreatedAt: time.Now(),
+	}
+	if err := db.SaveTaskMemory(database, mem); err != nil {
+		return fmt.Errorf("save memory row: %w", err)
+	}
+	return nil
+}
+
+// writeSystemStubMemory writes a placeholder task_memory row for runs
+// that ended involuntarily before the agent could produce its own
+// memory file. Maintains the SKY-141 invariant that every involuntarily-
+// failed run produces exactly one task_memory row, so downstream
+// consumers (circuit-breaker UI, materialize-at-startup) never see
+// an orphaned run record.
+//
+// No-op if a row already exists for the run — defensive against the
+// order-of-operations case where the agent wrote a real memory file
+// that got ingested, then a post-ingestion step crashed and fell into
+// the failure path. Duplicate stubs would pollute the history; a
+// single genuine entry wins.
+//
+// Cancellation is not a failure: handleCancelled does NOT call this,
+// so cancelled runs legitimately have no task_memory row. Downstream
+// code is responsible for handling that cleanly.
+func writeSystemStubMemory(database *sql.DB, runID, taskID, reason string) {
+	existing, err := db.GetTaskMemoryByRun(database, runID)
+	if err != nil {
+		log.Printf("[delegate] warning: failed to check existing memory for run %s: %v", runID, err)
+		// Fall through and try the insert anyway — better a duplicate
+		// than a lost stub.
+	}
+	if existing != nil {
+		return
+	}
+	content := fmt.Sprintf("# Run %s\n\nRun failed involuntarily: %s\n\nNo agent reasoning available.\n", runID, reason)
+	stub := domain.TaskMemory{
+		ID:        uuid.New().String(),
+		TaskID:    taskID,
+		RunID:     runID,
+		Content:   content,
+		Source:    "system",
+		CreatedAt: time.Now(),
+	}
+	if err := db.SaveTaskMemory(database, stub); err != nil {
+		log.Printf("[delegate] warning: failed to write system stub memory for run %s: %v", runID, err)
+	}
+}
+
+// runMemoryGate enforces the pre-complete task_memory file invariant.
+//
+// If the agent wrote ./task_memory/<runID>.md during its initial
+// invocation, returns the original completion unchanged. Otherwise
+// resumes the session (up to maxMemoryRetries times) with a correction
+// message and re-checks after each attempt. Completions from resumed
+// sessions are merged into the returned completion so cost/duration/
+// num_turns accounting reflects the full span of the run.
+//
+// The gate does not touch agent_runs status — that remains the caller's
+// responsibility. The gate's only side effects are (a) spawning resume
+// subprocesses via ResumeWithMessage, which write their own messages to
+// agent_messages via consumeClaudeStream's persistence, and (b) logging
+// progress for operator diagnosis.
+//
+// If no session id is available (shouldn't happen in practice because
+// consumeClaudeStream persists the init event, but defensive), the gate
+// logs and returns without retrying. The caller will see a missing
+// memory file and flag memory_missing.
+func (s *Spawner) runMemoryGate(
+	ctx context.Context,
+	runID, taskID, cwd string,
+	initial *runCompletion,
+	sessionID string,
+) *runCompletion {
+	if memoryFileExists(cwd, runID) {
+		return initial
+	}
+
+	if sessionID == "" {
+		log.Printf("[delegate] run %s: memory file missing and no session id available — cannot gate-retry", runID)
+		return initial
+	}
+
+	current := initial
+	for attempt := 1; attempt <= maxMemoryRetries; attempt++ {
+		log.Printf("[delegate] run %s: memory file missing after attempt %d, resuming", runID, attempt-1)
+		msg := fmt.Sprintf(
+			"You returned a completion JSON but did not write your memory file to ./task_memory/%s.md. "+
+				"Write it now — one paragraph of what you did, one of why, one of what to try next "+
+				"if this recurs — then return your completion JSON again.",
+			runID,
+		)
+		outcome, err := s.ResumeWithMessage(ctx, runID, sessionID, cwd, msg, ResumeOptions{})
+		if err != nil {
+			log.Printf("[delegate] run %s: resume attempt %d failed: %v", runID, attempt, err)
+			// Give up on further retries — the caller will mark
+			// memory_missing. Don't wipe out the initial completion's
+			// accounting just because the retry subprocess crashed.
+			return current
+		}
+		if outcome.Completion != nil {
+			current = mergeCompletion(current, outcome.Completion)
+		}
+		if memoryFileExists(cwd, runID) {
+			return current
+		}
+	}
+
+	return current
+}
+
+// mergeCompletion combines an initial completion event with one from a
+// resumed session so final accounting reflects total cost, duration, and
+// turn count across all invocations. The result text and stop_reason
+// come from the resume (that's what the caller wants to report as the
+// final outcome), but cost and turns are summed.
+//
+// If either the resume's Result or StopReason is empty, the base's
+// values are preserved — partial resume outcomes shouldn't blank
+// fields that were already populated.
+func mergeCompletion(base, resume *runCompletion) *runCompletion {
+	merged := *base
+	merged.CostUSD += resume.CostUSD
+	merged.DurationMs += resume.DurationMs
+	merged.NumTurns += resume.NumTurns
+	if resume.IsError {
+		merged.IsError = true
+	}
+	if resume.Result != "" {
+		merged.Result = resume.Result
+	}
+	if resume.StopReason != "" {
+		merged.StopReason = resume.StopReason
+	}
+	return &merged
+}
+
 // materializePriorMemories writes any existing task_memory rows for the
 // task into <cwd>/task_memory/<prior_run_id>.md as individual markdown
 // files, so a fresh agent invocation sees what previous iterations on
@@ -709,6 +900,20 @@ func (s *Spawner) updateStatus(runID, status string) {
 
 func (s *Spawner) failRun(runID, errMsg string) {
 	log.Printf("[delegate] run %s failed: %s", runID, errMsg)
+
+	// Look up task_id so we can write a system stub task_memory row,
+	// maintaining the SKY-141 invariant that every involuntarily-failed
+	// run produces exactly one task_memory row. Cancellation is handled
+	// separately via handleCancelled and intentionally does not write a
+	// stub — the circuit breaker UI treats cancellation as a non-failure
+	// terminal state.
+	var taskID sql.NullString
+	if err := s.database.QueryRow(`SELECT task_id FROM agent_runs WHERE id = ?`, runID).Scan(&taskID); err != nil {
+		log.Printf("[delegate] warning: failed to look up task_id for failed run %s: %v", runID, err)
+	} else if taskID.Valid && taskID.String != "" {
+		writeSystemStubMemory(s.database, runID, taskID.String, errMsg)
+	}
+
 	if _, err := s.database.Exec(`UPDATE agent_runs SET status = 'failed' WHERE id = ?`, runID); err != nil {
 		log.Printf("[delegate] warning: failed to mark run %s as failed: %v", runID, err)
 	}
@@ -817,11 +1022,12 @@ func parseAgentResult(text string) *agentResult {
 	return nil
 }
 
-// buildPrompt composes: mission + envelope (scope, tools, completion contract).
-func buildPrompt(mission, scope, toolsRef, binaryPath string) string {
+// buildPrompt composes: mission + envelope (scope, tools, task memory, completion contract).
+func buildPrompt(mission, scope, toolsRef, binaryPath, runID string) string {
 	envelope := strings.NewReplacer(
 		"{{SCOPE}}", scope,
 		"{{TOOLS_REFERENCE}}", toolsRef,
+		"{{RUN_ID}}", runID,
 	).Replace(ai.EnvelopeTemplate)
 
 	body := strings.ReplaceAll(mission, "todotriage exec", binaryPath+" exec")
