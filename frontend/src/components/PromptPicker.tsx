@@ -134,7 +134,6 @@ export default function PromptPicker({ open, onSelect, onClose, onEditPrompts }:
                 >
                   Edit Prompts
                 </button>
-                <span className="text-[11px] text-text-tertiary">Swipe up to delegate</span>
               </div>
             </div>
           </motion.div>
