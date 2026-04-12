@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/sky-ai-eng/todo-triage/internal/db"
@@ -45,6 +46,17 @@ func (s *Server) handleTriggerCreate(w http.ResponseWriter, r *http.Request) {
 		req.CooldownSeconds = 60
 	}
 
+	// Validate prompt exists
+	prompt, err := db.GetPrompt(s.db, req.PromptID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if prompt == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "prompt not found"})
+		return
+	}
+
 	trigger := domain.PromptTrigger{
 		ID:              uuid.New().String(),
 		PromptID:        req.PromptID,
@@ -56,6 +68,10 @@ func (s *Server) handleTriggerCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := db.SavePromptTrigger(s.db, trigger); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "a trigger already exists for this prompt and event type"})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
