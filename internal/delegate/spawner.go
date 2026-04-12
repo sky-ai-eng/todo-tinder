@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -288,6 +289,12 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	// Nuke the ghost ~/.claude/projects/<encoded-cwd> that claude auto-creates
 	// for this cwd. Safety-railed to only touch entries under $TMPDIR.
 	defer worktree.RemoveClaudeProjectDir(claudeCwd)
+
+	// Materialize any prior task memories into ./task_memory/ so the agent
+	// sees what previous iterations on this task have already tried. The
+	// directory is git-excluded by writeLocalExcludes (managedExcludePatterns
+	// in internal/worktree/worktree.go) so nothing leaks into the PR.
+	materializePriorMemories(s.database, claudeCwd, task.ID)
 
 	selfBin, err := os.Executable()
 	if err != nil {
@@ -606,6 +613,53 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, runID, sessionID, cwd, 
 	}
 
 	return outcome, nil
+}
+
+// materializePriorMemories writes any existing task_memory rows for the
+// task into <cwd>/task_memory/<prior_run_id>.md as individual markdown
+// files, so a fresh agent invocation sees what previous iterations on
+// the same task have already tried. The agent is taught to read this
+// directory by the envelope.
+//
+// Pattern: DB is the source of truth, we materialize into the worktree
+// at startup, and ingest back on completion. The worktree is destroyed
+// after every run, so these files never outlive their run on disk —
+// only the DB rows do.
+//
+// Degrades gracefully: database errors, mkdir failures, or per-file
+// write failures are logged but do not fail the run. An agent running
+// without materialized priors is still useful, just without the
+// cross-run memory benefit. This "advisory" posture only holds for
+// the read side — the write-before-finish gate in the next ticket is
+// strict about NEW memories being produced.
+func materializePriorMemories(database *sql.DB, cwd, taskID string) {
+	memories, err := db.GetTaskMemoriesForTask(database, taskID)
+	if err != nil {
+		log.Printf("[delegate] warning: failed to load prior task memories for task %s: %v", taskID, err)
+		return
+	}
+	if len(memories) == 0 {
+		return
+	}
+
+	memDir := filepath.Join(cwd, "task_memory")
+	if err := os.MkdirAll(memDir, 0755); err != nil {
+		log.Printf("[delegate] warning: failed to create task_memory dir at %s: %v", memDir, err)
+		return
+	}
+
+	written := 0
+	for _, m := range memories {
+		filename := filepath.Join(memDir, m.RunID+".md")
+		if err := os.WriteFile(filename, []byte(m.Content), 0644); err != nil {
+			log.Printf("[delegate] warning: failed to materialize task memory %s: %v", filename, err)
+			continue
+		}
+		written++
+	}
+	if written > 0 {
+		log.Printf("[delegate] materialized %d prior task memories for task %s", written, taskID)
+	}
 }
 
 // resolvePrompt finds the mission text for a task, either from an explicit ID or the default binding.
