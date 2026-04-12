@@ -161,7 +161,8 @@ func main() {
 
 	// Subscriber: auto-delegation — fires matching prompt_triggers on non-system events
 	bus.Subscribe(eventbus.Subscriber{
-		Name: "auto-delegate",
+		Name:   "auto-delegate",
+		Filter: []string{"github:", "jira:"},
 		Handle: func(evt domain.Event) {
 			delegate.MaybeAutoDelegate(database, spawner, evt)
 		},
