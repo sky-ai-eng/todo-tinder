@@ -6,10 +6,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sky-ai-eng/todo-triage/internal/auth"
-	"github.com/sky-ai-eng/todo-triage/internal/config"
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	ghclient "github.com/sky-ai-eng/todo-triage/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 )
 
 // handleDashboardStats returns aggregated PR statistics from tracked items.

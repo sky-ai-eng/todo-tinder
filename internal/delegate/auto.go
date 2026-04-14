@@ -5,9 +5,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/sky-ai-eng/todo-triage/internal/config"
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // MaybeAutoDelegate checks whether an event should trigger an automatic

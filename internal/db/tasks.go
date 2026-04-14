@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // taskColumns is the canonical SELECT column list for queryTasks. Every query that

@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // taskJSON is the API representation of a task.

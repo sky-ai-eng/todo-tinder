@@ -16,18 +16,18 @@ func TestParseGitRemoteURL(t *testing.T) {
 		wantOK    bool
 	}{
 		// HTTPS
-		{"https with .git", "https://github.com/sky-ai-eng/todo-triage.git", "sky-ai-eng", "todo-triage", true},
-		{"https without .git", "https://github.com/sky-ai-eng/todo-triage", "sky-ai-eng", "todo-triage", true},
+		{"https with .git", "https://github.com/sky-ai-eng/triage-factory.git", "sky-ai-eng", "triage-factory", true},
+		{"https without .git", "https://github.com/sky-ai-eng/triage-factory", "sky-ai-eng", "triage-factory", true},
 		{"https with trailing slash stripped", "https://github.com/octo/repo.git", "octo", "repo", true},
 		{"http enterprise host", "http://github.example.com/team/proj.git", "team", "proj", true},
 
 		// SCP-style SSH (git@host:path)
-		{"scp ssh with .git", "git@github.com:sky-ai-eng/todo-triage.git", "sky-ai-eng", "todo-triage", true},
+		{"scp ssh with .git", "git@github.com:sky-ai-eng/triage-factory.git", "sky-ai-eng", "triage-factory", true},
 		{"scp ssh without .git", "git@github.com:octo/repo", "octo", "repo", true},
 		{"scp ssh ghe host", "git@github.example.com:team/proj.git", "team", "proj", true},
 
 		// URL-style SSH
-		{"ssh:// with .git", "ssh://git@github.com/sky-ai-eng/todo-triage.git", "sky-ai-eng", "todo-triage", true},
+		{"ssh:// with .git", "ssh://git@github.com/sky-ai-eng/triage-factory.git", "sky-ai-eng", "triage-factory", true},
 		{"ssh:// without .git", "ssh://git@github.com/octo/repo", "octo", "repo", true},
 
 		// git://
@@ -80,7 +80,7 @@ func TestSplitOwnerRepoStr(t *testing.T) {
 		owner   string
 		repo    string
 	}{
-		{"valid", "sky-ai-eng/todo-triage", false, "sky-ai-eng", "todo-triage"},
+		{"valid", "sky-ai-eng/triage-factory", false, "sky-ai-eng", "triage-factory"},
 		{"valid with dashes", "my-org/my-repo", false, "my-org", "my-repo"},
 		{"empty", "", true, "", ""},
 		{"no slash", "owner", true, "", ""},
@@ -107,7 +107,7 @@ func TestSplitOwnerRepoStr(t *testing.T) {
 // TestResolveRepo_FlagWins verifies the explicit flag beats the env var.
 // Uses t.Setenv so the env state is scoped to this test and auto-restored.
 func TestResolveRepo_FlagWins(t *testing.T) {
-	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
+	t.Setenv("TRIAGE_FACTORY_REPO", "env-owner/env-repo")
 
 	owner, repo, err := resolveRepo([]string{"--repo", "flag-owner/flag-repo"})
 	if err != nil {
@@ -119,7 +119,7 @@ func TestResolveRepo_FlagWins(t *testing.T) {
 }
 
 func TestResolveRepo_EnvWhenNoFlag(t *testing.T) {
-	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
+	t.Setenv("TRIAGE_FACTORY_REPO", "env-owner/env-repo")
 
 	owner, repo, err := resolveRepo(nil)
 	if err != nil {
@@ -134,7 +134,7 @@ func TestResolveRepo_EnvWhenNoFlag(t *testing.T) {
 // with no env var and no git checkout, so every resolution path fails and
 // the resolver returns a clear error.
 func TestResolveRepo_HardErrorWhenNothingResolves(t *testing.T) {
-	t.Setenv("TODOTRIAGE_REPO", "")
+	t.Setenv("TRIAGE_FACTORY_REPO", "")
 
 	tmp := t.TempDir()
 	origWd, err := os.Getwd()
@@ -155,7 +155,7 @@ func TestResolveRepo_HardErrorWhenNothingResolves(t *testing.T) {
 // TestResolveRepo_InvalidFlagFormat — a malformed --repo value should
 // error, not fall through to env/git/hardcoded.
 func TestResolveRepo_InvalidFlagFormat(t *testing.T) {
-	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
+	t.Setenv("TRIAGE_FACTORY_REPO", "env-owner/env-repo")
 
 	_, _, err := resolveRepo([]string{"--repo", "not-a-valid-format"})
 	if err == nil {
@@ -173,7 +173,7 @@ func TestResolveRepo_InvalidFlagFormat(t *testing.T) {
 func TestResolveRepo_EmptyFlagValue(t *testing.T) {
 	// Set env so there IS a fallback available — the test is that we
 	// error instead of quietly using it.
-	t.Setenv("TODOTRIAGE_REPO", "env-owner/env-repo")
+	t.Setenv("TRIAGE_FACTORY_REPO", "env-owner/env-repo")
 
 	cases := [][]string{
 		{"--repo"},                      // last arg, no value
@@ -211,7 +211,7 @@ func TestResolveRepo_GitConfigFallback(t *testing.T) {
 		t.Skip("git not in PATH")
 	}
 
-	t.Setenv("TODOTRIAGE_REPO", "")
+	t.Setenv("TRIAGE_FACTORY_REPO", "")
 
 	// Use a fresh HOME so the user's global git config can't influence
 	// the test (e.g., a templateDir that pre-populates remotes).

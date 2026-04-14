@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	ghclient "github.com/sky-ai-eng/todo-triage/internal/github"
-	"github.com/sky-ai-eng/todo-triage/pkg/websocket"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
 type pendingReviewJSON struct {

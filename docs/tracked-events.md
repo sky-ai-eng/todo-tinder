@@ -1,6 +1,6 @@
 # Tracked Events
 
-Todo Triage monitors GitHub PRs and Jira issues for state changes and emits typed events when transitions are detected. Events power the triage queue, AI scoring, delegation triggers, and the dashboard.
+Triage Factory monitors GitHub PRs and Jira issues for state changes and emits typed events when transitions are detected. Events power the triage queue, AI scoring, delegation triggers, and the dashboard.
 
 ## How it works
 

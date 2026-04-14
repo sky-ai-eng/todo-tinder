@@ -7,13 +7,13 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sky-ai-eng/todo-triage/internal/delegate"
-	ghclient "github.com/sky-ai-eng/todo-triage/internal/github"
-	"github.com/sky-ai-eng/todo-triage/internal/jira"
-	"github.com/sky-ai-eng/todo-triage/pkg/websocket"
+	"github.com/sky-ai-eng/triage-factory/internal/delegate"
+	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
-// Server is the main HTTP server for Todo Triage.
+// Server is the main HTTP server for Triage Factory.
 type Server struct {
 	db                   *sql.DB
 	mux                  *http.ServeMux

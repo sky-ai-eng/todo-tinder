@@ -10,10 +10,10 @@
 
 ```bash
 # Default (port 3000, opens browser)
-./todotriage
+./triagefactory
 
 # Custom port, no browser
-./todotriage --port 8080 --no-browser
+./triagefactory --port 8080 --no-browser
 ```
 
 ## CLI subcommands
@@ -22,15 +22,15 @@ The binary exposes subcommands used internally by delegation agents. You don't n
 
 ```bash
 # Execute GitHub commands in the context of a delegated run
-./todotriage exec gh pr view --owner sky-ai-eng --repo myrepo --number 42
+./triagefactory exec gh pr view --owner sky-ai-eng --repo myrepo --number 42
 
 # Check agent run status
-./todotriage status <run-id>
+./triagefactory status <run-id>
 ```
 
 ## Configuration
 
-Config lives at `~/.todotriage/config.yaml` and can be edited via the Settings page or directly:
+Config lives at `~/.triagefactory/config.yaml` and can be edited via the Settings page or directly:
 
 ```yaml
 github:

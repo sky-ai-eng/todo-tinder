@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // PRStatus is the live status for a single PR, fetched on demand.

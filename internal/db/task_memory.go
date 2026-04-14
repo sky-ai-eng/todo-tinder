@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // SaveTaskMemory inserts a task_memory row. Callers populate the struct;

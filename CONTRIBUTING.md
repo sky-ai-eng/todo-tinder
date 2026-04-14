@@ -1,4 +1,4 @@
-# Contributing to Todo Triage
+# Contributing to Triage Factory
 
 Thanks for contributing.
 

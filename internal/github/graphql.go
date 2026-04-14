@@ -6,7 +6,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // prBaseFields are the common GraphQL fields shared between the discovery

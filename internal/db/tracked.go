@@ -3,7 +3,7 @@ package db
 import (
 	"database/sql"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // UpsertTrackedItem registers a tracked item. On conflict, updates task_id and

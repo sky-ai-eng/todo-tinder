@@ -18,12 +18,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sky-ai-eng/todo-triage/internal/ai"
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
-	ghclient "github.com/sky-ai-eng/todo-triage/internal/github"
-	"github.com/sky-ai-eng/todo-triage/internal/worktree"
-	"github.com/sky-ai-eng/todo-triage/pkg/websocket"
+	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/worktree"
+	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
 // Spawner manages delegated agent runs.
@@ -326,15 +326,15 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = claudeCwd
-	cmd.Env = append(os.Environ(), "TODOTRIAGE_RUN_ID="+runID, "TODOTRIAGE_REVIEW_PREVIEW=1")
-	// Set TODOTRIAGE_REPO when the run has a resolved GitHub repo context
+	cmd.Env = append(os.Environ(), "TRIAGE_FACTORY_RUN_ID="+runID, "TRIAGE_FACTORY_REVIEW_PREVIEW=1")
+	// Set TRIAGE_FACTORY_REPO when the run has a resolved GitHub repo context
 	// so gh subcommands can default to the right target without the agent
 	// needing to pass --repo on every invocation. Left unset for Jira runs
 	// with no matched repo; those commands either fall back to .git/config
 	// (unlikely — no worktree) or hard-error, which is correct since they
 	// shouldn't be touching GitHub.
 	if cfg.owner != "" && cfg.repo != "" {
-		cmd.Env = append(cmd.Env, "TODOTRIAGE_REPO="+cfg.owner+"/"+cfg.repo)
+		cmd.Env = append(cmd.Env, "TRIAGE_FACTORY_REPO="+cfg.owner+"/"+cfg.repo)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -538,7 +538,7 @@ type ResumeOptions struct {
 	Model string
 
 	// RepoEnv, if non-empty, is passed to the resumed subprocess as
-	// TODOTRIAGE_REPO=<value>. Preserves the GitHub repo context that
+	// TRIAGE_FACTORY_REPO=<value>. Preserves the GitHub repo context that
 	// the initial runAgent invocation set up for gh subcommands so
 	// resumes don't lose the implicit --repo default. Format is
 	// "owner/name" — composed by the caller from cfg.owner and cfg.repo.
@@ -614,13 +614,13 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, runID, sessionID, cwd, 
 
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "TODOTRIAGE_RUN_ID="+runID, "TODOTRIAGE_REVIEW_PREVIEW=1")
+	cmd.Env = append(os.Environ(), "TRIAGE_FACTORY_RUN_ID="+runID, "TRIAGE_FACTORY_REVIEW_PREVIEW=1")
 	// Preserve the initial run's GitHub repo context so gh subcommands
 	// in the resumed session keep their implicit --repo default. Without
 	// this, a resumed run on a GitHub task could suddenly fail any gh
 	// invocation that relied on the env var set in runAgent.
 	if opts.RepoEnv != "" {
-		cmd.Env = append(cmd.Env, "TODOTRIAGE_REPO="+opts.RepoEnv)
+		cmd.Env = append(cmd.Env, "TRIAGE_FACTORY_REPO="+opts.RepoEnv)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -1057,7 +1057,7 @@ func buildPrompt(mission, scope, toolsRef, binaryPath, runID string) string {
 		"{{RUN_ID}}", runID,
 	).Replace(ai.EnvelopeTemplate)
 
-	body := strings.ReplaceAll(mission, "todotriage exec", binaryPath+" exec")
+	body := strings.ReplaceAll(mission, "triagefactory exec", binaryPath+" exec")
 	full := body + "\n\n" + envelope
 	return strings.ReplaceAll(full, "{{BINARY_PATH}}", binaryPath)
 }

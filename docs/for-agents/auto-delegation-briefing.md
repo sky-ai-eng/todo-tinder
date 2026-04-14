@@ -8,7 +8,7 @@ Read your assigned ticket first (via Linear), then come back here for the contex
 
 ## The big picture
 
-Todo Triage polls GitHub and Linear, turns state changes into events, and can delegate prompts (headless Claude Code runs) to handle those events. Today, delegation is entirely manual — users swipe cards to trigger runs.
+Triage Factory polls GitHub and Linear, turns state changes into events, and can delegate prompts (headless Claude Code runs) to handle those events. Today, delegation is entirely manual — users swipe cards to trigger runs.
 
 This arc extends that model so:
 
@@ -21,7 +21,7 @@ This arc extends that model so:
 
 Follow-ups: retention (SKY-145), bulk/parallel delegation (SKY-143 — design-only, exploratory).
 
-The V1 demo story: _"A CI check fails on your PR. Todo Triage sees it, auto-delegates a CC run that pulls the failing logs, diagnoses the problem, commits a fix, and pushes. If CI fails again, a new run picks up where the last one left off using task memory. After 2 unsuccessful attempts it stops and surfaces the history to you for review."_
+The V1 demo story: _"A CI check fails on your PR. Triage Factory sees it, auto-delegates a CC run that pulls the failing logs, diagnoses the problem, commits a fix, and pushes. If CI fails again, a new run picks up where the last one left off using task memory. After 2 unsuccessful attempts it stops and surfaces the history to you for review."_
 
 ---
 
@@ -88,7 +88,7 @@ The `task_memory/` (SKY-141) and `_scratch/` (SKY-146) directories are added to 
 ### 10. Build order
 
 ```bash
-cd frontend && npm run build && cd .. && go build -o ./todotriage .
+cd frontend && npm run build && cd .. && go build -o ./triagefactory .
 ```
 
 ---

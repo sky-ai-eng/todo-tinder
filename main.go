@@ -7,23 +7,23 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/sky-ai-eng/todo-triage/internal/ai"
-	"github.com/sky-ai-eng/todo-triage/internal/auth"
-	"github.com/sky-ai-eng/todo-triage/internal/config"
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	"github.com/sky-ai-eng/todo-triage/internal/delegate"
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
-	"github.com/sky-ai-eng/todo-triage/internal/eventbus"
-	ghclient "github.com/sky-ai-eng/todo-triage/internal/github"
-	"github.com/sky-ai-eng/todo-triage/internal/jira"
-	"github.com/sky-ai-eng/todo-triage/internal/poller"
-	"github.com/sky-ai-eng/todo-triage/internal/repoprofile"
-	"github.com/sky-ai-eng/todo-triage/internal/server"
-	"github.com/sky-ai-eng/todo-triage/internal/skills"
-	"github.com/sky-ai-eng/todo-triage/internal/worktree"
-	"github.com/sky-ai-eng/todo-triage/pkg/websocket"
+	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/delegate"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/eventbus"
+	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/internal/poller"
+	"github.com/sky-ai-eng/triage-factory/internal/repoprofile"
+	"github.com/sky-ai-eng/triage-factory/internal/server"
+	"github.com/sky-ai-eng/triage-factory/internal/skills"
+	"github.com/sky-ai-eng/triage-factory/internal/worktree"
+	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 
-	"github.com/sky-ai-eng/todo-triage/cmd/exec"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec"
 )
 
 const defaultPort = 3000
@@ -72,7 +72,7 @@ func main() {
 	}
 
 	addr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Todo Triage running at http://localhost%s\n", addr)
+	fmt.Printf("Triage Factory running at http://localhost%s\n", addr)
 
 	if !noBrowser {
 		openBrowser(fmt.Sprintf("http://localhost%s", addr))

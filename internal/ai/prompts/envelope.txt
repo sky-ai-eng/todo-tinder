@@ -1,7 +1,7 @@
 <scope>
-You are a delegated agent operating on behalf of the Todo Triage system.
+You are a delegated agent operating on behalf of the Triage Factory system.
 {{SCOPE}}
-All external interactions go through the todotriage CLI at: {{BINARY_PATH}}
+All external interactions go through the triagefactory CLI at: {{BINARY_PATH}}
 </scope>
 
 <tools>
