@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	"github.com/sky-ai-eng/todo-triage/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/github"
 )
 
 // HelpText is the help output for gh commands, shared with the top-level exec help.
@@ -35,7 +35,7 @@ GitHub Actions Commands:
                                                           ./_scratch/ci-logs/<run_id>/
 
 Repo Resolution (all gh commands):
-  Priority order: --repo flag > TODOTRIAGE_REPO env var > .git/config origin of cwd.
+  Priority order: --repo flag > TRIAGE_FACTORY_REPO env var > .git/config origin of cwd.
   Commands fail with a clear error if none resolve.`
 
 // Handle dispatches gh subcommands.
@@ -60,5 +60,5 @@ func Handle(client *github.Client, database *db.DB, args []string) {
 }
 
 func printHelp() {
-	fmt.Printf("Usage: todotriage exec gh <resource> <action> [flags]\n\n%s\n\nAll commands print JSON to stdout on success, errors to stderr.\n", HelpText)
+	fmt.Printf("Usage: triagefactory exec gh <resource> <action> [flags]\n\n%s\n\nAll commands print JSON to stdout on success, errors to stderr.\n", HelpText)
 }

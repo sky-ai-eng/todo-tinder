@@ -3,7 +3,7 @@ package db
 import (
 	"database/sql"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // MarkScoring sets scoring_status = 'scoring' for the given task IDs.

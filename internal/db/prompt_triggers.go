@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // GetActiveTriggersForEvent returns all enabled triggers matching the given event type.

@@ -459,7 +459,7 @@ func TestWriteLocalExcludes_StrayEndMarkerBeforeBlock(t *testing.T) {
 	// maybe as a quoted example in a comment, maybe as leftover from a
 	// truncated previous managed block that someone hand-edited. The
 	// real managed block sits *after* this stray mention.
-	stray := "# example of a todotriage block looks like:\n" +
+	stray := "# example of a triagefactory block looks like:\n" +
 		"# " + managedExcludeEnd + "\n" +
 		"node_modules/\n\n" +
 		managedExcludeBegin + "\n" +
@@ -493,7 +493,7 @@ func TestWriteLocalExcludes_StrayEndMarkerBeforeBlock(t *testing.T) {
 	if !strings.Contains(firstStr, "node_modules/") {
 		t.Errorf("user line 'node_modules/' lost; file:\n%s", firstStr)
 	}
-	if !strings.Contains(firstStr, "# example of a todotriage block looks like:") {
+	if !strings.Contains(firstStr, "# example of a triagefactory block looks like:") {
 		t.Errorf("stray user comment lost; file:\n%s", firstStr)
 	}
 

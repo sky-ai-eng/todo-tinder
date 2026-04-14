@@ -2,7 +2,7 @@ A CI check has failed on a PR you own. Your job is to diagnose the failure, fix 
 
 ## Steps
 
-1. Your task metadata includes a `workflow_run_id` for the failing run. Start by running `todotriage exec gh actions download-logs <run_id>` to pull the full log archive to `./_scratch/ci-logs/<run_id>/`.
+1. Your task metadata includes a `workflow_run_id` for the failing run. Start by running `triagefactory exec gh actions download-logs <run_id>` to pull the full log archive to `./_scratch/ci-logs/<run_id>/`.
 2. Read the failing job's logs in that directory to identify the root cause.
 3. Read any prior entries in `./task_memory/` before making changes — they describe what previous iterations on this task have already tried, and what has been ruled out.
 4. Fix the issue, commit with a clear message explaining the root cause and fix, and push to the PR branch.

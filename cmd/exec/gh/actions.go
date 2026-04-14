@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sky-ai-eng/todo-triage/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/github"
 )
 
 // Size caps for GitHub Actions log archive downloads. Three layers of
@@ -45,7 +45,7 @@ const (
 // handleActions dispatches gh actions subcommands.
 func handleActions(client *github.Client, args []string) {
 	if len(args) < 1 {
-		exitErr("usage: todotriage exec gh actions <action> [flags]")
+		exitErr("usage: triagefactory exec gh actions <action> [flags]")
 	}
 
 	action := args[0]
@@ -92,7 +92,7 @@ func actionsDownloadLogs(client *github.Client, args []string) {
 	// over resolution errors.
 	runIDStr := firstPositional(args)
 	if runIDStr == "" {
-		exitErr("usage: todotriage exec gh actions download-logs <run_id> [--repo owner/repo]")
+		exitErr("usage: triagefactory exec gh actions download-logs <run_id> [--repo owner/repo]")
 	}
 	runID, err := strconv.ParseInt(runIDStr, 10, 64)
 	if err != nil || runID <= 0 {
@@ -186,7 +186,7 @@ func downloadAndExtractLogs(client *github.Client, owner, repo string, runID int
 	// Stream the archive to a temp file. We can't extract from a stream
 	// because archive/zip needs ReaderAt for the central directory at the
 	// end of the file.
-	tmpFile, err := os.CreateTemp("", "todotriage-ci-logs-*.zip")
+	tmpFile, err := os.CreateTemp("", "triagefactory-ci-logs-*.zip")
 	if err != nil {
 		return 0, fmt.Errorf("create temp file: %w", err)
 	}

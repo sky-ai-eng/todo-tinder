@@ -3,7 +3,7 @@ package tracker
 import (
 	"testing"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 func TestDiffPR_FirstSeen_ReviewRequested(t *testing.T) {

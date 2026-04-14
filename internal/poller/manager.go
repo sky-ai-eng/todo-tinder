@@ -6,13 +6,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sky-ai-eng/todo-triage/internal/auth"
-	"github.com/sky-ai-eng/todo-triage/internal/config"
-	"github.com/sky-ai-eng/todo-triage/internal/db"
-	"github.com/sky-ai-eng/todo-triage/internal/eventbus"
-	ghclient "github.com/sky-ai-eng/todo-triage/internal/github"
-	jiraclient "github.com/sky-ai-eng/todo-triage/internal/jira"
-	"github.com/sky-ai-eng/todo-triage/internal/tracker"
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/eventbus"
+	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/internal/tracker"
 )
 
 // Manager manages the lifecycle of polling loops, allowing them to be

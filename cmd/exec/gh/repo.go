@@ -17,7 +17,7 @@ import (
 //     expressed explicit intent and the safe behavior is to fail loudly
 //     rather than silently fall through to env/git resolution and
 //     possibly target the wrong repo.
-//  2. TODOTRIAGE_REPO env var (set by the spawner for delegated runs;
+//  2. TRIAGE_FACTORY_REPO env var (set by the spawner for delegated runs;
 //     never has a value for Jira-without-repo runs).
 //  3. git config remote.origin.url of the current working directory
 //     (fallback for manual invocation from a checkout).
@@ -39,8 +39,8 @@ func resolveRepo(args []string) (owner, repo string, err error) {
 	}
 
 	// 2. Env var from delegation context
-	if env := os.Getenv("TODOTRIAGE_REPO"); env != "" {
-		return splitOwnerRepoStr(env, "TODOTRIAGE_REPO env var")
+	if env := os.Getenv("TRIAGE_FACTORY_REPO"); env != "" {
+		return splitOwnerRepoStr(env, "TRIAGE_FACTORY_REPO env var")
 	}
 
 	// 3. git config origin of cwd
@@ -52,7 +52,7 @@ func resolveRepo(args []string) (owner, repo string, err error) {
 		}
 	}
 
-	return "", "", fmt.Errorf("could not resolve repo: pass --repo owner/repo, set TODOTRIAGE_REPO, or run from a git checkout with an origin remote")
+	return "", "", fmt.Errorf("could not resolve repo: pass --repo owner/repo, set TRIAGE_FACTORY_REPO, or run from a git checkout with an origin remote")
 }
 
 // splitOwnerRepoStr splits an "owner/repo" string, returning a descriptive
@@ -121,7 +121,7 @@ func parseGitRemoteURL(url string) (owner, repo string, ok bool) {
 //     wants nested groups flattened
 //   - GHES/Gitea custom layouts
 //
-// todo-triage is GitHub-focused and GitHub paths are always exactly
+// triage-factory is GitHub-focused and GitHub paths are always exactly
 // owner/repo, so a 2-segment requirement covers every supported case.
 // Users with non-GitHub remotes get a clean rejection from resolveRepo
 // and a clear prompt to pass --repo explicitly instead of silently

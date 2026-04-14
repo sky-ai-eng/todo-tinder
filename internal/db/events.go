@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"log"
 
-	"github.com/sky-ai-eng/todo-triage/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // SeedEventTypes inserts the canonical event type catalog. Skips rows that already exist,

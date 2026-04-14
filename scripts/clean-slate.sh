@@ -4,19 +4,19 @@
 
 set -euo pipefail
 
-echo "Cleaning Todo Triage local state..."
+echo "Cleaning Triage Factory local state..."
 
 # Database
-rm -f ~/.todotriage/todotriage.db ~/.todotriage/todotriage.db-wal ~/.todotriage/todotriage.db-shm
+rm -f ~/.triagefactory/triagefactory.db ~/.triagefactory/triagefactory.db-wal ~/.triagefactory/triagefactory.db-shm
 echo "  removed database"
 
 # Config
-rm -f ~/.todotriage/config.yaml
+rm -f ~/.triagefactory/config.yaml
 echo "  removed config"
 
 # Keychain
 for key in github_url github_pat github_username jira_url jira_pat; do
-  security delete-generic-password -s todotriage -a "$key" 2>/dev/null && echo "  removed keychain: $key" || true
+  security delete-generic-password -s triagefactory -a "$key" 2>/dev/null && echo "  removed keychain: $key" || true
 done
 
 echo "Done. Restart the server for a fresh setup."

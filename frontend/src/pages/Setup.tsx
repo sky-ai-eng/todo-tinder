@@ -159,7 +159,7 @@ export default function Setup() {
               Connect GitHub
             </h1>
             <p className="text-[13px] text-text-tertiary mt-1.5 leading-relaxed">
-              Todo Triage needs access to your GitHub to watch repositories and manage PRs. Tokens
+              Triage Factory needs access to your GitHub to watch repositories and manage PRs. Tokens
               are stored in your OS keychain and never leave your machine.
             </p>
           </div>
@@ -182,7 +182,7 @@ export default function Setup() {
             <p className="text-[11px] text-text-tertiary">
               Requires a{' '}
               <a
-                href="https://github.com/settings/tokens/new?scopes=repo,read:org&description=Todo+Triage"
+                href="https://github.com/settings/tokens/new?scopes=repo,read:org&description=Triage+Factory"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-accent hover:underline"

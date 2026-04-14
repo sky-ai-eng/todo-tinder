@@ -1,4 +1,4 @@
-module github.com/sky-ai-eng/todo-triage
+module github.com/sky-ai-eng/triage-factory
 
 go 1.26.1
 

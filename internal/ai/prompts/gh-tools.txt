@@ -7,7 +7,7 @@ Workflows:
 - Read files in the working directory for context beyond the diff.
 
 Repo target resolution:
-- All gh commands target a (owner, repo) pair. Resolution order: an explicit `--repo owner/repo` flag, then the `TODOTRIAGE_REPO` environment variable (set automatically for delegated runs with a resolved repo context), then the current directory's `.git/config` origin.
+- All gh commands target a (owner, repo) pair. Resolution order: an explicit `--repo owner/repo` flag, then the `TRIAGE_FACTORY_REPO` environment variable (set automatically for delegated runs with a resolved repo context), then the current directory's `.git/config` origin.
 - You almost never need to pass `--repo` — the env var is already set for you when your run has a repo context.
 
 Gotchas:

@@ -1,5 +1,5 @@
 # Binary
-todotriage
+triagefactory
 
 # Frontend
 frontend/node_modules/
@@ -17,4 +17,4 @@ frontend/dist/
 _scratch/
 .claude/*
 !.claude/settings.json
-docs/todotriage-spec.md
+docs/triagefactory-spec.md

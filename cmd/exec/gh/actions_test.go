@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sky-ai-eng/todo-triage/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/github"
 )
 
 // buildZip creates an in-memory zip archive from a map of path → contents.
@@ -422,7 +422,7 @@ func mustWrite(t *testing.T, path, content string) {
 // concurrent tests in the same package don't pollute the assertion.
 func countCILogTempFiles(t *testing.T) int {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "todotriage-ci-logs-*.zip"))
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "triagefactory-ci-logs-*.zip"))
 	if err != nil {
 		t.Fatalf("glob temp files: %v", err)
 	}

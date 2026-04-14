@@ -34,8 +34,8 @@ func lockRepo(owner, repo string) *sync.Mutex {
 }
 
 const (
-	reposDir = ".todotriage/repos" // bare clones: ~/.todotriage/repos/{owner}/{repo}.git
-	runsDir  = "todotriage-runs"   // worktrees: /tmp/todotriage-runs/{run-id}
+	reposDir = ".triagefactory/repos" // bare clones: ~/.triagefactory/repos/{owner}/{repo}.git
+	runsDir  = "triagefactory-runs"   // worktrees: /tmp/triagefactory-runs/{run-id}
 )
 
 func repoDir(owner, repo string) (string, error) {
@@ -261,8 +261,8 @@ var managedExcludePatterns = []string{"_scratch/", "task_memory/"}
 // patterns regardless of how managedExcludePatterns evolves — growing the
 // list reuses the existing section instead of appending a second header.
 const (
-	managedExcludeBegin = "# todotriage: begin managed exclude block (do not edit)"
-	managedExcludeEnd   = "# todotriage: end managed exclude block"
+	managedExcludeBegin = "# triagefactory: begin managed exclude block (do not edit)"
+	managedExcludeEnd   = "# triagefactory: end managed exclude block"
 )
 
 // writeLocalExcludes ensures the worktree's .git/info/exclude file contains
