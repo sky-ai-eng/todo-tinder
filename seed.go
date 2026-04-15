@@ -54,12 +54,15 @@ func seedDefaultPrompts(database *sql.DB) {
 		log.Printf("[seed] warning: failed to seed Jira implement prompt: %v", err)
 	}
 
-	// Default trigger: auto-fire CI fix on CI failures
+	// Default trigger: auto-fire CI fix on per-check CI failures.
+	// Uses the new per-action event type EventGitHubPRCICheckFailed (split on
+	// conclusion per docs/data-model-target.md). MaxIterations on the struct
+	// maps to the renamed `breaker_threshold` column.
 	if err := db.SavePromptTrigger(database, domain.PromptTrigger{
 		ID:              "system-trigger-ci-fix",
 		PromptID:        "system-ci-fix",
 		TriggerType:     domain.TriggerTypeEvent,
-		EventType:       domain.EventGitHubPRCIFailed,
+		EventType:       domain.EventGitHubPRCICheckFailed,
 		MaxIterations:   3,
 		CooldownSeconds: 60,
 		Enabled:         true,
