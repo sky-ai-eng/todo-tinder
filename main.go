@@ -89,9 +89,14 @@ func main() {
 	// Clean up any orphaned worktrees from crashed runs
 	worktree.Cleanup()
 
-	// Seed event type catalog and default prompts
+	// Seed event type catalog, task_rules defaults, and default prompts.
+	// Order matters: task_rules FK to events_catalog(id), so catalog must be
+	// seeded first.
 	if err := db.SeedEventTypes(database); err != nil {
 		log.Fatalf("failed to seed event types: %v", err)
+	}
+	if err := db.SeedTaskRules(database); err != nil {
+		log.Fatalf("failed to seed task rules: %v", err)
 	}
 	seedDefaultPrompts(database)
 

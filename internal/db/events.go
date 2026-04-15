@@ -7,12 +7,17 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// SeedEventTypes inserts the canonical event type catalog. Skips rows that already exist,
-// preserving user customizations to enabled/sort_order.
+// SeedEventTypes inserts the canonical event type catalog into events_catalog.
+// The events_catalog table is read-only system registry — only id/source/
+// category/label/description are persisted (no enabled, default_priority,
+// sort_order — those concerns moved to task_rules).
+//
+// Uses INSERT OR REPLACE so updated labels/descriptions in code propagate to
+// existing rows; user-mutable preference data lives elsewhere.
 func SeedEventTypes(db *sql.DB) error {
 	stmt, err := db.Prepare(`
-		INSERT OR IGNORE INTO event_types (id, source, category, label, description, default_priority, enabled, sort_order)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO events_catalog (id, source, category, label, description)
+		VALUES (?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -20,11 +25,11 @@ func SeedEventTypes(db *sql.DB) error {
 	defer stmt.Close()
 
 	for _, et := range domain.AllEventTypes() {
-		if _, err := stmt.Exec(et.ID, et.Source, et.Category, et.Label, et.Description, et.DefaultPriority, et.Enabled, et.SortOrder); err != nil {
+		if _, err := stmt.Exec(et.ID, et.Source, et.Category, et.Label, et.Description); err != nil {
 			return err
 		}
 	}
-	log.Printf("[db] seeded %d event types", len(domain.AllEventTypes()))
+	log.Printf("[db] seeded %d event types into events_catalog", len(domain.AllEventTypes()))
 	return nil
 }
 
