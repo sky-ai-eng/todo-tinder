@@ -177,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_prompt_triggers_prompt_created ON prompt_triggers
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     entity_id TEXT NOT NULL REFERENCES entities(id),
-    event_type TEXT NOT NULL,
+    event_type TEXT NOT NULL REFERENCES events_catalog(id) ON DELETE RESTRICT,
     dedup_key TEXT NOT NULL DEFAULT '',  -- inherited from primary event; participates in the partial unique index below
     primary_event_id TEXT NOT NULL REFERENCES events(id),
     status TEXT NOT NULL DEFAULT 'queued',  -- queued | claimed | delegated | done | dismissed | snoozed
