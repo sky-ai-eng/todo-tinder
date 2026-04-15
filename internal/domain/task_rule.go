@@ -6,9 +6,10 @@ import "time"
 // of automation — a user who wants surfacing without any auto-fire configures
 // a rule and no matching prompt_trigger.
 //
-// Dedup: at most one active task per (entity, event_type) across non-terminal
-// statuses, enforced by partial unique index on tasks. Subsequent matching
-// events bump the active task via task_events rather than creating new ones.
+// Dedup: at most one active task per (entity_id, event_type, dedup_key)
+// across non-terminal statuses, enforced by partial unique index on tasks.
+// Subsequent matching events with the same dedup tuple bump the active task
+// via task_events rather than creating new ones.
 type TaskRule struct {
 	ID                 string    `json:"id"`
 	EventType          string    `json:"event_type"`           // FK to events_catalog(id)
