@@ -46,7 +46,7 @@ func Migrate(db *sql.DB) error {
 	return err
 }
 
-// schema is the pristine end-state schema per _scratch/data-model-target.md.
+// schema is the pristine end-state schema per docs/data-model-target.md.
 // No ALTER TABLE migrations — this file is the source of truth and assumes the
 // on-disk DB can be wiped between major rewrites. Backwards compatibility is
 // deliberately **not maintained** as we are still pre-release.
