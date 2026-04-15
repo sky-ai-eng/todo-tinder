@@ -532,7 +532,9 @@ func (p GitHubPRNewCommitsPredicate) Matches(m GitHubPRNewCommitsMetadata) bool 
 
 **Actor-identity pattern:** any event with an actor (PR author, reviewer, commenter) captures both the raw identity AND a derived `...IsSelf` bool. Reviews carry `Reviewer` + `ReviewerIsSelf`; comments carry `Commenter` + `CommenterIsSelf`; and so on. Storing both costs nothing, keeps metadata faithful to what actually happened, and lets predicates default to the ergonomic self-check while still supporting exact-match on identity.
 
-**Labels as predicate fields:** PR events that surface from a labeled PR carry the current `Labels []string` snapshot in metadata; predicates expose a `HasLabel *string` (or equivalent slice match) so triggers can scope to labeled PRs. This is what powers user-driven opt-in flows like the self-review label in Scenario 5 — the user adds a label to a PR, future PR events on that entity carry it, and predicates filter accordingly. No special "label state" event needed beyond `label_added` / `label_removed` for the moments the label first appears or disappears.
+**Labels as predicate fields:** every PR event carries the current `Labels []string` snapshot in metadata (not just label events — `new_commits`, `ci_check_failed`, `review_*`, etc. all include it). Predicates expose a `HasLabel *string` (or equivalent slice match) so triggers can scope to labeled PRs. This is what powers user-driven opt-in flows like the self-review label in Scenario 5 — the user adds a label to a PR, future PR events on that entity carry it, and predicates filter accordingly. No special "label state" event needed beyond `label_added` / `label_removed` for the moments the label first appears or disappears.
+
+The `Labels` field on an event is the **snapshot at emission time** — the set of labels present when the event was observed, not the set of labels that caused the event. A `HasLabel: "self-review"` predicate on a `new_commits` event matches because the label was present when the commit landed, not because the label itself changed. This keeps the emission rule simple ("poller attaches whatever labels are currently on the entity") and avoids retroactive-matching confusion.
 
 **Rule of thumb:**
 
@@ -757,13 +759,14 @@ Walk-throughs of the key flows. If any requires contortion, the model is wrong.
 
 ### Scenario 3 — CI fails twice before task runs (bump case)
 
-1. CI fails on SHA-A → task T1 created (as in Scenario 2 steps 1-6).
-2. Trigger cooldown is 60s; auto-delegate defers.
-3. 30s later, user pushes SHA-B, the same checks re-run and fail again. Poller emits a fresh batch of `ci_check_failed` events (new check-run IDs at the new SHA).
-4. Routing: `(entity=PR18, event_type=ci_check_failed)` has active T1 (any non-terminal status — queued, claimed, delegated, or snoozed). Dedup index prevents new task creation.
-5. UPDATE `tasks` T1: bump metadata (latest head_sha, failing-check names) from the new events' snapshots.
-6. INSERT `task_events` (T1, each new event, kind=bumped).
-7. Cooldown expires. Auto-delegate fires on T1 using latest bumped state.
+1. CI fails on SHA-A → task T1 created (as in Scenario 2 steps 1-6). Auto-delegate fires **immediately** on task creation (cooldown does not gate the first fire). Run R1 starts.
+2. 30s later — while R1 is still running — user pushes SHA-B. The same checks re-run at the new SHA and fail. Poller emits a fresh batch of `ci_check_failed` events (new check-run IDs at the new SHA).
+3. Routing: `(entity=PR18, event_type=ci_check_failed, dedup_key='')` has active T1 (any non-terminal status — queued, claimed, delegated, or snoozed). Dedup index prevents new task creation.
+4. UPDATE `tasks` T1: bump metadata (latest head_sha, failing-check names) from the new events' snapshots.
+5. INSERT `task_events` (T1, each new event, kind=bumped).
+6. Auto-delegate subscriber evaluates the bump: trigger cooldown is 60s since T1 was created → skip. (If the bump arrives after the cooldown window, a second run R2 fires on the latest bumped state.)
+
+**Key point:** cooldown gates *subsequent* fires of the same trigger, not the initial fire on a fresh task. Auto-delegate always fires immediately on task creation if the trigger's gates (predicate, breaker, autonomy) pass — cooldown only kicks in for re-fires triggered by bumps.
 
 **Tables touched:** `tasks` (UPDATE), `task_events` (new `bumped` rows). ✓
 
@@ -790,9 +793,11 @@ Walk-throughs of the key flows. If any requires contortion, the model is wrong.
 
 **Phase A: Implement Jira ticket**
 
+**Prerequisite:** user has wired the seeded "Implement Jira ticket" prompt to `jira:issue:assigned` via a `prompt_trigger` of their own. We seed the prompt (useful default), but not the trigger — auto-implementing assigned Jiras is a big commitment and users should opt in explicitly.
+
 1. Poller sees Jira SKY-123 assigned to user. Event `jira:issue:assigned` with metadata `{assignee_is_self: true, priority: P2, ...}`.
 2. INSERT `entities` (jira, SKY-123, kind=issue) if not seen.
-3. Routing: seeded `task_rule` "Jira assigned to self" matches (predicate `{assignee_is_self: true}`). Also seeded `prompt_trigger` "Implement Jira ticket" matches. Task created, trigger fires.
+3. Routing: seeded `task_rule` "Jira assigned to self" matches (predicate `{assignee_is_self: true}`). The user's `prompt_trigger` "Implement Jira ticket" matches. Task created, trigger fires.
 4. INSERT `tasks` (event_type=`jira:issue:assigned`, status=queued) + `runs` (prompt=`system-implement-jira-ticket`).
 5. Agent creates branch `feature/SKY-123`, commits, pushes, opens PR #42.
 6. Agent writes memory: "Implemented feature X, tests pass, opened PR #42."
