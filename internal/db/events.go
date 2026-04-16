@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"log"
 
+	"github.com/google/uuid"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
@@ -40,16 +41,31 @@ func SeedEventTypes(db *sql.DB) error {
 	return nil
 }
 
-// RecordEvent inserts an event into the audit log and returns its ID.
-func RecordEvent(db *sql.DB, evt domain.Event) (int64, error) {
-	result, err := db.Exec(`
-		INSERT INTO events (event_type, task_id, source_id, metadata)
-		VALUES (?, ?, ?, ?)
-	`, evt.EventType, evt.TaskID, evt.SourceID, evt.Metadata)
-	if err != nil {
-		return 0, err
+// RecordEvent inserts an event into the audit log and returns its UUID.
+// If evt.ID is empty, a v4 UUID is generated; otherwise the caller's ID is
+// used (useful for pinning IDs in tests). The INSERT has no ON CONFLICT
+// handling — reusing an existing ID surfaces the PK violation to the caller.
+//
+// Idempotency is *not* a responsibility of this layer. The events table is
+// an append-only audit log (see db.go: "No idempotency — dedup happens
+// downstream"). The poller's restart-safe story is snapshot-driven: if a
+// crash happens between the emit and the snapshot_json commit, the next
+// poll's diff finds the same delta and re-emits cleanly. The atomicity
+// needed to make that "exactly-once" is SKY-178's job (emit + snapshot
+// commit wrapped in a single transaction).
+func RecordEvent(db *sql.DB, evt domain.Event) (string, error) {
+	id := evt.ID
+	if id == "" {
+		id = uuid.New().String()
 	}
-	return result.LastInsertId()
+	_, err := db.Exec(`
+		INSERT INTO events (id, entity_id, event_type, dedup_key, metadata_json)
+		VALUES (?, ?, ?, ?, ?)
+	`, id, evt.EntityID, evt.EventType, evt.DedupKey, evt.MetadataJSON)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // SetTaskEventType updates the event_type column on a task.
@@ -83,7 +99,7 @@ func SetPollerState(db *sql.DB, source, sourceID, stateJSON string) error {
 // RecentEvents returns the most recent N events, newest first.
 func RecentEvents(db *sql.DB, limit int) ([]domain.Event, error) {
 	rows, err := db.Query(`
-		SELECT id, event_type, task_id, source_id, COALESCE(metadata, ''), created_at
+		SELECT id, entity_id, event_type, dedup_key, COALESCE(metadata_json, ''), created_at
 		FROM events ORDER BY created_at DESC LIMIT ?
 	`, limit)
 	if err != nil {
@@ -94,7 +110,7 @@ func RecentEvents(db *sql.DB, limit int) ([]domain.Event, error) {
 	var events []domain.Event
 	for rows.Next() {
 		var e domain.Event
-		if err := rows.Scan(&e.ID, &e.EventType, &e.TaskID, &e.SourceID, &e.Metadata, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.EntityID, &e.EventType, &e.DedupKey, &e.MetadataJSON, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, e)
