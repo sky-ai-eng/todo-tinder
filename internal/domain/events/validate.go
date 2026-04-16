@@ -10,9 +10,9 @@ import (
 
 // ValidatePredicateJSON parses `rawJSON` against the registered predicate
 // type for `eventType`. On success it returns the canonical re-marshalling
-// of the predicate (stable field order, unknown fields dropped) so the DB
-// persists a canonical form; on failure it returns an error describing what
-// was wrong.
+// of the predicate (stable field order); unknown fields are rejected so the
+// DB persists a canonical form; on failure it returns an error describing
+// what was wrong.
 //
 // An empty / whitespace-only rawJSON is treated as "match-all" and returns
 // "" with no error — callers should persist NULL in that case.
