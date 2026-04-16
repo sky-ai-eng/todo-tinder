@@ -101,6 +101,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/triggers/{id}", s.handleTriggerUpdate)
 	s.mux.HandleFunc("DELETE /api/triggers/{id}", s.handleTriggerDelete)
 	s.mux.HandleFunc("POST /api/triggers/{id}/toggle", s.handleTriggerToggle)
+
+	s.mux.HandleFunc("GET /api/task-rules", s.handleTaskRulesList)
+	s.mux.HandleFunc("POST /api/task-rules", s.handleTaskRuleCreate)
+	s.mux.HandleFunc("PATCH /api/task-rules/{id}", s.handleTaskRuleUpdate)
+	s.mux.HandleFunc("DELETE /api/task-rules/{id}", s.handleTaskRuleDelete)
 	s.mux.HandleFunc("GET /api/prompts", s.handlePromptsList)
 	s.mux.HandleFunc("POST /api/prompts", s.handlePromptCreate)
 	s.mux.HandleFunc("GET /api/prompts/{id}", s.handlePromptGet)
