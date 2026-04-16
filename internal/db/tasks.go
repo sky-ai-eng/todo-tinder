@@ -65,14 +65,17 @@ func FindOrCreateTask(db *sql.DB, entityID, eventType, dedupKey, primaryEventID 
 
 // BumpTask records a new event on an existing task. Updates primary_event_id
 // to the latest event. If the task is snoozed, un-snoozes it (wake-on-bump).
+// BumpTask records a new matching event on an existing task. Does NOT update
+// primary_event_id — that stays as the original spawning event (the task_events
+// junction with kind=bumped tracks subsequent events). If the task is snoozed,
+// un-snoozes it (wake-on-bump: the snooze premise "nothing new" is invalidated).
 func BumpTask(db *sql.DB, taskID, eventID string) error {
 	_, err := db.Exec(`
 		UPDATE tasks
-		SET primary_event_id = ?,
-		    status = CASE WHEN status = 'snoozed' THEN 'queued' ELSE status END,
+		SET status = CASE WHEN status = 'snoozed' THEN 'queued' ELSE status END,
 		    snooze_until = CASE WHEN status = 'snoozed' THEN NULL ELSE snooze_until END
 		WHERE id = ?
-	`, eventID, taskID)
+	`, taskID)
 	return err
 }
 
