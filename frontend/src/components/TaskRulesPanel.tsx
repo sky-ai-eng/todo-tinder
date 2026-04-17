@@ -68,9 +68,9 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
     <AnimatePresence>
       {open && (
         <>
-          {/* Backdrop */}
+          {/* Invisible backdrop — click to close */}
           <motion.div
-            className="fixed inset-0 bg-black/10 backdrop-blur-sm z-40"
+            className="fixed inset-0 z-40"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -79,11 +79,11 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
 
           {/* Drawer */}
           <motion.div
-            className="fixed top-[60px] right-0 bottom-0 z-40 w-[400px] bg-surface-raised/95 backdrop-blur-2xl border-l border-border-glass shadow-2xl shadow-black/10 flex flex-col"
-            initial={{ x: '100%' }}
-            animate={{ x: 0 }}
-            exit={{ x: '100%' }}
-            transition={{ type: 'spring', damping: 30, stiffness: 300 }}
+            className="fixed top-20 right-4 bottom-4 z-50 w-[340px] bg-surface-raised border border-border-glass rounded-2xl shadow-xl shadow-black/[0.08] flex flex-col overflow-hidden"
+            initial={{ x: '100%', opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: '100%', opacity: 0 }}
+            transition={{ type: 'spring', damping: 28, stiffness: 300 }}
           >
             {/* Header */}
             <div className="px-5 pt-5 pb-3 flex items-center justify-between shrink-0 border-b border-border-subtle">

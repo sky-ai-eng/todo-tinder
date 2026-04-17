@@ -121,11 +121,11 @@ export default function EventFilterPanel({ open, onToggle, onChange }: Props) {
               onClick={onToggle}
             />
             <motion.div
-              initial={{ x: '100%', opacity: 0 }}
+              initial={{ x: '-100%', opacity: 0 }}
               animate={{ x: 0, opacity: 1 }}
-              exit={{ x: '100%', opacity: 0 }}
+              exit={{ x: '-100%', opacity: 0 }}
               transition={{ type: 'spring', damping: 28, stiffness: 300 }}
-              className="fixed top-20 right-4 bottom-4 z-50 w-[240px] bg-surface-raised border border-border-glass rounded-2xl shadow-xl shadow-black/[0.08] flex flex-col overflow-hidden"
+              className="fixed top-20 left-4 bottom-4 z-50 w-[240px] bg-surface-raised border border-border-glass rounded-2xl shadow-xl shadow-black/[0.08] flex flex-col overflow-hidden"
             >
               <div className="px-4 py-3.5 border-b border-border-subtle flex items-center justify-between shrink-0">
                 <span className="text-[13px] font-semibold text-text-primary">Event Filters</span>
