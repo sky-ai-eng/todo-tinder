@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -49,6 +50,7 @@ func (s *Server) handleTaskRuleCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "event_type is required"})
 		return
 	}
+	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 		return
@@ -99,12 +101,12 @@ func (s *Server) handleTaskRuleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-read so the response reflects server-set timestamps.
-	fresh, _ := db.GetTaskRule(s.db, rule.ID)
-	if fresh != nil {
-		writeJSON(w, http.StatusCreated, fresh)
-	} else {
-		writeJSON(w, http.StatusCreated, rule)
+	fresh, err := db.GetTaskRule(s.db, rule.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "created but failed to re-read: " + err.Error()})
+		return
 	}
+	writeJSON(w, http.StatusCreated, fresh)
 }
 
 // PATCH /api/task-rules/{id}
@@ -203,7 +205,11 @@ func (s *Server) handleTaskRuleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fresh, _ := db.GetTaskRule(s.db, id)
+	fresh, err := db.GetTaskRule(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "updated but failed to re-read: " + err.Error()})
+		return
+	}
 	if fresh != nil {
 		writeJSON(w, http.StatusOK, fresh)
 	} else {
