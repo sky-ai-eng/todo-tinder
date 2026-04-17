@@ -250,3 +250,24 @@ func (s *Server) handleTaskRuleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
+
+// PUT /api/task-rules/reorder
+//
+// Accepts an ordered array of rule IDs. Each rule's sort_order is set to
+// its index in the array. IDs not in the list keep their current order.
+func (s *Server) handleTaskRuleReorder(w http.ResponseWriter, r *http.Request) {
+	var ids []string
+	if err := json.NewDecoder(r.Body).Decode(&ids); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected array of rule IDs"})
+		return
+	}
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty ID list"})
+		return
+	}
+	if err := db.ReorderTaskRules(s.db, ids); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reordered"})
+}

@@ -187,6 +187,30 @@ func DeleteTaskRule(db *sql.DB, id string) error {
 	return err
 }
 
+// ReorderTaskRules updates sort_order for each rule based on its position in
+// the given ID list. IDs not in the list keep their current sort_order.
+func ReorderTaskRules(db *sql.DB, ids []string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`UPDATE task_rules SET sort_order = ?, updated_at = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now()
+	for i, id := range ids {
+		if _, err := stmt.Exec(i, now, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func scanTaskRule(rows *sql.Rows) (domain.TaskRule, error) {
 	var r domain.TaskRule
 	err := rows.Scan(&r.ID, &r.EventType, &r.ScopePredicateJSON, &r.Enabled, &r.Name,

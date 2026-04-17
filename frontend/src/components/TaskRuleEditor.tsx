@@ -327,22 +327,6 @@ export default function TaskRuleEditor({
                     </div>
                   </div>
 
-                  {/* Sort order */}
-                  <div>
-                    <label className="block text-[12px] font-medium text-text-secondary mb-1.5">
-                      Sort order
-                    </label>
-                    <input
-                      type="number"
-                      value={sortOrder}
-                      onChange={(e) => setSortOrder(parseInt(e.target.value) || 0)}
-                      className="w-[100px] px-3 py-2 rounded-lg border border-border-subtle bg-white/50 text-[13px] text-text-primary focus:outline-none focus:border-accent/40 focus:ring-1 focus:ring-accent/20 transition-colors"
-                    />
-                    <p className="text-[11px] text-text-tertiary mt-1">
-                      Lower numbers appear first in the triage queue.
-                    </p>
-                  </div>
-
                   {/* Enabled toggle — edit mode only */}
                   {isEdit && (
                     <div className="flex items-center gap-3">

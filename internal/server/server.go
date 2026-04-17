@@ -102,6 +102,7 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("GET /api/task-rules", s.handleTaskRulesList)
 	s.mux.HandleFunc("POST /api/task-rules", s.handleTaskRuleCreate)
+	s.mux.HandleFunc("PUT /api/task-rules/reorder", s.handleTaskRuleReorder)
 	s.mux.HandleFunc("PATCH /api/task-rules/{id}", s.handleTaskRuleUpdate)
 	s.mux.HandleFunc("DELETE /api/task-rules/{id}", s.handleTaskRuleDelete)
 	s.mux.HandleFunc("GET /api/prompts", s.handlePromptsList)

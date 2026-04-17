@@ -1,7 +1,22 @@
 import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
-import { X, Plus } from 'lucide-react'
+import { X, Plus, GripVertical } from 'lucide-react'
 import * as Switch from '@radix-ui/react-switch'
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core'
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  useSortable,
+  arrayMove,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import EventBadge from './EventBadge'
 import TaskRuleEditor from './TaskRuleEditor'
 import type { TaskRule } from '../types'
@@ -17,6 +32,8 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
   const [editingRule, setEditingRule] = useState<TaskRule | null>(null)
   const [creating, setCreating] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
+
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
 
   // Fetch rules on open or after mutations.
   useEffect(() => {
@@ -46,7 +63,6 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
   // Inline enabled toggle — optimistic update + PATCH.
   const toggleEnabled = useCallback(async (rule: TaskRule) => {
     const prev = rule.enabled
-    // Optimistic update.
     setRules((rs) => rs.map((r) => (r.id === rule.id ? { ...r, enabled: !prev } : r)))
 
     try {
@@ -57,10 +73,33 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
       })
       if (!res.ok) throw new Error()
     } catch {
-      // Revert on failure.
       setRules((rs) => rs.map((r) => (r.id === rule.id ? { ...r, enabled: prev } : r)))
     }
   }, [])
+
+  // Drag-to-reorder.
+  const handleDragEnd = useCallback(
+    async (event: DragEndEvent) => {
+      const { active, over } = event
+      if (!over || active.id === over.id) return
+
+      const oldIndex = rules.findIndex((r) => r.id === active.id)
+      const newIndex = rules.findIndex((r) => r.id === over.id)
+      const reordered = arrayMove(rules, oldIndex, newIndex)
+      setRules(reordered) // Optimistic
+
+      try {
+        await fetch('/api/task-rules/reorder', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reordered.map((r) => r.id)),
+        })
+      } catch {
+        refresh() // Revert on failure
+      }
+    },
+    [rules, refresh],
+  )
 
   const editorOpen = creating || editingRule !== null
 
@@ -77,7 +116,7 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
             onClick={onClose}
           />
 
-          {/* Drawer */}
+          {/* Panel */}
           <motion.div
             className="fixed top-20 right-4 bottom-4 z-50 w-[340px] bg-surface-raised border border-border-glass rounded-2xl shadow-xl shadow-black/[0.08] flex flex-col overflow-hidden"
             initial={{ x: '100%', opacity: 0 }}
@@ -123,54 +162,31 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
                 </div>
               )}
 
-              {rules.map((rule) => (
-                <button
-                  key={rule.id}
-                  onClick={() => setEditingRule(rule)}
-                  className="w-full text-left px-4 py-3 rounded-xl hover:bg-black/[0.03] transition-colors group"
+              {rules.length > 0 && (
+                <DndContext
+                  sensors={sensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={handleDragEnd}
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={`text-[13px] font-medium truncate ${
-                            rule.enabled ? 'text-text-primary' : 'text-text-tertiary line-through'
-                          }`}
-                        >
-                          {rule.name}
-                        </span>
-                        {rule.source === 'system' && (
-                          <span className="text-[10px] font-medium text-text-tertiary bg-black/[0.04] px-1.5 py-0.5 rounded shrink-0">
-                            SYS
-                          </span>
-                        )}
-                      </div>
-                      <div className="mt-1">
-                        <EventBadge eventType={rule.event_type} compact />
-                      </div>
-                      {rule.scope_predicate_json && (
-                        <p className="text-[11px] text-text-tertiary mt-1 truncate font-mono">
-                          {formatPredicate(rule.scope_predicate_json)}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* Enabled toggle */}
-                    <Switch.Root
-                      checked={rule.enabled}
-                      onCheckedChange={() => toggleEnabled(rule)}
-                      onClick={(e) => e.stopPropagation()}
-                      className="shrink-0 relative w-8 h-[18px] rounded-full transition-colors data-[state=checked]:bg-accent data-[state=unchecked]:bg-black/10 cursor-pointer"
-                    >
-                      <Switch.Thumb className="block w-[14px] h-[14px] rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-[14px] data-[state=unchecked]:translate-x-[2px]" />
-                    </Switch.Root>
-                  </div>
-                </button>
-              ))}
+                  <SortableContext
+                    items={rules.map((r) => r.id)}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    {rules.map((rule) => (
+                      <SortableRuleRow
+                        key={rule.id}
+                        rule={rule}
+                        onEdit={() => setEditingRule(rule)}
+                        onToggle={() => toggleEnabled(rule)}
+                      />
+                    ))}
+                  </SortableContext>
+                </DndContext>
+              )}
             </div>
           </motion.div>
 
-          {/* Editor modal (renders above the drawer) */}
+          {/* Editor modal (renders above the panel) */}
           <TaskRuleEditor
             open={editorOpen}
             rule={editingRule}
@@ -188,6 +204,86 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
         </>
       )}
     </AnimatePresence>
+  )
+}
+
+// --- Sortable rule row -----------------------------------------------------
+
+function SortableRuleRow({
+  rule,
+  onEdit,
+  onToggle,
+}: {
+  rule: TaskRule
+  onEdit: () => void
+  onToggle: () => void
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: rule.id,
+  })
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : undefined,
+  }
+
+  return (
+    <div ref={setNodeRef} style={style} className="flex items-start gap-1 group">
+      {/* Drag handle */}
+      <button
+        {...attributes}
+        {...listeners}
+        className="mt-3.5 shrink-0 cursor-grab active:cursor-grabbing text-text-tertiary/40 hover:text-text-tertiary transition-colors"
+      >
+        <GripVertical size={14} />
+      </button>
+
+      {/* Row content — click to edit */}
+      <button
+        onClick={onEdit}
+        className="flex-1 text-left px-3 py-3 rounded-xl hover:bg-black/[0.03] transition-colors"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span
+                className={`text-[13px] font-medium truncate ${
+                  rule.enabled ? 'text-text-primary' : 'text-text-tertiary line-through'
+                }`}
+              >
+                {rule.name}
+              </span>
+              {rule.source === 'system' && (
+                <span className="text-[10px] font-medium text-text-tertiary bg-black/[0.04] px-1.5 py-0.5 rounded shrink-0">
+                  SYS
+                </span>
+              )}
+            </div>
+            <div className="mt-1">
+              <EventBadge eventType={rule.event_type} compact />
+            </div>
+            {rule.scope_predicate_json && (
+              <p className="text-[11px] text-text-tertiary mt-1 truncate font-mono">
+                {formatPredicate(rule.scope_predicate_json)}
+              </p>
+            )}
+          </div>
+
+          {/* Enabled toggle */}
+          <div onClick={(e) => e.stopPropagation()} className="shrink-0 mt-0.5">
+            <Switch.Root
+              checked={rule.enabled}
+              onCheckedChange={onToggle}
+              className="relative w-8 h-[18px] rounded-full transition-colors data-[state=checked]:bg-accent data-[state=unchecked]:bg-black/10 cursor-pointer"
+            >
+              <Switch.Thumb className="block w-[14px] h-[14px] rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-[14px] data-[state=unchecked]:translate-x-[2px]" />
+            </Switch.Root>
+          </div>
+        </div>
+      </button>
+    </div>
   )
 }
 
