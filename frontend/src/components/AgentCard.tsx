@@ -39,7 +39,7 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
   }, [isActive])
 
   const elapsed =
-    !isActive && run.DurationMs
+    !isActive && run.DurationMs != null
       ? formatDurationMs(run.DurationMs)
       : formatElapsed(run.StartedAt, now)
   const isFailed = run.Status === 'failed'

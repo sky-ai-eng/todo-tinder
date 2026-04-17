@@ -1,10 +1,13 @@
+export type TaskSource = 'github' | 'jira'
+export type EntityKind = 'pr' | 'issue' | 'epic' | 'message'
+
 export interface Task {
   id: string
-  source: string
+  source: TaskSource
   source_id: string
   source_url: string
   title: string
-  entity_kind: string
+  entity_kind: EntityKind
   event_type: string
   dedup_key?: string
   severity?: string
