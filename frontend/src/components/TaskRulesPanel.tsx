@@ -92,11 +92,12 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
       setRules(reordered) // Optimistic
 
       try {
-        await fetch('/api/task-rules/reorder', {
+        const res = await fetch('/api/task-rules/reorder', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(reordered.map((r) => r.id)),
         })
+        if (!res.ok) throw new Error()
       } catch {
         refresh() // Revert on failure
       }
