@@ -215,6 +215,7 @@ export default function Cards() {
             <span>Rules</span>
           </button>
         </div>
+        <TaskRulesPanel open={rulesOpen} onClose={() => setRulesOpen(false)} />
       </div>
     )
   }
