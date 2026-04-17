@@ -144,6 +144,10 @@ function FieldRow({ field, value, onChange }: FieldRowProps) {
         <StringField value={value as string | undefined} onChange={onChange} />
       )}
       {field.type === 'int' && <IntField value={value as number | undefined} onChange={onChange} />}
+      {/* TODO: No predicate struct currently uses []string, so this path
+          is unreachable in v1. If a string_list predicate is added, this
+          needs to split on commas and send a JSON array (["a","b"]) instead
+          of a plain string — the backend validates against []string. */}
       {field.type === 'string_list' && (
         <StringField
           value={value as string | undefined}
