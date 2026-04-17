@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import { X, Plus } from 'lucide-react'
+import * as Switch from '@radix-ui/react-switch'
 import EventBadge from './EventBadge'
 import TaskRuleEditor from './TaskRuleEditor'
 import type { TaskRule } from '../types'
@@ -43,8 +44,7 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), [])
 
   // Inline enabled toggle — optimistic update + PATCH.
-  const toggleEnabled = useCallback(async (rule: TaskRule, e: React.MouseEvent) => {
-    e.stopPropagation() // don't open editor
+  const toggleEnabled = useCallback(async (rule: TaskRule) => {
     const prev = rule.enabled
     // Optimistic update.
     setRules((rs) => rs.map((r) => (r.id === rule.id ? { ...r, enabled: !prev } : r)))
@@ -156,22 +156,14 @@ export default function TaskRulesPanel({ open, onClose }: TaskRulesPanelProps) {
                     </div>
 
                     {/* Enabled toggle */}
-                    <div
-                      onClick={(e) => toggleEnabled(rule, e)}
-                      className="shrink-0 mt-0.5 cursor-pointer"
+                    <Switch.Root
+                      checked={rule.enabled}
+                      onCheckedChange={() => toggleEnabled(rule)}
+                      onClick={(e) => e.stopPropagation()}
+                      className="shrink-0 relative w-8 h-[18px] rounded-full transition-colors data-[state=checked]:bg-accent data-[state=unchecked]:bg-black/10 cursor-pointer"
                     >
-                      <div
-                        className={`relative w-8 h-[18px] rounded-full transition-colors ${
-                          rule.enabled ? 'bg-accent' : 'bg-black/10'
-                        }`}
-                      >
-                        <span
-                          className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow transition-transform ${
-                            rule.enabled ? 'translate-x-[14px]' : 'translate-x-[2px]'
-                          }`}
-                        />
-                      </div>
-                    </div>
+                      <Switch.Thumb className="block w-[14px] h-[14px] rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-[14px] data-[state=unchecked]:translate-x-[2px]" />
+                    </Switch.Root>
                   </div>
                 </button>
               ))}

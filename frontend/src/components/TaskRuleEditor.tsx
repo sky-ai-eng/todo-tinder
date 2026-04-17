@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import * as Tooltip from '@radix-ui/react-tooltip'
+import * as Switch from '@radix-ui/react-switch'
 import { X } from 'lucide-react'
 import PredicateEditor from './PredicateEditor'
 import type { TaskRule, EventType } from '../types'
@@ -342,19 +343,13 @@ export default function TaskRuleEditor({
                   {/* Enabled toggle — edit mode only */}
                   {isEdit && (
                     <div className="flex items-center gap-3">
-                      <button
-                        type="button"
-                        onClick={() => setEnabled(!enabled)}
-                        className={`relative w-8 h-[18px] rounded-full transition-colors ${
-                          enabled ? 'bg-accent' : 'bg-black/10'
-                        }`}
+                      <Switch.Root
+                        checked={enabled}
+                        onCheckedChange={setEnabled}
+                        className="relative w-9 h-5 rounded-full transition-colors data-[state=checked]:bg-accent data-[state=unchecked]:bg-black/10 cursor-pointer"
                       >
-                        <span
-                          className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow transition-transform ${
-                            enabled ? 'translate-x-[14px]' : 'translate-x-[2px]'
-                          }`}
-                        />
-                      </button>
+                        <Switch.Thumb className="block w-4 h-4 rounded-full bg-white shadow transition-transform data-[state=checked]:translate-x-[18px] data-[state=unchecked]:translate-x-[2px]" />
+                      </Switch.Root>
                       <span className="text-[13px] text-text-secondary">
                         {enabled ? 'Enabled' : 'Disabled'}
                       </span>
