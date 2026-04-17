@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AgentMessage, AgentRun, Task, ToolCall } from '../types'
+import SourceBadge from './SourceBadge'
 
 interface Props {
   task: Task
@@ -106,13 +107,7 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
           {task.title}
         </h3>
         <div className="flex items-center gap-2 text-[11px] text-text-tertiary">
-          <span
-            className={`font-medium uppercase tracking-wider px-1.5 py-0.5 rounded ${
-              task.source === 'github' ? 'bg-black/[0.04]' : 'bg-blue-500/10 text-blue-600'
-            }`}
-          >
-            {task.source === 'github' ? (task.entity_kind === 'pr' ? 'PR' : 'GH') : 'Jira'}
-          </span>
+          <SourceBadge task={task} />
           <span className="truncate">{task.source_id}</span>
         </div>
       </div>

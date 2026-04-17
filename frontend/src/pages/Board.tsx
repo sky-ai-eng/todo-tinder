@@ -6,6 +6,7 @@ import TaskCard from '../components/TaskCard'
 import PromptPicker from '../components/PromptPicker'
 import ReviewOverlay from '../components/ReviewOverlay'
 import EventBadge from '../components/EventBadge'
+import SourceBadge from '../components/SourceBadge'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   DndContext,
@@ -674,15 +675,7 @@ function SidebarTaskCard({ task }: { task: Task }) {
       {...listeners}
     >
       <div className="flex items-center gap-1.5 mb-1">
-        <span
-          className={`text-[9px] font-semibold uppercase tracking-wider px-1 py-0.5 rounded ${
-            task.source === 'github'
-              ? 'bg-black/[0.04] text-text-secondary'
-              : 'bg-blue-500/10 text-blue-600'
-          }`}
-        >
-          {task.source === 'github' ? (task.entity_kind === 'pr' ? 'PR' : 'GH') : 'Jira'}
-        </span>
+        <SourceBadge task={task} />
         <EventBadge eventType={task.event_type} compact />
       </div>
       <h4 className="text-[12px] font-medium text-text-primary leading-snug line-clamp-2">

@@ -7,6 +7,7 @@ import type { Task, WSEvent } from '../types'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { SlidersHorizontal } from 'lucide-react'
 import EventBadge from '../components/EventBadge'
+import SourceBadge from '../components/SourceBadge'
 import PromptPicker from '../components/PromptPicker'
 import TaskRulesPanel from '../components/TaskRulesPanel'
 
@@ -431,19 +432,7 @@ function SwipeCard({
       <div className="relative h-full p-7 flex flex-col overflow-hidden">
         {/* Source badge row */}
         <div className="flex items-center gap-2.5 mb-4 shrink-0">
-          <span
-            className={`text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-full ${
-              task.source === 'github'
-                ? 'bg-black/[0.05] text-text-secondary'
-                : 'bg-blue-500/10 text-blue-600'
-            }`}
-          >
-            {task.source === 'github'
-              ? task.entity_kind === 'pr'
-                ? 'Pull Request'
-                : 'GitHub'
-              : 'Jira'}
-          </span>
+          <SourceBadge task={task} size="lg" />
           <EventBadge eventType={task.event_type} />
           {task.severity && (
             <span className="text-[11px] font-medium text-accent bg-accent-soft px-2 py-0.5 rounded-full">

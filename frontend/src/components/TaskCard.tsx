@@ -1,6 +1,7 @@
 import { forwardRef } from 'react'
 import type { Task } from '../types'
 import EventBadge from './EventBadge'
+import SourceBadge from './SourceBadge'
 
 interface Props {
   task: Task
@@ -73,19 +74,6 @@ const TaskCard = forwardRef<HTMLDivElement, Props & React.HTMLAttributes<HTMLDiv
 
 TaskCard.displayName = 'TaskCard'
 export default TaskCard
-
-function SourceBadge({ task }: { task: Task }) {
-  const isGitHub = task.source === 'github'
-  return (
-    <span
-      className={`text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded ${
-        isGitHub ? 'bg-black/[0.04] text-text-secondary' : 'bg-blue-500/10 text-blue-600'
-      }`}
-    >
-      {isGitHub ? (task.entity_kind === 'pr' ? 'PR' : 'GH') : 'Jira'}
-    </span>
-  )
-}
 
 function formatAge(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime()
