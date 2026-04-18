@@ -149,8 +149,10 @@ func main() {
 			})
 			// Post-scoring re-derive: check deferred triggers whose
 			// min_autonomy_suitability threshold the scored tasks now meet.
+			// Runs async so it doesn't block the scorer from clearing its
+			// running flag and handling subsequent Trigger() calls.
 			if eventRouter != nil {
-				eventRouter.ReDeriveAfterScoring(taskIDs)
+				go eventRouter.ReDeriveAfterScoring(taskIDs)
 			}
 		},
 	})
