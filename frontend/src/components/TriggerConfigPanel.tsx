@@ -13,6 +13,7 @@ interface TriggerConfigPanelProps {
   onClose: () => void
   onSaved: () => void
   onDeleted: () => void
+  onRefresh?: () => void
 }
 
 export default function TriggerConfigPanel({
@@ -21,6 +22,7 @@ export default function TriggerConfigPanel({
   onClose,
   onSaved,
   onDeleted,
+  onRefresh,
 }: TriggerConfigPanelProps) {
   const [predicate, setPredicate] = useState<Record<string, unknown>>({})
   const [minAutonomy, setMinAutonomy] = useState(0)
@@ -60,13 +62,18 @@ export default function TriggerConfigPanel({
     if (!trigger) return
     setEnabled(checked)
     try {
-      await fetch(`/api/triggers/${encodeURIComponent(trigger.id)}/toggle`, {
+      const res = await fetch(`/api/triggers/${encodeURIComponent(trigger.id)}/toggle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: checked }),
       })
+      if (!res.ok) {
+        setEnabled(!checked)
+        return
+      }
+      onRefresh?.()
     } catch {
-      setEnabled(!checked) // revert
+      setEnabled(!checked)
     }
   }
 

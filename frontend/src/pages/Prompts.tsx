@@ -139,6 +139,7 @@ export default function Prompts() {
           setGraphKey((k) => k + 1)
           if (eventType) handleTriggerDeleted(eventType)
         }}
+        onRefresh={() => setGraphKey((k) => k + 1)}
       />
     </div>
   )
