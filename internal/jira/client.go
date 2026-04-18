@@ -13,9 +13,10 @@ import (
 
 // Client wraps the Jira REST API v2.
 type Client struct {
-	baseURL string
-	pat     string
-	http    *http.Client
+	baseURL    string
+	pat        string
+	http       *http.Client
+	cachedSelf *currentUserResponse // lazily populated by currentUser()
 }
 
 func NewClient(baseURL, pat string) *Client {
@@ -457,6 +458,9 @@ type currentUserResponse struct {
 }
 
 func (c *Client) currentUser() (*currentUserResponse, error) {
+	if c.cachedSelf != nil {
+		return c.cachedSelf, nil
+	}
 	body, err := c.get(fmt.Sprintf("%s/rest/api/2/myself", c.baseURL))
 	if err != nil {
 		return nil, err
@@ -465,6 +469,7 @@ func (c *Client) currentUser() (*currentUserResponse, error) {
 	if err := json.Unmarshal(body, &user); err != nil {
 		return nil, fmt.Errorf("parse myself: %w", err)
 	}
+	c.cachedSelf = &user
 	return &user, nil
 }
 
