@@ -437,9 +437,10 @@ func (t *Tracker) batchFetchJira(client *jiraclient.Client, baseURL string, keys
 // issueToSnapshot converts a Jira API Issue to our snapshot type.
 func issueToSnapshot(issue jiraclient.Issue, baseURL string) domain.JiraSnapshot {
 	snap := domain.JiraSnapshot{
-		Key:     issue.Key,
-		Summary: issue.Fields.Summary,
-		URL:     fmt.Sprintf("%s/browse/%s", baseURL, issue.Key),
+		Key:         issue.Key,
+		Summary:     issue.Fields.Summary,
+		Description: jiraclient.ExtractDescriptionText(issue.Fields.Description),
+		URL:         fmt.Sprintf("%s/browse/%s", baseURL, issue.Key),
 	}
 	if issue.Fields.Status != nil {
 		snap.Status = issue.Fields.Status.Name

@@ -174,6 +174,7 @@ func DedupCheckRunsByName(runs []CheckRun) []CheckRun {
 type JiraSnapshot struct {
 	Key          string   `json:"key"`
 	Summary      string   `json:"summary"`
+	Description  string   `json:"description"` // flattened from ADF (Cloud) or passthrough (Server/DC)
 	Status       string   `json:"status"`
 	Assignee     string   `json:"assignee"`
 	Priority     string   `json:"priority"`

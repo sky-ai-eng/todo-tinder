@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -117,6 +118,39 @@ func GetEntityBySource(db *sql.DB, source, sourceID string) (*domain.Entity, err
 		FROM entities WHERE source = ? AND source_id = ?
 	`, source, sourceID)
 	return scanEntity(row)
+}
+
+// GetEntitySnapshots returns snapshot_json for the given entity IDs as a map
+// keyed by entity ID. Missing/empty snapshots are omitted. Used by the scorer
+// to enrich TaskInput without doing N per-task queries.
+func GetEntitySnapshots(database *sql.DB, ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := `SELECT id, COALESCE(snapshot_json, '') FROM entities WHERE id IN (` +
+		strings.Join(placeholders, ",") + `)`
+	rows, err := database.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, snap string
+		if err := rows.Scan(&id, &snap); err != nil {
+			return nil, err
+		}
+		if snap != "" && snap != "{}" {
+			out[id] = snap
+		}
+	}
+	return out, rows.Err()
 }
 
 // ListActiveEntities returns all entities with state='active' for a given source.
