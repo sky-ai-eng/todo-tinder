@@ -22,12 +22,31 @@ type GitHubConfig struct {
 }
 
 type JiraConfig struct {
-	BaseURL          string        `yaml:"base_url"`
-	PollInterval     time.Duration `yaml:"poll_interval"`
-	Projects         []string      `yaml:"projects"`
-	PickupStatuses   []string      `yaml:"pickup_statuses"`
-	InProgressStatus string        `yaml:"in_progress_status"`
-	DoneStatus       string        `yaml:"done_status"`
+	BaseURL      string         `yaml:"base_url"`
+	PollInterval time.Duration  `yaml:"poll_interval"`
+	Projects     []string       `yaml:"projects"`
+	Pickup       JiraStatusRule `yaml:"pickup"`
+	InProgress   JiraStatusRule `yaml:"in_progress"`
+	Done         JiraStatusRule `yaml:"done"`
+}
+
+// JiraStatusRule captures the two questions a user answers about a Jira state:
+// which statuses count as this state (Members) and which status TF writes when
+// it transitions into it (Canonical). Canonical is empty for Pickup since TF
+// never writes tickets back to the pickup state — it only reads them.
+type JiraStatusRule struct {
+	Members   []string `yaml:"members"             json:"members"`
+	Canonical string   `yaml:"canonical,omitempty" json:"canonical,omitempty"`
+}
+
+// Contains reports whether the given Jira status name is a member of this rule.
+func (r JiraStatusRule) Contains(status string) bool {
+	for _, m := range r.Members {
+		if m == status {
+			return true
+		}
+	}
+	return false
 }
 
 type ServerConfig struct {

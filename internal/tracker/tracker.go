@@ -245,9 +245,20 @@ func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos
 
 // --- Jira ---
 
-// RefreshJira runs the full tracking cycle for Jira issues.
-func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, projects, pickupStatuses []string, username string) (int, error) {
+// RefreshJira runs the full tracking cycle for Jira issues. doneStatuses is
+// the configured Done.Members set — used to decide whether a newly-discovered
+// or reopened issue should be marked closed, and passed through to the diff
+// pass for jira:issue:completed emission.
+func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, projects, pickupStatuses, doneStatuses []string, username string) (int, error) {
 	startedAt := time.Now()
+	terminal := func(s string) bool {
+		for _, d := range doneStatuses {
+			if d == s {
+				return true
+			}
+		}
+		return false
+	}
 	// Phase 1: Discovery
 	discovered, err := t.discoverJira(client, baseURL, projects, pickupStatuses)
 	if err != nil {
@@ -266,7 +277,7 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 			if err := db.UpdateEntitySnapshot(t.database, entity.ID, string(snapJSON)); err != nil {
 				log.Printf("[tracker] failed to seed snapshot for %s: %v", snap.Key, err)
 			}
-			if isJiraTerminal(snap.Status) {
+			if terminal(snap.Status) {
 				if err := db.MarkEntityClosed(t.database, entity.ID); err != nil {
 					log.Printf("[tracker] failed to mark entity %s closed on discovery: %v", snap.Key, err)
 				}
@@ -276,7 +287,7 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 				_ = db.UpdateEntityTitle(t.database, entity.ID, snap.Summary)
 			}
 			// Reactivate if a previously-closed issue reappears as open.
-			if !isJiraTerminal(snap.Status) && entity.State == "closed" {
+			if !terminal(snap.Status) && entity.State == "closed" {
 				if reactivated, err := db.ReactivateEntity(t.database, entity.ID); err != nil {
 					log.Printf("[tracker] error reactivating %s: %v", snap.Key, err)
 				} else if reactivated {
@@ -326,7 +337,7 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 			}
 		}
 
-		events := DiffJiraSnapshots(prevSnap, newSnap, e.ID, username)
+		events := DiffJiraSnapshots(prevSnap, newSnap, e.ID, username, doneStatuses)
 
 		snapJSON, _ := json.Marshal(newSnap)
 		if err := db.UpdateEntitySnapshot(t.database, e.ID, string(snapJSON)); err != nil {

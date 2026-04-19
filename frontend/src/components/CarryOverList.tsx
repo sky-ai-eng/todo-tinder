@@ -76,8 +76,8 @@ export default function CarryOverList({ onSave, onSkip, onBack }: Props) {
       }
       const fetched: StockTicket[] = data.tickets || []
       setTickets(fetched)
-      // Pre-select "done" for tickets already in the user's configured
-      // DoneStatus — one-click cleanup of orphan entities. User can still
+      // Pre-select "done" for tickets already in any configured Done.Members
+      // status — one-click cleanup of orphan entities. User can still
       // deselect or change the action before saving.
       setSelections((prev) => {
         const next = { ...prev }
