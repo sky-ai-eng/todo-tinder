@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
 )
 
@@ -205,7 +207,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 
 		switch a.Action {
 		case "queue":
-			if _, _, err := db.FindOrCreateTask(s.db, entity.ID, domain.EventJiraIssueAssigned, "", "", 0.5); err != nil {
+			eventID, err := recordCarryOverAssignedEvent(s.db, entity.ID, snap, creds.JiraDisplayName)
+			if err != nil {
+				failed = append(failed, stockFailure{a.IssueKey, a.Action, "record event: " + err.Error()})
+				continue
+			}
+			if _, _, err := db.FindOrCreateTask(s.db, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5); err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
 			}
@@ -238,7 +245,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			// If either of these fails the ticket stays assigned + in-progress
 			// in Jira but has no task on our side; the next carry-over run
 			// would surface it again for retry.
-			task, _, err := db.FindOrCreateTask(s.db, entity.ID, domain.EventJiraIssueAssigned, "", "", 0.5)
+			eventID, err := recordCarryOverAssignedEvent(s.db, entity.ID, snap, creds.JiraDisplayName)
+			if err != nil {
+				failed = append(failed, stockFailure{a.IssueKey, a.Action, "record event: " + err.Error()})
+				continue
+			}
+			task, _, err := db.FindOrCreateTask(s.db, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5)
 			if err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
@@ -272,6 +284,36 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"applied": applied,
 		"failed":  failed,
+	})
+}
+
+// recordCarryOverAssignedEvent writes a synthesized jira:issue:assigned event
+// for a carry-over ticket and returns the event ID. Tasks require a non-null
+// primary_event_id FK to events.id, but carry-over has no upstream event —
+// the tracker seeded the snapshot silently on first poll per the "no events
+// on initial load" rule. Semantically this matches what would have fired if
+// the ticket had been assigned after we started watching. Uses RecordEvent
+// (not bus.Publish) so downstream handlers don't double-create a task.
+func recordCarryOverAssignedEvent(database *sql.DB, entityID string, snap domain.JiraSnapshot, displayName string) (string, error) {
+	meta := events.JiraIssueAssignedMetadata{
+		Assignee:       snap.Assignee,
+		AssigneeIsSelf: snap.Assignee == displayName,
+		IssueKey:       snap.Key,
+		Project:        projectFromKey(snap.Key),
+		IssueType:      snap.IssueType,
+		Priority:       snap.Priority,
+		Status:         snap.Status,
+		Summary:        snap.Summary,
+	}
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	eid := entityID
+	return db.RecordEvent(database, domain.Event{
+		EntityID:     &eid,
+		EventType:    domain.EventJiraIssueAssigned,
+		MetadataJSON: string(metaJSON),
 	})
 }
 
