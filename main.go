@@ -258,6 +258,7 @@ func main() {
 				Source string `json:"source"`
 			}
 			if err := json.Unmarshal([]byte(evt.MetadataJSON), &meta); err != nil {
+				log.Printf("[jira-poll-tracker] warning: failed to parse poll completion metadata: %v; raw metadata=%q", err, evt.MetadataJSON)
 				return
 			}
 			if meta.Source == "jira" {
