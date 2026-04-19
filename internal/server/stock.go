@@ -176,6 +176,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	client := jira.NewClient(creds.JiraURL, creds.JiraPAT)
 
 	applied := 0
+	queued := 0 // number of queue actions applied — gates the scorer trigger
 	failed := make([]stockFailure, 0)
 
 	for _, a := range req.Actions {
@@ -241,6 +242,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
 			}
+			queued++
 
 		case "claim":
 			if cfg.Jira.InProgress.Canonical == "" {
@@ -323,9 +325,11 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 
 	// Carry-over creates tasks without going through the poller, so no
 	// system:poll:completed fires to wake the scorer via its event-bus
-	// subscription. Poke it directly when we actually created queued tasks —
-	// claim-only or done-only flows don't produce anything to score.
-	if applied > 0 && s.scorerTrigger != nil {
+	// subscription. Poke it directly, but only when we actually produced
+	// queued tasks — claim promotes straight to 'claimed' (skipped by the
+	// UnscoredTasks query) and done doesn't create a task at all, so those
+	// two branches have nothing for the scorer to pick up.
+	if queued > 0 && s.scorerTrigger != nil {
 		s.scorerTrigger()
 	}
 
