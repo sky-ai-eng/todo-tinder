@@ -10,6 +10,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
 	"github.com/sky-ai-eng/triage-factory/internal/eventbus"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
@@ -460,11 +461,11 @@ func issueToSnapshot(issue jiraclient.Issue, baseURL string) domain.JiraSnapshot
 func (t *Tracker) EmitPollComplete(source string, startedAt time.Time, entityCount, eventCount int) {
 	t.bus.Publish(domain.Event{
 		EventType: domain.EventSystemPollCompleted,
-		MetadataJSON: mustJSON(map[string]any{
-			"source":     source,
-			"started_at": startedAt.UnixNano(),
-			"entities":   entityCount,
-			"events":     eventCount,
+		MetadataJSON: mustJSON(events.SystemPollCompletedMetadata{
+			Source:    source,
+			StartedAt: startedAt.UnixNano(),
+			Entities:  entityCount,
+			Events:    eventCount,
 		}),
 		CreatedAt: time.Now(),
 	})
