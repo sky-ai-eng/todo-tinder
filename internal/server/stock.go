@@ -174,7 +174,11 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		}
 
 		entity, err := db.GetEntityBySource(s.db, "jira", a.IssueKey)
-		if err != nil || entity == nil {
+		if err != nil {
+			failed = append(failed, stockFailure{a.IssueKey, a.Action, "failed to load entity"})
+			continue
+		}
+		if entity == nil {
 			failed = append(failed, stockFailure{a.IssueKey, a.Action, "entity not found"})
 			continue
 		}
