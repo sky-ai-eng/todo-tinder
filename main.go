@@ -190,9 +190,28 @@ func main() {
 		},
 	})
 
-	// Poller manager — uses event bus instead of direct callbacks
+	// Poller manager — uses event bus instead of direct callbacks.
+	// Poll errors are toasted with per-source time-based throttling: the
+	// poller fires OnError on every failure (raw signal), but we only
+	// refresh the user-facing toast every errorToastMinInterval. Without
+	// throttling, a persistent failure (expired PAT, network outage) would
+	// generate a sticky error toast every poll cycle (default 60s) until
+	// the user manually dismissed each one — badly spammy on the UI.
+	const errorToastMinInterval = 5 * time.Minute
+	var (
+		errorThrottleMu sync.Mutex
+		lastErrorToast  = map[string]time.Time{}
+	)
 	pollerMgr := poller.NewManager(database, bus)
 	pollerMgr.OnError = func(source string, err error) {
+		errorThrottleMu.Lock()
+		if last, ok := lastErrorToast[source]; ok && time.Since(last) < errorToastMinInterval {
+			errorThrottleMu.Unlock()
+			return
+		}
+		lastErrorToast[source] = time.Now()
+		errorThrottleMu.Unlock()
+
 		label := "Jira"
 		if source == "github" {
 			label = "GitHub"
