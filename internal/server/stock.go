@@ -215,18 +215,11 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, "in_progress_status not configured"})
 				continue
 			}
-			task, _, err := db.FindOrCreateTask(s.db, entity.ID, domain.EventJiraIssueAssigned, "", "", 0.5)
-			if err != nil {
-				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
-				continue
-			}
-			if err := db.SetTaskStatus(s.db, task.ID, "claimed"); err != nil {
-				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
-				continue
-			}
 
-			// Jira mutations — mirror the handleSwipe claim guard pattern so we
-			// don't re-assign/re-transition when the state is already correct.
+			// Do Jira mutations first: if Jira fails we bail before touching
+			// the task table, so there's no claimed-task orphan pointing at a
+			// Jira issue that never got assigned or transitioned. Claim-guard
+			// pattern skips the API calls when state is already correct.
 			state := client.GetClaimState(a.IssueKey)
 			if state == nil || !state.AssignedToSelf {
 				if err := client.AssignToSelf(a.IssueKey); err != nil {
@@ -239,6 +232,20 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 					failed = append(failed, stockFailure{a.IssueKey, a.Action, "transition: " + err.Error()})
 					continue
 				}
+			}
+
+			// Jira is now consistent — create the task and promote to claimed.
+			// If either of these fails the ticket stays assigned + in-progress
+			// in Jira but has no task on our side; the next carry-over run
+			// would surface it again for retry.
+			task, _, err := db.FindOrCreateTask(s.db, entity.ID, domain.EventJiraIssueAssigned, "", "", 0.5)
+			if err != nil {
+				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
+				continue
+			}
+			if err := db.SetTaskStatus(s.db, task.ID, "claimed"); err != nil {
+				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
+				continue
 			}
 
 		case "done":
