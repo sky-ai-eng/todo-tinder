@@ -20,7 +20,7 @@ type DashboardStats struct {
 }
 
 type DashboardPoint struct {
-	Week  string `json:"week"`
+	Date  string `json:"date"`
 	Count int    `json:"count"`
 }
 
@@ -53,7 +53,7 @@ func GetDashboardStats(database *sql.DB, username string, sinceDays int) (*Dashb
 	defer rows.Close()
 
 	stats := &DashboardStats{}
-	mergedByWeek := make(map[string]int)
+	mergedByDay := make(map[string]int)
 
 	for rows.Next() {
 		var snapJSON string
@@ -73,7 +73,7 @@ func GetDashboardStats(database *sql.DB, username string, sinceDays int) (*Dashb
 				mergedAt, err := time.Parse(time.RFC3339, snap.MergedAt)
 				if err == nil && mergedAt.After(since) {
 					stats.Merged++
-					mergedByWeek[mondayOf(mergedAt)]++
+					mergedByDay[mergedAt.Format("2006-01-02")]++
 				}
 
 			case snap.State == "CLOSED":
@@ -108,8 +108,8 @@ func GetDashboardStats(database *sql.DB, username string, sinceDays int) (*Dashb
 		return nil, err
 	}
 
-	// Build merged timeline
-	stats.MergedOverTime = buildTimeline(mergedByWeek, 5)
+	// Build merged timeline — last 14 days, per day
+	stats.MergedOverTime = buildTimeline(mergedByDay, 14)
 
 	return stats, nil
 }
@@ -177,23 +177,13 @@ func stateToLower(s string) string {
 	}
 }
 
-func mondayOf(t time.Time) string {
-	weekday := int(t.Weekday())
-	if weekday == 0 {
-		weekday = 7
-	}
-	monday := t.AddDate(0, 0, -(weekday - 1))
-	return monday.Format("2006-01-02")
-}
-
-func buildTimeline(buckets map[string]int, weeks int) []DashboardPoint {
+func buildTimeline(buckets map[string]int, days int) []DashboardPoint {
 	var points []DashboardPoint
 	now := time.Now()
-	for i := weeks - 1; i >= 0; i-- {
-		d := now.AddDate(0, 0, -i*7)
-		key := mondayOf(d)
+	for i := days - 1; i >= 0; i-- {
+		key := now.AddDate(0, 0, -i).Format("2006-01-02")
 		points = append(points, DashboardPoint{
-			Week:  key,
+			Date:  key,
 			Count: buckets[key],
 		})
 	}
