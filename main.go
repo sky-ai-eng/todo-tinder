@@ -223,9 +223,9 @@ func main() {
 
 		// Also refresh Jira client in case it's configured
 		if creds.JiraPAT != "" && creds.JiraURL != "" {
-			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress.Canonical)
+			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress)
 		} else {
-			srv.SetJiraClient(nil, "")
+			srv.SetJiraClient(nil, config.JiraStatusRule{})
 		}
 	})
 
@@ -239,9 +239,9 @@ func main() {
 		pollerMgr.RestartJira()
 
 		if creds.JiraPAT != "" && creds.JiraURL != "" {
-			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress.Canonical)
+			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress)
 		} else {
-			srv.SetJiraClient(nil, "")
+			srv.SetJiraClient(nil, config.JiraStatusRule{})
 		}
 	})
 
@@ -307,7 +307,7 @@ func main() {
 	}
 
 	if creds.JiraPAT != "" && creds.JiraURL != "" {
-		srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress.Canonical)
+		srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress)
 	}
 
 	if err := srv.ListenAndServe(addr); err != nil {
