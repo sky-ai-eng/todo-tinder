@@ -41,7 +41,11 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, _ := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
+		return
+	}
 
 	entities, err := db.ListActiveEntities(s.db, "jira")
 	if err != nil {
