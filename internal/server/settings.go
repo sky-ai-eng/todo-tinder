@@ -39,10 +39,19 @@ func validateStatusRule(name string, r config.JiraStatusRule, hasWriteTarget boo
 	return nil
 }
 
+// normalizeMembers returns a sorted, deduplicated copy of members so rules can
+// be compared using set semantics without mutating the original slice.
+func normalizeMembers(members []string) []string {
+	normalized := slices.Clone(members)
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
+}
+
 // ruleEqual compares two status rules by value. Used by change detection to
 // decide whether a Jira poller restart is needed. Nil-safe on the Members slice.
 func ruleEqual(a, b config.JiraStatusRule) bool {
-	return a.Canonical == b.Canonical && slices.Equal(a.Members, b.Members)
+	return a.Canonical == b.Canonical &&
+		slices.Equal(normalizeMembers(a.Members), normalizeMembers(b.Members))
 }
 
 // settingsResponse combines config values with auth status so the frontend
