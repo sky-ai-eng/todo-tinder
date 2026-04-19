@@ -13,6 +13,7 @@ interface StockTicket {
   parent_key?: string
   parent_url?: string
   url: string
+  already_done?: boolean
 }
 
 interface Props {
@@ -73,7 +74,20 @@ export default function CarryOverList({ onSave, onSkip, onBack }: Props) {
         }, POLL_INTERVAL_MS)
         return
       }
-      setTickets(data.tickets || [])
+      const fetched: StockTicket[] = data.tickets || []
+      setTickets(fetched)
+      // Pre-select "done" for tickets already in the user's configured
+      // DoneStatus — one-click cleanup of orphan entities. User can still
+      // deselect or change the action before saving.
+      setSelections((prev) => {
+        const next = { ...prev }
+        for (const t of fetched) {
+          if (t.already_done && next[t.issue_key] === undefined) {
+            next[t.issue_key] = 'done'
+          }
+        }
+        return next
+      })
       setPolling(false)
       setError('')
     } catch (err) {
@@ -317,6 +331,11 @@ function TicketRow({
           <span className="text-[13px] font-medium text-text-primary truncate">
             {ticket.summary}
           </span>
+          {ticket.already_done && (
+            <span className="shrink-0 text-[10px] text-text-tertiary bg-black/[0.04] rounded-full px-2 py-0.5">
+              already {ticket.status}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1.5 mt-0.5 text-[11px] text-text-tertiary">
           {ticket.parent_key && ticket.parent_url && (

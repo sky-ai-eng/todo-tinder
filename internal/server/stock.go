@@ -26,6 +26,11 @@ type stockTicket struct {
 	ParentKey string `json:"parent_key,omitempty"`
 	ParentURL string `json:"parent_url,omitempty"`
 	URL       string `json:"url"`
+	// AlreadyDone is true when snap.Status already matches the user's configured
+	// DoneStatus. Frontend pre-selects the "done" action so the user can close
+	// orphan entities with one click — the POST handler's existing no-op guard
+	// skips the Jira transition when the status is already correct.
+	AlreadyDone bool `json:"already_done,omitempty"`
 }
 
 // handleJiraStockGet lists non-terminal Jira tickets assigned to the user
@@ -90,16 +95,17 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		if snap.Assignee != creds.JiraDisplayName {
 			continue
 		}
-		// Skip tickets that are already in a terminal state — either one of
-		// the well-known done-like statuses (Done/Closed/Resolved) or the
-		// user's configured DoneStatus, which may be a custom label outside
-		// that set (e.g. "Complete", "Shipped").
+		// Skip well-known terminal statuses (Done/Closed/Resolved) — these
+		// get MarkEntityClosed at tracker-discovery time, so seeing them here
+		// is usually impossible, but guard anyway for safety.
 		if isJiraStatusTerminal(snap.Status) {
 			continue
 		}
-		if cfg.Jira.DoneStatus != "" && snap.Status == cfg.Jira.DoneStatus {
-			continue
-		}
+		// Include tickets already in the user's configured DoneStatus with a
+		// flag so the frontend can pre-select "done" — lets the user close
+		// orphan entities without side-effects on Jira (the POST no-op guard
+		// skips the transition when status already matches).
+		alreadyDone := cfg.Jira.DoneStatus != "" && snap.Status == cfg.Jira.DoneStatus
 
 		var parentURL string
 		if snap.ParentKey != "" && cfg.Jira.BaseURL != "" {
@@ -107,15 +113,16 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		}
 
 		tickets = append(tickets, stockTicket{
-			IssueKey:  snap.Key,
-			Summary:   snap.Summary,
-			Status:    snap.Status,
-			Project:   projectFromKey(snap.Key),
-			IssueType: snap.IssueType,
-			Priority:  snap.Priority,
-			ParentKey: snap.ParentKey,
-			ParentURL: parentURL,
-			URL:       snap.URL,
+			IssueKey:    snap.Key,
+			Summary:     snap.Summary,
+			Status:      snap.Status,
+			Project:     projectFromKey(snap.Key),
+			IssueType:   snap.IssueType,
+			Priority:    snap.Priority,
+			ParentKey:   snap.ParentKey,
+			ParentURL:   parentURL,
+			URL:         snap.URL,
+			AlreadyDone: alreadyDone,
 		})
 	}
 
@@ -208,8 +215,13 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			failed = append(failed, stockFailure{a.IssueKey, a.Action, "not assigned to you"})
 			continue
 		}
-		if isJiraStatusTerminal(snap.Status) ||
-			(cfg.Jira.DoneStatus != "" && snap.Status == cfg.Jira.DoneStatus) {
+		// Hard-terminal statuses (Done/Closed/Resolved) should never reach here
+		// because the tracker marks those entities closed at discovery, but
+		// guard anyway. Tickets already in the user's DoneStatus ARE allowed
+		// through — the GET flags them as already_done so the user can close
+		// the orphan entity, and the "done" branch below no-ops the Jira
+		// transition when the status already matches.
+		if isJiraStatusTerminal(snap.Status) {
 			failed = append(failed, stockFailure{a.IssueKey, a.Action, "ticket is already terminal"})
 			continue
 		}
