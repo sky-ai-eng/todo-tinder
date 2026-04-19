@@ -111,8 +111,8 @@ export default function Setup() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          url: jiraForm.url,
-          pat: jiraForm.pat,
+          url: jiraForm.url.trim(),
+          pat: jiraForm.pat.trim(),
         }),
       })
       if (!res.ok) {
