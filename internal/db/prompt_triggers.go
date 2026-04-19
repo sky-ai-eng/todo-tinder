@@ -13,7 +13,7 @@ import (
 func GetActiveTriggersForEvent(db *sql.DB, eventType string) ([]domain.PromptTrigger, error) {
 	rows, err := db.Query(`
 		SELECT id, prompt_id, trigger_type, event_type, scope_predicate_json,
-		       max_iterations, cooldown_seconds, enabled, created_at, updated_at
+		       breaker_threshold, cooldown_seconds, min_autonomy_suitability, enabled, created_at, updated_at
 		FROM prompt_triggers
 		WHERE event_type = ? AND enabled = 1
 	`, eventType)
@@ -37,7 +37,7 @@ func GetActiveTriggersForEvent(db *sql.DB, eventType string) ([]domain.PromptTri
 func GetPromptTrigger(db *sql.DB, id string) (*domain.PromptTrigger, error) {
 	row := db.QueryRow(`
 		SELECT id, prompt_id, trigger_type, event_type, scope_predicate_json,
-		       max_iterations, cooldown_seconds, enabled, created_at, updated_at
+		       breaker_threshold, cooldown_seconds, min_autonomy_suitability, enabled, created_at, updated_at
 		FROM prompt_triggers WHERE id = ?
 	`, id)
 
@@ -55,7 +55,7 @@ func GetPromptTrigger(db *sql.DB, id string) (*domain.PromptTrigger, error) {
 func ListPromptTriggers(db *sql.DB) ([]domain.PromptTrigger, error) {
 	rows, err := db.Query(`
 		SELECT id, prompt_id, trigger_type, event_type, scope_predicate_json,
-		       max_iterations, cooldown_seconds, enabled, created_at, updated_at
+		       breaker_threshold, cooldown_seconds, min_autonomy_suitability, enabled, created_at, updated_at
 		FROM prompt_triggers ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -78,7 +78,7 @@ func ListPromptTriggers(db *sql.DB) ([]domain.PromptTrigger, error) {
 func ListTriggersForPrompt(db *sql.DB, promptID string) ([]domain.PromptTrigger, error) {
 	rows, err := db.Query(`
 		SELECT id, prompt_id, trigger_type, event_type, scope_predicate_json,
-		       max_iterations, cooldown_seconds, enabled, created_at, updated_at
+		       breaker_threshold, cooldown_seconds, min_autonomy_suitability, enabled, created_at, updated_at
 		FROM prompt_triggers WHERE prompt_id = ? ORDER BY created_at DESC
 	`, promptID)
 	if err != nil {
@@ -97,6 +97,20 @@ func ListTriggersForPrompt(db *sql.DB, promptID string) ([]domain.PromptTrigger,
 	return triggers, rows.Err()
 }
 
+// SeedPromptTrigger inserts a system trigger only on first boot. If the
+// trigger already exists, it's left untouched — the user owns it after
+// the initial seed and can edit any field freely.
+func SeedPromptTrigger(db *sql.DB, t domain.PromptTrigger) error {
+	var exists int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM prompt_triggers WHERE id = ?`, t.ID).Scan(&exists); err != nil {
+		return fmt.Errorf("check trigger existence: %w", err)
+	}
+	if exists > 0 {
+		return nil
+	}
+	return SavePromptTrigger(db, t)
+}
+
 // SavePromptTrigger inserts or updates a trigger. Validates trigger_type.
 func SavePromptTrigger(db *sql.DB, t domain.PromptTrigger) error {
 	if t.TriggerType != domain.TriggerTypeEvent {
@@ -106,19 +120,20 @@ func SavePromptTrigger(db *sql.DB, t domain.PromptTrigger) error {
 	now := time.Now()
 	_, err := db.Exec(`
 		INSERT INTO prompt_triggers (id, prompt_id, trigger_type, event_type, scope_predicate_json,
-		                             max_iterations, cooldown_seconds, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                             breaker_threshold, cooldown_seconds, min_autonomy_suitability, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			prompt_id = excluded.prompt_id,
 			trigger_type = excluded.trigger_type,
 			event_type = excluded.event_type,
 			scope_predicate_json = excluded.scope_predicate_json,
-			max_iterations = excluded.max_iterations,
+			breaker_threshold = excluded.breaker_threshold,
 			cooldown_seconds = excluded.cooldown_seconds,
+			min_autonomy_suitability = excluded.min_autonomy_suitability,
 			enabled = excluded.enabled,
 			updated_at = ?
 	`, t.ID, t.PromptID, t.TriggerType, t.EventType, t.ScopePredicateJSON,
-		t.MaxIterations, t.CooldownSeconds, t.Enabled, now, now, now)
+		t.BreakerThreshold, t.CooldownSeconds, t.MinAutonomySuitability, t.Enabled, now, now, now)
 	return err
 }
 
@@ -140,7 +155,7 @@ func SetTriggerEnabled(db *sql.DB, id string, enabled bool) error {
 func scanTrigger(rows *sql.Rows) (domain.PromptTrigger, error) {
 	var t domain.PromptTrigger
 	err := rows.Scan(&t.ID, &t.PromptID, &t.TriggerType, &t.EventType, &t.ScopePredicateJSON,
-		&t.MaxIterations, &t.CooldownSeconds, &t.Enabled, &t.CreatedAt, &t.UpdatedAt)
+		&t.BreakerThreshold, &t.CooldownSeconds, &t.MinAutonomySuitability, &t.Enabled, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }
 
@@ -148,6 +163,6 @@ func scanTrigger(rows *sql.Rows) (domain.PromptTrigger, error) {
 func scanTriggerRow(row *sql.Row) (domain.PromptTrigger, error) {
 	var t domain.PromptTrigger
 	err := row.Scan(&t.ID, &t.PromptID, &t.TriggerType, &t.EventType, &t.ScopePredicateJSON,
-		&t.MaxIterations, &t.CooldownSeconds, &t.Enabled, &t.CreatedAt, &t.UpdatedAt)
+		&t.BreakerThreshold, &t.CooldownSeconds, &t.MinAutonomySuitability, &t.Enabled, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }

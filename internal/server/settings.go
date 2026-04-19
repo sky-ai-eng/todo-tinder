@@ -2,16 +2,57 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"slices"
+	"sort"
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
-	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
 )
+
+// validateStatusRule enforces the shape invariants for a JiraStatusRule.
+// hasWriteTarget distinguishes the two roles:
+//   - true (InProgress/Done): TF transitions into this state, so Canonical
+//     must be set whenever Members is non-empty, and must itself be a member.
+//   - false (Pickup): TF only reads this state, it never writes tickets back
+//     to it — Canonical must be empty. A non-empty Canonical is rejected even
+//     if it happens to be in Members, because storing it would let stale
+//     config drift through and later mislead readers ("why does Pickup have
+//     a canonical?").
+func validateStatusRule(name string, r config.JiraStatusRule, hasWriteTarget bool) error {
+	if !hasWriteTarget {
+		if r.Canonical != "" {
+			return fmt.Errorf("jira %s: canonical must be empty — this rule has no write target", name)
+		}
+		return nil
+	}
+	if r.Canonical != "" && !slices.Contains(r.Members, r.Canonical) {
+		return fmt.Errorf("jira %s: canonical status %q is not in members", name, r.Canonical)
+	}
+	if len(r.Members) > 0 && r.Canonical == "" {
+		return fmt.Errorf("jira %s: canonical status is required when members are set", name)
+	}
+	return nil
+}
+
+// normalizeMembers returns a sorted, deduplicated copy of members so rules can
+// be compared using set semantics without mutating the original slice.
+func normalizeMembers(members []string) []string {
+	normalized := slices.Clone(members)
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
+}
+
+// ruleEqual compares two status rules by value. Used by change detection to
+// decide whether a Jira poller restart is needed. Nil-safe on the Members slice.
+func ruleEqual(a, b config.JiraStatusRule) bool {
+	return a.Canonical == b.Canonical &&
+		slices.Equal(normalizeMembers(a.Members), normalizeMembers(b.Members))
+}
 
 // settingsResponse combines config values with auth status so the frontend
 // can render everything on one page.
@@ -30,13 +71,14 @@ type githubSettings struct {
 }
 
 type jiraSettings struct {
-	Enabled          bool     `json:"enabled"`
-	BaseURL          string   `json:"base_url"`
-	HasToken         bool     `json:"has_token"`
-	PollInterval     string   `json:"poll_interval"`
-	Projects         []string `json:"projects"`
-	PickupStatuses   []string `json:"pickup_statuses"`
-	InProgressStatus string   `json:"in_progress_status"`
+	Enabled      bool                  `json:"enabled"`
+	BaseURL      string                `json:"base_url"`
+	HasToken     bool                  `json:"has_token"`
+	PollInterval string                `json:"poll_interval"`
+	Projects     []string              `json:"projects"`
+	Pickup       config.JiraStatusRule `json:"pickup"`
+	InProgress   config.JiraStatusRule `json:"in_progress"`
+	Done         config.JiraStatusRule `json:"done"`
 }
 
 type serverSettings struct {
@@ -66,13 +108,14 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 			PollInterval: cfg.GitHub.PollInterval.String(),
 		},
 		Jira: jiraSettings{
-			Enabled:          creds.JiraPAT != "",
-			BaseURL:          cfg.Jira.BaseURL,
-			HasToken:         creds.JiraPAT != "",
-			PollInterval:     cfg.Jira.PollInterval.String(),
-			Projects:         cfg.Jira.Projects,
-			PickupStatuses:   cfg.Jira.PickupStatuses,
-			InProgressStatus: cfg.Jira.InProgressStatus,
+			Enabled:      creds.JiraPAT != "",
+			BaseURL:      cfg.Jira.BaseURL,
+			HasToken:     creds.JiraPAT != "",
+			PollInterval: cfg.Jira.PollInterval.String(),
+			Projects:     cfg.Jira.Projects,
+			Pickup:       cfg.Jira.Pickup,
+			InProgress:   cfg.Jira.InProgress,
+			Done:         cfg.Jira.Done,
 		},
 		Server: serverSettings{
 			Port: cfg.Server.Port,
@@ -88,8 +131,14 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	if resp.Jira.Projects == nil {
 		resp.Jira.Projects = []string{}
 	}
-	if resp.Jira.PickupStatuses == nil {
-		resp.Jira.PickupStatuses = []string{}
+	if resp.Jira.Pickup.Members == nil {
+		resp.Jira.Pickup.Members = []string{}
+	}
+	if resp.Jira.InProgress.Members == nil {
+		resp.Jira.InProgress.Members = []string{}
+	}
+	if resp.Jira.Done.Members == nil {
+		resp.Jira.Done.Members = []string{}
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -105,14 +154,18 @@ type settingsUpdateRequest struct {
 	JiraPAT       string `json:"jira_pat"` // empty means "keep existing"
 
 	// Config
-	GitHubPollInterval   string   `json:"github_poll_interval"`
-	JiraPollInterval     string   `json:"jira_poll_interval"`
-	JiraProjects         []string `json:"jira_projects"`
-	JiraPickupStatuses   []string `json:"jira_pickup_statuses"`
-	JiraInProgressStatus string   `json:"jira_in_progress_status"`
-	AIModel              string   `json:"ai_model"`
-	AIAutoDelegate       *bool    `json:"ai_auto_delegate_enabled"` // pointer to distinguish absent from false
-	ServerPort           int      `json:"server_port"`
+	GitHubPollInterval string   `json:"github_poll_interval"`
+	JiraPollInterval   string   `json:"jira_poll_interval"`
+	JiraProjects       []string `json:"jira_projects"`
+	// JiraPickup/InProgress/Done are pointers so the request can distinguish
+	// "don't touch" (nil) from "clear" ({Members:[], Canonical:""}). Empty
+	// members + non-empty canonical is a validation error.
+	JiraPickup     *config.JiraStatusRule `json:"jira_pickup,omitempty"`
+	JiraInProgress *config.JiraStatusRule `json:"jira_in_progress,omitempty"`
+	JiraDone       *config.JiraStatusRule `json:"jira_done,omitempty"`
+	AIModel        string                 `json:"ai_model"`
+	AIAutoDelegate *bool                  `json:"ai_auto_delegate_enabled"` // pointer to distinguish absent from false
+	ServerPort     int                    `json:"server_port"`
 }
 
 func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
@@ -137,8 +190,9 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	prevJiraURL := creds.JiraURL
 	prevJiraPAT := creds.JiraPAT
 	prevJiraProjects := cfg.Jira.Projects
-	prevJiraPickupStatuses := cfg.Jira.PickupStatuses
-	prevJiraInProgressStatus := cfg.Jira.InProgressStatus
+	prevJiraPickup := cfg.Jira.Pickup
+	prevJiraInProgress := cfg.Jira.InProgress
+	prevJiraDone := cfg.Jira.Done
 	prevJiraPollInterval := cfg.Jira.PollInterval
 
 	// --- Handle GitHub ---
@@ -182,19 +236,16 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// Disabled — clear GitHub credentials, keychain entries, and tracked data
+		// Disconnect is a soft gesture — clear credentials and stop polling,
+		// but keep entities/tasks/runs/memory intact. Reconnecting the same
+		// account resumes where we left off. Full wipe is a separate
+		// destructive action (not implemented in v1).
 		creds.GitHubURL = ""
 		creds.GitHubPAT = ""
 		creds.GitHubUsername = ""
 		cfg.GitHub.BaseURL = ""
 		if err := auth.ClearGitHub(); err != nil {
 			log.Printf("[settings] failed to clear GitHub keychain entry: %v", err)
-		}
-		if err := db.ClearTrackedItems(s.db, "github"); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "failed to clear GitHub tracked items: " + err.Error(),
-				"field": "github",
-			})
-			return
 		}
 	}
 
@@ -213,7 +264,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Jira URL is required"})
 				return
 			}
-			_, err := auth.ValidateJira(url, req.JiraPAT)
+			jiraUser, err := auth.ValidateJira(url, req.JiraPAT)
 			if err != nil {
 				writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
 					"error": "Jira: " + err.Error(),
@@ -222,20 +273,16 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			creds.JiraPAT = req.JiraPAT
+			creds.JiraDisplayName = jiraUser.DisplayName
 		}
 	} else {
+		// Soft disconnect — keep entities/tasks/runs/memory intact.
 		creds.JiraURL = ""
 		creds.JiraPAT = ""
+		creds.JiraDisplayName = ""
 		cfg.Jira.BaseURL = ""
 		if err := auth.ClearJira(); err != nil {
 			log.Printf("[settings] failed to clear Jira keychain entry: %v", err)
-		}
-		if err := db.ClearTrackedItems(s.db, "jira"); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "failed to clear Jira tracked items: " + err.Error(),
-				"field": "jira",
-			})
-			return
 		}
 	}
 
@@ -253,11 +300,28 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	if req.JiraProjects != nil {
 		cfg.Jira.Projects = req.JiraProjects
 	}
-	if req.JiraPickupStatuses != nil {
-		cfg.Jira.PickupStatuses = req.JiraPickupStatuses
+	// Validate rule shapes before touching cfg — reject the whole request if
+	// any rule has canonical outside members. Pickup has no canonical to check.
+	if req.JiraInProgress != nil {
+		if err := validateStatusRule("in_progress", *req.JiraInProgress, true); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		cfg.Jira.InProgress = *req.JiraInProgress
 	}
-	if req.JiraInProgressStatus != "" {
-		cfg.Jira.InProgressStatus = req.JiraInProgressStatus
+	if req.JiraDone != nil {
+		if err := validateStatusRule("done", *req.JiraDone, true); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		cfg.Jira.Done = *req.JiraDone
+	}
+	if req.JiraPickup != nil {
+		if err := validateStatusRule("pickup", *req.JiraPickup, false); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		cfg.Jira.Pickup = *req.JiraPickup
 	}
 	if req.AIModel != "" {
 		cfg.AI.Model = req.AIModel
@@ -287,15 +351,22 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	jiraChanged := creds.JiraURL != prevJiraURL ||
 		creds.JiraPAT != prevJiraPAT ||
 		!slices.Equal(cfg.Jira.Projects, prevJiraProjects) ||
-		!slices.Equal(cfg.Jira.PickupStatuses, prevJiraPickupStatuses) ||
-		cfg.Jira.InProgressStatus != prevJiraInProgressStatus ||
+		!ruleEqual(cfg.Jira.Pickup, prevJiraPickup) ||
+		!ruleEqual(cfg.Jira.InProgress, prevJiraInProgress) ||
+		!ruleEqual(cfg.Jira.Done, prevJiraDone) ||
 		cfg.Jira.PollInterval != prevJiraPollInterval
 
+	// Mark Jira restarted synchronously before launching the async callback so
+	// jiraPollReady flips false before this request returns. Otherwise the
+	// frontend can race ahead and hit /api/jira/stock while the old state is
+	// still reported as ready.
 	if ghChanged && s.onGitHubChanged != nil {
 		// GitHub change triggers full restart (includes Jira poller restart)
+		s.MarkJiraRestarted()
 		go s.onGitHubChanged()
 	} else if jiraChanged && s.onJiraChanged != nil {
 		// Jira-only change — just restart Jira poller
+		s.MarkJiraRestarted()
 		go s.onJiraChanged()
 	}
 
@@ -340,6 +411,7 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 	// Persist credentials and config
 	creds.JiraURL = req.URL
 	creds.JiraPAT = req.PAT
+	creds.JiraDisplayName = jiraUser.DisplayName
 	cfg.Jira.BaseURL = req.URL
 
 	if err := auth.Store(creds); err != nil {
@@ -382,22 +454,42 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 
 	client := jira.NewClient(creds.JiraURL, creds.JiraPAT)
 
-	// Collect statuses across all projects, deduplicated
-	seen := map[string]bool{}
-	var statuses []jira.Status
-	for _, proj := range projects {
+	// Intersect statuses across all projects — only return statuses that
+	// exist in every project. A union would let users pick a status that
+	// fails on some projects (TransitionTo can't find the transition).
+	var counts map[string]int            // status name → number of projects it appears in
+	var canonical map[string]jira.Status // status name → first-seen Status object
+	for i, proj := range projects {
 		projectStatuses, err := client.ProjectStatuses(proj)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to fetch statuses for " + proj + ": " + err.Error()})
 			return
 		}
+		if i == 0 {
+			counts = make(map[string]int, len(projectStatuses))
+			canonical = make(map[string]jira.Status, len(projectStatuses))
+		}
+		seen := map[string]bool{}
 		for _, st := range projectStatuses {
 			if !seen[st.Name] {
 				seen[st.Name] = true
-				statuses = append(statuses, st)
+				counts[st.Name]++
+				if _, ok := canonical[st.Name]; !ok {
+					canonical[st.Name] = st
+				}
 			}
 		}
 	}
+
+	var statuses []jira.Status
+	for name, count := range counts {
+		if count == len(projects) {
+			statuses = append(statuses, canonical[name])
+		}
+	}
+	sort.Slice(statuses, func(i, j int) bool {
+		return statuses[i].Name < statuses[j].Name
+	})
 
 	writeJSON(w, http.StatusOK, statuses)
 }

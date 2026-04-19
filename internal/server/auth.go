@@ -90,8 +90,11 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[auth] warning: failed to save config: %v", err)
 	}
 
-	// Setup always includes GitHub — trigger full restart
+	// Setup always includes GitHub — trigger full restart. Mark Jira restarted
+	// synchronously so jiraPollReady flips false before the async callback
+	// starts, closing a race where carry-over reads stale snapshots.
 	if s.onGitHubChanged != nil {
+		s.MarkJiraRestarted()
 		go s.onGitHubChanged()
 	}
 
@@ -132,6 +135,21 @@ func (s *Server) handleAuthDelete(w http.ResponseWriter, r *http.Request) {
 	if err := auth.Clear(); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+}
+
+// DELETE /api/auth/jira — clears Jira credentials only, preserving GitHub.
+func (s *Server) handleAuthDeleteJira(w http.ResponseWriter, r *http.Request) {
+	if err := auth.ClearJira(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	// Stop the Jira poller and clear the in-memory client so it doesn't
+	// keep polling with stale credentials.
+	if s.onJiraChanged != nil {
+		s.MarkJiraRestarted()
+		go s.onJiraChanged()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
 }

@@ -2,25 +2,13 @@ package domain
 
 import (
 	"sort"
-	"time"
 )
-
-// TrackedItem represents a GitHub PR or Jira issue we're actively monitoring for state changes.
-type TrackedItem struct {
-	Source       string // "github" | "jira"
-	SourceID     string // "owner/repo#42" (GitHub) or "SKY-45" (Jira)
-	TaskID       string // FK to tasks table
-	NodeID       string // GitHub GraphQL node ID (empty for Jira)
-	Snapshot     string // JSON-serialized snapshot
-	TrackedSince time.Time
-	LastPolled   *time.Time
-	TerminalAt   *time.Time // non-nil = merged/closed/done
-}
 
 // PRSnapshot is the extracted state we store for a GitHub pull request.
 // Every field here can trigger events when it changes between poll cycles.
 type PRSnapshot struct {
 	// Identity
+	NodeID   string `json:"node_id"` // GitHub GraphQL node ID — stored in snapshot for entity-based refresh
 	Number   int    `json:"number"`
 	Title    string `json:"title"`
 	Author   string `json:"author"`    // login of the PR author
@@ -117,8 +105,7 @@ func IsFailingConclusion(conclusion string) bool {
 // CIStatusFromCheckRuns derives a lowercase aggregate CI status from a list of
 // check runs. Returns "failure" if any check failed, "pending" if any check is
 // still running, "success" if all completed non-failing, or "" if the list is
-// empty. Values match domain.Task.CIStatus so the tracker can use this
-// directly when building tasks from snapshots.
+// empty. Used by dashboard and display code for aggregate CI status badges.
 //
 // The success bucket is intentionally permissive — *any* completed check whose
 // conclusion isn't in IsFailingConclusion counts as success-like. That covers
@@ -183,7 +170,10 @@ func DedupCheckRunsByName(runs []CheckRun) []CheckRun {
 	return out
 }
 
-// JiraSnapshot is the extracted state we store for a Jira issue.
+// JiraSnapshot is the extracted state we diff against on each poll to emit
+// per-action events. Keep it small — large bulk text (issue descriptions,
+// PR bodies) lives on entities.description instead so diff reads don't
+// drag it through every refresh cycle.
 type JiraSnapshot struct {
 	Key          string   `json:"key"`
 	Summary      string   `json:"summary"`

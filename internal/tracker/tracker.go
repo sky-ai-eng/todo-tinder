@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
 	"github.com/sky-ai-eng/triage-factory/internal/eventbus"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
@@ -18,9 +18,23 @@ import (
 
 const (
 	jiraBatchSize = 100 // max issues per JQL key IN (...) query
+
+	// descriptionStoreMaxRunes caps what we persist on entities.description.
+	// Jira descriptions are unbounded (teams regularly paste multi-KB specs,
+	// stack traces, etc.); storing them raw would bloat the column for no
+	// current benefit — the scorer already truncates at 1500 runes for the
+	// LLM prompt, so 2000 gives a small buffer while keeping rows compact.
+	// If a future UI wants to render the full body it should re-fetch from
+	// Jira directly rather than relying on this mirror.
+	descriptionStoreMaxRunes = 2000
 )
 
-// Tracker manages the discover → refresh → diff → emit cycle for both GitHub and Jira.
+// Tracker manages the discover → refresh → diff → emit cycle for both
+// GitHub and Jira. In the entity-first model, the tracker:
+//   - creates/updates entities (not tasks — that's routing's job)
+//   - diffs entity snapshots to produce per-action events
+//   - publishes events to the bus (recording is routing's job)
+//   - does NOT create or update tasks
 type Tracker struct {
 	database *sql.DB
 	bus      *eventbus.Bus
@@ -35,102 +49,112 @@ func New(database *sql.DB, bus *eventbus.Bus) *Tracker {
 
 // RefreshGitHub runs the full tracking cycle for GitHub PRs.
 func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos []string) (int, error) {
-	// Phase 1: Discovery
+	startedAt := time.Now()
+	// Phase 1: Discovery — find new PRs and register as entities.
 	discovered, err := t.discoverGitHub(client, username, repos)
 	if err != nil {
 		log.Printf("[tracker] GitHub discovery error: %v", err)
 	}
 
-	// Register newly discovered items and upsert tasks
 	for _, d := range discovered {
-		task := prSnapshotToTask(d.Snapshot, username)
-		if err := db.UpsertTask(t.database, task); err != nil {
-			log.Printf("[tracker] error upserting task for PR #%d: %v", d.Snapshot.Number, err)
+		// Ensure the NodeID is stored in the snapshot so entity-based refresh
+		// can extract it without a separate column.
+		snap := d.Snapshot
+		snap.NodeID = d.NodeID
+
+		sid := ghSourceID(snap.Repo, snap.Number)
+		entity, created, err := db.FindOrCreateEntity(t.database,
+			"github", sid, "pr", snap.Title, snap.URL)
+		if err != nil {
+			log.Printf("[tracker] error creating entity for %s: %v", sid, err)
 			continue
 		}
-		sid := ghSourceID(d.Snapshot.Repo, d.Snapshot.Number)
-		taskID := t.resolveTaskID("github", sid)
 
-		item := domain.TrackedItem{
-			Source:   "github",
-			SourceID: sid,
-			TaskID:   taskID,
-			NodeID:   d.NodeID,
-		}
-		if err := db.UpsertTrackedItem(t.database, item); err != nil {
-			log.Printf("[tracker] error registering tracked item %s: %v", sid, err)
-		}
-
-		// Seed the discovery snapshot for newly-inserted items so Phase 2
-		// classification can see whether this PR is terminal (merged/closed).
-		// Without this, new items have '{}' as their snapshot default,
-		// Phase 2 parses that as zero-value (Merged=false, State=""), and
-		// every newly-discovered PR gets classified as "open" and refreshed
-		// with the expensive full fragment.
-		//
-		// The WHERE snapshot='{}' guard is critical: for already-tracked
-		// items, the stored snapshot is the previous cycle's full-refresh
-		// data (with real CheckRuns). Overwriting it with the lightweight
-		// discovery snapshot (nil CheckRuns) would cause Phase 3 to diff
-		// against nil instead of last-cycle state, silently skipping CI
-		// event detection.
-		snapJSON, _ := json.Marshal(d.Snapshot)
-		if _, err := t.database.Exec(
-			`UPDATE tracked_items SET snapshot = ? WHERE source = ? AND source_id = ? AND snapshot = '{}'`,
-			string(snapJSON), "github", sid,
-		); err != nil {
-			log.Printf("[tracker] warning: failed to seed discovery snapshot for %s: %v", sid, err)
-		}
-
-		// Reactivate if a previously-terminal item is now open (e.g., reopened PR)
-		if !d.Snapshot.Merged && d.Snapshot.State != "CLOSED" {
-			if reactivated, err := db.ReactivateTrackedItem(t.database, "github", sid); err != nil {
-				log.Printf("[tracker] error reactivating %s: %v", sid, err)
-			} else if reactivated {
-				log.Printf("[tracker] reactivated %s (reopened)", sid)
+		if created {
+			// Seed the discovery snapshot.
+			snapJSON, _ := json.Marshal(snap)
+			if err := db.UpdateEntitySnapshot(t.database, entity.ID, string(snapJSON)); err != nil {
+				log.Printf("[tracker] failed to seed snapshot for %s: %v", sid, err)
+			}
+			// If the PR is already terminal, mark the entity closed immediately
+			// so it doesn't sit in the active refresh set forever (Phase 3
+			// won't emit a merged/closed event because prev==curr).
+			if snap.Merged || snap.State == "CLOSED" || snap.State == "MERGED" {
+				if err := db.MarkEntityClosed(t.database, entity.ID); err != nil {
+					log.Printf("[tracker] failed to mark entity %s closed on discovery: %v", sid, err)
+				}
+			} else if username != "" && containsString(snap.ReviewRequests, username) {
+				// Backfill: user is a pending reviewer on a just-discovered
+				// open PR. DiffPRSnapshots' "no events on initial load" rule
+				// means pr:review_requested would never fire for requests that
+				// existed before we started watching — the user would only see
+				// them if someone re-requested. Synthesize the event + queued
+				// task directly so existing review-requests land in the queue
+				// on first connect. Mirrors the Jira carry-over queue path in
+				// handleJiraStockPost.
+				if err := t.backfillReviewRequested(entity.ID, snap, username); err != nil {
+					log.Printf("[tracker] failed to backfill review_requested for %s: %v", sid, err)
+				}
+			}
+		} else {
+			// Update title if changed.
+			if entity.Title != snap.Title {
+				_ = db.UpdateEntityTitle(t.database, entity.ID, snap.Title)
+			}
+			// Reactivate if a previously-closed entity reappears as open
+			// (e.g., reopened PR).
+			if !snap.Merged && snap.State != "CLOSED" && snap.State != "MERGED" && entity.State == "closed" {
+				if reactivated, err := db.ReactivateEntity(t.database, entity.ID); err != nil {
+					log.Printf("[tracker] error reactivating %s: %v", sid, err)
+				} else if reactivated {
+					log.Printf("[tracker] reactivated entity %s (reopened)", sid)
+				}
 			}
 		}
 	}
 
-	// Phase 2: Refresh tracked items.
-	//
-	// Load tracked items first (we also need them for Phase 3 diffing)
-	// and classify by stored-snapshot state so we can use the right
-	// GraphQL fragment for each tier:
-	//
-	//   Open PRs     → full fragment (includes check runs for CI diffing)
-	//   Terminal PRs → lightweight fragment (CI is irrelevant; much cheaper)
-	//
-	// Terminal PRs go through exactly one refresh after discovery (to get
-	// final state), then MarkTerminal excludes them from future polls.
-	tracked, err := db.ListActiveTrackedItems(t.database, "github")
+	// Phase 2: Refresh active entities.
+	entities, err := db.ListActiveEntities(t.database, "github")
 	if err != nil {
-		return 0, fmt.Errorf("list tracked items: %w", err)
+		return 0, fmt.Errorf("list active github entities: %w", err)
 	}
 
-	var openIDs, terminalIDs []string
-	for _, item := range tracked {
-		if item.NodeID == "" {
-			continue
-		}
+	// Classify by snapshot state (open vs terminal) for query cost tiering.
+	type entityWithSnap struct {
+		entity domain.Entity
+		snap   domain.PRSnapshot
+		nodeID string
+	}
+	var openItems, terminalItems []entityWithSnap
+
+	for _, e := range entities {
 		var snap domain.PRSnapshot
-		if item.Snapshot != "" && item.Snapshot != "{}" {
-			_ = json.Unmarshal([]byte(item.Snapshot), &snap)
+		if e.SnapshotJSON != "" && e.SnapshotJSON != "{}" {
+			_ = json.Unmarshal([]byte(e.SnapshotJSON), &snap)
 		}
+		if snap.NodeID == "" {
+			continue // can't refresh without a node ID
+		}
+		item := entityWithSnap{entity: e, snap: snap, nodeID: snap.NodeID}
 		if snap.Merged || snap.State == "CLOSED" || snap.State == "MERGED" {
-			terminalIDs = append(terminalIDs, item.NodeID)
+			terminalItems = append(terminalItems, item)
 		} else {
-			openIDs = append(openIDs, item.NodeID)
+			openItems = append(openItems, item)
 		}
 	}
 
-	if len(openIDs) == 0 && len(terminalIDs) == 0 {
+	if len(openItems) == 0 && len(terminalItems) == 0 {
 		return 0, nil
 	}
 
+	// Fetch fresh state — open PRs get the full fragment (includes CheckRuns).
 	refreshed := make(map[string]domain.PRSnapshot)
-	if len(openIDs) > 0 {
-		open, err := client.RefreshPRs(openIDs, true)
+	if len(openItems) > 0 {
+		nodeIDs := make([]string, len(openItems))
+		for i, item := range openItems {
+			nodeIDs[i] = item.nodeID
+		}
+		open, err := client.RefreshPRs(nodeIDs, true)
 		if err != nil {
 			return 0, fmt.Errorf("refresh open PRs: %w", err)
 		}
@@ -138,8 +162,12 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 			refreshed[k] = v
 		}
 	}
-	if len(terminalIDs) > 0 {
-		terminal, err := client.RefreshPRs(terminalIDs, false)
+	if len(terminalItems) > 0 {
+		nodeIDs := make([]string, len(terminalItems))
+		for i, item := range terminalItems {
+			nodeIDs[i] = item.nodeID
+		}
+		terminal, err := client.RefreshPRs(nodeIDs, false)
 		if err != nil {
 			return 0, fmt.Errorf("refresh terminal PRs: %w", err)
 		}
@@ -148,91 +176,43 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 		}
 	}
 
-	// Phase 3: Diff, upsert tasks, and emit events
-	// (reuses `tracked` from Phase 2 — same active set, no extra query)
+	// Phase 3: Diff + emit events.
+	allItems := append(openItems, terminalItems...)
 	eventsEmitted := 0
-	for _, item := range tracked {
-		if item.NodeID == "" {
-			continue
-		}
 
-		newSnap, ok := refreshed[item.NodeID]
+	for _, item := range allItems {
+		newSnap, ok := refreshed[item.nodeID]
 		if !ok {
-			log.Printf("[tracker] tracked item %s not returned by refresh, skipping", item.SourceID)
 			continue
 		}
+		// Preserve NodeID through the refresh (RefreshPRs returns map[nodeID]→snap
+		// but doesn't set snap.NodeID).
+		newSnap.NodeID = item.nodeID
 
-		// Update the task with fresh snapshot data
-		task := prSnapshotToTask(newSnap, username)
-		if err := db.UpsertTask(t.database, task); err != nil {
-			log.Printf("[tracker] error upserting task for PR #%d: %v", newSnap.Number, err)
-		}
+		// Diff against previous snapshot.
+		events := DiffPRSnapshots(item.snap, newSnap, item.entity.ID, username)
 
-		// Ensure task_id is linked
-		if item.TaskID == "" {
-			item.TaskID = t.resolveTaskID("github", item.SourceID)
-		}
-
-		// Parse previous snapshot and diff
-		var prevSnap domain.PRSnapshot
-		if item.Snapshot != "" && item.Snapshot != "{}" {
-			if err := json.Unmarshal([]byte(item.Snapshot), &prevSnap); err != nil {
-				log.Printf("[tracker] corrupt snapshot for %s, skipping diff: %v", item.SourceID, err)
-				// Overwrite with fresh state so next cycle can diff cleanly
-				snapJSON, _ := json.Marshal(newSnap)
-				if err := db.UpdateTrackedSnapshot(t.database, "github", item.SourceID, string(snapJSON)); err != nil {
-					log.Printf("[tracker] failed to rewrite corrupt snapshot for %s: %v", item.SourceID, err)
-				}
-				continue
-			}
-		}
-
-		events := DiffPRSnapshots(prevSnap, newSnap, item.SourceID, username)
-
-		// Persist new snapshot
+		// Update entity snapshot + title.
 		snapJSON, _ := json.Marshal(newSnap)
-		if err := db.UpdateTrackedSnapshot(t.database, "github", item.SourceID, string(snapJSON)); err != nil {
-			log.Printf("[tracker] error updating snapshot for %s: %v", item.SourceID, err)
+		if err := db.UpdateEntitySnapshot(t.database, item.entity.ID, string(snapJSON)); err != nil {
+			log.Printf("[tracker] error updating snapshot for %s: %v", item.entity.SourceID, err)
+		}
+		if item.entity.Title != newSnap.Title {
+			_ = db.UpdateEntityTitle(t.database, item.entity.ID, newSnap.Title)
 		}
 
-		// Record and publish events
+		// Publish events to bus. Recording + routing happens downstream.
 		for _, evt := range events {
-			evt.TaskID = item.TaskID
-			if id, err := db.RecordEvent(t.database, evt); err != nil {
-				log.Printf("[tracker] error recording event: %v", err)
-			} else {
-				evt.ID = id
-			}
-			if item.TaskID != "" {
-				if err := db.SetTaskEventType(t.database, item.TaskID, evt.EventType); err != nil {
-					log.Printf("[tracker] failed to set event type for task %s: %v", item.TaskID, err)
-				}
-			}
 			t.bus.Publish(evt)
 			eventsEmitted++
 		}
-
-		// Sync task status when PR state changes
-		if item.TaskID != "" && prevSnap.State != newSnap.State {
-			newTaskStatus := prStateToTaskStatus(newSnap)
-			if _, err := t.database.Exec(`UPDATE tasks SET status = ? WHERE id = ? AND status != ?`, newTaskStatus, item.TaskID, newTaskStatus); err != nil {
-				log.Printf("[tracker] failed to sync task status for %s: %v", item.TaskID, err)
-			}
-		}
-
-		if newSnap.Merged || newSnap.State == "CLOSED" {
-			if err := db.MarkTerminal(t.database, "github", item.SourceID); err != nil {
-				log.Printf("[tracker] failed to mark github/%s terminal: %v", item.SourceID, err)
-			}
-		}
 	}
 
-	log.Printf("[tracker] GitHub refresh: %d discovered, %d tracked, %d refreshed, %d events",
-		len(discovered), len(tracked), len(refreshed), eventsEmitted)
+	log.Printf("[tracker] GitHub refresh: %d discovered, %d entities, %d refreshed, %d events",
+		len(discovered), len(entities), len(refreshed), eventsEmitted)
 
-	// Emit poll-complete sentinel
-	if len(tracked) > 0 {
-		t.EmitPollComplete("github", len(tracked), eventsEmitted)
+	if len(entities) > 0 {
+		t.EmitPollComplete("github", startedAt, len(entities), eventsEmitted)
 	}
 
 	return eventsEmitted, nil
@@ -284,56 +264,145 @@ func (t *Tracker) discoverGitHub(client *ghclient.Client, username string, repos
 	return all, nil
 }
 
+// backfillReviewRequested synthesizes a pr:review_requested event + queued
+// task for a PR being discovered for the first time with the session user
+// already in its requested-reviewer list. Uses db.RecordEvent (not
+// bus.Publish) so downstream routing doesn't double-create a task — we own
+// task creation here via FindOrCreateTask, identical to the Jira carry-over
+// queue path. The task's primary_event_id FK is satisfied by the synthesized
+// event's ID.
+func (t *Tracker) backfillReviewRequested(entityID string, snap domain.PRSnapshot, username string) error {
+	authorIsSelf := snap.Author == username
+	meta := events.GitHubPRReviewRequestedMetadata{
+		Author:       snap.Author,
+		AuthorIsSelf: authorIsSelf,
+		Repo:         snap.Repo,
+		PRNumber:     snap.Number,
+		IsDraft:      snap.IsDraft,
+		HeadSHA:      snap.HeadSHA,
+		Labels:       snap.Labels,
+		Title:        snap.Title,
+	}
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	eid := entityID
+	eventID, err := db.RecordEvent(t.database, domain.Event{
+		EntityID:     &eid,
+		EventType:    domain.EventGitHubPRReviewRequested,
+		MetadataJSON: string(metaJSON),
+	})
+	if err != nil {
+		return fmt.Errorf("record event: %w", err)
+	}
+	// Stamp the backfilled task with the PR's createdAt rather than now.
+	// GitHub doesn't expose per-review-request timestamps, so PR.CreatedAt
+	// is the closest bound we have — a review request can't predate the PR.
+	// Better than "just now" on the card for a PR that's been pending your
+	// review for weeks. Falls back to time.Now() if the GraphQL timestamp
+	// is missing or unparseable (shouldn't happen in practice).
+	createdAt := time.Now()
+	if snap.CreatedAt != "" {
+		if parsed, perr := time.Parse(time.RFC3339, snap.CreatedAt); perr == nil {
+			createdAt = parsed
+		}
+	}
+	if _, _, err := db.FindOrCreateTaskAt(t.database, entityID, domain.EventGitHubPRReviewRequested, "", eventID, 0.5, createdAt); err != nil {
+		return fmt.Errorf("create task: %w", err)
+	}
+	return nil
+}
+
+// containsString reports whether s is present in items. Small loop rather
+// than slices.Contains to keep the tracker's import set minimal.
+func containsString(items []string, s string) bool {
+	for _, item := range items {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
 // --- Jira ---
 
-// RefreshJira runs the full tracking cycle for Jira issues.
-func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, projects, pickupStatuses []string) (int, error) {
+// RefreshJira runs the full tracking cycle for Jira issues. doneStatuses is
+// the configured Done.Members set — used to decide whether a newly-discovered
+// or reopened issue should be marked closed, and passed through to the diff
+// pass for jira:issue:completed emission.
+func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, projects, pickupStatuses, doneStatuses []string, username string) (int, error) {
+	startedAt := time.Now()
+	terminal := func(s string) bool {
+		for _, d := range doneStatuses {
+			if d == s {
+				return true
+			}
+		}
+		return false
+	}
 	// Phase 1: Discovery
-	discovered, err := t.discoverJira(client, baseURL, projects, pickupStatuses)
+	discovered, err := t.discoverJira(client, baseURL, projects, pickupStatuses, doneStatuses)
 	if err != nil {
 		log.Printf("[tracker] Jira discovery error: %v", err)
 	}
 
-	// Register newly discovered items and upsert tasks
-	for _, snap := range discovered {
-		task := jiraSnapshotToTask(snap, baseURL)
-		if err := db.UpsertTask(t.database, task); err != nil {
-			log.Printf("[tracker] error upserting task for %s: %v", snap.Key, err)
+	for _, state := range discovered {
+		snap := state.Snap
+		entity, created, err := db.FindOrCreateEntity(t.database,
+			"jira", snap.Key, "issue", snap.Summary, snap.URL)
+		if err != nil {
+			log.Printf("[tracker] error creating entity for %s: %v", snap.Key, err)
 			continue
 		}
-		taskID := t.resolveTaskID("jira", snap.Key)
-
-		item := domain.TrackedItem{
-			Source:   "jira",
-			SourceID: snap.Key,
-			TaskID:   taskID,
-		}
-		if err := db.UpsertTrackedItem(t.database, item); err != nil {
-			log.Printf("[tracker] error registering tracked item %s: %v", snap.Key, err)
-		}
-
-		// Reactivate if a previously-terminal item is now active (e.g., reopened issue)
-		if !isJiraTerminal(snap.Status) {
-			if reactivated, err := db.ReactivateTrackedItem(t.database, "jira", snap.Key); err != nil {
-				log.Printf("[tracker] error reactivating %s: %v", snap.Key, err)
-			} else if reactivated {
-				log.Printf("[tracker] reactivated %s (reopened)", snap.Key)
+		if created {
+			snapJSON, _ := json.Marshal(snap)
+			if err := db.UpdateEntitySnapshot(t.database, entity.ID, string(snapJSON)); err != nil {
+				log.Printf("[tracker] failed to seed snapshot for %s: %v", snap.Key, err)
+			}
+			if state.Description != "" {
+				if err := db.UpdateEntityDescription(t.database, entity.ID, state.Description); err != nil {
+					log.Printf("[tracker] failed to seed description for %s: %v", snap.Key, err)
+				}
+			}
+			if terminal(snap.Status) {
+				if err := db.MarkEntityClosed(t.database, entity.ID); err != nil {
+					log.Printf("[tracker] failed to mark entity %s closed on discovery: %v", snap.Key, err)
+				}
+			}
+		} else {
+			if entity.Title != snap.Summary {
+				_ = db.UpdateEntityTitle(t.database, entity.ID, snap.Summary)
+			}
+			if entity.Description != state.Description {
+				_ = db.UpdateEntityDescription(t.database, entity.ID, state.Description)
+			}
+			// Reactivate if a previously-closed issue reappears as open.
+			if !terminal(snap.Status) && entity.State == "closed" {
+				if reactivated, err := db.ReactivateEntity(t.database, entity.ID); err != nil {
+					log.Printf("[tracker] error reactivating %s: %v", snap.Key, err)
+				} else if reactivated {
+					log.Printf("[tracker] reactivated entity %s (reopened)", snap.Key)
+				}
 			}
 		}
 	}
 
 	// Phase 2: Refresh
-	tracked, err := db.ListActiveTrackedItems(t.database, "jira")
+	entities, err := db.ListActiveEntities(t.database, "jira")
 	if err != nil {
-		return 0, fmt.Errorf("list tracked jira items: %w", err)
+		return 0, fmt.Errorf("list active jira entities: %w", err)
 	}
-	if len(tracked) == 0 {
+	if len(entities) == 0 {
+		// No entities to refresh, but still emit poll-complete so carry-over
+		// readiness flips true on fresh-setup / empty-project cases.
+		t.EmitPollComplete("jira", startedAt, 0, 0)
 		return 0, nil
 	}
 
-	keys := make([]string, len(tracked))
-	for i, item := range tracked {
-		keys[i] = item.SourceID
+	keys := make([]string, len(entities))
+	for i, e := range entities {
+		keys[i] = e.SourceID
 	}
 
 	refreshed, err := t.batchFetchJira(client, baseURL, keys)
@@ -341,87 +410,66 @@ func (t *Tracker) RefreshJira(client *jiraclient.Client, baseURL string, project
 		return 0, fmt.Errorf("batch fetch jira: %w", err)
 	}
 
-	// Phase 3: Diff, upsert tasks, and emit events
+	// Phase 3: Diff + emit events.
 	eventsEmitted := 0
-	for _, item := range tracked {
-		newSnap, ok := refreshed[item.SourceID]
+	for _, e := range entities {
+		newState, ok := refreshed[e.SourceID]
 		if !ok {
-			log.Printf("[tracker] tracked Jira item %s not returned by refresh, skipping", item.SourceID)
 			continue
 		}
-
-		// Update task with fresh data
-		task := jiraSnapshotToTask(newSnap, baseURL)
-		if err := db.UpsertTask(t.database, task); err != nil {
-			log.Printf("[tracker] error upserting task for %s: %v", newSnap.Key, err)
-		}
-
-		if item.TaskID == "" {
-			item.TaskID = t.resolveTaskID("jira", item.SourceID)
-		}
+		newSnap := newState.Snap
 
 		var prevSnap domain.JiraSnapshot
-		if item.Snapshot != "" && item.Snapshot != "{}" {
-			if err := json.Unmarshal([]byte(item.Snapshot), &prevSnap); err != nil {
-				log.Printf("[tracker] corrupt snapshot for %s, skipping diff: %v", item.SourceID, err)
+		if e.SnapshotJSON != "" && e.SnapshotJSON != "{}" {
+			if err := json.Unmarshal([]byte(e.SnapshotJSON), &prevSnap); err != nil {
+				log.Printf("[tracker] corrupt jira snapshot for %s, reseeding: %v", e.SourceID, err)
 				snapJSON, _ := json.Marshal(newSnap)
-				if err := db.UpdateTrackedSnapshot(t.database, "jira", item.SourceID, string(snapJSON)); err != nil {
-					log.Printf("[tracker] failed to rewrite corrupt snapshot for %s: %v", item.SourceID, err)
-				}
+				_ = db.UpdateEntitySnapshot(t.database, e.ID, string(snapJSON))
 				continue
 			}
 		}
 
-		events := DiffJiraSnapshots(prevSnap, newSnap, item.SourceID)
-
-		// Sync task status when the source status changes
-		if item.TaskID != "" && (prevSnap.Status != newSnap.Status || prevSnap.Assignee != newSnap.Assignee) {
-			newTaskStatus := jiraStatusToTaskStatus(newSnap)
-			if _, err := t.database.Exec(`UPDATE tasks SET status = ? WHERE id = ? AND status != ?`, newTaskStatus, item.TaskID, newTaskStatus); err != nil {
-				log.Printf("[tracker] failed to sync task status for %s: %v", item.TaskID, err)
-			}
-		}
+		events := DiffJiraSnapshots(prevSnap, newSnap, e.ID, username, doneStatuses)
 
 		snapJSON, _ := json.Marshal(newSnap)
-		if err := db.UpdateTrackedSnapshot(t.database, "jira", item.SourceID, string(snapJSON)); err != nil {
-			log.Printf("[tracker] error updating snapshot for %s: %v", item.SourceID, err)
+		if err := db.UpdateEntitySnapshot(t.database, e.ID, string(snapJSON)); err != nil {
+			log.Printf("[tracker] error updating jira snapshot for %s: %v", e.SourceID, err)
 		}
+		if e.Title != newSnap.Summary {
+			_ = db.UpdateEntityTitle(t.database, e.ID, newSnap.Summary)
+		}
+		// Description intentionally not updated here — batchFetchJira
+		// excludes the description field to save bandwidth, so newState's
+		// description would be the empty-string parse result of an absent
+		// field and writing it back would wipe the stored value. Description
+		// is seeded and refreshed by phase 1 (discoverJira), which is the
+		// only place that actually carries the field in the response.
 
 		for _, evt := range events {
-			evt.TaskID = item.TaskID
-			if id, err := db.RecordEvent(t.database, evt); err != nil {
-				log.Printf("[tracker] error recording event: %v", err)
-			} else {
-				evt.ID = id
-			}
-			if item.TaskID != "" {
-				if err := db.SetTaskEventType(t.database, item.TaskID, evt.EventType); err != nil {
-					log.Printf("[tracker] failed to set event type for task %s: %v", item.TaskID, err)
-				}
-			}
 			t.bus.Publish(evt)
 			eventsEmitted++
 		}
-
-		if isJiraTerminal(newSnap.Status) {
-			if err := db.MarkTerminal(t.database, "jira", item.SourceID); err != nil {
-				log.Printf("[tracker] failed to mark jira/%s terminal: %v", item.SourceID, err)
-			}
-		}
 	}
 
-	log.Printf("[tracker] Jira refresh: %d discovered, %d tracked, %d refreshed, %d events",
-		len(discovered), len(tracked), len(refreshed), eventsEmitted)
+	log.Printf("[tracker] Jira refresh: %d discovered, %d entities, %d refreshed, %d events",
+		len(discovered), len(entities), len(refreshed), eventsEmitted)
 
-	if len(tracked) > 0 {
-		t.EmitPollComplete("jira", len(tracked), eventsEmitted)
-	}
+	// Always fire the sentinel — it means "a poll cycle completed," not "a
+	// poll produced work." Carry-over readiness depends on this firing even
+	// on an empty first poll (e.g. projects configured but nothing assigned
+	// yet), otherwise the setup step shimmers forever.
+	t.EmitPollComplete("jira", startedAt, len(entities), eventsEmitted)
 
 	return eventsEmitted, nil
 }
 
-// discoverJira runs JQL queries to find new issues.
-func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projects, pickupStatuses []string) ([]domain.JiraSnapshot, error) {
+// discoverJira runs JQL queries to find new issues. doneStatuses is the
+// configured Done.Members set — used to exclude terminal tickets from the
+// assigned-user discovery query. Hardcoding the exclusion list would mean
+// any user-defined "done" variant (e.g. "Verified") stayed eligible for
+// rediscovery on every poll, churning the DB and contradicting the
+// per-deployment-workflow contract.
+func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projects, pickupStatuses, doneStatuses []string) ([]jiraIssueState, error) {
 	if len(projects) == 0 {
 		return nil, nil
 	}
@@ -438,13 +486,25 @@ func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projec
 			`project IN (%s) AND status IN (%s) AND assignee IS EMPTY`, projectList, strings.Join(quoted, ", ")))
 	}
 
-	queries = append(queries, fmt.Sprintf(
-		`project IN (%s) AND assignee = currentUser() AND status NOT IN (Done, Closed, Resolved)`, projectList))
+	// Assigned-to-me query, with terminal statuses excluded via the user's
+	// Done.Members set. If empty (defensive — Ready() gates the poller on
+	// non-empty Done.Members, so we shouldn't hit this in practice), the
+	// NOT IN clause is dropped entirely rather than falling back to a
+	// hardcoded list that would contradict the user's workflow.
+	assignedJQL := fmt.Sprintf(`project IN (%s) AND assignee = currentUser()`, projectList)
+	if len(doneStatuses) > 0 {
+		quoted := make([]string, len(doneStatuses))
+		for i, s := range doneStatuses {
+			quoted[i] = fmt.Sprintf("%q", s)
+		}
+		assignedJQL += fmt.Sprintf(` AND status NOT IN (%s)`, strings.Join(quoted, ", "))
+	}
+	queries = append(queries, assignedJQL)
 
 	seen := map[string]bool{}
-	var all []domain.JiraSnapshot
+	var all []jiraIssueState
 
-	fields := []string{"summary", "status", "assignee", "priority", "labels", "issuetype", "parent", "comment"}
+	fields := []string{"summary", "description", "status", "assignee", "priority", "labels", "issuetype", "parent", "comment"}
 
 	for _, jql := range queries {
 		issues, err := client.SearchIssues(jql, fields, 100)
@@ -455,7 +515,7 @@ func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projec
 		for _, issue := range issues {
 			if !seen[issue.Key] {
 				seen[issue.Key] = true
-				all = append(all, issueToSnapshot(issue, baseURL))
+				all = append(all, issueToState(issue, baseURL))
 			}
 		}
 	}
@@ -463,9 +523,16 @@ func (t *Tracker) discoverJira(client *jiraclient.Client, baseURL string, projec
 	return all, nil
 }
 
-// batchFetchJira fetches current state for tracked Jira issues.
-func (t *Tracker) batchFetchJira(client *jiraclient.Client, baseURL string, keys []string) (map[string]domain.JiraSnapshot, error) {
-	results := make(map[string]domain.JiraSnapshot, len(keys))
+// batchFetchJira fetches current state for tracked Jira issues. Description
+// is deliberately excluded from the field list — it's seeded on discovery
+// and only relevant to the scorer, which reads from the stored column rather
+// than the API response. Skipping the multi-KB body on every poll saves
+// bandwidth and latency; the tradeoff is that descriptions for entities
+// that stop matching discovery's JQL (e.g. reassigned to someone else) stay
+// pinned at their last-captured value. Acceptable — description relevance
+// drops fast once a ticket is off the user's plate.
+func (t *Tracker) batchFetchJira(client *jiraclient.Client, baseURL string, keys []string) (map[string]jiraIssueState, error) {
+	results := make(map[string]jiraIssueState, len(keys))
 	fields := []string{"summary", "status", "assignee", "priority", "labels", "issuetype", "parent", "comment"}
 
 	for i := 0; i < len(keys); i += jiraBatchSize {
@@ -482,93 +549,27 @@ func (t *Tracker) batchFetchJira(client *jiraclient.Client, baseURL string, keys
 		}
 
 		for _, issue := range issues {
-			results[issue.Key] = issueToSnapshot(issue, baseURL)
+			results[issue.Key] = issueToState(issue, baseURL)
 		}
 	}
 
 	return results, nil
 }
 
-// --- Snapshot → Task converters ---
-
-// prSnapshotToTask builds a Task from a PR snapshot.
-func prSnapshotToTask(snap domain.PRSnapshot, username string) domain.Task {
-	status := "queued"
-	if snap.Merged || snap.State == "CLOSED" {
-		status = "done"
-	}
-
-	// Determine relevance reason
-	reason := "authored"
-	if snap.Author != username {
-		reason = "mentioned"
-		for _, rr := range snap.ReviewRequests {
-			if rr == username {
-				reason = "review_requested"
-				break
-			}
-		}
-		if reason == "mentioned" {
-			for _, r := range snap.Reviews {
-				if r.Author == username {
-					reason = "reviewed"
-					break
-				}
-			}
-		}
-	}
-
-	return domain.Task{
-		ID:              uuid.New().String(),
-		Source:          "github",
-		SourceID:        ghSourceID(snap.Repo, snap.Number),
-		SourceURL:       snap.URL,
-		Title:           snap.Title,
-		Repo:            snap.Repo,
-		Author:          snap.Author,
-		Labels:          snap.Labels,
-		DiffAdditions:   snap.Additions,
-		DiffDeletions:   snap.Deletions,
-		FilesChanged:    snap.ChangedFiles,
-		CIStatus:        domain.CIStatusFromCheckRuns(snap.CheckRuns),
-		RelevanceReason: reason,
-		CreatedAt:       parseTimeOrNow(snap.CreatedAt),
-		FetchedAt:       time.Now(),
-		Status:          status,
-	}
+// jiraIssueState bundles the diff-scope snapshot with the bulk description
+// body. Description is carried alongside rather than inside the snapshot so
+// the persisted snapshot_json stays small — diff reads don't drag multi-KB
+// issue bodies through every poll.
+type jiraIssueState struct {
+	Snap        domain.JiraSnapshot
+	Description string
 }
 
-// jiraSnapshotToTask builds a Task from a Jira snapshot.
-func jiraSnapshotToTask(snap domain.JiraSnapshot, baseURL string) domain.Task {
-	status := "queued"
-	reason := "available"
-	if snap.Assignee != "" {
-		status = "claimed"
-		reason = "assigned"
-	}
-	if isJiraTerminal(snap.Status) {
-		status = "done"
-	}
-
-	return domain.Task{
-		ID:              uuid.New().String(),
-		Source:          "jira",
-		SourceID:        snap.Key,
-		SourceURL:       snap.URL,
-		Title:           snap.Summary,
-		Author:          snap.Assignee,
-		Labels:          snap.Labels,
-		Severity:        snap.Priority,
-		SourceStatus:    snap.Status,
-		RelevanceReason: reason,
-		CreatedAt:       time.Now(),
-		FetchedAt:       time.Now(),
-		Status:          status,
-	}
-}
-
-// issueToSnapshot converts a Jira API Issue to our snapshot type.
-func issueToSnapshot(issue jiraclient.Issue, baseURL string) domain.JiraSnapshot {
+// issueToState converts a Jira API Issue into the diff-scope snapshot plus
+// a flattened description. The description is stored on entities.description
+// separately; the snapshot itself only carries fields that DiffJiraSnapshots
+// compares.
+func issueToState(issue jiraclient.Issue, baseURL string) jiraIssueState {
 	snap := domain.JiraSnapshot{
 		Key:     issue.Key,
 		Summary: issue.Fields.Summary,
@@ -593,58 +594,43 @@ func issueToSnapshot(issue jiraclient.Issue, baseURL string) domain.JiraSnapshot
 		snap.CommentCount = issue.Fields.Comment.Total
 	}
 	snap.Labels = issue.Fields.Labels
-	return snap
+	return jiraIssueState{
+		Snap:        snap,
+		Description: truncateDescription(jiraclient.ExtractDescriptionText(issue.Fields.Description), descriptionStoreMaxRunes),
+	}
+}
+
+// truncateDescription caps the stored description at maxRunes codepoints
+// (rune-based so we never persist a string that ends mid-UTF-8-codepoint).
+// Strict cap — when truncation happens the returned string contains exactly
+// maxRunes runes, with the last rune replaced by an ellipsis so downstream
+// readers can distinguish a cut string from a genuinely short one.
+func truncateDescription(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 // --- Helpers ---
 
-// parseTimeOrNow parses an RFC3339 timestamp, falling back to time.Now().
-func parseTimeOrNow(s string) time.Time {
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t
-	}
-	return time.Now()
-}
-
-// prStateToTaskStatus maps a PR's GraphQL state to a task status.
-func prStateToTaskStatus(snap domain.PRSnapshot) string {
-	if snap.Merged || snap.State == "CLOSED" {
-		return "done"
-	}
-	return "queued"
-}
-
-// jiraStatusToTaskStatus maps a Jira issue's current state to a task status.
-func jiraStatusToTaskStatus(snap domain.JiraSnapshot) string {
-	if isJiraTerminal(snap.Status) {
-		return "done"
-	}
-	if snap.Assignee != "" {
-		return "claimed"
-	}
-	return "queued"
-}
-
-// resolveTaskID looks up the task ID for a source+sourceID pair.
-func (t *Tracker) resolveTaskID(source, sourceID string) string {
-	var id string
-	// sql.ErrNoRows is expected for un-tracked items and passes silently.
-	// Any other error (connection drop, schema drift) is a real problem
-	// we want visible in the logs — otherwise it looks identical to
-	// "genuinely untracked" at the call site.
-	err := t.database.QueryRow(`SELECT id FROM tasks WHERE source = ? AND source_id = ?`, source, sourceID).Scan(&id)
-	if err != nil && err != sql.ErrNoRows {
-		log.Printf("[tracker] resolveTaskID %s/%s: %v", source, sourceID, err)
-	}
-	return id
-}
-
-// EmitPollComplete publishes the system poll-completed sentinel.
-func (t *Tracker) EmitPollComplete(source string, taskCount, eventCount int) {
+// EmitPollComplete publishes the system poll-completed sentinel. startedAt
+// is the wall-clock time the poll cycle started, carried in metadata so
+// subscribers can ignore sentinels emitted by pre-restart poll generations
+// (an old RefreshXxx goroutine that finishes after a config-triggered restart).
+func (t *Tracker) EmitPollComplete(source string, startedAt time.Time, entityCount, eventCount int) {
 	t.bus.Publish(domain.Event{
 		EventType: domain.EventSystemPollCompleted,
-		SourceID:  source,
-		Metadata:  mustJSON(map[string]any{"tasks": taskCount, "events": eventCount}),
+		MetadataJSON: mustJSON(events.SystemPollCompletedMetadata{
+			Source:    source,
+			StartedAt: startedAt.UnixNano(),
+			Entities:  entityCount,
+			Events:    eventCount,
+		}),
 		CreatedAt: time.Now(),
 	})
 }

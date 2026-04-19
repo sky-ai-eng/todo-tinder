@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
@@ -18,6 +20,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
 	"github.com/sky-ai-eng/triage-factory/internal/poller"
 	"github.com/sky-ai-eng/triage-factory/internal/repoprofile"
+	"github.com/sky-ai-eng/triage-factory/internal/routing"
 	"github.com/sky-ai-eng/triage-factory/internal/server"
 	"github.com/sky-ai-eng/triage-factory/internal/skills"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
@@ -89,9 +92,14 @@ func main() {
 	// Clean up any orphaned worktrees from crashed runs
 	worktree.Cleanup()
 
-	// Seed event type catalog and default prompts
+	// Seed event type catalog, task_rules defaults, and default prompts.
+	// Order matters: task_rules FK to events_catalog(id), so catalog must be
+	// seeded first.
 	if err := db.SeedEventTypes(database); err != nil {
 		log.Fatalf("failed to seed event types: %v", err)
+	}
+	if err := db.SeedTaskRules(database); err != nil {
+		log.Fatalf("failed to seed task rules: %v", err)
 	}
 	seedDefaultPrompts(database)
 
@@ -125,6 +133,10 @@ func main() {
 	// Profile gate — scorer waits for this before running
 	profileGate := repoprofile.NewProfileGate(database)
 
+	// Declare eventRouter early so the scorer callback can reference it.
+	// Actual initialization happens below after the spawner is created.
+	var eventRouter *routing.Router
+
 	scorer := ai.NewRunner(database, ai.RunnerCallbacks{
 		OnScoringStarted: func(taskIDs []string) {
 			wsHub.Broadcast(websocket.Event{
@@ -137,10 +149,18 @@ func main() {
 				Type: "scoring_completed",
 				Data: map[string]any{"task_ids": taskIDs},
 			})
+			// Post-scoring re-derive: check deferred triggers whose
+			// min_autonomy_suitability threshold the scored tasks now meet.
+			// Runs async so it doesn't block the scorer from clearing its
+			// running flag and handling subsequent Trigger() calls.
+			if eventRouter != nil {
+				go eventRouter.ReDeriveAfterScoring(taskIDs)
+			}
 		},
 	})
 	scorer.SetProfileGate(profileGate.Ready)
 	scorer.Start()
+	srv.SetScorerTrigger(scorer.Trigger)
 	log.Println("[ai] scorer started (model: haiku)")
 
 	// Subscriber: scorer trigger — only reacts to poll-complete sentinels
@@ -159,13 +179,14 @@ func main() {
 	spawner := delegate.NewSpawner(database, nil, wsHub, "")
 	srv.SetSpawner(spawner)
 
-	// Subscriber: auto-delegation — fires matching prompt_triggers on non-system events
+	// Event router — records events, creates/bumps tasks, auto-delegates on
+	// matching triggers, runs inline close checks. Also handles post-scoring
+	// re-derive via the scorer callback wired above.
+	eventRouter = routing.NewRouter(database, spawner, scorer, wsHub)
 	bus.Subscribe(eventbus.Subscriber{
-		Name:   "auto-delegate",
+		Name:   "router",
 		Filter: []string{"github:", "jira:"},
-		Handle: func(evt domain.Event) {
-			delegate.MaybeAutoDelegate(database, spawner, evt)
-		},
+		Handle: eventRouter.HandleEvent,
 	})
 
 	// GitHub changed: invalidate profiles → stop all → re-profile → restart all
@@ -202,9 +223,9 @@ func main() {
 
 		// Also refresh Jira client in case it's configured
 		if creds.JiraPAT != "" && creds.JiraURL != "" {
-			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgressStatus)
+			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress)
 		} else {
-			srv.SetJiraClient(nil, "")
+			srv.SetJiraClient(nil, config.JiraStatusRule{})
 		}
 	})
 
@@ -218,10 +239,44 @@ func main() {
 		pollerMgr.RestartJira()
 
 		if creds.JiraPAT != "" && creds.JiraURL != "" {
-			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgressStatus)
+			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress)
 		} else {
-			srv.SetJiraClient(nil, "")
+			srv.SetJiraClient(nil, config.JiraStatusRule{})
 		}
+	})
+
+	// Subscriber: track Jira poll completions so /api/jira/stock knows when
+	// snapshots are ready to read.
+	bus.Subscribe(eventbus.Subscriber{
+		Name:   "jira-poll-tracker",
+		Filter: []string{"system:poll:"},
+		Handle: func(evt domain.Event) {
+			if evt.EventType != domain.EventSystemPollCompleted {
+				return
+			}
+			var meta struct {
+				Source    string `json:"source"`
+				StartedAt int64  `json:"started_at"`
+			}
+			if err := json.Unmarshal([]byte(evt.MetadataJSON), &meta); err != nil {
+				log.Printf("[jira-poll-tracker] warning: failed to parse poll completion metadata: %v; raw metadata=%q", err, evt.MetadataJSON)
+				return
+			}
+			if meta.Source != "jira" {
+				return
+			}
+			// Pass the poll's started_at so MarkJiraPollComplete can ignore
+			// stale sentinels from pre-restart poll goroutines that finish
+			// late — RestartJira doesn't cancel in-flight RefreshJira calls.
+			// A missing field yields StartedAt=0; pass a zero time.Time so
+			// MarkJiraPollComplete treats it as "unknown generation" and
+			// accepts it rather than getting stuck on {status:"polling"}.
+			var startedAt time.Time
+			if meta.StartedAt != 0 {
+				startedAt = time.Unix(0, meta.StartedAt)
+			}
+			srv.MarkJiraPollComplete(startedAt)
+		},
 	})
 
 	// Initial start with current credentials
@@ -252,7 +307,7 @@ func main() {
 	}
 
 	if creds.JiraPAT != "" && creds.JiraURL != "" {
-		srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgressStatus)
+		srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT), cfg.Jira.InProgress)
 	}
 
 	if err := srv.ListenAndServe(addr); err != nil {

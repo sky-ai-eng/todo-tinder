@@ -6,7 +6,10 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
@@ -15,16 +18,24 @@ import (
 
 // Server is the main HTTP server for Triage Factory.
 type Server struct {
-	db                   *sql.DB
-	mux                  *http.ServeMux
-	static               fs.FS
-	ws                   *websocket.Hub
-	spawner              *delegate.Spawner
-	ghClient             *ghclient.Client
-	jiraClient           *jira.Client
-	jiraInProgressStatus string
-	onGitHubChanged      func() // GitHub creds/repos changed — full restart + re-profile
-	onJiraChanged        func() // Jira config changed — restart Jira poller only
+	db                 *sql.DB
+	mux                *http.ServeMux
+	static             fs.FS
+	ws                 *websocket.Hub
+	spawner            *delegate.Spawner
+	ghClient           *ghclient.Client
+	jiraClient         *jira.Client
+	jiraInProgressRule config.JiraStatusRule // full rule — Members for guards, Canonical for writes
+	onGitHubChanged    func()                // GitHub creds/repos changed — full restart + re-profile
+	onJiraChanged      func()                // Jira config changed — restart Jira poller only
+	scorerTrigger      func()                // invoked after non-poll task creation (e.g. carry-over) to kick scoring immediately
+
+	// Jira poll readiness — used by /api/jira/stock to decide whether the
+	// poller has completed its first cycle after a restart. Carry-over reads
+	// from the DB and needs snapshots to be populated before showing tickets.
+	jiraPollMu      sync.RWMutex
+	jiraRestartedAt time.Time
+	jiraLastPollAt  time.Time
 }
 
 // New creates a new server with the given database and registers all routes.
@@ -48,6 +59,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/auth/setup", s.handleAuthSetup)
 	s.mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("DELETE /api/auth", s.handleAuthDelete)
+	s.mux.HandleFunc("DELETE /api/auth/jira", s.handleAuthDeleteJira)
 
 	s.mux.HandleFunc("GET /api/queue", s.handleQueue)
 	s.mux.HandleFunc("GET /api/tasks", s.handleTasks)
@@ -82,6 +94,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/repos/{owner}/{repo}/branches", s.handleRepoBranches)
 	s.mux.HandleFunc("POST /api/jira/connect", s.handleJiraConnect)
 	s.mux.HandleFunc("GET /api/jira/statuses", s.handleJiraStatuses)
+	s.mux.HandleFunc("GET /api/jira/stock", s.handleJiraStockGet)
+	s.mux.HandleFunc("POST /api/jira/stock", s.handleJiraStockPost)
 
 	s.mux.HandleFunc("GET /api/reviews/{id}", s.handleReviewGet)
 	s.mux.HandleFunc("PATCH /api/reviews/{id}", s.handleReviewUpdate)
@@ -92,12 +106,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/agent/runs/{runID}/review", s.handleRunReview)
 
 	s.mux.HandleFunc("GET /api/event-types", s.handleEventTypes)
-	s.mux.HandleFunc("PUT /api/event-types/{id}/toggle", s.handleEventTypeToggle)
-	s.mux.HandleFunc("PUT /api/event-types/reorder", s.handleEventTypeReorder)
+	s.mux.HandleFunc("GET /api/event-schemas", s.handleEventSchemasList)
+	s.mux.HandleFunc("GET /api/event-schemas/{event_type}", s.handleEventSchemaGet)
 	s.mux.HandleFunc("GET /api/triggers", s.handleTriggersList)
 	s.mux.HandleFunc("POST /api/triggers", s.handleTriggerCreate)
+	s.mux.HandleFunc("PUT /api/triggers/{id}", s.handleTriggerUpdate)
 	s.mux.HandleFunc("DELETE /api/triggers/{id}", s.handleTriggerDelete)
 	s.mux.HandleFunc("POST /api/triggers/{id}/toggle", s.handleTriggerToggle)
+
+	s.mux.HandleFunc("GET /api/task-rules", s.handleTaskRulesList)
+	s.mux.HandleFunc("POST /api/task-rules", s.handleTaskRuleCreate)
+	s.mux.HandleFunc("PUT /api/task-rules/reorder", s.handleTaskRuleReorder)
+	s.mux.HandleFunc("PATCH /api/task-rules/{id}", s.handleTaskRuleUpdate)
+	s.mux.HandleFunc("DELETE /api/task-rules/{id}", s.handleTaskRuleDelete)
 	s.mux.HandleFunc("GET /api/prompts", s.handlePromptsList)
 	s.mux.HandleFunc("POST /api/prompts", s.handlePromptCreate)
 	s.mux.HandleFunc("GET /api/prompts/{id}", s.handlePromptGet)
@@ -156,15 +177,65 @@ func (s *Server) SetOnJiraChanged(fn func()) {
 	s.onJiraChanged = fn
 }
 
+// SetScorerTrigger registers a callback to kick the AI scorer. Used by
+// flows that create tasks outside the normal poll→event path (e.g.
+// carry-over) so scoring starts immediately rather than waiting for the
+// next poll cycle.
+func (s *Server) SetScorerTrigger(fn func()) {
+	s.scorerTrigger = fn
+}
+
 // SetGitHubClient sets the GitHub client for review approval submissions.
 func (s *Server) SetGitHubClient(client *ghclient.Client) {
 	s.ghClient = client
 }
 
-// SetJiraClient sets the Jira client and in-progress status for claim actions.
-func (s *Server) SetJiraClient(client *jira.Client, inProgressStatus string) {
+// SetJiraClient sets the Jira client and the in-progress rule used by claim
+// and undo handlers. The rule carries both Members (for guards — is the
+// ticket already in *any* in-progress variant?) and Canonical (the status
+// we actually transition into when claiming).
+func (s *Server) SetJiraClient(client *jira.Client, inProgressRule config.JiraStatusRule) {
 	s.jiraClient = client
-	s.jiraInProgressStatus = inProgressStatus
+	s.jiraInProgressRule = inProgressRule
+}
+
+// MarkJiraRestarted records the moment the Jira poller was restarted. Clears
+// the last-poll timestamp so jiraPollReady reports false until a completion
+// event arrives. Call this before kicking off a Jira poller restart.
+func (s *Server) MarkJiraRestarted() {
+	s.jiraPollMu.Lock()
+	defer s.jiraPollMu.Unlock()
+	s.jiraRestartedAt = time.Now()
+	s.jiraLastPollAt = time.Time{}
+}
+
+// MarkJiraPollComplete records a successful Jira poll cycle. Call from the
+// event-bus subscriber on system:poll:completed when source == "jira".
+// startedAt is the wall-clock time the poll cycle started; completions from
+// poll goroutines that started before the most recent MarkJiraRestarted are
+// ignored so an in-flight pre-restart poll can't incorrectly flip readiness
+// back to true.
+//
+// A zero startedAt means the emitter didn't supply a start time (metadata
+// field missing or the event came from a publisher unaware of the race
+// guard). Accept those completions so a malformed/future event can't leave
+// carry-over stuck on {status:"polling"} indefinitely — race protection
+// degrades gracefully rather than silently failing open.
+func (s *Server) MarkJiraPollComplete(startedAt time.Time) {
+	s.jiraPollMu.Lock()
+	defer s.jiraPollMu.Unlock()
+	if !startedAt.IsZero() && startedAt.Before(s.jiraRestartedAt) {
+		return
+	}
+	s.jiraLastPollAt = time.Now()
+}
+
+// jiraPollReady returns true when the poller has completed at least one cycle
+// since the last restart. Used by /api/jira/stock to gate the list response.
+func (s *Server) jiraPollReady() bool {
+	s.jiraPollMu.RLock()
+	defer s.jiraPollMu.RUnlock()
+	return !s.jiraLastPollAt.IsZero() && s.jiraLastPollAt.After(s.jiraRestartedAt)
 }
 
 // --- Stub handlers (to be implemented) ---

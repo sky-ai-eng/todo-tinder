@@ -6,66 +6,54 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// taskJSON is the API representation of a task.
+// taskJSON is the API representation of a task. Maps entity-joined fields
+// to the frontend's expected shape for backward compatibility.
 type taskJSON struct {
-	ID                string   `json:"id"`
-	Source            string   `json:"source"`
-	SourceID          string   `json:"source_id"`
-	SourceURL         string   `json:"source_url"`
-	Title             string   `json:"title"`
-	Description       string   `json:"description,omitempty"`
-	Repo              string   `json:"repo,omitempty"`
-	Author            string   `json:"author,omitempty"`
-	Labels            []string `json:"labels"`
-	Severity          string   `json:"severity,omitempty"`
-	DiffAdditions     int      `json:"diff_additions,omitempty"`
-	DiffDeletions     int      `json:"diff_deletions,omitempty"`
-	FilesChanged      int      `json:"files_changed,omitempty"`
-	CIStatus          string   `json:"ci_status,omitempty"`
-	RelevanceReason   string   `json:"relevance_reason,omitempty"`
-	EventType         string   `json:"event_type,omitempty"`
-	ScoringStatus     string   `json:"scoring_status"`
-	CreatedAt         string   `json:"created_at"`
-	Status            string   `json:"status"`
-	PriorityScore     *float64 `json:"priority_score"`
-	AISummary         string   `json:"ai_summary,omitempty"`
-	PriorityReasoning string   `json:"priority_reasoning,omitempty"`
-	AgentConfidence   *float64 `json:"agent_confidence"`
+	ID                  string   `json:"id"`
+	Source              string   `json:"source"`      // from entity
+	SourceID            string   `json:"source_id"`   // from entity
+	SourceURL           string   `json:"source_url"`  // from entity
+	Title               string   `json:"title"`       // from entity
+	EntityKind          string   `json:"entity_kind"` // "pr" | "issue"
+	EventType           string   `json:"event_type"`
+	DedupKey            string   `json:"dedup_key,omitempty"`
+	Severity            string   `json:"severity,omitempty"`
+	RelevanceReason     string   `json:"relevance_reason,omitempty"`
+	ScoringStatus       string   `json:"scoring_status"`
+	CreatedAt           string   `json:"created_at"`
+	Status              string   `json:"status"`
+	PriorityScore       *float64 `json:"priority_score"`
+	AutonomySuitability *float64 `json:"autonomy_suitability"`
+	AISummary           string   `json:"ai_summary,omitempty"`
+	PriorityReasoning   string   `json:"priority_reasoning,omitempty"`
+	CloseReason         string   `json:"close_reason,omitempty"`
 }
 
 func taskToJSON(t domain.Task) taskJSON {
-	labels := t.Labels
-	if labels == nil {
-		labels = []string{}
-	}
 	return taskJSON{
-		ID:                t.ID,
-		Source:            t.Source,
-		SourceID:          t.SourceID,
-		SourceURL:         t.SourceURL,
-		Title:             t.Title,
-		Description:       t.Description,
-		Repo:              t.Repo,
-		Author:            t.Author,
-		Labels:            labels,
-		Severity:          t.Severity,
-		DiffAdditions:     t.DiffAdditions,
-		DiffDeletions:     t.DiffDeletions,
-		FilesChanged:      t.FilesChanged,
-		CIStatus:          t.CIStatus,
-		RelevanceReason:   t.RelevanceReason,
-		EventType:         t.EventType,
-		ScoringStatus:     t.ScoringStatus,
-		CreatedAt:         t.CreatedAt.Format(time.RFC3339),
-		Status:            t.Status,
-		PriorityScore:     t.PriorityScore,
-		AISummary:         t.AISummary,
-		PriorityReasoning: t.PriorityReasoning,
-		AgentConfidence:   t.AgentConfidence,
+		ID:                  t.ID,
+		Source:              t.EntitySource,
+		SourceID:            t.EntitySourceID,
+		SourceURL:           t.SourceURL,
+		Title:               t.Title,
+		EntityKind:          t.EntityKind,
+		EventType:           t.EventType,
+		DedupKey:            t.DedupKey,
+		Severity:            t.Severity,
+		RelevanceReason:     t.RelevanceReason,
+		ScoringStatus:       t.ScoringStatus,
+		CreatedAt:           t.CreatedAt.Format(time.RFC3339),
+		Status:              t.Status,
+		PriorityScore:       t.PriorityScore,
+		AutonomySuitability: t.AutonomySuitability,
+		AISummary:           t.AISummary,
+		PriorityReasoning:   t.PriorityReasoning,
+		CloseReason:         t.CloseReason,
 	}
 }
 
@@ -119,7 +107,7 @@ func (s *Server) handleTaskGet(w http.ResponseWriter, r *http.Request) {
 type swipeRequest struct {
 	Action       string `json:"action"`
 	HesitationMs int    `json:"hesitation_ms"`
-	PromptID     string `json:"prompt_id,omitempty"` // optional: explicit prompt for delegation
+	PromptID     string `json:"prompt_id,omitempty"`
 }
 
 func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
@@ -147,19 +135,40 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 
 	response := map[string]any{"status": newStatus}
 
-	// On claim: if Jira task, assign to self and transition to in-progress
-	if req.Action == "claim" && s.jiraClient != nil && s.jiraInProgressStatus != "" {
+	// On claim: if Jira task, assign to self and transition to in-progress.
+	// Claim guard: with multiple tasks per entity, a second claim on the same
+	// Jira issue would re-assign + re-transition redundantly (and probably
+	// error). Skip the transition when the ticket is already in ANY member of
+	// the in-progress rule — if the user (or an earlier claim) moved it to
+	// "In Review" while canonical is "In Progress", transitioning back to the
+	// canonical would be a spurious status change that would confuse watchers.
+	rule := s.jiraInProgressRule
+	if req.Action == "claim" && s.jiraClient != nil && rule.Canonical != "" {
 		task, err := db.GetTask(s.db, id)
-		if err == nil && task != nil && task.Source == "jira" {
-			go func(issueKey, targetStatus string) {
-				if err := s.jiraClient.AssignToSelf(issueKey); err != nil {
-					log.Printf("[jira] failed to assign %s: %v", issueKey, err)
+		if err == nil && task != nil && task.EntitySource == "jira" {
+			go func(issueKey string, rule config.JiraStatusRule) {
+				state := s.jiraClient.GetClaimState(issueKey)
+
+				needAssign := state == nil || !state.AssignedToSelf
+				needTransition := state == nil || !rule.Contains(state.StatusName)
+
+				if !needAssign && !needTransition {
+					log.Printf("[jira] claim guard: %s already assigned to self and already in in-progress (%q), skipping", issueKey, state.StatusName)
 					return
 				}
-				if err := s.jiraClient.TransitionTo(issueKey, targetStatus); err != nil {
-					log.Printf("[jira] failed to transition %s to %q: %v", issueKey, targetStatus, err)
+
+				if needAssign {
+					if err := s.jiraClient.AssignToSelf(issueKey); err != nil {
+						log.Printf("[jira] failed to assign %s: %v", issueKey, err)
+						return
+					}
 				}
-			}(task.SourceID, s.jiraInProgressStatus)
+				if needTransition {
+					if err := s.jiraClient.TransitionTo(issueKey, rule.Canonical); err != nil {
+						log.Printf("[jira] failed to transition %s to %q: %v", issueKey, rule.Canonical, err)
+					}
+				}
+			}(task.EntitySourceID, rule)
 		}
 	}
 
@@ -180,7 +189,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 }
 
 type snoozeRequest struct {
-	Until        string `json:"until"` // RFC3339 or duration like "1h", "4h", "tomorrow"
+	Until        string `json:"until"`
 	HesitationMs int    `json:"hesitation_ms"`
 }
 
@@ -210,7 +219,6 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	// Read task before undo so we know the source status to revert to
 	task, _ := db.GetTask(s.db, id)
 
 	if err := db.UndoLastSwipe(s.db, id); err != nil {
@@ -218,16 +226,41 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Revert Jira ticket: unassign and transition back to original status
-	if task != nil && task.Source == "jira" && task.SourceStatus != "" && s.jiraClient != nil {
+	// Revert Jira ticket: unassign and transition back to original status.
+	// Undo guard: if someone else reassigned the issue or the status diverged
+	// from what we stored, don't step on their manual changes.
+	if task != nil && task.EntitySource == "jira" && task.SourceStatus != "" && s.jiraClient != nil {
 		go func(issueKey, originalStatus string) {
-			if err := s.jiraClient.Unassign(issueKey); err != nil {
-				log.Printf("[jira] failed to unassign %s on undo: %v", issueKey, err)
+			state := s.jiraClient.GetClaimState(issueKey)
+
+			// Three assignee cases:
+			//   - assigned to someone else -> skip undo entirely (manual reassignment)
+			//   - unassigned -> skip Unassign (already unassigned), still transition
+			//   - assigned to self -> proceed normally (unassign + transition)
+			if state != nil && !state.AssignedToSelf && !state.Unassigned {
+				log.Printf("[jira] undo guard: %s reassigned to someone else, skipping undo", issueKey)
+				return
+			}
+			// Skip undo if the ticket has moved out of the in-progress rule
+			// entirely — that means someone progressed it (to done, back to
+			// pickup, etc.) and we shouldn't yank it back. Membership rather
+			// than strict-canonical match, because a user moving Claim →
+			// "In Review" is still "working on it on my plate" and undo should
+			// still unwind to the original status.
+			if state != nil && len(s.jiraInProgressRule.Members) > 0 && !s.jiraInProgressRule.Contains(state.StatusName) {
+				log.Printf("[jira] undo guard: %s status is %q (not in in-progress members %v), skipping undo", issueKey, state.StatusName, s.jiraInProgressRule.Members)
+				return
+			}
+
+			if state == nil || state.AssignedToSelf {
+				if err := s.jiraClient.Unassign(issueKey); err != nil {
+					log.Printf("[jira] failed to unassign %s on undo: %v", issueKey, err)
+				}
 			}
 			if err := s.jiraClient.TransitionTo(issueKey, originalStatus); err != nil {
 				log.Printf("[jira] failed to transition %s back to %q on undo: %v", issueKey, originalStatus, err)
 			}
-		}(task.SourceID, task.SourceStatus)
+		}(task.EntitySourceID, task.SourceStatus)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
@@ -246,7 +279,6 @@ func parseSnoozeUntil(s string) (time.Time, error) {
 		tomorrow := now.AddDate(0, 0, 1)
 		return time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 9, 0, 0, 0, tomorrow.Location()), nil
 	default:
-		// Try parsing as RFC3339
 		return time.Parse(time.RFC3339, s)
 	}
 }

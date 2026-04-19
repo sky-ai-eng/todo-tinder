@@ -8,14 +8,18 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Client wraps the Jira REST API v2.
 type Client struct {
-	baseURL string
-	pat     string
-	http    *http.Client
+	baseURL  string
+	pat      string
+	http     *http.Client
+	selfOnce sync.Once
+	selfVal  *currentUserResponse
+	selfErr  error
 }
 
 func NewClient(baseURL, pat string) *Client {
@@ -119,6 +123,54 @@ func (c *Client) TransitionTo(issueKey, targetStatusName string) error {
 		available[i] = t.To.Name
 	}
 	return fmt.Errorf("no transition to %q found (available: %s)", targetStatusName, strings.Join(available, ", "))
+}
+
+// ClaimState describes the assignee + status of a Jira issue, used by
+// claim guards to skip redundant API mutations on multi-task entities.
+type ClaimState struct {
+	AssignedToSelf bool
+	Unassigned     bool   // true when assignee is null (no one assigned)
+	StatusName     string // current workflow status
+}
+
+// GetClaimState fetches the current assignee and status of an issue and
+// checks whether the assignee is the authenticated user. Returns nil on
+// any error — callers treat failure as "unknown, proceed normally".
+func (c *Client) GetClaimState(issueKey string) *ClaimState {
+	// Fetch only assignee + status to minimize payload. The ?fields param
+	// works identically on Cloud and Server/DC (v2 REST API).
+	url := fmt.Sprintf("%s/rest/api/2/issue/%s?fields=assignee,status", c.baseURL, issueKey)
+	body, err := c.get(url)
+	if err != nil {
+		log.Printf("[jira] claim guard: failed to fetch %s: %v", issueKey, err)
+		return nil
+	}
+	var issue Issue
+	if err := json.Unmarshal(body, &issue); err != nil {
+		log.Printf("[jira] claim guard: failed to parse %s: %v", issueKey, err)
+		return nil
+	}
+
+	myself, err := c.currentUser()
+	if err != nil {
+		log.Printf("[jira] claim guard: failed to get current user: %v", err)
+		return nil
+	}
+
+	state := &ClaimState{}
+	if issue.Fields.Status != nil {
+		state.StatusName = issue.Fields.Status.Name
+	}
+	if issue.Fields.Assignee == nil {
+		state.Unassigned = true
+	} else {
+		if myself.AccountID != "" {
+			state.AssignedToSelf = issue.Fields.Assignee.AccountID == myself.AccountID
+		} else {
+			state.AssignedToSelf = issue.Fields.Assignee.Name == myself.Name
+		}
+	}
+	return state
 }
 
 // Issue represents core fields of a Jira issue.
@@ -240,6 +292,51 @@ func (c *Client) GetChildIssues(parentKey string) ([]Issue, error) {
 
 // DefaultSearchFields is the default set of fields returned by SearchIssues.
 var DefaultSearchFields = []string{"summary", "description", "status", "issuetype", "priority", "assignee", "parent", "labels"}
+
+// ExtractDescriptionText flattens a Jira issue description to plain text.
+// Server/DC returns description as a JSON string; Cloud returns an ADF
+// document ({type:"doc", content:[...]}). Returns empty string for null,
+// missing, or unparseable input. Caller should truncate as needed — Jira
+// descriptions can be arbitrarily large.
+func ExtractDescriptionText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	// Try plain string first (Server/DC).
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return asString
+	}
+	// Otherwise assume ADF — recursively collect every `text` field.
+	var node map[string]any
+	if err := json.Unmarshal(raw, &node); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	walkADF(node, &sb)
+	return strings.TrimSpace(sb.String())
+}
+
+// walkADF recursively extracts text content from an ADF node. Paragraphs,
+// list items, and headings get a trailing newline so the output is readable
+// rather than one long run-on line.
+func walkADF(node map[string]any, sb *strings.Builder) {
+	if text, ok := node["text"].(string); ok {
+		sb.WriteString(text)
+	}
+	if content, ok := node["content"].([]any); ok {
+		for _, c := range content {
+			if child, ok := c.(map[string]any); ok {
+				walkADF(child, sb)
+			}
+		}
+	}
+	// Block-level nodes get a separator so output reads as multi-line prose.
+	switch node["type"] {
+	case "paragraph", "heading", "listItem", "codeBlock", "blockquote":
+		sb.WriteString("\n")
+	}
+}
 
 // SearchIssues runs a JQL query and returns matching issues.
 // If fields is nil, DefaultSearchFields is used. Pass []string{"*all"} for everything.
@@ -420,15 +517,20 @@ type currentUserResponse struct {
 }
 
 func (c *Client) currentUser() (*currentUserResponse, error) {
-	body, err := c.get(fmt.Sprintf("%s/rest/api/2/myself", c.baseURL))
-	if err != nil {
-		return nil, err
-	}
-	var user currentUserResponse
-	if err := json.Unmarshal(body, &user); err != nil {
-		return nil, fmt.Errorf("parse myself: %w", err)
-	}
-	return &user, nil
+	c.selfOnce.Do(func() {
+		body, err := c.get(fmt.Sprintf("%s/rest/api/2/myself", c.baseURL))
+		if err != nil {
+			c.selfErr = err
+			return
+		}
+		var user currentUserResponse
+		if err := json.Unmarshal(body, &user); err != nil {
+			c.selfErr = fmt.Errorf("parse myself: %w", err)
+			return
+		}
+		c.selfVal = &user
+	})
+	return c.selfVal, c.selfErr
 }
 
 func (c *Client) getTransitions(issueKey string) ([]Transition, error) {

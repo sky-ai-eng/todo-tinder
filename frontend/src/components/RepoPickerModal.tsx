@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
+import { RotateCw } from 'lucide-react'
 
 interface GitHubRepo {
   full_name: string
@@ -18,37 +19,56 @@ interface Props {
   onClose: () => void
   /** If true, renders as a full-page step instead of an overlay */
   inline?: boolean
+  /** If provided, shows a Back button in inline mode */
+  onBack?: () => void
+  /** Pre-fetched repo list — skips the /api/github/repos fetch if provided */
+  cachedRepos?: GitHubRepo[]
+  /** Called with fetched repos so the parent can cache them */
+  onReposFetched?: (repos: GitHubRepo[]) => void
 }
 
-export default function RepoPickerModal({ selected, onSave, onClose, inline }: Props) {
-  const [repos, setRepos] = useState<GitHubRepo[]>([])
-  const [loading, setLoading] = useState(true)
+export type { GitHubRepo }
+
+export default function RepoPickerModal({
+  selected,
+  onSave,
+  onClose,
+  inline,
+  onBack,
+  cachedRepos,
+  onReposFetched,
+}: Props) {
+  const [repos, setRepos] = useState<GitHubRepo[]>(cachedRepos ?? [])
+  const [loading, setLoading] = useState(!cachedRepos)
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
   const [checked, setChecked] = useState<Set<string>>(new Set(selected))
 
-  useEffect(() => {
-    fetchRepos()
-  }, [])
-
-  const fetchRepos = async () => {
+  const fetchRepos = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
       const res = await fetch('/api/github/repos')
       if (!res.ok) {
-        const data = await res.json()
-        setError(data.error || 'Failed to fetch repos')
+        const data = await res.json().catch(() => ({}))
+        console.error('Failed to fetch repos:', data.error || `HTTP ${res.status}`)
+        setError('Failed to fetch repositories')
         return
       }
       const data: GitHubRepo[] = await res.json()
       setRepos(data)
-    } catch {
-      setError('Could not connect to server')
+      onReposFetched?.(data)
+    } catch (err) {
+      console.error('Failed to fetch repos:', err)
+      setError('Failed to fetch repositories')
     } finally {
       setLoading(false)
     }
-  }
+  }, [onReposFetched])
+
+  useEffect(() => {
+    if (!cachedRepos) fetchRepos()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const filtered = useMemo(() => {
     if (!search.trim()) return repos
@@ -97,14 +117,36 @@ export default function RepoPickerModal({ selected, onSave, onClose, inline }: P
       {/* List */}
       <div className="flex-1 overflow-y-auto px-6 min-h-0">
         {loading && (
-          <div className="flex items-center justify-center py-12">
-            <p className="text-[13px] text-text-tertiary">Loading repositories...</p>
+          <div className="space-y-1 py-2">
+            {[1, 2, 3, 4, 5, 6, 7, 8].map((i) => (
+              <div key={i} className="flex items-center gap-3 px-3 py-2.5 rounded-xl">
+                <div className="w-4 h-4 rounded bg-black/[0.04] animate-pulse" />
+                <div className="flex-1 space-y-1.5">
+                  <div
+                    className="h-3 rounded bg-black/[0.04] animate-pulse"
+                    style={{ width: `${55 + ((i * 17) % 35)}%` }}
+                  />
+                  <div
+                    className="h-2.5 rounded bg-black/[0.03] animate-pulse"
+                    style={{ width: `${30 + ((i * 23) % 40)}%` }}
+                  />
+                </div>
+              </div>
+            ))}
           </div>
         )}
 
         {error && (
-          <div className="rounded-xl bg-dismiss/[0.08] border border-dismiss/20 px-4 py-2.5 text-[13px] text-dismiss">
-            {error}
+          <div className="flex flex-col items-center justify-center py-12 gap-3">
+            <div className="text-[13px] text-text-secondary text-center">{error}</div>
+            <button
+              type="button"
+              onClick={fetchRepos}
+              className="flex items-center gap-1.5 text-[12px] font-medium text-accent hover:text-accent/80 transition-colors"
+            >
+              <RotateCw size={13} />
+              Retry
+            </button>
           </div>
         )}
 
@@ -178,6 +220,15 @@ export default function RepoPickerModal({ selected, onSave, onClose, inline }: P
           {checked.size} repo{checked.size !== 1 ? 's' : ''} selected
         </span>
         <div className="flex gap-3">
+          {inline && onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="text-[13px] text-text-secondary hover:text-text-primary bg-white/50 hover:bg-white/80 border border-border-subtle rounded-xl px-4 py-2 transition-colors"
+            >
+              Back
+            </button>
+          )}
           {!inline && (
             <button
               type="button"
