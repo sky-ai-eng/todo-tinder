@@ -354,33 +354,39 @@ function TicketRow({
 // issue_type · parent. Separators are inserted only between present values
 // so trailing/leading dots never appear. Status is hidden when already_done
 // is showing it via the trailing pill on the first line.
+//
+// Each part carries its own stable key ("status" / "priority" / ...) so
+// React reconciliation doesn't mis-match nodes when visibility changes (e.g.
+// a ticket flipping already_done causes status to drop out of the list, and
+// index keys would then shift "priority" into "status"'s slot).
 function MetadataLine({ ticket }: { ticket: StockTicket }) {
-  const parts: React.ReactNode[] = []
+  const parts: { key: string; node: React.ReactNode }[] = []
   if (ticket.status && !ticket.already_done) {
-    parts.push(
-      <span key="status" className="text-text-secondary font-medium">
-        {ticket.status}
-      </span>,
-    )
+    parts.push({
+      key: 'status',
+      node: <span className="text-text-secondary font-medium">{ticket.status}</span>,
+    })
   }
   if (ticket.priority) {
-    parts.push(<span key="priority">{ticket.priority}</span>)
+    parts.push({ key: 'priority', node: <span>{ticket.priority}</span> })
   }
   if (ticket.issue_type) {
-    parts.push(<span key="type">{ticket.issue_type}</span>)
+    parts.push({ key: 'type', node: <span>{ticket.issue_type}</span> })
   }
   if (ticket.parent_key && ticket.parent_url) {
-    parts.push(
-      <a
-        key="parent"
-        href={ticket.parent_url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="hover:text-accent transition-colors"
-      >
-        {ticket.parent_key}
-      </a>,
-    )
+    parts.push({
+      key: 'parent',
+      node: (
+        <a
+          href={ticket.parent_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="hover:text-accent transition-colors"
+        >
+          {ticket.parent_key}
+        </a>
+      ),
+    })
   }
 
   return (
@@ -389,9 +395,9 @@ function MetadataLine({ ticket }: { ticket: StockTicket }) {
         <span className="italic">no metadata</span>
       ) : (
         parts.map((p, i) => (
-          <span key={i} className="flex items-center gap-1.5">
+          <span key={p.key} className="flex items-center gap-1.5">
             {i > 0 && <span>·</span>}
-            {p}
+            {p.node}
           </span>
         ))
       )}
