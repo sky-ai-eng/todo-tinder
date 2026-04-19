@@ -27,6 +27,7 @@ type Server struct {
 	jiraInProgressStatus string
 	onGitHubChanged      func() // GitHub creds/repos changed — full restart + re-profile
 	onJiraChanged        func() // Jira config changed — restart Jira poller only
+	scorerTrigger        func() // invoked after non-poll task creation (e.g. carry-over) to kick scoring immediately
 
 	// Jira poll readiness — used by /api/jira/stock to decide whether the
 	// poller has completed its first cycle after a restart. Carry-over reads
@@ -173,6 +174,14 @@ func (s *Server) SetOnGitHubChanged(fn func()) {
 // This restarts only the Jira poller.
 func (s *Server) SetOnJiraChanged(fn func()) {
 	s.onJiraChanged = fn
+}
+
+// SetScorerTrigger registers a callback to kick the AI scorer. Used by
+// flows that create tasks outside the normal poll→event path (e.g.
+// carry-over) so scoring starts immediately rather than waiting for the
+// next poll cycle.
+func (s *Server) SetScorerTrigger(fn func()) {
+	s.scorerTrigger = fn
 }
 
 // SetGitHubClient sets the GitHub client for review approval submissions.

@@ -321,6 +321,14 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		applied++
 	}
 
+	// Carry-over creates tasks without going through the poller, so no
+	// system:poll:completed fires to wake the scorer via its event-bus
+	// subscription. Poke it directly when we actually created queued tasks —
+	// claim-only or done-only flows don't produce anything to score.
+	if applied > 0 && s.scorerTrigger != nil {
+		s.scorerTrigger()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"applied": applied,
 		"failed":  failed,

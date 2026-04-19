@@ -160,6 +160,7 @@ func main() {
 	})
 	scorer.SetProfileGate(profileGate.Ready)
 	scorer.Start()
+	srv.SetScorerTrigger(scorer.Trigger)
 	log.Println("[ai] scorer started (model: haiku)")
 
 	// Subscriber: scorer trigger — only reacts to poll-complete sentinels
