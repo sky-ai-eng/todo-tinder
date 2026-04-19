@@ -202,10 +202,16 @@ func (s *Server) MarkJiraRestarted() {
 // poll goroutines that started before the most recent MarkJiraRestarted are
 // ignored so an in-flight pre-restart poll can't incorrectly flip readiness
 // back to true.
+//
+// A zero startedAt means the emitter didn't supply a start time (metadata
+// field missing or the event came from a publisher unaware of the race
+// guard). Accept those completions so a malformed/future event can't leave
+// carry-over stuck on {status:"polling"} indefinitely — race protection
+// degrades gracefully rather than silently failing open.
 func (s *Server) MarkJiraPollComplete(startedAt time.Time) {
 	s.jiraPollMu.Lock()
 	defer s.jiraPollMu.Unlock()
-	if startedAt.Before(s.jiraRestartedAt) {
+	if !startedAt.IsZero() && startedAt.Before(s.jiraRestartedAt) {
 		return
 	}
 	s.jiraLastPollAt = time.Now()

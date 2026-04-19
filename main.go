@@ -267,7 +267,14 @@ func main() {
 			// Pass the poll's started_at so MarkJiraPollComplete can ignore
 			// stale sentinels from pre-restart poll goroutines that finish
 			// late — RestartJira doesn't cancel in-flight RefreshJira calls.
-			srv.MarkJiraPollComplete(time.Unix(0, meta.StartedAt))
+			// A missing field yields StartedAt=0; pass a zero time.Time so
+			// MarkJiraPollComplete treats it as "unknown generation" and
+			// accepts it rather than getting stuck on {status:"polling"}.
+			var startedAt time.Time
+			if meta.StartedAt != 0 {
+				startedAt = time.Unix(0, meta.StartedAt)
+			}
+			srv.MarkJiraPollComplete(startedAt)
 		},
 	})
 
