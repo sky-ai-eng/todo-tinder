@@ -18,6 +18,15 @@ import (
 
 const (
 	jiraBatchSize = 100 // max issues per JQL key IN (...) query
+
+	// descriptionStoreMaxRunes caps what we persist on entities.description.
+	// Jira descriptions are unbounded (teams regularly paste multi-KB specs,
+	// stack traces, etc.); storing them raw would bloat the column for no
+	// current benefit — the scorer already truncates at 1500 runes for the
+	// LLM prompt, so 2000 gives a small buffer while keeping rows compact.
+	// If a future UI wants to render the full body it should re-fetch from
+	// Jira directly rather than relying on this mirror.
+	descriptionStoreMaxRunes = 2000
 )
 
 // Tracker manages the discover → refresh → diff → emit cycle for both
@@ -490,8 +499,23 @@ func issueToState(issue jiraclient.Issue, baseURL string) jiraIssueState {
 	snap.Labels = issue.Fields.Labels
 	return jiraIssueState{
 		Snap:        snap,
-		Description: jiraclient.ExtractDescriptionText(issue.Fields.Description),
+		Description: truncateDescription(jiraclient.ExtractDescriptionText(issue.Fields.Description), descriptionStoreMaxRunes),
 	}
+}
+
+// truncateDescription caps the stored description at a rune count (not byte
+// count) so we never persist a string that ends mid-UTF-8-codepoint. Appends
+// an ellipsis when truncation happens so downstream readers can tell the
+// content was cut rather than a genuinely short description.
+func truncateDescription(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 
 // --- Helpers ---
