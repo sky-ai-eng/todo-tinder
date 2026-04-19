@@ -309,12 +309,26 @@ function RepoCard({
           </p>
         )}
 
-        {/* Doc presence pinned to the well's bottom-right */}
+        {/* Doc presence pinned to the well's bottom-right. Present chips
+            link to the file on GitHub (default branch) — one click to see
+            exactly what fed the profiling agent. */}
         {hasAnyDocs && (
           <div className="mt-3 flex items-center justify-end gap-1">
-            <DocChip label="README" present={profile.has_readme} />
-            <DocChip label="CLAUDE" present={profile.has_claude_md} />
-            <DocChip label="AGENTS" present={profile.has_agents_md} />
+            <DocChip
+              label="README"
+              present={profile.has_readme}
+              href={docURL(profile, 'README.md')}
+            />
+            <DocChip
+              label="CLAUDE"
+              present={profile.has_claude_md}
+              href={docURL(profile, 'CLAUDE.md')}
+            />
+            <DocChip
+              label="AGENTS"
+              present={profile.has_agents_md}
+              href={docURL(profile, 'AGENTS.md')}
+            />
           </div>
         )}
       </div>
@@ -322,7 +336,7 @@ function RepoCard({
   )
 }
 
-function DocChip({ label, present }: { label: string; present: boolean }) {
+function DocChip({ label, present, href }: { label: string; present: boolean; href?: string }) {
   if (!present) {
     return (
       <span className="rounded-full px-1.5 py-0.5 text-[9px] font-medium tracking-wide text-text-tertiary/50 line-through">
@@ -330,11 +344,31 @@ function DocChip({ label, present }: { label: string; present: boolean }) {
       </span>
     )
   }
+  const base =
+    'rounded-full border border-accent/15 bg-accent/5 px-1.5 py-0.5 text-[9px] font-medium tracking-wide text-accent'
+  if (!href) {
+    return <span className={base}>{label}</span>
+  }
   return (
-    <span className="rounded-full border border-accent/15 bg-accent/5 px-1.5 py-0.5 text-[9px] font-medium tracking-wide text-accent">
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={`Open ${label === 'README' ? 'README' : label}.md on GitHub`}
+      className={`${base} transition-colors hover:border-accent/35 hover:bg-accent/10`}
+    >
       {label}
-    </span>
+    </a>
   )
+}
+
+// docURL builds a github.com web URL for a doc file at the repo's default
+// branch. Hardcodes github.com for now — GitHub Enterprise users would need
+// this derived from their configured base_url; cross that bridge if someone
+// reports it, since every GHE deployment uses a different web root.
+function docURL(profile: RepoProfile, filename: string): string {
+  const branch = profile.default_branch || 'main'
+  return `https://github.com/${profile.owner}/${profile.repo}/blob/${branch}/${filename}`
 }
 
 // --- Helpers ---------------------------------------------------------------
