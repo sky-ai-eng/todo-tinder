@@ -206,9 +206,11 @@ function StatusDot({ state }: { state: DotState }) {
 function RepoCard({
   profile,
   onBranchChange,
+  webBaseURL,
 }: {
   profile: RepoProfile
   onBranchChange: (branch: string) => void
+  webBaseURL: string | undefined
 }) {
   const [expanded, setExpanded] = useState(false)
   const bodyRef = useRef<HTMLParagraphElement>(null)
@@ -317,17 +319,17 @@ function RepoCard({
             <DocChip
               label="README"
               present={profile.has_readme}
-              href={docURL(profile, 'README.md')}
+              href={docURL(webBaseURL, profile, 'README.md')}
             />
             <DocChip
               label="CLAUDE"
               present={profile.has_claude_md}
-              href={docURL(profile, 'CLAUDE.md')}
+              href={docURL(webBaseURL, profile, 'CLAUDE.md')}
             />
             <DocChip
               label="AGENTS"
               present={profile.has_agents_md}
-              href={docURL(profile, 'AGENTS.md')}
+              href={docURL(webBaseURL, profile, 'AGENTS.md')}
             />
           </div>
         )}
@@ -362,13 +364,45 @@ function DocChip({ label, present, href }: { label: string; present: boolean; hr
   )
 }
 
-// docURL builds a github.com web URL for a doc file at the repo's default
-// branch. Hardcodes github.com for now — GitHub Enterprise users would need
-// this derived from their configured base_url; cross that bridge if someone
-// reports it, since every GHE deployment uses a different web root.
-function docURL(profile: RepoProfile, filename: string): string {
+// docURL builds a web URL for a doc file at the repo's default branch,
+// honoring the user's configured GitHub base URL so Enterprise installs
+// open the right host. Returns undefined when webBaseURL isn't known yet —
+// DocChip renders as non-clickable in that case rather than sending the
+// user to a wrong destination.
+function docURL(
+  webBaseURL: string | undefined,
+  profile: RepoProfile,
+  filename: string,
+): string | undefined {
+  if (!webBaseURL) return undefined
   const branch = profile.default_branch || 'main'
-  return `https://github.com/${profile.owner}/${profile.repo}/blob/${branch}/${filename}`
+  const root = webBaseURL.replace(/\/+$/, '') // drop trailing slash if any
+  return `${root}/${profile.owner}/${profile.repo}/blob/${branch}/${filename}`
+}
+
+// deriveGitHubWebRoot converts a GitHub API URL to the corresponding web
+// root. Users store the API URL in settings (what the gh client needs);
+// the web UI lives at a different path on Enterprise.
+//
+//   https://api.github.com           → https://github.com           (GH.com)
+//   https://api.github.com/          → https://github.com           (trailing slash)
+//   https://github.example.com/api/v3 → https://github.example.com  (GHE)
+//   https://github.com               → https://github.com           (already web)
+//
+// Returns undefined when the input is unparseable — caller renders
+// doc chips as non-clickable in that case. We don't guess github.com
+// because that's the wrong destination for Enterprise users.
+function deriveGitHubWebRoot(apiURL: string): string | undefined {
+  try {
+    const u = new URL(apiURL)
+    if (u.hostname === 'api.github.com') {
+      return 'https://github.com'
+    }
+    const path = u.pathname.replace(/\/api\/v[34]\/?$/, '')
+    return `${u.protocol}//${u.host}${path}`.replace(/\/+$/, '')
+  } catch {
+    return undefined
+  }
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -393,6 +427,11 @@ export default function Repos() {
   const [pickerOpen, setPickerOpen] = useState(false)
   const [selectedRepos, setSelectedRepos] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
+  // Starts unset — we don't know the right host until settings load. Doc
+  // chips render as non-clickable text until this populates. Better than
+  // briefly pointing at github.com: an Enterprise user clicking that gets
+  // a broken destination, which is worse than no destination.
+  const [webBaseURL, setWebBaseURL] = useState<string | undefined>(undefined)
 
   const fetchData = async () => {
     try {
@@ -411,6 +450,18 @@ export default function Repos() {
 
   useEffect(() => {
     fetchData()
+    fetch('/api/settings')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        const url = data?.github?.base_url
+        if (typeof url === 'string' && url) {
+          setWebBaseURL(deriveGitHubWebRoot(url))
+        }
+      })
+      .catch(() => {
+        // If settings fetch fails, webBaseURL stays undefined and doc
+        // chips render as non-clickable — no silent wrong-destination links.
+      })
   }, [])
 
   // Live updates from profiling pipeline
@@ -566,6 +617,7 @@ export default function Repos() {
               key={profile.id}
               profile={profile}
               onBranchChange={handleBranchChange(profile)}
+              webBaseURL={webBaseURL}
             />
           ))}
         </div>
