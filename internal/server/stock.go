@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
@@ -162,6 +163,8 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 	// own creation timestamp); when a snapshot predates this field (zero
 	// value) we fall back to the entity's TF-side created_at so ordering
 	// degrades gracefully instead of jumping to top/bottom.
+	// Times are parsed to time.Time before comparison so timezone/offset
+	// format differences (e.g. "+0000" vs "-07:00") don't corrupt ordering.
 	byNewest := func(list []scored) {
 		sort.SliceStable(list, func(i, j int) bool {
 			iKey := list[i].createdAt
@@ -171,6 +174,11 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 			jKey := list[j].createdAt
 			if jKey == "" {
 				jKey = list[j].fallback
+			}
+			it, iOK := parseTime(iKey)
+			jt, jOK := parseTime(jKey)
+			if iOK && jOK {
+				return it.After(jt)
 			}
 			return iKey > jKey
 		})
@@ -553,4 +561,22 @@ func projectFromKey(key string) string {
 		return key[:i]
 	}
 	return key
+}
+
+// parseTime parses a timestamp string produced by Jira or TF's own
+// entity.CreatedAt. Jira's format omits the colon in the UTC offset
+// (e.g. "+0000"), which RFC3339 rejects; we try that layout before the
+// standard ones so the common case succeeds on the first attempt.
+func parseTime(s string) (time.Time, bool) {
+	for _, layout := range []string{
+		"2006-01-02T15:04:05.000-0700",
+		"2006-01-02T15:04:05-0700",
+		time.RFC3339Nano,
+		time.RFC3339,
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
