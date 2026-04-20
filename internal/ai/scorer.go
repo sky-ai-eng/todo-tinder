@@ -42,6 +42,15 @@ var RepoProfilePrompt string
 //go:embed prompts/ci-fix.txt
 var CIFixPromptTemplate string
 
+//go:embed prompts/self-review-draft-pr.txt
+var SelfReviewDraftPRPromptTemplate string
+
+//go:embed prompts/address-self-review.txt
+var AddressSelfReviewPromptTemplate string
+
+//go:embed prompts/respond-to-external-review.txt
+var RespondToExternalReviewPromptTemplate string
+
 const batchSize = 10
 
 // TaskInput is the minimal info we send to the LLM for scoring.
