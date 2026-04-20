@@ -421,22 +421,9 @@ func toSet(items []string) map[string]bool {
 
 // matchesAny reports whether the session user's identities (direct
 // username or any team they belong to, in "org/slug" form) overlap with
-// the reviewers list. Mirrors tracker.isReviewerMatch — duplicated here
-// to keep diff.go pure (no tracker-package dependency).
+// the reviewers list.
 func matchesAny(reviewers []string, username string, userTeams []string) bool {
-	if len(reviewers) == 0 {
-		return false
-	}
-	set := toSet(reviewers)
-	if username != "" && set[username] {
-		return true
-	}
-	for _, t := range userTeams {
-		if set[t] {
-			return true
-		}
-	}
-	return false
+	return isReviewerMatch(reviewers, username, userTeams)
 }
 
 func reviewMap(reviews []domain.ReviewState) map[string]domain.ReviewState {
