@@ -14,8 +14,11 @@ import (
 // discriminators (labels). A zero-value prev (Number == 0) indicates first
 // discovery — emits initial events from the current state.
 //
+// userTeams is the "org/slug" list of teams the session user belongs to,
+// used so team-requested reviews also emit pr:review_requested.
+//
 // Pure function — no IO.
-func DiffPRSnapshots(prev, curr domain.PRSnapshot, entityID, username string) []domain.Event {
+func DiffPRSnapshots(prev, curr domain.PRSnapshot, entityID, username string, userTeams []string) []domain.Event {
 	now := time.Now()
 	eid := &entityID
 	authorIsSelf := curr.Author == username
@@ -153,10 +156,13 @@ func DiffPRSnapshots(prev, curr domain.PRSnapshot, entityID, username string) []
 	}
 
 	// --- Review requests ---------------------------------------------------
-	// Fire when the session user appears in the request list.
-	prevRR := toSet(prev.ReviewRequests)
-	currRR := toSet(curr.ReviewRequests)
-	if username != "" && currRR[username] && !prevRR[username] {
+	// Fire when the session user appears in the request list — directly
+	// (username) or via any of their teams (org/slug). Transition is "was
+	// not matched before, is matched now" so repeated team-level requests
+	// don't re-fire across polls where nothing changed.
+	prevMatched := matchesAny(prev.ReviewRequests, username, userTeams)
+	currMatched := matchesAny(curr.ReviewRequests, username, userTeams)
+	if currMatched && !prevMatched {
 		emit(domain.EventGitHubPRReviewRequested, "", events.GitHubPRReviewRequestedMetadata{
 			Author: curr.Author, AuthorIsSelf: authorIsSelf,
 			Repo: curr.Repo, PRNumber: curr.Number,
@@ -401,6 +407,26 @@ func toSet(items []string) map[string]bool {
 		m[item] = true
 	}
 	return m
+}
+
+// matchesAny reports whether the session user's identities (direct
+// username or any team they belong to, in "org/slug" form) overlap with
+// the reviewers list. Mirrors tracker.isReviewerMatch — duplicated here
+// to keep diff.go pure (no tracker-package dependency).
+func matchesAny(reviewers []string, username string, userTeams []string) bool {
+	if len(reviewers) == 0 {
+		return false
+	}
+	set := toSet(reviewers)
+	if username != "" && set[username] {
+		return true
+	}
+	for _, t := range userTeams {
+		if set[t] {
+			return true
+		}
+	}
+	return false
 }
 
 func reviewMap(reviews []domain.ReviewState) map[string]domain.ReviewState {

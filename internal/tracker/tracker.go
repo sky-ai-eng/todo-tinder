@@ -47,8 +47,11 @@ func New(database *sql.DB, bus *eventbus.Bus) *Tracker {
 
 // --- GitHub ---
 
-// RefreshGitHub runs the full tracking cycle for GitHub PRs.
-func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos []string) (int, error) {
+// RefreshGitHub runs the full tracking cycle for GitHub PRs. userTeams
+// is the "org/slug" list of teams the session user belongs to — used to
+// match team-based review requests (where the PR's reviewRequests list
+// contains the team, not the user's individual login).
+func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, userTeams, repos []string) (int, error) {
 	startedAt := time.Now()
 	// Phase 1: Discovery — find new PRs and register as entities.
 	discovered, err := t.discoverGitHub(client, username, repos)
@@ -83,10 +86,11 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 				if err := db.MarkEntityClosed(t.database, entity.ID); err != nil {
 					log.Printf("[tracker] failed to mark entity %s closed on discovery: %v", sid, err)
 				}
-			} else if username != "" && containsString(snap.ReviewRequests, username) {
-				// Backfill: user is a pending reviewer on a just-discovered
-				// open PR. DiffPRSnapshots' "no events on initial load" rule
-				// means pr:review_requested would never fire for requests that
+			} else if isReviewerMatch(snap.ReviewRequests, username, userTeams) {
+				// Backfill: user is a pending reviewer (directly or via one
+				// of their teams) on a just-discovered open PR.
+				// DiffPRSnapshots' "no events on initial load" rule means
+				// pr:review_requested would never fire for requests that
 				// existed before we started watching — the user would only see
 				// them if someone re-requested. Synthesize the event + queued
 				// task directly so existing review-requests land in the queue
@@ -190,7 +194,7 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, repos 
 		newSnap.NodeID = item.nodeID
 
 		// Diff against previous snapshot.
-		events := DiffPRSnapshots(item.snap, newSnap, item.entity.ID, username)
+		events := DiffPRSnapshots(item.snap, newSnap, item.entity.ID, username, userTeams)
 
 		// Update entity snapshot + title.
 		snapJSON, _ := json.Marshal(newSnap)
@@ -314,11 +318,27 @@ func (t *Tracker) backfillReviewRequested(entityID string, snap domain.PRSnapsho
 	return nil
 }
 
-// containsString reports whether s is present in items. Small loop rather
-// than slices.Contains to keep the tracker's import set minimal.
-func containsString(items []string, s string) bool {
-	for _, item := range items {
-		if item == s {
+// isReviewerMatch reports whether the session user appears in a PR's
+// reviewer list, either directly (as username) or via any of their teams
+// (as "org/slug"). Both the discovery backfill and the per-poll diff use
+// this check — getting it wrong in either place means team-based review
+// requests never surface as tasks, which is the case historically (only
+// direct-to-user requests matched the old containsString(rr, username)).
+func isReviewerMatch(reviewers []string, username string, userTeams []string) bool {
+	if len(reviewers) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(reviewers))
+	for _, r := range reviewers {
+		set[r] = struct{}{}
+	}
+	if username != "" {
+		if _, ok := set[username]; ok {
+			return true
+		}
+	}
+	for _, t := range userTeams {
+		if _, ok := set[t]; ok {
 			return true
 		}
 	}
