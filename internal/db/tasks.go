@@ -30,7 +30,7 @@ const taskColumnsWithEntity = `
 			ELSE NULL
 		END,
 		0
-	))`
+	)`
 
 // FindOrCreateTask implements the dedup logic via the partial unique index
 // (entity_id, event_type, dedup_key) WHERE status NOT IN ('done','dismissed').
