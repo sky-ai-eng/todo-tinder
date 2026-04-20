@@ -25,6 +25,7 @@ import { SortableContext, verticalListSortingStrategy, useSortable } from '@dnd-
 import { CSS } from '@dnd-kit/utilities'
 import PRCard from '../components/PRCard'
 import { useWebSocket } from '../hooks/useWebSocket'
+import type { WSEvent } from '../types'
 
 export interface PRSummary {
   number: number
@@ -129,17 +130,28 @@ export default function PRDashboard() {
   // can emit a burst of events (new commit + ci_check_* + review_requested);
   // coalescing into one refetch keeps the DB quiet without sacrificing
   // perceived responsiveness.
+  //
+  // Memoized with useCallback — an inline handler would create a fresh
+  // function identity every render, causing useWebSocket's latest-ref
+  // update effect to re-run on each render (the subscription itself stays
+  // stable, but the ref-assignment effect is still a per-render tick).
+  // Since fetchAll is already stable (useCallback with []), this handler
+  // is effectively created once for the lifetime of the component.
   const wsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useWebSocket((event) => {
-    if (event.type !== 'event') return
-    const evt = event.data.event_type
-    if (!evt || !evt.startsWith('github:pr:')) return
-    if (wsDebounceRef.current) clearTimeout(wsDebounceRef.current)
-    wsDebounceRef.current = setTimeout(() => {
-      wsDebounceRef.current = null
-      fetchAll()
-    }, 500)
-  })
+  const handleWSEvent = useCallback(
+    (event: WSEvent) => {
+      if (event.type !== 'event') return
+      const evt = event.data.event_type
+      if (!evt || !evt.startsWith('github:pr:')) return
+      if (wsDebounceRef.current) clearTimeout(wsDebounceRef.current)
+      wsDebounceRef.current = setTimeout(() => {
+        wsDebounceRef.current = null
+        fetchAll()
+      }, 500)
+    },
+    [fetchAll],
+  )
+  useWebSocket(handleWSEvent)
 
   useEffect(() => {
     return () => {
