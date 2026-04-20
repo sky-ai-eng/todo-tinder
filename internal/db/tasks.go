@@ -20,10 +20,17 @@ const taskColumnsWithEntity = `
 	t.source_status, t.snooze_until, t.close_reason, t.close_event_type,
 	t.closed_at, t.created_at,
 	COALESCE(e.title, ''), COALESCE(e.url, ''), e.source_id, e.source, e.kind,
-	-- SQLite json_extract returns null for missing paths or null snapshot;
-	-- COALESCE to 0 so GitHub tasks and subtask-less Jira tickets report
-	-- cleanly as "no open subtasks" instead of NULL.
-	COALESCE(json_extract(e.snapshot_json, '$.open_subtask_count'), 0)`
+	-- Guard json_extract so malformed or empty legacy snapshots do not fail
+	-- the entire task query. Missing paths and null values still fall back
+	-- cleanly to 0 so subtask-less entities report "no open subtasks".
+	COALESCE(
+		CASE
+			WHEN json_valid(NULLIF(e.snapshot_json, ''))
+				THEN json_extract(NULLIF(e.snapshot_json, ''), '$.open_subtask_count')
+			ELSE NULL
+		END,
+		0
+	))`
 
 // FindOrCreateTask implements the dedup logic via the partial unique index
 // (entity_id, event_type, dedup_key) WHERE status NOT IN ('done','dismissed').
