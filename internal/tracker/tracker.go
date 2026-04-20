@@ -595,6 +595,7 @@ func issueToState(issue jiraclient.Issue, baseURL string, doneStatuses []string)
 		snap.CommentCount = issue.Fields.Comment.Total
 	}
 	snap.Labels = issue.Fields.Labels
+	snap.CreatedAt = issue.Fields.Created
 	snap.OpenSubtaskCount = countOpenSubtasks(issue, doneStatuses)
 	return jiraIssueState{
 		Snap:        snap,
