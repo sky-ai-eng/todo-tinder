@@ -11,12 +11,17 @@ interface Props {
   onDeleted?: () => void
 }
 
-// TEMPLATE_VAR_GROUPS mirrors what internal/delegate/placeholders.go
-// interpolates at runtime. If a prompt references a placeholder not listed
-// here, it falls through as a literal {{X}} string at spawn time — agents
-// see it and fail loudly, which is the right signal. Placeholders that
-// don't apply to the task's event type render empty (e.g. {{WORKFLOW_RUN_ID}}
-// on a Jira task).
+// TEMPLATE_VAR_GROUPS is the mission-facing subset of what
+// internal/delegate/placeholders.go interpolates at runtime. If a prompt
+// references a placeholder not listed here, it falls through as a literal
+// {{X}} string at spawn time — agents see it and fail loudly, which is
+// the right signal. Placeholders that don't apply to the task's event
+// type render empty (e.g. {{WORKFLOW_RUN_ID}} on a Jira task).
+//
+// Deliberately omitted: {{SCOPE}} and {{TOOLS_REFERENCE}}. The replacer
+// populates them because the envelope template references them, but they
+// are envelope-internal — an author referencing either in their mission
+// body would just duplicate what the envelope already contains.
 type TemplateVar = { name: string; desc: string }
 type TemplateVarGroup = { label: string; caption: string; vars: TemplateVar[] }
 
