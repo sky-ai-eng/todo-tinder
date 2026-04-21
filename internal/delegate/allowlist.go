@@ -53,9 +53,9 @@ func BuildAllowedTools(selfBin string) string {
 		// branch, which is isolated and cleaned up after the run.
 		"Bash(git *)",
 
-		// File inspection - read-only.
+		// File inspection - read-only. Keep these non-interactive in headless
+		// runs; use cat/head/tail instead of pagers like less/more.
 		"Bash(cat *)", "Bash(head *)", "Bash(tail *)",
-		"Bash(less *)", "Bash(more *)",
 		"Bash(ls *)", "Bash(tree *)",
 		"Bash(stat *)", "Bash(file *)", "Bash(wc *)",
 		"Bash(du *)",
