@@ -46,12 +46,45 @@ func BuildAllowedTools(selfBin string) string {
 		// instead of hitting those APIs directly.
 		"Bash(" + selfBin + " exec *)",
 
-		// Git. Broad by design - git is the primary work tool, and scoping
-		// subcommands would miss too many legitimate flows (log, diff, show,
-		// blame, bisect, rebase, cherry-pick, stash, etc.). The destructive
-		// subcommands (reset --hard, push --force) target the worktree
-		// branch, which is isolated and cleaned up after the run.
-		"Bash(git *)",
+		// Git. Keep this scoped to common repository/worktree operations.
+		// Do NOT allow blanket `git *`: commands such as `git config --global`
+		// / `--system`, `git credential-*`, and similar can modify host-level
+		// git state outside the checked-out repo and persist across runs.
+		//
+		// We therefore enumerate the common subcommands the agent needs for
+		// local history inspection and branch manipulation, while excluding
+		// config/credential plumbing and other host-affecting surfaces.
+		"Bash(git add *)",
+		"Bash(git apply *)",
+		"Bash(git bisect *)",
+		"Bash(git blame *)",
+		"Bash(git branch)", "Bash(git branch *)",
+		"Bash(git checkout *)",
+		"Bash(git cherry-pick *)",
+		"Bash(git clean *)",
+		"Bash(git commit *)",
+		"Bash(git diff)", "Bash(git diff *)",
+		"Bash(git fetch *)",
+		"Bash(git grep *)",
+		"Bash(git init *)",
+		"Bash(git log)", "Bash(git log *)",
+		"Bash(git merge *)",
+		"Bash(git mv *)",
+		"Bash(git pull *)",
+		"Bash(git push *)",
+		"Bash(git rebase *)",
+		"Bash(git reflog)", "Bash(git reflog *)",
+		"Bash(git remote)", "Bash(git remote *)",
+		"Bash(git reset *)",
+		"Bash(git restore *)",
+		"Bash(git rev-parse)", "Bash(git rev-parse *)",
+		"Bash(git rm *)",
+		"Bash(git show)", "Bash(git show *)",
+		"Bash(git stash)", "Bash(git stash *)",
+		"Bash(git status)", "Bash(git status *)",
+		"Bash(git switch *)",
+		"Bash(git tag)", "Bash(git tag *)",
+		"Bash(git worktree *)",
 
 		// File inspection - read-only. Keep these non-interactive in headless
 		// runs; use cat/head/tail instead of pagers like less/more.
