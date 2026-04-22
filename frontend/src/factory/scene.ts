@@ -31,6 +31,9 @@ import {
 } from './nodes'
 
 const COLOR_ACCENT = 0xc47a5a
+const TEXT_PRIMARY = 0x1a1a1a
+const TEXT_TERTIARY = 0xa09a94
+const TEXT_SECONDARY = 0x6b6560
 /** Grid cell size. All primitives position their centers on integer grid
  * coordinates, so axis-aligned belts between them are guaranteed straight. */
 const GRID = 80
@@ -90,8 +93,8 @@ const NODE_DEFS: NodeDef[] = [
   { kind: 'station', eventType: 'github:pr:review_commented', col: 34, row: 8 }, //          18 down 4, spaced 3 from approved
   { kind: 'station', eventType: 'github:pr:review_approved', col: 34, row: 11 }, //          19 down 5 (middle)
   { kind: 'station', eventType: 'github:pr:review_changes_requested', col: 34, row: 14 }, // 20 down 6, spaced 3 from approved
-  { kind: 'station', eventType: 'github:pr:merged', col: 40, row: 11 }, //                   21 aligned with review_approved row 11
-  { kind: 'station', eventType: 'github:pr:closed', col: 40, row: 16 }, //                   22 closed-bus terminal (bus moved down 2)
+  { kind: 'station', eventType: 'github:pr:merged', col: 41, row: 11 }, //                   21 right 1 so closed can clear bus merger 29 at col 38
+  { kind: 'station', eventType: 'github:pr:closed', col: 41, row: 16 }, //                   22 right 1 so the bus has belt room between merger 29 (col 38) and closed
 
   // ─── Closed-bus infrastructure ─────────────────────────────────────────────
   { kind: 'splitter', label: 'continue?', col: 11, row: 6, orientation: 'left' }, //         23 s_rfr (moved right 1)
@@ -209,9 +212,13 @@ const BELT_EDGES: EdgeDef[] = [
   { from: 20, to: 25, fromSide: 'right', toSide: 'left' }, //  changes_requested → s_changes
   { from: 25, to: 30, fromSide: 'bottom', toSide: 'top' }, //  s_changes.bottom → bus merger (abandon drop)
   { from: 26, to: 27, fromSide: 'right', toSide: 'left' }, //  bus entry pole → bus merger 1
-  { from: 27, to: 29, fromSide: 'right', toSide: 'left' }, //  bus merger 1 → bus merger 2
-  { from: 29, to: 30, fromSide: 'right', toSide: 'left' }, //  bus merger 2 → bus merger 3
-  { from: 30, to: 22, fromSide: 'right', toSide: 'left' }, //  bus merger 3 → closed
+  // Bus mergers sit at cols 37 (node 30) and 38 (node 29), so the chain has
+  // to hit 30 BEFORE 29 to stay monotonically left-to-right. Earlier this
+  // wired 27→29→30→22 which looped col 38→37 backwards before continuing
+  // to closed at col 40.
+  { from: 27, to: 30, fromSide: 'right', toSide: 'left' }, //  bus merger 1 → bus merger (col 37, picks up changes_requested)
+  { from: 30, to: 29, fromSide: 'right', toSide: 'left' }, //  col 37 → col 38 (picks up review_commented)
+  { from: 29, to: 22, fromSide: 'right', toSide: 'left' }, //  col 38 → closed
 
   // ─── changes_requested retry loopback ──────────────────────────────────────
   // New: vertical tunnel from s_changes straight up to near retry pole 31.
@@ -408,7 +415,14 @@ export async function createFactoryScene(
       else n.update(dt)
     }
     for (const ch of chevronLayers) ch.update(dt)
-    items.update(dt)
+    // Items use scale for LOD and the visible world rect for culling the
+    // expanded-detail path. Recompute both once per tick instead of per
+    // item — both are cheap but still worth sharing.
+    const vb = scene.getVisibleBounds()
+    items.update(dt, {
+      scale,
+      visibleBounds: { x: vb.x, y: vb.y, width: vb.width, height: vb.height },
+    })
   }
   app.ticker.add(tick)
 
@@ -763,8 +777,24 @@ function buildItemSpawner(parent: Container, nodes: GraphNode[], edges: Edge[]) 
     return SCRIPTS[0].stops
   }
 
+  interface ItemMeta {
+    id: number
+    mine: boolean
+    title: string
+    repo: string
+    author: string
+    diffAdd: number
+    diffDel: number
+  }
+
   interface Item {
     gfx: Container
+    /** Compact pill — label only. Shown at mid / far zoom or when the
+     * item is off-screen at near zoom. */
+    compactGroup: Container
+    /** Expanded card — title, repo, author, diff. Shown only when near
+     * zoom AND the item is inside the viewport's visible world rect. */
+    detailGroup: Container
     script: number[]
     /** Index of the NEXT scripted stop to reach. scriptIdx-1 is the stop
      * we most recently arrived at (or script[0] if we haven't moved yet). */
@@ -783,45 +813,105 @@ function buildItemSpawner(parent: Container, nodes: GraphNode[], edges: Edge[]) 
   const ITEM_W = 60
   const ITEM_H = 22
 
+  // Detail card — shown at near zoom instead of the compact pill. Sized
+  // small enough to fit between adjacent stations on the main row without
+  // overflowing into the next station (belt span there is ~60 world units,
+  // so some visual overlap is inevitable; the chosen width is a compromise
+  // between legibility and not engulfing neighbours).
+  const DETAIL_W = 140
+  const DETAIL_H = 56
+
   // Ownership tint — warm terracotta for entities where the session user
   // authored the PR, cooler muted blue for entities authored by others.
   // We track every PR we can see, so the floor should show both.
   const TINT_MINE = COLOR_ACCENT // 0xc47a5a terracotta
   const TINT_OTHER = 0x7a9aad // muted slate-blue
 
-  const createItem = (label: string, mine: boolean): Item => {
+  // Demo pools for the synthetic item metadata. Real-event wiring will
+  // replace these with entity data from the events stream; for now they
+  // just populate the expanded item card with plausible-looking content
+  // so the near-zoom experience isn't empty.
+  const REPOS = [
+    'sky-ai-eng/triage-factory',
+    'sky-ai-eng/poller',
+    'acme/payments',
+    'acme/dashboard',
+    'acme/auth-service',
+  ]
+  const TITLES = [
+    'Fix CI flakes in build step',
+    'Add retry logic for poller',
+    'Refactor auth middleware',
+    'Improve error handling in tracker',
+    'Bump Go toolchain to 1.26',
+    'Cache repo profiles for 3 days',
+    'Wire WS event broadcasts',
+    'Handle merge conflicts safely',
+    'Add task dedup key',
+    'Clean up stale worktrees',
+    'Parallelize CI matrix jobs',
+    'Fix race in snapshot diff',
+    'Tighten scope predicate schema',
+    'Move secrets to keychain',
+    'Reduce scorer cold-start time',
+  ]
+  const MY_HANDLE = '@aidan'
+  const OTHER_HANDLES = ['@maria', '@jun', '@priya', '@sam', '@alex', '@devon']
+  const pick = <T>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)]
+
+  const genMeta = (id: number, mine: boolean): ItemMeta => ({
+    id,
+    mine,
+    title: pick(TITLES),
+    repo: pick(REPOS),
+    author: mine ? MY_HANDLE : pick(OTHER_HANDLES),
+    diffAdd: 3 + Math.floor(Math.random() * 240),
+    diffDel: Math.floor(Math.random() * 120),
+  })
+
+  // Pixi Text rasters at creation-time DPI. A 3× resolution keeps text
+  // crisp up to the NEAR zoom ceiling without rebuilding textures when
+  // the viewport zooms.
+  const TEXT_RES = 3
+
+  const createItem = (meta: ItemMeta): Item => {
     const g = new Container()
     layer.addChild(g)
-    const tint = mine ? TINT_MINE : TINT_OTHER
+    const tint = meta.mine ? TINT_MINE : TINT_OTHER
 
+    // Shadow stays on the belt surface regardless of which LOD body is
+    // showing — gives both the compact pill and the expanded card the
+    // "floating above conveyor" lift.
     const shadow = new Graphics()
     shadow.ellipse(0, 2, ITEM_W / 2 - 2, 4)
     shadow.fill({ color: 0x000000, alpha: 0.22 })
     g.addChild(shadow)
 
-    const body = new Container()
-    body.y = -ITEM_LIFT
-    g.addChild(body)
+    // ── Compact pill (mid / far LOD) ──────────────────────────────────────
+    const compactGroup = new Container()
+    compactGroup.y = -ITEM_LIFT
+    g.addChild(compactGroup)
 
     const bg = new Graphics()
     bg.roundRect(-ITEM_W / 2, -ITEM_H / 2, ITEM_W, ITEM_H, ITEM_H / 2)
     bg.fill({ color: 0xffffff, alpha: 0.97 })
     bg.stroke({ width: 1, color: tint, alpha: 0.55 })
-    body.addChild(bg)
+    compactGroup.addChild(bg)
 
     const inner = new Graphics()
     inner.roundRect(-ITEM_W / 2 + 2, -ITEM_H / 2 + 2, ITEM_W - 4, ITEM_H - 4, (ITEM_H - 4) / 2)
     inner.fill({ color: tint, alpha: 0.1 })
-    body.addChild(inner)
+    compactGroup.addChild(inner)
 
     const topHighlight = new Graphics()
     topHighlight.moveTo(-ITEM_W / 2 + 6, -ITEM_H / 2 + 1.5)
     topHighlight.lineTo(ITEM_W / 2 - 6, -ITEM_H / 2 + 1.5)
     topHighlight.stroke({ width: 1, color: 0xffffff, alpha: 0.9 })
-    body.addChild(topHighlight)
+    compactGroup.addChild(topHighlight)
 
-    const text = new Text({
-      text: label,
+    const compactText = new Text({
+      text: `PR #${meta.id}`,
+      resolution: TEXT_RES,
       style: {
         fontFamily: 'Inter, system-ui, sans-serif',
         fontSize: 11,
@@ -830,8 +920,121 @@ function buildItemSpawner(parent: Container, nodes: GraphNode[], edges: Edge[]) 
         letterSpacing: 0.2,
       },
     })
-    text.anchor.set(0.5, 0.5)
-    body.addChild(text)
+    compactText.anchor.set(0.5, 0.5)
+    compactGroup.addChild(compactText)
+
+    // ── Expanded detail card (near LOD) ───────────────────────────────────
+    // Anchored above the belt the same way as the compact pill, just a
+    // bigger vertical offset so its bottom edge aligns with the belt top
+    // rather than the belt center.
+    const detailGroup = new Container()
+    detailGroup.y = -ITEM_LIFT - (DETAIL_H - ITEM_H) / 2
+    detailGroup.visible = false // toggled by update() per LOD + culling
+    g.addChild(detailGroup)
+
+    const dHW = DETAIL_W / 2
+    const dHH = DETAIL_H / 2
+
+    const detailBg = new Graphics()
+    detailBg.roundRect(-dHW, -dHH, DETAIL_W, DETAIL_H, 8)
+    detailBg.fill({ color: 0xffffff, alpha: 0.97 })
+    detailBg.stroke({ width: 1, color: tint, alpha: 0.55 })
+    detailGroup.addChild(detailBg)
+
+    const detailInner = new Graphics()
+    detailInner.roundRect(-dHW + 2, -dHH + 2, DETAIL_W - 4, DETAIL_H - 4, 7)
+    detailInner.fill({ color: tint, alpha: 0.06 })
+    detailGroup.addChild(detailInner)
+
+    const detailTopHighlight = new Graphics()
+    detailTopHighlight.moveTo(-dHW + 8, -dHH + 1.5)
+    detailTopHighlight.lineTo(dHW - 8, -dHH + 1.5)
+    detailTopHighlight.stroke({ width: 1, color: 0xffffff, alpha: 0.9 })
+    detailGroup.addChild(detailTopHighlight)
+
+    const padX = 8
+    const titleY = -14
+    const repoY = 0
+    const footerY = 14
+
+    // Fit a Pixi Text inside a max width by iteratively trimming characters
+    // and re-measuring. Character-count truncation is unreliable with
+    // proportional fonts (w is wider than i), so we rely on Pixi's actual
+    // rasterized width instead. Cheap — only runs at item creation.
+    const fitText = (t: Text, original: string, maxWidth: number) => {
+      if (t.width <= maxWidth) return
+      let s = original
+      while (s.length > 2 && t.width > maxWidth) {
+        s = s.slice(0, -1)
+        t.text = s.trimEnd() + '…'
+      }
+    }
+    const innerW = DETAIL_W - padX * 2
+
+    const titleText = new Text({
+      text: meta.title,
+      resolution: TEXT_RES,
+      style: {
+        fontFamily: 'Inter, system-ui, sans-serif',
+        fontSize: 11,
+        fontWeight: '700',
+        fill: TEXT_PRIMARY,
+        letterSpacing: 0.1,
+      },
+    })
+    titleText.anchor.set(0, 0.5)
+    titleText.x = -dHW + padX
+    titleText.y = titleY
+    fitText(titleText, meta.title, innerW)
+    detailGroup.addChild(titleText)
+
+    const repoText = new Text({
+      text: meta.repo,
+      resolution: TEXT_RES,
+      style: {
+        fontFamily: 'Inter, system-ui, sans-serif',
+        fontSize: 8,
+        fontWeight: '500',
+        fill: TEXT_TERTIARY,
+        letterSpacing: 0.2,
+      },
+    })
+    repoText.anchor.set(0, 0.5)
+    repoText.x = -dHW + padX
+    repoText.y = repoY
+    fitText(repoText, meta.repo, innerW)
+    detailGroup.addChild(repoText)
+
+    const authorText = new Text({
+      text: meta.author,
+      resolution: TEXT_RES,
+      style: {
+        fontFamily: 'Inter, system-ui, sans-serif',
+        fontSize: 8,
+        fontWeight: '600',
+        fill: tint,
+        letterSpacing: 0.3,
+      },
+    })
+    authorText.anchor.set(0, 0.5)
+    authorText.x = -dHW + padX
+    authorText.y = footerY
+    detailGroup.addChild(authorText)
+
+    const diffText = new Text({
+      text: `+${meta.diffAdd} −${meta.diffDel}`,
+      resolution: TEXT_RES,
+      style: {
+        fontFamily: 'SF Mono, Fira Code, monospace',
+        fontSize: 8,
+        fontWeight: '500',
+        fill: TEXT_SECONDARY,
+      },
+    })
+    diffText.anchor.set(1, 0.5)
+    diffText.x = dHW - padX
+    diffText.y = footerY
+    detailGroup.addChild(diffText)
 
     // Pick a scripted journey and seed the item on the first belt heading
     // toward script[1] (item starts at script[0] and travels from there).
@@ -839,6 +1042,8 @@ function buildItemSpawner(parent: Container, nodes: GraphNode[], edges: Edge[]) 
     const initial = script.length >= 2 ? edgeToward(script[0], script[1]) : null
     return {
       gfx: g,
+      compactGroup,
+      detailGroup,
       script,
       scriptIdx: 1,
       currentEdge: initial,
@@ -854,10 +1059,54 @@ function buildItemSpawner(parent: Container, nodes: GraphNode[], edges: Edge[]) 
     items.splice(i, 1)
   }
 
+  // Precomputed station rects (AABBs) in world coords. Items near a
+  // station fall back to the compact pill at near zoom so the expanded
+  // detail card never slips half-behind the station's HTML overlay —
+  // that overlay renders on a DOM layer above the canvas, so there's no
+  // z-index trick to push items in front of it. Hiding detail inside
+  // the station zone turns "item disappears behind overlay" into "item
+  // dives into the station" visually.
+  const STATION_MARGIN = 12
+  const DETAIL_HALF_W = DETAIL_W / 2
+  const DETAIL_HALF_H = DETAIL_H / 2
+  const DETAIL_CENTER_Y_OFFSET = -ITEM_LIFT - (DETAIL_H - ITEM_H) / 2
+  const stationRects: Array<{ cx: number; cy: number; hw: number; hh: number }> = []
+  for (const n of nodes) {
+    if (n.kind === 'station') {
+      stationRects.push({
+        cx: n.center.x,
+        cy: n.center.y,
+        hw: n.worldSize.w / 2,
+        hh: n.worldSize.h / 2,
+      })
+    }
+  }
+  const detailOverlapsAnyStation = (itemX: number, itemY: number): boolean => {
+    const cx = itemX
+    const cy = itemY + DETAIL_CENTER_Y_OFFSET
+    for (const r of stationRects) {
+      if (
+        Math.abs(cx - r.cx) < DETAIL_HALF_W + r.hw + STATION_MARGIN &&
+        Math.abs(cy - r.cy) < DETAIL_HALF_H + r.hh + STATION_MARGIN
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
   let nextId = 1042
 
+  interface ViewContext {
+    scale: number
+    /** Viewport's visible world rect. Used to cull expanded-detail
+     * updates — off-screen items stay in compact form so Pixi can skip
+     * drawing their detail text even at near zoom. */
+    visibleBounds: { x: number; y: number; width: number; height: number }
+  }
+
   return {
-    update(dt: number) {
+    update(dt: number, view: ViewContext) {
       sinceSpawn += dt
       if (sinceSpawn >= spawnInterval) {
         sinceSpawn = 0
@@ -865,8 +1114,11 @@ function buildItemSpawner(parent: Container, nodes: GraphNode[], edges: Edge[]) 
         // the real-event model this will come from entity metadata
         // (author_is_self) rather than a coin flip.
         const mine = Math.random() < 0.6
-        items.push(createItem(`PR #${nextId++}`, mine))
+        items.push(createItem(genMeta(nextId++, mine)))
       }
+
+      const nearZoom = view.scale >= NEAR_ZOOM_THRESHOLD
+      const vb = view.visibleBounds
 
       for (let i = items.length - 1; i >= 0; i--) {
         const it = items[i]
@@ -964,6 +1216,21 @@ function buildItemSpawner(parent: Container, nodes: GraphNode[], edges: Edge[]) 
           const fade = Math.min(1, it.t / 0.08, (1 - it.t) / 0.08)
           it.gfx.alpha = Math.max(0, fade)
         }
+
+        // LOD + culling. At near zoom the item switches to the expanded
+        // detail card, but ONLY when:
+        //   - currently inside the viewport's visible world rect (Pixi
+        //     skips drawing detail text for off-screen items), AND
+        //   - not overlapping any station's footprint, since stations
+        //     have HTML detail overlays at near zoom and we can't raise
+        //     canvas-drawn items above DOM overlays. Falling back to the
+        //     compact pill near stations reads as the item docking
+        //     briefly rather than half-disappearing behind an overlay.
+        const inView =
+          pos.x >= vb.x && pos.x <= vb.x + vb.width && pos.y >= vb.y && pos.y <= vb.y + vb.height
+        const showDetail = nearZoom && inView && !detailOverlapsAnyStation(pos.x, pos.y)
+        it.compactGroup.visible = !showDetail
+        it.detailGroup.visible = showDetail
       }
     },
   }

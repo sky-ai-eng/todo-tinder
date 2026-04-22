@@ -215,6 +215,10 @@ export function buildStation(parent: Container, opts: StationOptions): StationHa
 
   const title = new Text({
     text: event.label,
+    // resolution: 3 lets the raster stay sharp up to 3× zoom (NEAR). Pixi
+    // rasters Text once at creation-time DPI and then transforms the
+    // texture at draw — without this bump, text gets fuzzy at near zoom.
+    resolution: 3,
     style: {
       fontFamily: 'Inter, system-ui, sans-serif',
       fontSize: 14,
@@ -231,6 +235,7 @@ export function buildStation(parent: Container, opts: StationOptions): StationHa
   // Source badge — rounded pill, right side of header.
   const badgeText = new Text({
     text: event.source,
+    resolution: 3,
     style: {
       fontFamily: 'Inter, system-ui, sans-serif',
       fontSize: 9,
@@ -323,6 +328,7 @@ export function buildStation(parent: Container, opts: StationOptions): StationHa
 
   const farTitle = new Text({
     text: event.label,
+    resolution: 2,
     style: {
       fontFamily: 'Inter, system-ui, sans-serif',
       fontSize: 32,
@@ -524,6 +530,7 @@ function drawChip(
 ) {
   const text = new Text({
     text: label,
+    resolution: 3,
     style: {
       fontFamily: 'Inter, system-ui, sans-serif',
       fontSize: 9,
