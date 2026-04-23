@@ -166,6 +166,30 @@ export default function Factory() {
     setDrawer({ task: summary.task, run: summary.run })
   }
 
+  // Project each entity to the station it's currently parked at, using the
+  // same rule the Pixi scene uses: walk `recent_events` from the tail and
+  // pick the most recent entry whose event_type corresponds to a station on
+  // the board. This avoids the mismatch between `current_event_type`
+  // (ordered by insertion time in the backend) and `recent_events` (ordered
+  // by source time via COALESCE), which produced the "item shows in mid
+  // view but missing from near-zoom Waiting" bug.
+  const stationEventTypes = new Set(stations.map((s) => s.eventType))
+  const entityParkedAt = new Map<string, string>()
+  for (const e of factoryData?.entities ?? []) {
+    const recent = e.recent_events ?? []
+    let latest: string | undefined
+    for (let i = recent.length - 1; i >= 0; i--) {
+      if (stationEventTypes.has(recent[i].event_type)) {
+        latest = recent[i].event_type
+        break
+      }
+    }
+    if (!latest && e.current_event_type && stationEventTypes.has(e.current_event_type)) {
+      latest = e.current_event_type
+    }
+    if (latest) entityParkedAt.set(e.id, latest)
+  }
+
   // Resolve per-station overlay props from the factory snapshot. Stations
   // with no activity get undefined so the overlay falls back to its own
   // empty-state rendering.
@@ -192,10 +216,14 @@ export default function Factory() {
       triggered24h: fs.triggered_24h,
       active: fs.active_runs,
     }
-    const runEntityIds = new Set((fs.runs ?? []).map((r) => r.task.id))
+    // Entities with an active run at this station belong in the Active Runs
+    // list, not Waiting. Dedup by entity_id (the canonical key) — the
+    // earlier version keyed on task.id, which never matched entity.id and
+    // effectively disabled the filter.
+    const runEntityIds = new Set((fs.runs ?? []).map((r) => r.task.entity_id))
     const waiting: StationWaitingEntity[] =
       factoryData?.entities
-        .filter((e) => e.current_event_type === eventType)
+        .filter((e) => entityParkedAt.get(e.id) === eventType)
         .filter((e) => !runEntityIds.has(e.id))
         .map((e) => ({
           id: e.id,

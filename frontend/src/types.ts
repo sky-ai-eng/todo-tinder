@@ -3,6 +3,7 @@ export type EntityKind = 'pr' | 'issue' | 'epic' | 'message'
 
 export interface Task {
   id: string
+  entity_id: string
   source: TaskSource
   source_id: string
   source_url: string

@@ -15,6 +15,7 @@ import (
 // to the frontend's expected shape for backward compatibility.
 type taskJSON struct {
 	ID                  string   `json:"id"`
+	EntityID            string   `json:"entity_id"`   // FK to entities.id — lets callers correlate tasks back to their entity
 	Source              string   `json:"source"`      // from entity
 	SourceID            string   `json:"source_id"`   // from entity
 	SourceURL           string   `json:"source_url"`  // from entity
@@ -41,6 +42,7 @@ type taskJSON struct {
 func taskToJSON(t domain.Task) taskJSON {
 	return taskJSON{
 		ID:                  t.ID,
+		EntityID:            t.EntityID,
 		Source:              t.EntitySource,
 		SourceID:            t.EntitySourceID,
 		SourceURL:           t.SourceURL,
