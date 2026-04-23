@@ -251,9 +251,18 @@ func ListRecentEventsByEntity(database *sql.DB, ids []string, perEntity int) (ma
 			return nil, err
 		}
 		for rows.Next() {
-			var entityID, eventType string
-			var eventAt time.Time
-			if err := rows.Scan(&entityID, &eventType, &eventAt); err != nil {
+			var entityID, eventType, eventAtStr string
+			// COALESCE over two DATETIME columns loses the column-type
+			// metadata mattn/go-sqlite3 needs to scan directly into
+			// time.Time (driver returns the value as a string). Scan as
+			// string and parse ourselves — cheap and consistent across
+			// whichever source column contributed the value.
+			if err := rows.Scan(&entityID, &eventType, &eventAtStr); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			eventAt, err := parseDBDatetime(eventAtStr)
+			if err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -269,6 +278,29 @@ func ListRecentEventsByEntity(database *sql.DB, ids []string, perEntity int) (ma
 		rows.Close()
 	}
 	return out, nil
+}
+
+// parseDBDatetime handles the ISO-8601 and SQLite-default datetime
+// formats we see in the events table. Direct time.Time scans work for
+// plain DATETIME columns because mattn/go-sqlite3 reads the column type
+// and parses; once COALESCE enters the picture that type metadata is
+// gone and we get back a raw string. Accept both the RFC3339 Go-side
+// writer format (from explicit time.Time inserts) and SQLite's default
+// "2006-01-02 15:04:05" CURRENT_TIMESTAMP format.
+func parseDBDatetime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return t, nil
+	}
+	return time.Parse("2006-01-02T15:04:05.999999999Z07:00", s)
 }
 
 // ListFactoryEntities returns up to `limit` active entities with their
