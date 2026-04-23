@@ -222,16 +222,29 @@ func ListRecentEventsByEntity(database *sql.DB, ids []string, perEntity int) (ma
 		}
 		args = append(args, perEntity)
 
+		// Chain ordering is driven by source time (commit committed_at,
+		// check-run completed_at, review submitted_at) when available —
+		// detection time (created_at) as a fallback. rowid is a tie-breaker
+		// for genuine collisions (two events sharing a source timestamp to
+		// the second, or both lacking a source time and inserted in the
+		// same poll cycle). Inner window partitions on COALESCE so the
+		// "most recent" per entity is stable regardless of which column is
+		// populated.
 		query := `
-			SELECT entity_id, event_type, created_at
+			SELECT entity_id, event_type, event_at
 			FROM (
-				SELECT entity_id, event_type, created_at,
-					ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY created_at DESC) AS rn
+				SELECT entity_id, event_type,
+					COALESCE(occurred_at, created_at) AS event_at,
+					rowid AS row_id,
+					ROW_NUMBER() OVER (
+						PARTITION BY entity_id
+						ORDER BY COALESCE(occurred_at, created_at) DESC, rowid DESC
+					) AS rn
 				FROM events
 				WHERE entity_id IN (` + strings.Join(placeholders, ",") + `)
 			)
 			WHERE rn <= ?
-			ORDER BY entity_id, created_at ASC
+			ORDER BY entity_id, event_at ASC, row_id ASC
 		`
 		rows, err := database.Query(query, args...)
 		if err != nil {
@@ -239,14 +252,14 @@ func ListRecentEventsByEntity(database *sql.DB, ids []string, perEntity int) (ma
 		}
 		for rows.Next() {
 			var entityID, eventType string
-			var createdAt time.Time
-			if err := rows.Scan(&entityID, &eventType, &createdAt); err != nil {
+			var eventAt time.Time
+			if err := rows.Scan(&entityID, &eventType, &eventAt); err != nil {
 				rows.Close()
 				return nil, err
 			}
 			out[entityID] = append(out[entityID], FactoryRecentEvent{
 				EventType: eventType,
-				CreatedAt: createdAt,
+				CreatedAt: eventAt,
 			})
 		}
 		if err := rows.Err(); err != nil {
