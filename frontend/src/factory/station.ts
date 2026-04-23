@@ -44,11 +44,15 @@ export const BELT_WIDTH = 28
  * conveyor material is visually continuous. */
 export const PORT_STUB_LEN = 24
 
-// Port offsets in station-local coords. Port y is the vertical center of
-// the core chamber — the belt visually aligns with the core's interior.
+// Port offsets in station-local coords. Port y is forced to 0 (the
+// station's vertical center, which sits on the grid row line) so belts
+// between stations and other nodes — whose ports are all at center.y —
+// are perfectly horizontal. The core chamber's midline is ~3px below
+// this axis; that offset is small enough to read as intentional
+// asymmetry between header and chip strip rather than a bent belt.
 const CORE_Y = -H / 2 + HEADER_H + CORE_PAD_TOP
 const CORE_H = H - HEADER_H - CHIPS_H - CORE_PAD_TOP - CORE_PAD_BOT
-const PORT_LOCAL_Y = CORE_Y + CORE_H / 2
+const PORT_LOCAL_Y = 0
 
 const CATEGORY_COLOR: Record<string, number> = {
   pr_flow: 0xc47a5a,
