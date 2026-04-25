@@ -404,7 +404,22 @@ func (r *Router) DrainEntity(entityID string) {
 		runID, skipReason := r.attemptDrainOne(firing)
 		if runID != "" {
 			if err := dbpkg.MarkPendingFiringFired(r.db, firing.ID, runID); err != nil {
-				log.Printf("[router] mark firing %d fired (run %s): %v", firing.ID, runID, err)
+				// Durability race: the run was created (side-effect
+				// committed inside the spawner goroutine) but the UPDATE
+				// that records the firing→run association failed. The
+				// firing row is still 'pending' — a later DrainEntity
+				// would pop the same row and fire again, duplicating.
+				// Cancel the run we just spawned to roll back the
+				// side-effect; the firing stays pending and a future
+				// drain will re-fire it fresh, with no concurrent run.
+				log.Printf("[router] mark firing %d fired (run %s) failed: %v — cancelling run to keep firing→run association consistent",
+					firing.ID, runID, err)
+				if r.spawner != nil {
+					if cerr := r.spawner.Cancel(runID); cerr != nil {
+						log.Printf("[router] cancel run %s after mark-fired failure: %v — orphaned run + still-pending firing, manual cleanup may be needed",
+							runID, cerr)
+					}
+				}
 			}
 			return // one fire per drain — the new run gates the rest
 		}
