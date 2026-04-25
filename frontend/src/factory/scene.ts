@@ -833,12 +833,20 @@ function buildItemSpawner(
     label: string
     mine: boolean
     gfx: Container
-    /** Compact pill — label only. Shown at mid / far zoom or when the
-     * item is off-screen at near zoom. */
+    /** Compact pill — label only. Shown at mid zoom (and as the near-zoom
+     * fallback when the item is off-screen or overlapping a station). */
     compactGroup: Container
     /** Expanded card — title, repo, author, diff. Shown only when near
      * zoom AND the item is inside the viewport's visible world rect. */
     detailGroup: Container
+    /** Tiny dot + glow shown at far zoom on traveling items. Keeps the
+     * belts visibly alive when individual pills would be unreadable, and
+     * complements the station count badges (parked items aren't drawn —
+     * the badge represents them). */
+    farDot: Container
+    /** Belt-surface shadow for the compact / detail bodies. Hidden at far
+     * zoom because the dot doesn't need a "lift" — it sits on the belt. */
+    shadow: Graphics
     /** Station node index where the item is currently parked. -1 while
      * traveling between stations. */
     parkedAt: number
@@ -905,13 +913,37 @@ function buildItemSpawner(
     layer.addChild(g)
     const tint = meta.mine ? TINT_MINE : TINT_OTHER
 
-    // Shadow stays on the belt surface regardless of which LOD body is
-    // showing — gives both the compact pill and the expanded card the
-    // "floating above conveyor" lift.
+    // Shadow stays on the belt surface for the compact pill and detail
+    // card — gives the "floating above conveyor" lift. Hidden at far zoom
+    // since the far-dot sits on the belt itself and doesn't lift.
     const shadow = new Graphics()
     shadow.ellipse(0, 2, ITEM_W / 2 - 2, 4)
     shadow.fill({ color: 0x000000, alpha: 0.22 })
     g.addChild(shadow)
+
+    // ── Far-zoom dot (with faint glow) ────────────────────────────────────
+    // At far zoom, individual pills are unreadable; instead, render each
+    // traveling item as a small tinted dot so belts visibly carry flow.
+    // The glow (a larger, low-alpha disc behind the dot) gives density
+    // legibility without bumping the core radius — clusters read as
+    // brighter regions rather than overlapping pinpoints. Sits at y=0
+    // (belt surface) — no shadow, no lift; the dot IS the entity at this
+    // LOD. Toggled visible by update() based on far-zoom + traveling.
+    const farDot = new Container()
+    g.addChild(farDot)
+    const farGlow = new Graphics()
+    farGlow.circle(0, 0, 8)
+    farGlow.fill({ color: tint, alpha: 0.22 })
+    farDot.addChild(farGlow)
+    const farCore = new Graphics()
+    farCore.circle(0, 0, 3.5)
+    farCore.fill({ color: tint, alpha: 1 })
+    farDot.addChild(farCore)
+    const farHighlight = new Graphics()
+    farHighlight.circle(-0.8, -0.8, 1.2)
+    farHighlight.fill({ color: 0xffffff, alpha: 0.55 })
+    farDot.addChild(farHighlight)
+    farDot.visible = false // update() toggles per zoom + traveling
 
     // ── Compact pill (mid / far LOD) ──────────────────────────────────────
     const compactGroup = new Container()
@@ -1071,6 +1103,8 @@ function buildItemSpawner(
       gfx: g,
       compactGroup,
       detailGroup,
+      farDot,
+      shadow,
       parkedAt,
       target: -1,
       currentEdge: null,
@@ -1289,13 +1323,12 @@ function buildItemSpawner(
       const nearZoom = view.scale >= NEAR_ZOOM_THRESHOLD
       const vb = view.visibleBounds
 
-      // At far zoom individual item pills are unreadable and clutter the
-      // glyph — stations carry the count badge instead. Hide the whole
-      // item layer rather than iterating per-item to flip visibility.
-      if (farZoom) {
-        for (const it of items.values()) it.gfx.visible = false
-        return
-      }
+      // We do NOT early-return at far zoom: items still need to advance
+      // along belts (so they reach stations and trigger restack, which
+      // refreshes the count badges that ARE visible at far zoom). Per-item
+      // LOD visibility is decided below — far zoom shows the dot, parked
+      // items stay hidden at every zoom (station count/strip/overlay
+      // represents them).
 
       for (const it of items.values()) {
         // Parked items sit at station center, offset by their stack ordinal.
@@ -1388,18 +1421,28 @@ function buildItemSpawner(
           it.gfx.visible = false
         }
 
-        // LOD + culling. At near zoom the item switches to the expanded
-        // detail card, but ONLY when:
-        //   - currently inside the viewport's visible world rect, AND
-        //   - not overlapping any station's footprint, since stations
-        //     have HTML detail overlays at near zoom and we can't raise
-        //     canvas-drawn items above DOM overlays.
+        // LOD + culling. Three mutually-exclusive bodies:
+        //  - far zoom → tinted dot + glow (no shadow, no lift)
+        //  - near zoom + visible + away from a station → expanded detail card
+        //  - everything else (mid zoom, near-zoom fallbacks) → compact pill
+        // The decision still gates on gfx.visible: parked items are never
+        // drawn here (stations represent them) so the per-LOD toggles
+        // collapse to nothing when the parent is hidden.
         const px = it.gfx.x
         const py = it.gfx.y
         const inView = px >= vb.x && px <= vb.x + vb.width && py >= vb.y && py <= vb.y + vb.height
         const showDetail = nearZoom && inView && !detailOverlapsAnyStation(px, py)
-        it.compactGroup.visible = !showDetail
-        it.detailGroup.visible = showDetail
+        if (farZoom) {
+          it.farDot.visible = true
+          it.shadow.visible = false
+          it.compactGroup.visible = false
+          it.detailGroup.visible = false
+        } else {
+          it.farDot.visible = false
+          it.shadow.visible = true
+          it.compactGroup.visible = !showDetail
+          it.detailGroup.visible = showDetail
+        }
       }
     },
   }
