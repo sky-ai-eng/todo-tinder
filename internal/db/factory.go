@@ -145,15 +145,15 @@ func ListFactoryActiveRuns(database *sql.DB) ([]FactoryActiveRun, error) {
 			&r.ResultSummary, &r.SessionID,
 			&r.MemoryMissing, &r.TriggerType, &r.TriggerID,
 		}
-		// Task half: delegated to taskScanTargets so the NULL-able text
-		// columns (ai_summary, severity, close_reason, ...) flow through
-		// sql.NullString instead of erroring on "converting NULL to string"
-		// for unscored tasks.
-		taskTargets, finalizeTask := taskScanTargets(&t)
-		if err := rows.Scan(append(runTargets, taskTargets...)...); err != nil {
+		// Task half: taskScanState holds the NullX intermediates on the
+		// caller's stack so NULL-able text columns (ai_summary, severity,
+		// close_reason, ...) don't error on "converting NULL to string" for
+		// unscored tasks, without a per-row closure/heap allocation.
+		var ts taskScanState
+		if err := rows.Scan(append(runTargets, ts.targets(&t)...)...); err != nil {
 			return nil, err
 		}
-		finalizeTask()
+		ts.finalize(&t)
 		if completedAt.Valid {
 			r.CompletedAt = &completedAt.Time
 		}
