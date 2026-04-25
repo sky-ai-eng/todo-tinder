@@ -387,10 +387,9 @@ func (r *Router) DrainEntity(entityID string) {
 	// blocks until the first releases, by which point the firing has
 	// landed in a terminal status and the second drain's pop returns the
 	// next row (or nothing).
-	// MUTEX TEMPORARILY DISABLED for race regression check.
-	// mu := r.entityDrainLock(entityID)
-	// mu.Lock()
-	// defer mu.Unlock()
+	mu := r.entityDrainLock(entityID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	for {
 		firing, err := dbpkg.PopPendingFiringForEntity(r.db, entityID)
