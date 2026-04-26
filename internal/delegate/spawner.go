@@ -224,10 +224,12 @@ func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*Takeove
 
 	destPath, err := worktree.CopyForTakeover(ctx, runID, run.WorktreePath, baseDir)
 	if err != nil {
-		// The takenOver flag stays set even on failure — the runAgent
-		// goroutine has already exited (or is about to) and any further
-		// writes to the run row would be misleading. Surface the error
-		// and let the user retry; nothing's clobbered.
+		// Copy failed — the agent has been cancelled but the gated
+		// defers in runAgent suppressed all the normal cleanup. Roll
+		// back: clear the flag, do the cleanup ourselves, and mark the
+		// row terminal so it doesn't sit in 'running' forever and so a
+		// retry isn't permanently blocked by a stale takenOver entry.
+		s.abortTakeover(runID, run.WorktreePath, "")
 		return nil, fmt.Errorf("copy worktree: %w", err)
 	}
 
@@ -240,19 +242,19 @@ func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*Takeove
 
 	ok, err := db.MarkAgentRunTakenOver(s.database, runID, destPath)
 	if err != nil {
-		if rmErr := os.RemoveAll(destPath); rmErr != nil {
-			log.Printf("[delegate] warning: failed to clean up takeover dir %s after DB error: %v", destPath, rmErr)
-		}
+		// Same rollback as the copy-failure path. destPath needs
+		// removing too since the row never got marked.
+		s.abortTakeover(runID, run.WorktreePath, destPath)
 		return nil, fmt.Errorf("mark taken_over: %w", err)
 	}
 	if !ok {
-		// The race-guard tripped — someone else (a competing handler,
-		// or the goroutine before our SIGKILL landed) already wrote a
-		// terminal status. Roll back the destination directory so we
-		// don't leave an orphaned takeover folder.
-		if rmErr := os.RemoveAll(destPath); rmErr != nil {
-			log.Printf("[delegate] warning: failed to clean up takeover dir %s after race: %v", destPath, rmErr)
-		}
+		// Race-loss: the goroutine wrote a real terminal status before
+		// our flag was set. Its natural defers ran (the gates evaluated
+		// false at that point), but ours skipped because the flag was
+		// set by the time they fired — abortTakeover catches them up.
+		// abortTakeover's guarded UPDATE will no-op since the row is
+		// already terminal, so the agent's actual outcome is preserved.
+		s.abortTakeover(runID, run.WorktreePath, destPath)
 		return nil, fmt.Errorf("run %s reached a terminal state before takeover could finalize", runID)
 	}
 
@@ -260,6 +262,51 @@ func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*Takeove
 	toast.Info(s.wsHub, fmt.Sprintf("Taken over: run %s — resume in your terminal", shortRunID(runID)))
 
 	return &TakeoverResult{TakeoverPath: destPath, SessionID: run.SessionID}, nil
+}
+
+// abortTakeover unwinds the in-progress takeover state when CopyForTakeover
+// or the final DB mark fails. Without it, every cleanup path in runAgent
+// stays gated forever (because takenOver is sticky), the run row sits at
+// whatever non-terminal status it last had, future takeover attempts get
+// "already being taken over," and the ~/.claude/projects JSONL leaks.
+//
+// The order is: clear the flag, then do the cleanup the gated defers
+// skipped (worktree.Remove + RemoveClaudeProjectDir), then mark the row
+// terminal — but only if it isn't already (race-loss path against
+// natural completion preserves the agent's real outcome).
+//
+// destPath may be empty (copy never produced one) or may point at a
+// partial directory; either way we RemoveAll it.
+func (s *Spawner) abortTakeover(runID, claudeCwd, destPath string) {
+	s.mu.Lock()
+	delete(s.takenOver, runID)
+	s.mu.Unlock()
+
+	if destPath != "" {
+		if err := os.RemoveAll(destPath); err != nil {
+			log.Printf("[delegate] warning: abort takeover for %s: remove dest %s: %v", runID, destPath, err)
+		}
+	}
+	if claudeCwd != "" {
+		worktree.RemoveClaudeProjectDir(claudeCwd)
+	}
+	if err := worktree.Remove(runID); err != nil {
+		log.Printf("[delegate] warning: abort takeover for %s: remove worktree: %v", runID, err)
+	}
+
+	// If the row is still non-terminal (copy/DB-error path: the
+	// goroutine's gated handleCancelled didn't write anything), mark it
+	// cancelled so the UI and the active-run gate don't see a phantom
+	// running run forever. If the row is already terminal (race-loss
+	// path), this no-ops and we leave the agent's real outcome alone.
+	ok, err := db.MarkAgentRunCancelledIfActive(s.database, runID, "takeover_failed", "Takeover failed; run was cancelled")
+	if err != nil {
+		log.Printf("[delegate] warning: abort takeover for %s: mark cancelled: %v", runID, err)
+		return
+	}
+	if ok {
+		s.broadcastRunUpdate(runID, "cancelled")
+	}
 }
 
 // runConfig holds everything the generic agent runner needs.

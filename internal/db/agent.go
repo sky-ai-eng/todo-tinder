@@ -184,6 +184,33 @@ func MarkAgentRunTakenOver(database *sql.DB, runID, takeoverPath string) (bool, 
 	return n > 0, nil
 }
 
+// MarkAgentRunCancelledIfActive marks a run cancelled with the given
+// stop_reason / summary, but only if the row hasn't already reached a
+// terminal state. Returns ok=false (no error) when the row is already
+// terminal — used by takeover-rollback so the rollback can recover from
+// either "we cancelled the goroutine and need to write the terminal
+// status ourselves" or "the goroutine completed naturally before our
+// takeover landed; leave its real outcome alone." Either way, the row
+// ends up in a sensible terminal state and isn't left stuck on
+// 'running'.
+func MarkAgentRunCancelledIfActive(database *sql.DB, runID, stopReason, summary string) (bool, error) {
+	now := time.Now()
+	res, err := database.Exec(`
+		UPDATE runs
+		SET status = 'cancelled', completed_at = ?, stop_reason = ?, result_summary = ?
+		WHERE id = ?
+		  AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval', 'taken_over')
+	`, now, stopReason, summary, runID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // MarkAgentRunMemoryMissing flags a run whose pre-complete memory-file gate
 // exhausted all retries without the agent producing a memory file. The run
 // still completes (we don't punish the agent for partial success by failing
