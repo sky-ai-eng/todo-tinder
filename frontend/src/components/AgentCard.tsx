@@ -3,6 +3,7 @@ import type { AgentMessage, AgentRun, Task, ToolCall } from '../types'
 import SourceBadge from './SourceBadge'
 import { toast } from './Toast/toastStore'
 import { readError } from '../lib/api'
+import TakeoverModal, { type TakeoverInfo } from './TakeoverModal'
 
 interface Props {
   task: Task
@@ -15,6 +16,8 @@ interface Props {
 export default function AgentCard({ task, run, messages, onRequeue, onReview }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [now, setNow] = useState(() => Date.now())
+  const [takeoverInfo, setTakeoverInfo] = useState<TakeoverInfo | null>(null)
+  const [takeoverPending, setTakeoverPending] = useState(false)
 
   const isActive = [
     'cloning',
@@ -23,6 +26,12 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
     'agent_starting',
     'running',
   ].includes(run.Status)
+  // Takeover only makes sense once the agent has actually started — earlier
+  // phases either don't yet have a session_id (clone/fetch/worktree_created)
+  // or are at the agent's startup boundary. Gating on session_id presence
+  // also catches the brief window between agent_starting and the first
+  // system/init event.
+  const canTakeOver = run.Status === 'running' && !!run.SessionID
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -72,6 +81,7 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
 
   return (
     <div className="bg-surface-raised backdrop-blur-xl border border-border-glass rounded-2xl overflow-hidden shadow-sm shadow-black/[0.03]">
+      <TakeoverModal info={takeoverInfo} onClose={() => setTakeoverInfo(null)} />
       {/* Header */}
       <div className="px-5 pt-4 pb-3">
         <div className="flex items-center justify-between mb-2">
@@ -85,6 +95,33 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[11px] text-text-tertiary">{elapsed}</span>
+            {canTakeOver && (
+              <button
+                disabled={takeoverPending}
+                onClick={async () => {
+                  setTakeoverPending(true)
+                  try {
+                    const res = await fetch(`/api/agent/runs/${run.ID}/takeover`, {
+                      method: 'POST',
+                    })
+                    if (!res.ok) {
+                      toast.error(await readError(res, 'Failed to take over run'))
+                      return
+                    }
+                    const data = (await res.json()) as TakeoverInfo
+                    setTakeoverInfo(data)
+                  } catch (err) {
+                    toast.error(`Failed to take over run: ${(err as Error).message}`)
+                  } finally {
+                    setTakeoverPending(false)
+                  }
+                }}
+                className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-md text-accent bg-accent/10 hover:bg-accent/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                title="Stop the headless run, clone its worktree to your takeover dir, and resume the session in your terminal"
+              >
+                Take over
+              </button>
+            )}
             {isActive && (
               <button
                 onClick={async () => {

@@ -101,8 +101,18 @@ func main() {
 	}
 	srv.SetStatic(distFS)
 
-	// Clean up any orphaned worktrees from crashed runs
-	worktree.Cleanup()
+	// Clean up any orphaned worktrees from crashed runs. taken_over runs
+	// are preserved at the ~/.claude/projects level so the user can still
+	// resume their takeover sessions after a binary restart.
+	preserveIDs, err := db.ListTakenOverRunIDs(database)
+	if err != nil {
+		log.Printf("[server] warning: failed to load taken_over run ids: %v", err)
+	}
+	preserveSet := make(map[string]bool, len(preserveIDs))
+	for _, id := range preserveIDs {
+		preserveSet[id] = true
+	}
+	worktree.CleanupWithOptions(worktree.CleanupOptions{PreserveClaudeProjectFor: preserveSet})
 
 	// Seed event type catalog, task_rules defaults, and default prompts.
 	// Order matters: task_rules FK to events_catalog(id), so catalog must be

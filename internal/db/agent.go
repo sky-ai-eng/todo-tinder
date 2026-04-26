@@ -154,6 +154,36 @@ func SetAgentRunSession(database *sql.DB, runID, sessionID string) error {
 	return err
 }
 
+// MarkAgentRunTakenOver finalizes a run as terminal in the "user pulled it
+// out for interactive resume" sense. Distinct from cancelled because the
+// session lives on under the user's control — the row's stop_reason carries
+// the takeover destination so the audit trail records where the work moved.
+// Cost/duration accounting is left blank: the headless invocation didn't
+// finish a turn and any meaningful spend belongs to whatever the user does
+// next, which we no longer track.
+//
+// Guarded against late-completion races: the UPDATE only fires when the
+// row is still in a non-terminal status. Returns ok=false (no error) when
+// the row already reached a terminal state — the caller treats that as
+// "the run finished on its own; takeover came too late."
+func MarkAgentRunTakenOver(database *sql.DB, runID, takeoverPath string) (bool, error) {
+	now := time.Now()
+	res, err := database.Exec(`
+		UPDATE runs
+		SET status = 'taken_over', completed_at = ?, stop_reason = 'user_takeover', result_summary = ?
+		WHERE id = ?
+		  AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval', 'taken_over')
+	`, now, "Taken over by user → "+takeoverPath, runID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // MarkAgentRunMemoryMissing flags a run whose pre-complete memory-file gate
 // exhausted all retries without the agent producing a memory file. The run
 // still completes (we don't punish the agent for partial success by failing
@@ -172,7 +202,7 @@ func HasActiveRunForTask(database *sql.DB, taskID string) (bool, error) {
 	var count int
 	err := database.QueryRow(`
 		SELECT COUNT(*) FROM runs
-		WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval')
+		WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval', 'taken_over')
 	`, taskID).Scan(&count)
 	return count > 0, err
 }
@@ -189,8 +219,29 @@ func HasActiveRunForTask(database *sql.DB, taskID string) (bool, error) {
 func ActiveRunIDsForTask(database *sql.DB, taskID string) ([]string, error) {
 	rows, err := database.Query(`
 		SELECT id FROM runs
-		WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval')
+		WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval', 'taken_over')
 	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ListTakenOverRunIDs returns the IDs of every run whose final state was
+// taken_over. Read at startup so the worktree-cleanup sweep knows to leave
+// those runs' ~/.claude/projects entries alone — the JSONL inside is what
+// makes `claude --resume` work in the takeover destination.
+func ListTakenOverRunIDs(database *sql.DB) ([]string, error) {
+	rows, err := database.Query(`SELECT id FROM runs WHERE status = 'taken_over'`)
 	if err != nil {
 		return nil, err
 	}

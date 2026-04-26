@@ -1,8 +1,11 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
@@ -46,6 +49,45 @@ func (s *Server) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
+func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("runID")
+	if s.spawner == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("load config: %v", err)})
+		return
+	}
+	baseDir, err := cfg.Server.ResolvedTakeoverDir()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("resolve takeover dir: %v", err)})
+		return
+	}
+
+	result, err := s.spawner.Takeover(r.Context(), runID, baseDir)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"takeover_path":   result.TakeoverPath,
+		"session_id":      result.SessionID,
+		"resume_command":  fmt.Sprintf("cd %s && claude --resume %s", shellQuote(result.TakeoverPath), result.SessionID),
+	})
+}
+
+// shellQuote wraps a path in single quotes for safe shell pasting,
+// escaping any embedded single quotes the standard way ('"'"'). Used so
+// the resume_command we hand back to the UI is paste-safe even when the
+// takeover dir contains spaces or apostrophes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 func (s *Server) handleAgentRuns(w http.ResponseWriter, r *http.Request) {

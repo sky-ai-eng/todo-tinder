@@ -3,6 +3,7 @@ package worktree
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -493,6 +494,234 @@ func detectDefaultBranch(ctx context.Context, bareDir string) string {
 	return "main"
 }
 
+// CopyForTakeover materializes a standalone working copy of a delegated
+// run's worktree at <baseDir>/run-<runID>/ so the user can resume the
+// headless Claude Code session interactively. Returns the absolute
+// destination path on success.
+//
+// The destination is a *fresh git clone* of the same bare repo the
+// original linked-worktree pointed at, checked out to the same branch.
+// The agent's working-tree state — modified, added, and untracked files,
+// minus the managed scratch directories — is then layered on top so the
+// user sees exactly what the agent was looking at when they took over.
+//
+// Why clone-from-bare instead of a raw recursive copy: linked worktrees
+// have a `.git` *file* pointing at <bareDir>/worktrees/<runID>, which
+// the spawner's deferred cleanup is about to delete. A literal copy
+// would leave the user with a broken `.git` reference. Cloning gives
+// them a normal repo with origin pointing at the still-live bare cache,
+// so `git push`, `git pull`, branch ops all work.
+//
+// Files matching managedExcludePatterns (task_memory/, _scratch/) are
+// not copied — they're triagefactory infrastructure, not user-relevant
+// state. The destination's .git/info/exclude is left at git's default;
+// the managed block is only useful while the agent is running.
+//
+// Returns an error if the source isn't a valid linked worktree, if
+// destination creation fails, or if the clone fails. Partial copies
+// are left in place on error for diagnosis.
+func CopyForTakeover(ctx context.Context, runID, srcWorktree, baseDir string) (string, error) {
+	if runID == "" {
+		return "", fmt.Errorf("takeover: empty run id")
+	}
+	if srcWorktree == "" {
+		return "", fmt.Errorf("takeover: empty source worktree path")
+	}
+	srcInfo, err := os.Stat(srcWorktree)
+	if err != nil {
+		return "", fmt.Errorf("takeover: stat source worktree: %w", err)
+	}
+	if !srcInfo.IsDir() {
+		return "", fmt.Errorf("takeover: source worktree is not a directory: %s", srcWorktree)
+	}
+
+	bareDir, err := resolveBareDirFromWorktree(srcWorktree)
+	if err != nil {
+		return "", fmt.Errorf("takeover: locate bare repo: %w", err)
+	}
+
+	branch, err := currentBranch(ctx, srcWorktree)
+	if err != nil {
+		return "", fmt.Errorf("takeover: read current branch: %w", err)
+	}
+
+	destDir := filepath.Join(baseDir, "run-"+runID)
+	if err := os.MkdirAll(filepath.Dir(destDir), 0755); err != nil {
+		return "", fmt.Errorf("takeover: mkdir base: %w", err)
+	}
+	if _, err := os.Stat(destDir); err == nil {
+		// A previous takeover for the same run was already materialized.
+		// Returning the existing path is the right call — re-invoking
+		// the endpoint shouldn't clobber a working copy the user may
+		// already have local edits in.
+		return destDir, nil
+	}
+
+	if err := gitRunCtx(ctx, "", "clone", bareDir, destDir); err != nil {
+		return "", fmt.Errorf("takeover: clone from bare: %w", err)
+	}
+	if branch != "" {
+		// The clone defaulted to the bare's HEAD branch. Switch to the
+		// branch the agent was on; -B creates the local branch tracking
+		// origin/<branch> if it doesn't already exist (it won't, since
+		// the clone only auto-creates one local branch).
+		if err := gitRunCtx(ctx, destDir, "checkout", "-B", branch, "origin/"+branch); err != nil {
+			return "", fmt.Errorf("takeover: checkout %s: %w", branch, err)
+		}
+	}
+
+	if err := overlayWorkingTree(srcWorktree, destDir); err != nil {
+		return "", fmt.Errorf("takeover: overlay working tree: %w", err)
+	}
+
+	log.Printf("[worktree] takeover copy: %s -> %s (branch %s)", srcWorktree, destDir, branch)
+	return destDir, nil
+}
+
+// resolveBareDirFromWorktree finds the bare repo a linked worktree
+// points at. Reads the `.git` pointer file to extract the gitdir, then
+// walks up two levels (.../worktrees/<runID> -> .../worktrees -> bare).
+//
+// Falls back to `git rev-parse --git-common-dir` when the pointer
+// resolution doesn't fit the expected layout — that command is git's
+// canonical answer to "where's the shared git directory" and works for
+// both linked worktrees and plain repos.
+func resolveBareDirFromWorktree(wtDir string) (string, error) {
+	commonDir, err := gitOutput(wtDir, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", fmt.Errorf("rev-parse --git-common-dir: %w", err)
+	}
+	commonDir = strings.TrimSpace(commonDir)
+	if commonDir == "" {
+		return "", fmt.Errorf("git-common-dir returned empty")
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(wtDir, commonDir)
+	}
+	abs, err := filepath.Abs(commonDir)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", fmt.Errorf("git common dir %s does not exist: %w", abs, err)
+	}
+	return abs, nil
+}
+
+func currentBranch(ctx context.Context, wtDir string) (string, error) {
+	out, err := gitOutputCtx(ctx, wtDir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	branch := strings.TrimSpace(out)
+	if branch == "HEAD" {
+		// Detached head — return empty so the caller skips the explicit
+		// checkout step (the clone's default HEAD is fine).
+		return "", nil
+	}
+	return branch, nil
+}
+
+// overlayWorkingTree copies every file from src onto dest, skipping the
+// `.git` directory (the destination already has its own git metadata
+// from the clone) and skipping managedExcludePatterns (those are TF
+// infrastructure dirs, not user-relevant state).
+//
+// Modified files in dest are overwritten with their src counterparts —
+// the agent's working-tree state takes precedence over the bare repo's
+// HEAD content. Untracked files in src are added to dest. Files that
+// were deleted in src (present at HEAD, removed by the agent) are NOT
+// removed from dest — captured separately via `git status` so the
+// caller can recreate the deletion deterministically.
+func overlayWorkingTree(src, dest string) error {
+	skipNames := map[string]bool{".git": true}
+	for _, pat := range managedExcludePatterns {
+		// managedExcludePatterns end with '/' — strip for filename match
+		skipNames[strings.TrimSuffix(pat, "/")] = true
+	}
+
+	srcAbs, err := filepath.Abs(src)
+	if err != nil {
+		return err
+	}
+
+	return filepath.Walk(srcAbs, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(srcAbs, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		// Top-level skips: .git, task_memory, _scratch
+		topSegment := rel
+		if i := strings.Index(rel, string(filepath.Separator)); i >= 0 {
+			topSegment = rel[:i]
+		}
+		if skipNames[topSegment] {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		destPath := filepath.Join(dest, rel)
+		if info.IsDir() {
+			return os.MkdirAll(destPath, info.Mode().Perm())
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			_ = os.Remove(destPath)
+			return os.Symlink(target, destPath)
+		}
+		return copyFile(path, destPath, info.Mode().Perm())
+	})
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+func gitOutput(dir string, args ...string) (string, error) {
+	return gitOutputCtx(context.Background(), dir, args...)
+}
+
+func gitOutputCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("cancelled")
+		}
+		return "", err
+	}
+	return string(out), nil
+}
+
 // Remove cleans up a worktree after a run completes or fails.
 func Remove(runID string) error {
 	wtDir := runDir(runID)
@@ -514,6 +743,26 @@ func Remove(runID string) error {
 // Cleanup removes all orphaned worktrees on startup and prunes bare repos.
 // Also sweeps ~/.claude/projects ghost entries for each orphaned cwd.
 func Cleanup() {
+	CleanupWithOptions(CleanupOptions{})
+}
+
+// CleanupOptions controls Cleanup behavior.
+type CleanupOptions struct {
+	// PreserveClaudeProjectFor names runIDs whose ~/.claude/projects entry
+	// must NOT be deleted because their session JSONL is still required
+	// for an interactive resume (taken_over runs). The orphaned worktree
+	// directory under $TMPDIR is still removed — it's the project dir
+	// holding the conversation state that needs to survive.
+	//
+	// Keys are run IDs. Both wt-style (<runID>) and no-cwd (<runID>-nocwd)
+	// directory names are matched.
+	PreserveClaudeProjectFor map[string]bool
+}
+
+// CleanupWithOptions is the parameterized Cleanup the takeover flow uses
+// at startup to keep session JSONLs alive across crashes — see
+// CleanupOptions.PreserveClaudeProjectFor.
+func CleanupWithOptions(opts CleanupOptions) {
 	runsBase := filepath.Join(os.TempDir(), runsDir)
 	entries, err := os.ReadDir(runsBase)
 	if err != nil {
@@ -524,10 +773,13 @@ func Cleanup() {
 	for _, e := range entries {
 		if e.IsDir() {
 			fullPath := filepath.Join(runsBase, e.Name())
-			// Each entry here was a live claude cwd at some point — nuke its
-			// ghost ~/.claude/projects entry before removing the dir itself
-			// (EvalSymlinks needs the dir to still exist to resolve).
-			RemoveClaudeProjectDir(fullPath)
+			runID := strings.TrimSuffix(e.Name(), "-nocwd")
+			if !opts.PreserveClaudeProjectFor[runID] {
+				// Each entry here was a live claude cwd at some point — nuke its
+				// ghost ~/.claude/projects entry before removing the dir itself
+				// (EvalSymlinks needs the dir to still exist to resolve).
+				RemoveClaudeProjectDir(fullPath)
+			}
 			os.RemoveAll(fullPath)
 			count++
 		}

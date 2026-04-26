@@ -51,21 +51,33 @@ type Spawner struct {
 	database *sql.DB
 	wsHub    *websocket.Hub
 
-	mu       sync.Mutex
-	ghClient *ghclient.Client
-	model    string
-	cancels  map[string]context.CancelFunc // runID → cancel the entire run
-	drainer  QueueDrainer                  // nil-safe; set post-construction via SetQueueDrainer
+	mu        sync.Mutex
+	ghClient  *ghclient.Client
+	model     string
+	cancels   map[string]context.CancelFunc // runID → cancel the entire run
+	drainer   QueueDrainer                  // nil-safe; set post-construction via SetQueueDrainer
+	takenOver map[string]bool               // runIDs whose status was finalized as taken_over; suppresses the cancel-path's "cancelled" overwrite and the deferred ~/.claude/projects cleanup
 }
 
 func NewSpawner(database *sql.DB, ghClient *ghclient.Client, wsHub *websocket.Hub, model string) *Spawner {
 	return &Spawner{
-		database: database,
-		ghClient: ghClient,
-		wsHub:    wsHub,
-		model:    model,
-		cancels:  make(map[string]context.CancelFunc),
+		database:  database,
+		ghClient:  ghClient,
+		wsHub:     wsHub,
+		model:     model,
+		cancels:   make(map[string]context.CancelFunc),
+		takenOver: make(map[string]bool),
 	}
+}
+
+// wasTakenOver reports whether Takeover() finalized this run. Read by
+// runAgent's deferred cleanup (skip ~/.claude/projects deletion) and by
+// handleCancelled (skip the status overwrite that would clobber
+// taken_over with cancelled).
+func (s *Spawner) wasTakenOver(runID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.takenOver[runID]
 }
 
 // SetQueueDrainer wires the firing-queue drainer into the spawner. Done
@@ -122,6 +134,103 @@ func (s *Spawner) Cancel(runID string) error {
 	return nil
 }
 
+// TakeoverResult is what Takeover returns to the HTTP handler.
+type TakeoverResult struct {
+	TakeoverPath string `json:"takeover_path"`
+	SessionID    string `json:"session_id"`
+}
+
+// Takeover hands a running headless session over to the user for
+// interactive resume. Synchronously: copies the run's worktree to a
+// stable destination outside $TMPDIR (so it survives the temp-dir
+// cleanup), marks the run terminal as taken_over in the DB, then
+// triggers the existing cancel path to stop the headless process.
+//
+// Preconditions: the run must be active (have a registered cancel
+// func) and have produced a session_id (which spawner.consumeClaudeStream
+// persists from the system/init event, before any meaningful work is
+// possible). Without a session id `claude --resume` has nothing to
+// attach to, so the takeover would be useless.
+//
+// The session JSONL under ~/.claude/projects survives by virtue of two
+// hooks: (a) runAgent's deferred RemoveClaudeProjectDir checks
+// wasTakenOver() and skips, (b) startup Cleanup() reads
+// ListTakenOverRunIDs and preserves entries for those runs.
+//
+// The original /tmp worktree is removed by the cancel path — the user's
+// resume happens against the fresh clone at TakeoverResult.TakeoverPath.
+func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*TakeoverResult, error) {
+	if baseDir == "" {
+		return nil, fmt.Errorf("takeover: empty destination base dir")
+	}
+
+	s.mu.Lock()
+	_, active := s.cancels[runID]
+	already := s.takenOver[runID]
+	s.mu.Unlock()
+	if !active {
+		return nil, fmt.Errorf("no active run %s", runID)
+	}
+	if already {
+		return nil, fmt.Errorf("run %s already taken over", runID)
+	}
+
+	run, err := db.GetAgentRun(s.database, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load run: %w", err)
+	}
+	if run == nil {
+		return nil, fmt.Errorf("run %s not found", runID)
+	}
+	if run.SessionID == "" {
+		return nil, fmt.Errorf("run %s has no session id yet — wait until the agent has started", runID)
+	}
+	if run.WorktreePath == "" {
+		return nil, fmt.Errorf("run %s has no worktree to take over (no-repo Jira run)", runID)
+	}
+
+	destPath, err := worktree.CopyForTakeover(ctx, runID, run.WorktreePath, baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("copy worktree: %w", err)
+	}
+
+	ok, err := db.MarkAgentRunTakenOver(s.database, runID, destPath)
+	if err != nil {
+		// Worktree copy succeeded but DB write failed — the dir is
+		// orphaned (no row references it). Clean it up so we don't leak
+		// disk on transient SQLite errors.
+		if rmErr := os.RemoveAll(destPath); rmErr != nil {
+			log.Printf("[delegate] warning: failed to clean up takeover dir %s after DB error: %v", destPath, rmErr)
+		}
+		return nil, fmt.Errorf("mark taken_over: %w", err)
+	}
+	if !ok {
+		// Lost the race with natural completion. The runAgent goroutine
+		// has already finalized the run normally and (as part of its
+		// deferred cleanup) deleted the ~/.claude/projects JSONL —
+		// without that, `claude --resume` against the copy would fail.
+		// Drop the copy rather than leave a dead-end directory.
+		if rmErr := os.RemoveAll(destPath); rmErr != nil {
+			log.Printf("[delegate] warning: failed to clean up takeover dir %s after race: %v", destPath, rmErr)
+		}
+		return nil, fmt.Errorf("run %s finished before takeover could land — try opening the run row to see its result", runID)
+	}
+
+	// Register the takeover BEFORE cancelling so the cancel-path's
+	// handleCancelled / RemoveClaudeProjectDir hooks see the flag and
+	// skip their normal cleanup. Cancel is fire-and-forget — the
+	// goroutine handles teardown.
+	s.mu.Lock()
+	s.takenOver[runID] = true
+	cancel := s.cancels[runID]
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	return &TakeoverResult{TakeoverPath: destPath, SessionID: run.SessionID}, nil
+}
+
 // runConfig holds everything the generic agent runner needs.
 type runConfig struct {
 	scope    string // what the agent is scoped to (repo, PR, issue)
@@ -176,14 +285,15 @@ func (s *Spawner) Delegate(task domain.Task, explicitPromptID string, triggerTyp
 		defer func() {
 			s.mu.Lock()
 			delete(s.cancels, runID)
+			delete(s.takenOver, runID)
 			s.mu.Unlock()
 			cancel()
 			// Drain the per-entity firing queue. Fires after every
 			// terminal status (completed, failed, cancelled,
-			// task_unsolvable, pending_approval) since this defer
-			// runs unconditionally on goroutine exit. notifyDrainer
-			// itself filters out manual runs — manual is decoupled
-			// from the queue per SKY-189.
+			// task_unsolvable, pending_approval, taken_over) since
+			// this defer runs unconditionally on goroutine exit.
+			// notifyDrainer itself filters out manual runs — manual
+			// is decoupled from the queue per SKY-189.
 			s.notifyDrainer(triggerType, task.EntityID)
 		}()
 
@@ -365,7 +475,14 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	}
 	// Nuke the ghost ~/.claude/projects/<encoded-cwd> that claude auto-creates
 	// for this cwd. Safety-railed to only touch entries under $TMPDIR.
-	defer worktree.RemoveClaudeProjectDir(claudeCwd)
+	// Skipped when the run was taken over by the user — the JSONL inside
+	// is the conversation state the resumed `claude --resume` reads.
+	defer func() {
+		if s.wasTakenOver(runID) {
+			return
+		}
+		worktree.RemoveClaudeProjectDir(claudeCwd)
+	}()
 
 	// Materialize any prior task memories into ./task_memory/ so the agent
 	// sees what previous iterations on this task have already tried. The
@@ -974,6 +1091,18 @@ func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID string) (stri
 }
 
 func (s *Spawner) handleCancelled(runID string, startTime time.Time, hasWT bool) {
+	if s.wasTakenOver(runID) {
+		// Status was already finalized to taken_over by Takeover(); the
+		// cancel that woke us up was just the mechanism for stopping the
+		// headless process. Don't overwrite the row with "cancelled" —
+		// just announce the terminal state and drop the temp worktree
+		// (the user's takeover copy lives elsewhere).
+		s.broadcastRunUpdate(runID, "taken_over")
+		if hasWT {
+			_ = worktree.Remove(runID)
+		}
+		return
+	}
 	elapsed := int(time.Since(startTime).Milliseconds())
 	if err := db.CompleteAgentRun(s.database, runID, "cancelled", 0, elapsed, 0, "cancelled", "Cancelled by user"); err != nil {
 		log.Printf("[delegate] warning: failed to record cancellation for run %s: %v", runID, err)
