@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -140,6 +141,26 @@ type TakeoverResult struct {
 	SessionID    string `json:"session_id"`
 }
 
+// Sentinel errors the takeover HTTP handler uses to pick an HTTP status
+// class. Anything NOT matching one of these is treated as a server-
+// side problem (filesystem, git subprocess, DB) and surfaced as 5xx.
+var (
+	// ErrTakeoverInvalidState — the run is not in a state that can be
+	// taken over (no active goroutine, no session id yet, no worktree).
+	// 400 Bad Request: the client asked for something that doesn't make
+	// sense given the run's state, but nothing's broken.
+	ErrTakeoverInvalidState = errors.New("takeover: run not in a takeoverable state")
+
+	// ErrTakeoverInProgress — another takeover for the same run is
+	// already running. 409 Conflict: a previous request owns the slot.
+	ErrTakeoverInProgress = errors.New("takeover: already in progress")
+
+	// ErrTakeoverRaceLost — the run reached a terminal state on its own
+	// before our takeover could finalize. 409 Conflict: the resource
+	// changed under us, the client should re-fetch.
+	ErrTakeoverRaceLost = errors.New("takeover: run finished before takeover could finalize")
+)
+
 // Takeover hands a running headless session over to the user for
 // interactive resume.
 //
@@ -187,13 +208,13 @@ func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*Takeove
 		return nil, fmt.Errorf("load run: %w", err)
 	}
 	if run == nil {
-		return nil, fmt.Errorf("run %s not found", runID)
+		return nil, fmt.Errorf("%w: run %s not found", ErrTakeoverInvalidState, runID)
 	}
 	if run.SessionID == "" {
-		return nil, fmt.Errorf("run %s has no session id yet — wait until the agent has started", runID)
+		return nil, fmt.Errorf("%w: run %s has no session id yet — wait until the agent has started", ErrTakeoverInvalidState, runID)
 	}
 	if run.WorktreePath == "" {
-		return nil, fmt.Errorf("run %s has no worktree to take over (no-repo Jira run)", runID)
+		return nil, fmt.Errorf("%w: run %s has no worktree to take over (no-repo Jira run)", ErrTakeoverInvalidState, runID)
 	}
 
 	// Atomically: confirm the run is still active, confirm we haven't
@@ -206,11 +227,11 @@ func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*Takeove
 	already := s.takenOver[runID]
 	if !active {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("run %s is no longer active — it may have just finished", runID)
+		return nil, fmt.Errorf("%w: run %s is no longer active — it may have just finished", ErrTakeoverInvalidState, runID)
 	}
 	if already {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("run %s already being taken over", runID)
+		return nil, fmt.Errorf("%w: run %s", ErrTakeoverInProgress, runID)
 	}
 	s.takenOver[runID] = true
 	s.mu.Unlock()
@@ -255,7 +276,7 @@ func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*Takeove
 		// abortTakeover's guarded UPDATE will no-op since the row is
 		// already terminal, so the agent's actual outcome is preserved.
 		s.abortTakeover(runID, run.WorktreePath, destPath)
-		return nil, fmt.Errorf("run %s reached a terminal state before takeover could finalize", runID)
+		return nil, fmt.Errorf("%w: run %s", ErrTakeoverRaceLost, runID)
 	}
 
 	s.broadcastRunUpdate(runID, "taken_over")

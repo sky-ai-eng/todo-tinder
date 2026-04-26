@@ -156,24 +156,36 @@ func SetAgentRunSession(database *sql.DB, runID, sessionID string) error {
 
 // MarkAgentRunTakenOver finalizes a run as terminal in the "user pulled it
 // out for interactive resume" sense. Distinct from cancelled because the
-// session lives on under the user's control — the row's stop_reason carries
-// the takeover destination so the audit trail records where the work moved.
-// Cost/duration accounting is left blank: the headless invocation didn't
-// finish a turn and any meaningful spend belongs to whatever the user does
-// next, which we no longer track.
+// session lives on under the user's control.
 //
-// Guarded against late-completion races: the UPDATE only fires when the
-// row is still in a non-terminal status. Returns ok=false (no error) when
-// the row already reached a terminal state — the caller treats that as
-// "the run finished on its own; takeover came too late."
+// Updates worktree_path to point at the takeover destination — the
+// original /tmp worktree is removed by Spawner.Takeover, so leaving the
+// column pointing at a now-deleted path would be actively misleading.
+// Subsequent GetAgentRun calls return the live takeover dir as the
+// structured location of the run's working tree. result_summary
+// duplicates this in human-readable form for log/audit display.
+//
+// Cost/duration accounting is left blank: the headless invocation
+// didn't finish a turn and any meaningful spend belongs to whatever
+// the user does next, which we no longer track.
+//
+// Guarded against late-completion races: the UPDATE only fires when
+// the row is still in a non-terminal status. Returns ok=false (no
+// error) when the row already reached a terminal state — the caller
+// treats that as "the run finished on its own; takeover came too
+// late."
 func MarkAgentRunTakenOver(database *sql.DB, runID, takeoverPath string) (bool, error) {
 	now := time.Now()
 	res, err := database.Exec(`
 		UPDATE runs
-		SET status = 'taken_over', completed_at = ?, stop_reason = 'user_takeover', result_summary = ?
+		SET status = 'taken_over',
+		    completed_at = ?,
+		    stop_reason = 'user_takeover',
+		    result_summary = ?,
+		    worktree_path = ?
 		WHERE id = ?
 		  AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval', 'taken_over')
-	`, now, "Taken over by user → "+takeoverPath, runID)
+	`, now, "Taken over by user → "+takeoverPath, takeoverPath, runID)
 	if err != nil {
 		return false, err
 	}

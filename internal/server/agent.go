@@ -1,12 +1,14 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
@@ -71,7 +73,7 @@ func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.spawner.Takeover(r.Context(), runID, baseDir)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeJSON(w, takeoverErrorStatus(err), map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -88,6 +90,25 @@ func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
 // takeover dir contains spaces or apostrophes.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
+// takeoverErrorStatus maps a Takeover() error to an HTTP status code.
+// Validation failures (no session id, no worktree, run not active) are
+// 400 — the client asked for something the run state doesn't support.
+// Conflicts (already in progress, race-loss) are 409 — the resource
+// state shifted in a way the client should re-check. Everything else
+// is 500 — filesystem, git subprocess, DB and other internal failures
+// are server-side and shouldn't be misclassified as bad client input.
+func takeoverErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, delegate.ErrTakeoverInvalidState):
+		return http.StatusBadRequest
+	case errors.Is(err, delegate.ErrTakeoverInProgress),
+		errors.Is(err, delegate.ErrTakeoverRaceLost):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 func (s *Server) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
