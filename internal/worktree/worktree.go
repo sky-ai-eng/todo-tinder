@@ -494,32 +494,46 @@ func detectDefaultBranch(ctx context.Context, bareDir string) string {
 	return "main"
 }
 
-// CopyForTakeover materializes a standalone working copy of a delegated
-// run's worktree at <baseDir>/run-<runID>/ so the user can resume the
-// headless Claude Code session interactively. Returns the absolute
-// destination path on success.
+// CopyForTakeover materializes a working copy of a delegated run's
+// worktree at <baseDir>/run-<runID>/ so the user can resume the headless
+// Claude Code session interactively. Returns the absolute destination
+// path on success.
 //
-// The destination is a *fresh git clone* of the same bare repo the
-// original linked-worktree pointed at, checked out to the same branch.
-// The agent's working-tree state — modified, added, and untracked files,
-// minus the managed scratch directories — is then layered on top so the
-// user sees exactly what the agent was looking at when they took over.
+// The destination is a *linked worktree* of the same bare repo the
+// original run used — the same lightweight pattern CreateForPR /
+// CreateForBranch already use. `.git` in the destination is a 1-line
+// pointer file referencing <bareDir>/worktrees/run-<runID>/, NOT a
+// full git directory. Trade-offs vs. a full clone:
 //
-// Why clone-from-bare instead of a raw recursive copy: linked worktrees
-// have a `.git` *file* pointing at <bareDir>/worktrees/<runID>, which
-// the spawner's deferred cleanup is about to delete. A literal copy
-// would leave the user with a broken `.git` reference. Cloning gives
-// them a normal repo with origin pointing at the still-live bare cache,
-// so `git push`, `git pull`, branch ops all work.
+//   - Near-instant. No object copying, no blob materialization, no
+//     network. For a multi-GB repo the difference is "minutes" vs.
+//     "milliseconds." This is the whole point of the change.
+//   - Full git functionality: status, diff, log, commit, push to the
+//     bare's origin (i.e. GitHub) all work normally, because the bare
+//     repo is the worktree's gitdir.
+//   - Coupled to TF's repo cache: if the user wipes
+//     ~/.triagefactory/repos, the takeover dir breaks. The modal
+//     surfaces this so the user can `git clone` to detach if they want
+//     a fully standalone copy.
+//
+// We add the linked worktree on the SAME branch the agent was using so
+// the user can continue and push back without extra steps. This is
+// safe because Spawner.Takeover removes the original /tmp worktree
+// before returning — git allows multiple worktrees on the same branch
+// only one at a time, but the original is gone by the time the user
+// touches the takeover dir.
+//
+// `--no-checkout` skips materializing files from HEAD (which would
+// trigger lazy blob fetching from the partial-clone bare). We then
+// overlay the agent's working-tree state from the source worktree —
+// modified, added, and untracked files, minus the managed scratch
+// directories — so the user sees exactly what the agent was looking
+// at when takeover happened.
 //
 // Files matching managedExcludePatterns (task_memory/, _scratch/) are
-// not copied — they're triagefactory infrastructure, not user-relevant
-// state. The destination's .git/info/exclude is left at git's default;
-// the managed block is only useful while the agent is running.
-//
-// Returns an error if the source isn't a valid linked worktree, if
-// destination creation fails, or if the clone fails. Partial copies
-// are left in place on error for diagnosis.
+// not copied. The destination's .git/info/exclude inherits the bare's
+// configuration; we re-write our managed block so those paths stay
+// hidden from `git status` in the takeover dir as well.
 func CopyForTakeover(ctx context.Context, runID, srcWorktree, baseDir string) (string, error) {
 	if runID == "" {
 		return "", fmt.Errorf("takeover: empty run id")
@@ -557,24 +571,36 @@ func CopyForTakeover(ctx context.Context, runID, srcWorktree, baseDir string) (s
 		return destDir, nil
 	}
 
-	if err := gitRunCtx(ctx, "", "clone", bareDir, destDir); err != nil {
-		return "", fmt.Errorf("takeover: clone from bare: %w", err)
-	}
+	// Linked-worktree add against the same bare. --no-checkout means git
+	// only writes the gitdir + .git pointer; the working tree starts
+	// empty and we fill it via overlayWorkingTree. Without --no-checkout
+	// git would lazy-fetch blobs from the partial-clone bare, which is
+	// the slow path we're explicitly avoiding.
+	args := []string{"worktree", "add", "--no-checkout"}
 	if branch != "" {
-		// The clone defaulted to the bare's HEAD branch. Switch to the
-		// branch the agent was on; -B creates the local branch tracking
-		// origin/<branch> if it doesn't already exist (it won't, since
-		// the clone only auto-creates one local branch).
-		if err := gitRunCtx(ctx, destDir, "checkout", "-B", branch, "origin/"+branch); err != nil {
-			return "", fmt.Errorf("takeover: checkout %s: %w", branch, err)
-		}
+		args = append(args, destDir, branch)
+	} else {
+		// Detached HEAD on the source — give the destination a detached
+		// HEAD too. The user can branch off it themselves if they want.
+		args = append(args, "--detach", destDir)
+	}
+	if err := gitRunCtx(ctx, bareDir, args...); err != nil {
+		return "", fmt.Errorf("takeover: worktree add: %w", err)
+	}
+
+	// Re-apply the managed exclude block (task_memory/, _scratch/) so
+	// `git status` in the takeover dir doesn't surface our infra dirs
+	// even if the user ends up needing them. Best-effort: a failure here
+	// is annoying but not fatal — git status will just be a bit noisy.
+	if err := writeLocalExcludes(destDir); err != nil {
+		log.Printf("[worktree] warning: takeover %s: write excludes: %v", runID, err)
 	}
 
 	if err := overlayWorkingTree(srcWorktree, destDir); err != nil {
 		return "", fmt.Errorf("takeover: overlay working tree: %w", err)
 	}
 
-	log.Printf("[worktree] takeover copy: %s -> %s (branch %s)", srcWorktree, destDir, branch)
+	log.Printf("[worktree] takeover linked-worktree: %s -> %s (branch %s)", srcWorktree, destDir, branch)
 	return destDir, nil
 }
 
@@ -647,6 +673,14 @@ func overlayWorkingTree(src, dest string) error {
 
 	return filepath.Walk(srcAbs, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
+			// A file vanishing between readdir and lstat (e.g. the agent
+			// or a child subprocess flushing writes during the brief
+			// window before SIGKILL is reaped) is recoverable — we
+			// just skip the entry and continue. Anything else is fatal.
+			if os.IsNotExist(walkErr) {
+				log.Printf("[worktree] takeover overlay: skipping vanished entry %s", path)
+				return nil
+			}
 			return walkErr
 		}
 		rel, err := filepath.Rel(srcAbs, path)
@@ -674,12 +708,21 @@ func overlayWorkingTree(src, dest string) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, err := os.Readlink(path)
 			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
 				return err
 			}
 			_ = os.Remove(destPath)
 			return os.Symlink(target, destPath)
 		}
-		return copyFile(path, destPath, info.Mode().Perm())
+		if err := copyFile(path, destPath, info.Mode().Perm()); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		return nil
 	})
 }
 

@@ -18,6 +18,12 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
   const [now, setNow] = useState(() => Date.now())
   const [takeoverInfo, setTakeoverInfo] = useState<TakeoverInfo | null>(null)
   const [takeoverPending, setTakeoverPending] = useState(false)
+  // While a takeover is pending we cover the activity log with a "Loading
+  // takeover" pulse. Clicking the overlay sets this flag so the user can
+  // still scroll through agent messages while the backend works. Reset
+  // every time we kick off a new takeover so a previous dismissal doesn't
+  // bleed into the next attempt.
+  const [pendingOverlayDismissed, setPendingOverlayDismissed] = useState(false)
 
   const isActive = [
     'cloning',
@@ -95,10 +101,11 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[11px] text-text-tertiary">{elapsed}</span>
-            {canTakeOver && (
+            {(canTakeOver || takeoverPending) && (
               <button
                 disabled={takeoverPending}
                 onClick={async () => {
+                  setPendingOverlayDismissed(false)
                   setTakeoverPending(true)
                   try {
                     const res = await fetch(`/api/agent/runs/${run.ID}/takeover`, {
@@ -116,10 +123,21 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
                     setTakeoverPending(false)
                   }
                 }}
-                className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-md text-accent bg-accent/10 hover:bg-accent/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                title="Stop the headless run, clone its worktree to your takeover dir, and resume the session in your terminal"
+                className="inline-flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-md text-accent bg-accent/10 hover:bg-accent/20 disabled:bg-accent/10 disabled:cursor-wait transition-colors"
+                title={
+                  takeoverPending
+                    ? 'Stopping the headless session and preparing your takeover dir…'
+                    : 'Stop the headless run, link a worktree at your takeover dir, and resume the session in your terminal'
+                }
               >
-                Take over
+                {takeoverPending ? (
+                  <>
+                    <Spinner />
+                    <span>Taking over…</span>
+                  </>
+                ) : (
+                  <span>Take over</span>
+                )}
               </button>
             )}
             {isActive && (
@@ -158,15 +176,33 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
         </div>
       </div>
 
-      {/* Activity log */}
-      <div
-        ref={scrollRef}
-        className="mx-3 mb-3 rounded-xl bg-black/[0.02] border border-border-subtle max-h-[200px] overflow-y-auto"
-      >
-        {messages.length === 0 && isActive && (
-          <div className="px-4 py-3 text-[12px] text-text-tertiary">Waiting for agent...</div>
+      {/* Activity log + optional pending-takeover overlay */}
+      <div className="relative mx-3 mb-3">
+        <div
+          ref={scrollRef}
+          className={`rounded-xl bg-black/[0.02] border border-border-subtle max-h-[200px] overflow-y-auto transition-[filter,opacity] ${takeoverPending && !pendingOverlayDismissed ? 'opacity-50 grayscale pointer-events-none' : ''}`}
+        >
+          {messages.length === 0 && isActive && (
+            <div className="px-4 py-3 text-[12px] text-text-tertiary">Waiting for agent...</div>
+          )}
+          {renderActivityLog(messages, isActive, run)}
+        </div>
+        {takeoverPending && !pendingOverlayDismissed && (
+          <button
+            type="button"
+            onClick={() => setPendingOverlayDismissed(true)}
+            className="absolute inset-0 rounded-xl flex items-center justify-center bg-surface-raised/40 backdrop-blur-[1px] cursor-pointer group"
+            aria-label="Dismiss to view agent messages while takeover finishes"
+          >
+            <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-surface-raised/90 border border-border-glass shadow-sm text-[11px] font-semibold uppercase tracking-wider text-accent">
+              <span className="inline-block w-2 h-2 rounded-full bg-accent animate-pulse" />
+              Loading takeover
+              <span className="text-text-tertiary normal-case font-medium tracking-normal opacity-0 group-hover:opacity-100 transition-opacity">
+                · click to view log
+              </span>
+            </span>
+          </button>
         )}
-        {renderActivityLog(messages, isActive, run)}
       </div>
 
       {/* Footer */}
@@ -469,6 +505,23 @@ function formatElapsed(dateStr: string, now: number = Date.now()): string {
 function compactNum(n: number): string {
   if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
   return String(n)
+}
+
+// 12px spinner sized to match the Take over button's text.
+function Spinner() {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 16 16"
+      fill="none"
+      className="animate-spin text-accent"
+      aria-hidden
+    >
+      <circle cx="8" cy="8" r="6" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2" />
+      <path d="M8 2a6 6 0 0 1 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  )
 }
 
 function computeStats(messages: AgentMessage[], _run: AgentRun) {
