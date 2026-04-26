@@ -61,10 +61,12 @@ func MarkPendingFiringFired(database *sql.DB, firingID int64, runID string) erro
 }
 
 // MarkPendingFiringSkipped transitions a pending firing to 'skipped_stale'
-// with a reason describing why the drainer didn't fire it (task closed,
-// trigger disabled, breaker tripped, fire-time error). Skipping doesn't
-// halt the drain loop — the next pending firing for the entity is still
-// considered.
+// with a reason describing a definitive stale outcome that means the
+// drainer should not fire or retry it (for example: task closed, trigger
+// disabled, breaker tripped). Transient fire-time/delegation/validation
+// failures are not marked skipped; they remain pending for retry. Skipping
+// doesn't halt the drain loop — the next pending firing for the entity is
+// still considered.
 func MarkPendingFiringSkipped(database *sql.DB, firingID int64, reason string) error {
 	_, err := database.Exec(`
 		UPDATE pending_firings
