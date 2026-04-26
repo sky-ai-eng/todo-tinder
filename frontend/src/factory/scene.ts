@@ -367,8 +367,8 @@ export async function createFactoryScene(
   // Initial zoom floor. `scene.fit(true)` alone drops small screens down
   // to ~0.4, well below FAR_ZOOM_THRESHOLD (0.6), so the page would open
   // stuck in the simplified far view even on a normal laptop. Floor the
-  // initial scale at 0.7 — comfortably inside the mid tier — and let the
-  // user zoom out further themselves if they want the overview.
+  // initial scale at 0.4 — starting out at 'far' zoom — and let the
+  // user zoom in themselves if they want more details.
   const INITIAL_MIN_SCALE = 0.4
   const fitAndCenter = () => {
     scene.resize(app.screen.width, app.screen.height, SCENE_W, SCENE_H)
