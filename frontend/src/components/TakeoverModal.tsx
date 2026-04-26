@@ -16,8 +16,11 @@ interface Props {
 // Centered modal that surfaces the takeover destination + resume command.
 // Built inline because the codebase's existing overlays (RunDrawer is a
 // side drawer, RepoPickerModal is bespoke) don't fit a centered card.
-// Closes on Escape and on backdrop click; copy buttons fall back to the
-// document.execCommand path on older browsers without the Clipboard API.
+// Closes on Escape and on backdrop click. Copy buttons use the
+// Clipboard API (navigator.clipboard.writeText) — fine because the app
+// only runs on localhost, which is a secure context everywhere the
+// API is supported. A failure surfaces as a toast and the user can
+// still select the field text manually.
 export default function TakeoverModal({ info, onClose }: Props) {
   const open = info !== null
 
