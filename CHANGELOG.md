@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/sky-ai-eng/triage-factory/compare/v1.1.0...v1.1.1) (2026-04-27)
+
+
+### Bug Fixes
+
+* **deps:** fix npm audit ([d58be7d](https://github.com/sky-ai-eng/triage-factory/commit/d58be7de46cd3aabc482dc1971e11bb253f0befb))
+
 ## [1.1.0](https://github.com/sky-ai-eng/triage-factory/compare/v1.0.0...v1.1.0) (2026-04-27)
 
 
