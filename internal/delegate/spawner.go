@@ -263,6 +263,16 @@ func (s *Spawner) Takeover(runID, baseDir string) (*TakeoverResult, error) {
 	s.takenOver[runID] = true
 	s.mu.Unlock()
 
+	// Capture the source cwd's symlink-resolved path BEFORE
+	// CopyForTakeover removes/renames it. We need this later to find
+	// the agent's session JSONL under ~/.claude/projects/<encoded-cwd>;
+	// Claude Code keys session storage by cwd-encoding, so without
+	// MaterializeSessionForTakeover the user's `claude --resume <id>`
+	// from the takeover dir fails with "No conversation found." The
+	// resolution has to happen here (path still exists) rather than
+	// after the move (path is gone).
+	resolvedOldCwd := worktree.ResolveClaudeProjectCwd(run.WorktreePath)
+
 	// Stop the agent. Fire-and-forget — the kill-watcher SIGKILLs the
 	// process group, the goroutine's gated defers skip cleanup, the
 	// worktree stays on disk for our copy.
@@ -284,6 +294,16 @@ func (s *Spawner) Takeover(runID, baseDir string) (*TakeoverResult, error) {
 	// CopyForTakeover removes the source: the move path renames it out
 	// of /tmp atomically, the overlay fallback explicitly Removes after
 	// the copy. Either way no further cleanup of the original is needed.
+
+	// Materialize the session JSONL under the takeover dir's project
+	// entry so `claude --resume` finds it. Done before the DB mark so
+	// that a copy failure rolls the whole takeover back rather than
+	// leaving the row in 'taken_over' state pointing at a destination
+	// the user can't actually resume from.
+	if err := worktree.MaterializeSessionForTakeover(resolvedOldCwd, destPath, run.SessionID); err != nil {
+		s.abortTakeover(runID, run.WorktreePath, destPath)
+		return nil, fmt.Errorf("copy session jsonl: %w", err)
+	}
 
 	ok, err := db.MarkAgentRunTakenOver(s.database, runID, destPath)
 	if err != nil {

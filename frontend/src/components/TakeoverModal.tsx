@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'motion/react'
 import { toast } from './Toast/toastStore'
 
@@ -21,6 +22,12 @@ interface Props {
 // only runs on localhost, which is a secure context everywhere the
 // API is supported. A failure surfaces as a toast and the user can
 // still select the field text manually.
+//
+// Rendered via a portal to document.body. The trigger lives inside
+// AgentCard, whose root has `backdrop-blur-xl`; that creates a
+// containing block for `fixed` descendants, which would otherwise pin
+// the "fixed inset-0" overlay to the card's bounds rather than the
+// viewport. Same trick StationDetailOverlay's WaitingPill uses.
 export default function TakeoverModal({ info, onClose }: Props) {
   const open = info !== null
 
@@ -33,7 +40,7 @@ export default function TakeoverModal({ info, onClose }: Props) {
     return () => window.removeEventListener('keydown', onKey)
   }, [open, onClose])
 
-  return (
+  return createPortal(
     <AnimatePresence>
       {open && info && (
         <>
@@ -107,7 +114,8 @@ export default function TakeoverModal({ info, onClose }: Props) {
           </motion.div>
         </>
       )}
-    </AnimatePresence>
+    </AnimatePresence>,
+    document.body,
   )
 }
 

@@ -72,6 +72,86 @@ func RemoveRunCwd(runID string) {
 	os.RemoveAll(filepath.Join(os.TempDir(), runsDir, runID+"-nocwd"))
 }
 
+// claudeProjectEncoding returns the directory-name Claude Code uses
+// for a given cwd inside ~/.claude/projects/. Encoding rule: take the
+// symlink-resolved absolute path, replace every '/' with '-' (the
+// leading '/' becomes a leading '-'). Centralized here so callers
+// (RemoveClaudeProjectDir, MaterializeSessionForTakeover) compute
+// identical names. Returns the encoded name and the resolved path; on
+// EvalSymlinks failure, falls back to the input path so callers still
+// get a deterministic encoding for the typical no-symlinks case.
+func claudeProjectEncoding(cwd string) (encoded, resolved string) {
+	resolved = cwd
+	if r, err := filepath.EvalSymlinks(cwd); err == nil {
+		resolved = r
+	}
+	encoded = strings.ReplaceAll(resolved, "/", "-")
+	return encoded, resolved
+}
+
+// MaterializeSessionForTakeover copies the Claude Code session JSONL
+// from the agent's original ~/.claude/projects entry into the takeover
+// destination's project entry, so `claude --resume <id>` works when
+// the user runs it from the takeover dir.
+//
+// Claude Code keys session storage by encoded cwd: the agent ran at
+// oldCwd, so its conversation lives at
+// ~/.claude/projects/<encoded-oldCwd>/<sessionId>.jsonl. The user's
+// resume runs from newCwd, where Claude Code looks under
+// ~/.claude/projects/<encoded-newCwd>/. Without copying the JSONL
+// across, the resume fails with "No conversation found with session
+// ID" — empirically observed.
+//
+// oldCwd MUST be resolved (EvalSymlinks'd) before the source worktree
+// gets moved/removed, otherwise the symlink resolution would fail.
+// Callers capture this in Spawner.Takeover before CopyForTakeover
+// runs. newCwd is the live takeover destination and gets resolved
+// here.
+//
+// Returns an error if the source JSONL doesn't exist or the copy
+// fails — both are conditions that would leave the user unable to
+// resume, so we want them surfaced loudly rather than silently
+// degrading.
+func MaterializeSessionForTakeover(resolvedOldCwd, newCwd, sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("materialize session: empty session id")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("materialize session: %w", err)
+	}
+
+	oldEncoded := strings.ReplaceAll(resolvedOldCwd, "/", "-")
+	newEncoded, _ := claudeProjectEncoding(newCwd)
+
+	src := filepath.Join(home, claudeProjectsDir, oldEncoded, sessionID+".jsonl")
+	destDir := filepath.Join(home, claudeProjectsDir, newEncoded)
+	dest := filepath.Join(destDir, sessionID+".jsonl")
+
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("materialize session: source JSONL at %s: %w", src, err)
+	}
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		return fmt.Errorf("materialize session: mkdir %s: %w", destDir, err)
+	}
+	if err := copyFile(src, dest, 0600); err != nil {
+		return fmt.Errorf("materialize session: copy %s -> %s: %w", src, dest, err)
+	}
+	log.Printf("[worktree] materialized session %s for takeover (%s -> %s)", sessionID, src, dest)
+	return nil
+}
+
+// ResolveClaudeProjectCwd returns the symlink-resolved absolute path
+// the way Claude Code records cwds for project-dir naming. Spawner.
+// Takeover captures this for the source worktree BEFORE the move/
+// overlay removes the path; passing the resolved value to
+// MaterializeSessionForTakeover later is what makes the JSONL copy
+// find the right source.
+func ResolveClaudeProjectCwd(cwd string) string {
+	_, resolved := claudeProjectEncoding(cwd)
+	return resolved
+}
+
 // RemoveClaudeProjectDir deletes the ~/.claude/projects/<encoded-cwd> entry that
 // Claude Code auto-creates whenever it's invoked in a new cwd. Called after
 // each delegated run to prevent a ghost project dir from accumulating for every

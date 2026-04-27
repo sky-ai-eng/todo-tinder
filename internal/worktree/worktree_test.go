@@ -1280,6 +1280,91 @@ func TestCleanupWithOptions_SkipClaudeProjectCleanup(t *testing.T) {
 	}
 }
 
+// TestMaterializeSessionForTakeover_CopiesJSONL is the regression
+// guard for the "No conversation found with session ID" bug Claude
+// Code raises when `claude --resume <id>` is run from a directory
+// whose ~/.claude/projects/<encoded-cwd>/<id>.jsonl file doesn't
+// exist. Claude Code keys session storage by encoded cwd, so without
+// copying the JSONL across the user can't resume from the takeover
+// dir even though the conversation history lives intact under the
+// agent's original cwd encoding.
+func TestMaterializeSessionForTakeover_CopiesJSONL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	oldCwd := filepath.Join(t.TempDir(), "agent-was-here")
+	if err := os.MkdirAll(oldCwd, 0755); err != nil {
+		t.Fatalf("mkdir oldCwd: %v", err)
+	}
+	newCwd := filepath.Join(t.TempDir(), "takeover-dest")
+	if err := os.MkdirAll(newCwd, 0755); err != nil {
+		t.Fatalf("mkdir newCwd: %v", err)
+	}
+
+	// Pre-create the source JSONL at where Claude Code would have
+	// written it: ~/.claude/projects/<encoded-oldCwd>/<sessionID>.jsonl.
+	sessionID := "abc123-def456"
+	resolved := ResolveClaudeProjectCwd(oldCwd)
+	srcEncoded := strings.ReplaceAll(resolved, "/", "-")
+	srcDir := filepath.Join(home, claudeProjectsDir, srcEncoded)
+	if err := os.MkdirAll(srcDir, 0700); err != nil {
+		t.Fatalf("mkdir source project: %v", err)
+	}
+	jsonlContent := `{"type":"system","subtype":"init","session_id":"` + sessionID + `"}` + "\n"
+	if err := os.WriteFile(filepath.Join(srcDir, sessionID+".jsonl"), []byte(jsonlContent), 0644); err != nil {
+		t.Fatalf("write source jsonl: %v", err)
+	}
+
+	if err := MaterializeSessionForTakeover(resolved, newCwd, sessionID); err != nil {
+		t.Fatalf("MaterializeSessionForTakeover: %v", err)
+	}
+
+	// Destination JSONL must exist with the same content.
+	newResolved := ResolveClaudeProjectCwd(newCwd)
+	destEncoded := strings.ReplaceAll(newResolved, "/", "-")
+	destPath := filepath.Join(home, claudeProjectsDir, destEncoded, sessionID+".jsonl")
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read dest jsonl: %v", err)
+	}
+	if string(got) != jsonlContent {
+		t.Errorf("dest content = %q, want %q", string(got), jsonlContent)
+	}
+}
+
+// TestMaterializeSessionForTakeover_MissingSource fails loudly when the
+// source JSONL doesn't exist. Spawner.Takeover relies on this so it
+// can roll back rather than mark the run taken_over with a non-
+// resumable destination.
+func TestMaterializeSessionForTakeover_MissingSource(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	oldCwd := filepath.Join(t.TempDir(), "no-jsonl-here")
+	if err := os.MkdirAll(oldCwd, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	resolved := ResolveClaudeProjectCwd(oldCwd)
+
+	err := MaterializeSessionForTakeover(resolved, t.TempDir(), "missing-session")
+	if err == nil {
+		t.Fatal("expected error when source JSONL is missing")
+	}
+	if !strings.Contains(err.Error(), "source JSONL") {
+		t.Errorf("error %q should mention source JSONL", err.Error())
+	}
+}
+
+// TestMaterializeSessionForTakeover_EmptySessionID rejects calls with
+// no session id (defensive — should be caught upstream by Takeover's
+// validation, but cheap to verify here).
+func TestMaterializeSessionForTakeover_EmptySessionID(t *testing.T) {
+	err := MaterializeSessionForTakeover("/tmp/x", "/tmp/y", "")
+	if err == nil {
+		t.Fatal("expected error on empty session id")
+	}
+}
+
 // TestRemoveAt_HandlesNonCanonicalPath guards review-comment fix #3:
 // callers like CopyForTakeover's overlay path and abortTakeover hold
 // the source worktree path explicitly. If they used Remove(runID)
