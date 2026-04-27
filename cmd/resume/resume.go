@@ -84,6 +84,7 @@ func Handle(args []string) {
 			renderRuns(filtered)
 			os.Exit(1)
 		}
+		return
 	}
 
 	if len(runs) == 1 {
