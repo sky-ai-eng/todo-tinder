@@ -674,8 +674,9 @@ func currentBranch(ctx context.Context, wtDir string) (string, error) {
 	}
 	branch := strings.TrimSpace(out)
 	if branch == "HEAD" {
-		// Detached head — return empty so the caller skips the explicit
-		// checkout step (the clone's default HEAD is fine).
+		// Detached HEAD — return empty so the caller can detect the
+		// detached state and handle it explicitly (for example by resolving
+		// the source HEAD commit), rather than relying on a clone default.
 		return "", nil
 	}
 	return branch, nil
