@@ -4,11 +4,9 @@
 
 <p align="center">An AI-powered software factory where humans decide what gets automated—and can take over anytime.</p>
 
-Triage Factory pulls in everything that needs your attention across GitHub and Jira, scores it with AI, and lets you blast through it. Swipe right to claim, swipe up to hand it to a Claude Code agent, swipe left to make it go away. The things you delegate get done how you want them done using custom prompts you write or import from Claude Code skills. PR reviews, Jira implementations, and merge conflict resolution are all handled automatically in isolated worktrees, streaming results back in real time.
+Triage Factory tracks everything that needs your attention across GitHub and Jira, scores it with AI, and routes it through an automation engine visualized as a factory floor. In Triage view, swipe to claim, dismiss, or delegate tasks to Claude. You decide exactly what gets automated, and you can take over any agent's run when needed. The things you delegate get done how you want them done using prompts you write or skills imported from Claude Code. PR reviews, Jira implementations, CI failures, and merge conflict resolution are all handled automatically in isolated worktrees, streaming results to a centralized dashboard in real time.
 
 It runs as a single Go binary on your machine. No hosted service, no team rollout, no DevOps. Credentials live in the OS keychain, and the only things that leave your machine are API calls to GitHub, Jira, and Claude.
-
-![Pull Requests dashboard](docs/imgs/prs-page.png)
 
 ## What it does
 
@@ -20,11 +18,13 @@ It runs as a single Go binary on your machine. No hosted service, no team rollou
 
 **Prompt routing** — A visual graph editor maps event types to delegation prompts. "Review requested" routes to your PR review prompt, "Jira assigned" routes to your implementation prompt. Drag event types onto prompt nodes to wire them up.
 
-Events are **per-action signals** — one event per check completion, one per review submission, one per push. Event types split when the discriminator changes whether the situation needs attention (`ci_check_failed` and `ci_check_passed` are separate; `review_changes_requested` and `review_approved` are separate); attributes that just narrow the same situation (reviewer, check name, repo, label) stay as predicate-filterable metadata. The poller's diff prevents re-emitting the same action twice (a check-run ID seen last cycle doesn't fire again), and routing dedups distinct events into one active card per `(entity_id, event_type, dedup_key)` — with `dedup_key` usually empty, but available for open-set discriminators like labels or status — so a CI that keeps failing across pushes ends up as a single "CI failing on PR #42" card, bumped on each new failure. Closes happen on run completion, on entity lifecycle (the PR merging closes everything on it), or via narrow inline checks inside specific event handlers — not via a generalized aggregate-state cascade.
-
 ![Prompt routing graph](docs/imgs/prompts-page.png)
 
+> Events are **per-action signals** — one event per check completion, one per review submission, one per push. Routing dedups those into one active card per `(entity_id, event_type, dedup_key)` so repeated churn bumps the same work item instead of spawning duplicates. For the current tracked event taxonomy, see [docs/tracked-events.md](docs/tracked-events.md).
+
 **PR dashboard** — Status donut, merge timeline, review balance, and 30-day totals. All your open, merged, and closed PRs in one place. Drag between "Ready for review" and "Drafts" to convert, all while keeping an eye on build status and merge conflicts.
+
+![Pull Requests dashboard](docs/imgs/prs-page.png)
 
 **Repo profiling** — AI-generated profiles of your configured repos (from README, CLAUDE.md, AGENTS.md) so the scorer and delegation agents understand context without you having to explain it.
 
@@ -40,26 +40,7 @@ triagefactory
 
 For direct downloads, building from source, prerequisites, and platform-specific notes, see [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
-Similarly, [docs/usage.md](docs/usage.md) details CLI flags, configuration reference, and polling details.
-
-## Taking over a delegated run
-
-When a delegated agent is running, the **Take over** button on its card stops the headless session and hands the working tree to you for interactive resume. The takeover modal shows a `cd … && claude --resume <id>` command you can paste into a terminal.
-
-For a shorter form, install the binary on your `$PATH` and use `triagefactory resume`:
-
-```bash
-# One-time setup (macOS default: /usr/local/bin/triagefactory; Linux default: ~/.local/bin/triagefactory)
-./triagefactory install
-# Override the destination if you keep binaries elsewhere:
-./triagefactory install --dest ~/bin/triagefactory
-
-# Then, after clicking "Take over" in the UI:
-triagefactory resume                # auto-resumes when there's exactly one taken-over run
-triagefactory resume <short-id>     # disambiguate by run-ID prefix (the 8-char id from the modal)
-```
-
-`triagefactory resume` `cd`s into the takeover working tree and `exec`s `claude --resume <session-id>`, replacing the current process so your terminal becomes the interactive Claude Code session directly. The takeover dirs live under `~/.triagefactory/takeovers/` and persist across server restarts; `scripts/clean-slate.sh` clears them when wiping local state.
+Similarly, [docs/usage.md](docs/usage.md) details CLI flags, configuration reference, polling details, and delegation/takeover workflows.
 
 ## License
 
