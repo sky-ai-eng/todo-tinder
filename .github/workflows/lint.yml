@@ -39,5 +39,13 @@ jobs:
       - name: Install frontend deps
         run: cd frontend && npm ci
 
+      # frontend/dist must exist before go vet / golangci-lint run because
+      # the root package's go:embed directive requires the directory to
+      # exist at typecheck time. Without it, both `go vet` and
+      # golangci-lint fail with `pattern frontend/dist/*: no matching
+      # files found`.
+      - name: Build frontend
+        run: cd frontend && npm run build
+
       - name: Run lint
         run: ./scripts/lint.sh
