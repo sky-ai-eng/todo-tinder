@@ -5,7 +5,8 @@
 // the repo) still have a clean exit.
 //
 // What it removes:
-//   - ~/.triagefactory/ in full (db, config, takeovers, bare repo clones)
+//   - ~/.triagefactory/ in full (db, config, bare repo clones, and
+//     default-location takeovers)
 //   - the corresponding ~/.claude/projects/<encoded> session JSONL dirs
 //     for any takeovers (enumerated BEFORE the takeovers dir is deleted)
 //   - all keychain entries under the "triagefactory" service
@@ -25,6 +26,7 @@ package uninstall
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -33,6 +35,7 @@ import (
 	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 )
 
 // Handle dispatches the uninstall subcommand.
@@ -49,9 +52,10 @@ func Handle(args []string) {
 		fail("resolve home dir: %v", err)
 	}
 	dataDir := filepath.Join(home, ".triagefactory")
+	takeoversDir, takeoversDirErr := resolvedTakeoversDir(dataDir)
 	linkPath := defaultInstallLink()
 
-	plan := buildPlan(dataDir, linkPath)
+	plan := buildPlan(dataDir, takeoversDir, linkPath)
 	if plan.empty() {
 		fmt.Println("triagefactory: no on-disk local state found.")
 		fmt.Println("Stored keychain credentials may still be present and can be removed.")
@@ -90,15 +94,30 @@ func Handle(args []string) {
 
 	failed := false
 
+	if takeoversDirErr != nil {
+		fmt.Fprintf(os.Stderr, "  warn: resolve server.takeover_dir: %v (falling back to %s)\n", takeoversDirErr, takeoversDir)
+		failed = true
+	}
+
 	// Order: enumerate takeover dirs and clear their Claude project
-	// entries BEFORE removing the takeovers tree, otherwise we lose
-	// the inputs needed to compute the encoded names.
+	// entries BEFORE removing takeover trees, otherwise we lose the
+	// inputs needed to compute the encoded names.
 	if plan.hasTakeovers {
-		if n, err := removeClaudeProjectsForTakeovers(filepath.Join(dataDir, "takeovers"), home); err != nil {
-			fmt.Fprintf(os.Stderr, "  warn: enumerating takeovers: %v\n", err)
-			failed = true
-		} else if n > 0 {
+		n, err := removeClaudeProjectsForTakeovers(plan.takeoversDir, home)
+		if n > 0 {
 			fmt.Printf("  removed %d Claude Code session entr%s\n", n, plural(n, "y", "ies"))
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warn: remove Claude Code session entries for takeovers: %v\n", err)
+			failed = true
+		}
+		if !isSubpathOf(plan.takeoversDir, dataDir) {
+			if err := os.RemoveAll(plan.takeoversDir); err != nil {
+				fmt.Fprintf(os.Stderr, "  warn: remove %s: %v\n", plan.takeoversDir, err)
+				failed = true
+			} else {
+				fmt.Printf("  removed %s\n", plan.takeoversDir)
+			}
 		}
 	}
 
@@ -177,6 +196,7 @@ func Handle(args []string) {
 // were never there in the first place.
 type uninstallPlan struct {
 	dataDir        string
+	takeoversDir   string
 	linkPath       string
 	hasDataDir     bool
 	hasTakeovers   bool
@@ -189,15 +209,16 @@ func (p uninstallPlan) empty() bool {
 	// read each item. Probing here would prompt 6 times before the
 	// user even said yes. The Clear() call later is no-op for missing
 	// keys, so it's safe to always run.
-	return !p.hasDataDir && !p.hasInstallLink
+	return !p.hasDataDir && !p.hasTakeovers && !p.hasInstallLink
 }
 
 func (p uninstallPlan) summary() []string {
 	var lines []string
 	if p.hasDataDir {
-		lines = append(lines, fmt.Sprintf("%s/ (database, config, takeovers, repo clones)", p.dataDir))
+		lines = append(lines, fmt.Sprintf("%s/ (database, config, repo clones)", p.dataDir))
 	}
 	if p.hasTakeovers {
+		lines = append(lines, fmt.Sprintf("takeovers under %s", p.takeoversDir))
 		lines = append(lines, "Claude Code session entries under ~/.claude/projects/ for any takeovers")
 	}
 	lines = append(lines, "credentials in the OS keychain (GitHub + Jira tokens)")
@@ -207,14 +228,16 @@ func (p uninstallPlan) summary() []string {
 	return lines
 }
 
-func buildPlan(dataDir, linkPath string) uninstallPlan {
-	p := uninstallPlan{dataDir: dataDir, linkPath: linkPath}
+func buildPlan(dataDir, takeoversDir, linkPath string) uninstallPlan {
+	p := uninstallPlan{dataDir: dataDir, takeoversDir: takeoversDir, linkPath: linkPath}
 
 	if info, err := os.Stat(dataDir); err == nil && info.IsDir() {
 		p.hasDataDir = true
 	}
-	if info, err := os.Stat(filepath.Join(dataDir, "takeovers")); err == nil && info.IsDir() {
-		p.hasTakeovers = true
+	if p.takeoversDir != "" {
+		if info, err := os.Stat(p.takeoversDir); err == nil && info.IsDir() {
+			p.hasTakeovers = true
+		}
 	}
 	// Lstat — we want the symlink itself, not its target. A broken
 	// symlink (target removed) still counts as something to clean up.
@@ -226,22 +249,22 @@ func buildPlan(dataDir, linkPath string) uninstallPlan {
 	return p
 }
 
-// removeClaudeProjectsForTakeovers walks ~/.triagefactory/takeovers/run-*
-// and deletes the matching ~/.claude/projects/<encoded> dir for each.
+// removeClaudeProjectsForTakeovers walks takeover run dirs and deletes
+// the matching ~/.claude/projects/<encoded> dir for each.
 // Encoding rule mirrors encodeClaudeProjectDir in internal/worktree:
 // every '/' AND every '.' becomes '-'. Returns the number of project
 // dirs successfully removed.
 //
-// We don't import internal/worktree to reuse its encoder — uninstall is
-// the one entrypoint where we want zero coupling to the server's
-// dependency graph (config readers, db drivers, etc.) so the subcommand
-// stays cheap and side-effect-free at startup.
+// We don't import internal/worktree to reuse its encoder — uninstall only
+// needs this tiny mapping and keeping it local avoids pulling in the
+// worktree package just for path encoding.
 func removeClaudeProjectsForTakeovers(takeoversDir, home string) (int, error) {
 	entries, err := os.ReadDir(takeoversDir)
 	if err != nil {
 		return 0, err
 	}
 	count := 0
+	var joinedErr error
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "run-") {
 			continue
@@ -253,11 +276,48 @@ func removeClaudeProjectsForTakeovers(takeoversDir, home string) (int, error) {
 		}
 		encoded := strings.NewReplacer("/", "-", ".", "-").Replace(resolved)
 		projectDir := filepath.Join(home, ".claude", "projects", encoded)
-		if err := os.RemoveAll(projectDir); err == nil {
-			count++
+		if _, err := os.Stat(projectDir); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			joinedErr = errors.Join(joinedErr, fmt.Errorf("inspect %s: %w", projectDir, err))
+			continue
 		}
+		if err := os.RemoveAll(projectDir); err != nil {
+			joinedErr = errors.Join(joinedErr, fmt.Errorf("remove %s: %w", projectDir, err))
+			continue
+		}
+		count++
 	}
-	return count, nil
+	return count, joinedErr
+}
+
+func resolvedTakeoversDir(dataDir string) (string, error) {
+	fallback := filepath.Join(dataDir, "takeovers")
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fallback, err
+	}
+	dir, err := cfg.Server.ResolvedTakeoverDir()
+	if err != nil {
+		return fallback, err
+	}
+	if dir == "" {
+		return fallback, nil
+	}
+	return filepath.Clean(dir), nil
+}
+
+// isSubpathOf reports whether path is lexically contained by parent.
+// Used to avoid double-deleting takeover dirs already covered by
+// removing ~/.triagefactory itself.
+func isSubpathOf(path, parent string) bool {
+	rel, err := filepath.Rel(parent, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 // defaultInstallLink mirrors the destination logic in cmd/install. We
