@@ -42,7 +42,7 @@ func TestTakeoverErrorStatus(t *testing.T) {
 // TestShellQuote covers the safe-paste contract for the resume_command
 // the takeover endpoint hands back to the UI. The quoting strategy
 // is single-quote wrapping with the standard '"'"' escape for
-// embedded single quotes — same shape every shell understands.
+// embedded single quotes — the standard shape POSIX shells understand.
 func TestShellQuote(t *testing.T) {
 	cases := []struct {
 		name string
