@@ -36,12 +36,16 @@ func DiffPRSnapshots(prev, curr domain.PRSnapshot, entityID, username string, us
 
 	// emitAt records an event with a specific source timestamp parsed
 	// from the GitHub ISO-8601 string on the snapshot (commit
-	// committedAt, check-run completedAt, review submittedAt). Blank or
-	// unparseable values degrade to the entity-level updatedAt fallback
-	// via emit().
+	// committedAt, check-run completedAt, review submittedAt) or a
+	// timeline lookup. Blank or unparseable values degrade to the
+	// entity-level updatedAt fallback via emit().
+	//
+	// Goes through the shared external-time parser so a fractional-
+	// seconds shape (RFC3339Nano) doesn't silently miss the way it
+	// would with a single-layout time.Parse(time.RFC3339).
 	emitAt := func(eventType, dedupKey, sourceAt string, metadata any) {
-		t, err := time.Parse(time.RFC3339, sourceAt)
-		if sourceAt == "" || err != nil {
+		t, ok := domain.ParseExternalTime(sourceAt)
+		if !ok {
 			emit(eventType, dedupKey, metadata)
 			return
 		}
@@ -523,9 +527,13 @@ func lookupReadyForReviewTime(timeline []domain.TimelineEvent) string {
 // parses, otherwise leaves occurred_at zero so chronological consumers
 // degrade to created_at. Shared between the PR and Jira diffs since both
 // use a "no specific timestamp on the snapshot, but the entity-level
-// updatedAt is a fair approximation" pattern. fallbackAt is the GitHub
-// ISO-8601 / Jira RFC3339-ish string from the snapshot — both formats
-// parse cleanly via time.Parse(time.RFC3339).
+// updatedAt is a fair approximation" pattern.
+//
+// fallbackAt may be a GitHub RFC3339 timestamp ("2026-04-25T18:30:00Z")
+// or a Jira-flavored one ("2026-04-25T18:30:00.123+0000" — note the
+// missing colon in the offset). domain.ParseExternalTime tries the full
+// known layout set so a less-common Jira shape doesn't silently drop
+// occurred_at and degrade to created_at ordering.
 func emitWithFallback(eventType, dedupKey, fallbackAt string, metadata any, entityID *string, now time.Time, evts *[]domain.Event) {
 	metaJSON, _ := json.Marshal(metadata)
 	evt := domain.Event{
@@ -535,17 +543,8 @@ func emitWithFallback(eventType, dedupKey, fallbackAt string, metadata any, enti
 		MetadataJSON: string(metaJSON),
 		CreatedAt:    now,
 	}
-	if fallbackAt != "" {
-		// Jira returns "2026-04-27T19:02:11.123+0000" — the trailing
-		// "+0000" form is RFC3339-adjacent but lacks the colon. Try the
-		// strict RFC3339 first, then fall back to the Jira variant
-		// before giving up. Empty occurred_at on parse failure is fine —
-		// callers degrade to created_at.
-		if t, err := time.Parse(time.RFC3339, fallbackAt); err == nil {
-			evt.OccurredAt = t
-		} else if t, err := time.Parse("2006-01-02T15:04:05.000-0700", fallbackAt); err == nil {
-			evt.OccurredAt = t
-		}
+	if t, ok := domain.ParseExternalTime(fallbackAt); ok {
+		evt.OccurredAt = t
 	}
 	*evts = append(*evts, evt)
 }

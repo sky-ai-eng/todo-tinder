@@ -3,10 +3,28 @@ package tracker
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
 )
+
+// assertOccurredAt compares a parsed OccurredAt to a UTC reference time
+// using time.Time.Equal, which is location-agnostic and catches a bug
+// where OccurredAt got parsed in a non-UTC location even though the
+// "wall clock" digits look right. A previous version of these tests
+// formatted with the literal layout "2006-01-02T15:04:05Z" — Z there
+// is a literal character, not a UTC marker, so a non-UTC bug would
+// slip through.
+func assertOccurredAt(t *testing.T, evt *domain.Event, want time.Time) {
+	t.Helper()
+	if evt == nil {
+		t.Fatalf("event missing; cannot assert OccurredAt")
+	}
+	if !evt.OccurredAt.Equal(want) {
+		t.Errorf("OccurredAt = %v (loc=%s), want %v", evt.OccurredAt, evt.OccurredAt.Location(), want)
+	}
+}
 
 const testEntityID = "entity-123"
 const testUser = "aidan"
@@ -1130,13 +1148,8 @@ func TestDiffPRSnapshots_LabelAddedUsesTimelineCreatedAt(t *testing.T) {
 		},
 	}
 	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
-	added := findEvent(evts, domain.EventGitHubPRLabelAdded)
-	if added == nil {
-		t.Fatalf("expected pr:label_added event")
-	}
-	if got := added.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-20T09:00:00Z" {
-		t.Errorf("OccurredAt = %v, want 2026-04-20T09:00:00Z (timeline win, not updatedAt)", got)
-	}
+	assertOccurredAt(t, findEvent(evts, domain.EventGitHubPRLabelAdded),
+		time.Date(2026, 4, 20, 9, 0, 0, 0, time.UTC))
 }
 
 func TestDiffPRSnapshots_LabelRemovedUsesTimelineCreatedAt(t *testing.T) {
@@ -1150,13 +1163,8 @@ func TestDiffPRSnapshots_LabelRemovedUsesTimelineCreatedAt(t *testing.T) {
 		},
 	}
 	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
-	removed := findEvent(evts, domain.EventGitHubPRLabelRemoved)
-	if removed == nil {
-		t.Fatalf("expected pr:label_removed event")
-	}
-	if got := removed.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-22T11:30:00Z" {
-		t.Errorf("OccurredAt = %v, want 2026-04-22T11:30:00Z", got)
-	}
+	assertOccurredAt(t, findEvent(evts, domain.EventGitHubPRLabelRemoved),
+		time.Date(2026, 4, 22, 11, 30, 0, 0, time.UTC))
 }
 
 func TestDiffPRSnapshots_ReviewRequestedUsesTimelineCreatedAt(t *testing.T) {
@@ -1170,13 +1178,8 @@ func TestDiffPRSnapshots_ReviewRequestedUsesTimelineCreatedAt(t *testing.T) {
 		},
 	}
 	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
-	req := findEvent(evts, domain.EventGitHubPRReviewRequested)
-	if req == nil {
-		t.Fatalf("expected pr:review_requested event")
-	}
-	if got := req.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-20T09:00:00Z" {
-		t.Errorf("OccurredAt = %v, want 2026-04-20T09:00:00Z (timeline beats updatedAt)", got)
-	}
+	assertOccurredAt(t, findEvent(evts, domain.EventGitHubPRReviewRequested),
+		time.Date(2026, 4, 20, 9, 0, 0, 0, time.UTC))
 }
 
 func TestDiffPRSnapshots_ReviewRequestedMatchesTeamIdentity(t *testing.T) {
@@ -1189,13 +1192,8 @@ func TestDiffPRSnapshots_ReviewRequestedMatchesTeamIdentity(t *testing.T) {
 		},
 	}
 	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, []string{"acme/platform"})
-	req := findEvent(evts, domain.EventGitHubPRReviewRequested)
-	if req == nil {
-		t.Fatalf("expected pr:review_requested event matched via team identity")
-	}
-	if got := req.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-20T09:00:00Z" {
-		t.Errorf("OccurredAt = %v, want timeline timestamp via team match", got)
-	}
+	assertOccurredAt(t, findEvent(evts, domain.EventGitHubPRReviewRequested),
+		time.Date(2026, 4, 20, 9, 0, 0, 0, time.UTC))
 }
 
 func TestDiffPRSnapshots_ReadyForReviewUsesTimelineCreatedAt(t *testing.T) {
@@ -1208,13 +1206,8 @@ func TestDiffPRSnapshots_ReadyForReviewUsesTimelineCreatedAt(t *testing.T) {
 		},
 	}
 	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
-	rdy := findEvent(evts, domain.EventGitHubPRReadyForReview)
-	if rdy == nil {
-		t.Fatalf("expected pr:ready_for_review event")
-	}
-	if got := rdy.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-23T14:15:00Z" {
-		t.Errorf("OccurredAt = %v, want 2026-04-23T14:15:00Z", got)
-	}
+	assertOccurredAt(t, findEvent(evts, domain.EventGitHubPRReadyForReview),
+		time.Date(2026, 4, 23, 14, 15, 0, 0, time.UTC))
 }
 
 func TestDiffPRSnapshots_TimelineMissDegradesToUpdatedAt(t *testing.T) {
@@ -1228,13 +1221,8 @@ func TestDiffPRSnapshots_TimelineMissDegradesToUpdatedAt(t *testing.T) {
 		Timeline:  nil,
 	}
 	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
-	added := findEvent(evts, domain.EventGitHubPRLabelAdded)
-	if added == nil {
-		t.Fatalf("expected pr:label_added event")
-	}
-	if got := added.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-25T18:30:00Z" {
-		t.Errorf("OccurredAt = %v, want 2026-04-25T18:30:00Z (updatedAt fallback)", got)
-	}
+	assertOccurredAt(t, findEvent(evts, domain.EventGitHubPRLabelAdded),
+		time.Date(2026, 4, 25, 18, 30, 0, 0, time.UTC))
 }
 
 // --- updatedAt fallback for source time -------------------------------------
@@ -1247,16 +1235,8 @@ func TestDiffPRSnapshots_LabelEventsCarryUpdatedAtAsSourceTime(t *testing.T) {
 		UpdatedAt: "2026-04-25T18:30:00Z",
 	}
 	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
-	added := findEvent(evts, domain.EventGitHubPRLabelAdded)
-	if added == nil {
-		t.Fatalf("expected pr:label_added event")
-	}
-	if added.OccurredAt.IsZero() {
-		t.Errorf("expected OccurredAt populated from updatedAt, got zero")
-	}
-	if added.OccurredAt.Format("2006-01-02T15:04:05Z") != "2026-04-25T18:30:00Z" {
-		t.Errorf("OccurredAt = %v, want 2026-04-25T18:30:00Z", added.OccurredAt)
-	}
+	assertOccurredAt(t, findEvent(evts, domain.EventGitHubPRLabelAdded),
+		time.Date(2026, 4, 25, 18, 30, 0, 0, time.UTC))
 }
 
 func TestDiffPRSnapshots_ConflictsHasNoSourceTime(t *testing.T) {
@@ -1284,13 +1264,25 @@ func TestDiffJiraSnapshots_StatusChangeUsesUpdatedAtAsSourceTime(t *testing.T) {
 		UpdatedAt: "2026-04-25T18:30:00Z",
 	}
 	evts := DiffJiraSnapshots(prev, curr, testEntityID, testUser, testDoneStatuses)
-	change := findEvent(evts, domain.EventJiraIssueStatusChanged)
-	if change == nil {
-		t.Fatalf("expected jira:issue:status_changed event")
+	assertOccurredAt(t, findEvent(evts, domain.EventJiraIssueStatusChanged),
+		time.Date(2026, 4, 25, 18, 30, 0, 0, time.UTC))
+}
+
+// TestDiffJiraSnapshots_StatusChangeParsesJiraNativeFormat covers the
+// Jira-style timestamp shape ("...+0000" with milliseconds, no colon
+// in the offset). RFC3339 alone rejects it; without the multi-layout
+// parser, OccurredAt would silently fall to zero and the factory
+// would degrade to created_at ordering.
+func TestDiffJiraSnapshots_StatusChangeParsesJiraNativeFormat(t *testing.T) {
+	prev := domain.JiraSnapshot{Key: "SKY-1", Status: "To Do"}
+	curr := domain.JiraSnapshot{
+		Key:       "SKY-1",
+		Status:    "In Progress",
+		UpdatedAt: "2026-04-27T19:02:11.123+0000",
 	}
-	if change.OccurredAt.IsZero() {
-		t.Errorf("expected OccurredAt populated from updatedAt, got zero")
-	}
+	evts := DiffJiraSnapshots(prev, curr, testEntityID, testUser, testDoneStatuses)
+	assertOccurredAt(t, findEvent(evts, domain.EventJiraIssueStatusChanged),
+		time.Date(2026, 4, 27, 19, 2, 11, 123_000_000, time.UTC))
 }
 
 // --- extractProject helper --------------------------------------------------
