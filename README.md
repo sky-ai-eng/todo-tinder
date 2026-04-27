@@ -10,6 +10,12 @@
   <a href="https://github.com/sky-ai-eng/triage-factory/releases">
     <img src="https://img.shields.io/github/v/release/sky-ai-eng/triage-factory?include_prereleases&sort=semver&label=latest%20pre-release" alt="Latest pre-release" />
   </a>
+  <a href="https://github.com/sky-ai-eng/triage-factory/actions/workflows/test.yml">
+    <img src="https://github.com/sky-ai-eng/triage-factory/actions/workflows/test.yml/badge.svg?branch=main" alt="Test" />
+  </a>
+  <a href="https://github.com/sky-ai-eng/triage-factory/actions/workflows/lint.yml">
+    <img src="https://github.com/sky-ai-eng/triage-factory/actions/workflows/lint.yml/badge.svg?branch=main" alt="Lint" />
+  </a>
 </p>
 
 Triage Factory tracks everything that needs your attention across GitHub and Jira, scores it with AI, and routes it through an automation engine visualized as a factory floor. In Triage view, swipe to claim, dismiss, snooze, or delegate tasks to Claude. You decide exactly what gets automated, and you can take over any agent's run when needed. The things you delegate get done how you want them done using prompts you write or skills imported from Claude Code. PR reviews, Jira implementations, CI failures, and merge conflict resolution are all handled automatically in isolated worktrees, streaming results to a centralized dashboard in real time.
@@ -17,6 +23,8 @@ Triage Factory tracks everything that needs your attention across GitHub and Jir
 It runs as a single Go binary on your machine. No hosted service, no team rollout, no DevOps. Credentials live in the OS keychain, and the only things that leave your machine are API calls to GitHub, Jira, and Claude.
 
 ## What it does
+
+**Factory** — A live factory-floor view of your automation pipeline. Event stations show where work is in flight, how much throughput each stage is handling, and which delegated runs need attention. Zoom in and out to see more detail and take control of individual stations and runs.
 
 **Triage queue** — A Tinder-style card stack of everything that needs you. AI scores and ranks items so the most urgent stuff surfaces first. Swipe left (dismiss), right (claim), up (delegate to agent), down (snooze).
 
