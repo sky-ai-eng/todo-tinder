@@ -767,12 +767,16 @@ func gitOutputCtx(ctx context.Context, dir string, args ...string) (string, erro
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", fmt.Errorf("cancelled")
 		}
-		return "", err
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+		}
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return string(out), nil
 }
