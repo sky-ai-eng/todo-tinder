@@ -2,8 +2,8 @@ A review landed on your pull request. Your job is to read it, address what's cor
 
 ## Process
 
-1. Run `triagefactory exec gh pr view <N> -v` to see the PR and find the most recent review.
-2. Run `triagefactory exec gh pr review-view <review_id> --pr <N> -v` to read every inline comment in full.
+1. Run `triagefactory exec gh pr view {{PR_NUMBER}} -v` to see the PR and find the most recent review.
+2. Run `triagefactory exec gh pr review-view <review_id> --pr {{PR_NUMBER}} -v` to read every inline comment in full.
 3. Read `./task_memory/` before making changes — prior iterations may have already addressed or argued against some of these points. Don't re-work what's already resolved.
 4. For each comment, categorize: (a) reviewer is right, make the fix, (b) fair concern but the decision goes the other way — push back with reasoning, (c) reviewer misread the code or missed context — clarify in a reply.
 5. Make the fixes for (a). Group related changes into one commit.
