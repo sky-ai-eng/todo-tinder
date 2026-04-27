@@ -32,13 +32,28 @@ func ImportAll(database *sql.DB) ImportResult {
 		return result
 	}
 
-	// Search paths: personal + project-scoped
+	// Search paths: personal + project-scoped (relative to current working dir)
 	searchDirs := []string{
 		filepath.Join(home, ".claude", "skills"),
 		filepath.Join(".claude", "skills"),
 	}
 
+	seenDirs := make(map[string]struct{})
+	seenFiles := make(map[string]struct{})
+
 	for _, dir := range searchDirs {
+		normalizedDir, err := normalizePath(dir)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("normalize dir %s: %v", dir, err))
+			continue
+		}
+		if _, ok := seenDirs[normalizedDir]; ok {
+			// If the project-scoped dir resolves to the same location as the
+			// personal dir (e.g. cwd is $HOME), only scan it once.
+			continue
+		}
+		seenDirs[normalizedDir] = struct{}{}
+
 		pattern := filepath.Join(dir, "*", "SKILL.md")
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
@@ -47,17 +62,35 @@ func ImportAll(database *sql.DB) ImportResult {
 		}
 
 		for _, path := range matches {
+			normalizedPath, err := normalizePath(path)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("normalize file %s: %v", path, err))
+				continue
+			}
+			if _, ok := seenFiles[normalizedPath]; ok {
+				result.Skipped++
+				continue
+			}
+			seenFiles[normalizedPath] = struct{}{}
+
 			result.Scanned++
-			if err := importSkillFile(database, path); err != nil {
-				if err == errSkillUnchanged {
+			if err := importSkillFile(database, normalizedPath); err != nil {
+				if err == errSkillUnchanged || err == errSkillDuplicate {
 					result.Skipped++
 				} else {
-					result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", path, err))
+					result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", normalizedPath, err))
 				}
 			} else {
 				result.Imported++
 			}
 		}
+	}
+
+	hiddenDuplicates, err := hideDuplicateImportedPrompts(database)
+	if err != nil {
+		result.Errors = append(result.Errors, "deduplicate imported prompts: "+err.Error())
+	} else if hiddenDuplicates > 0 {
+		log.Printf("[skills] deduplicated %d already-imported skills (same name/body)", hiddenDuplicates)
 	}
 
 	if result.Imported > 0 {
@@ -67,7 +100,10 @@ func ImportAll(database *sql.DB) ImportResult {
 	return result
 }
 
-var errSkillUnchanged = fmt.Errorf("skill unchanged")
+var (
+	errSkillUnchanged = fmt.Errorf("skill unchanged")
+	errSkillDuplicate = fmt.Errorf("duplicate imported skill")
+)
 
 func importSkillFile(database *sql.DB, path string) error {
 	data, err := os.ReadFile(path)
@@ -78,8 +114,9 @@ func importSkillFile(database *sql.DB, path string) error {
 	content := string(data)
 	name, description, body := parseSkillFile(content, path)
 
-	// Deterministic ID from the file path so re-imports are idempotent
-	id := fmt.Sprintf("imported-%x", sha256.Sum256([]byte(path)))[:20]
+	// Deterministic ID from the normalized file path so re-imports are idempotent
+	// even when the same file is discovered as relative/absolute or via symlink.
+	id := promptIDForPath(path)
 
 	// Check if already exists
 	existing, err := db.GetPrompt(database, id)
@@ -96,6 +133,17 @@ func importSkillFile(database *sql.DB, path string) error {
 		}
 		log.Printf("[skills] updated %q from %s", name, path)
 		return nil
+	}
+
+	// Skip creating a duplicate imported prompt if the same skill body/name is
+	// already present from another path.
+	duplicateID, err := findVisibleImportedPromptByContent(database, name, body)
+	if err != nil {
+		return err
+	}
+	if duplicateID != "" {
+		log.Printf("[skills] skipped duplicate %q from %s (already imported as %s)", name, path, duplicateID)
+		return errSkillDuplicate
 	}
 
 	prompt := domain.Prompt{
@@ -165,4 +213,102 @@ func splitFrontmatter(content string) (string, string) {
 	}
 
 	return "", content
+}
+
+func normalizePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	// Fall back to absolute clean path for non-existent paths, broken links,
+	// or permission errors; we still want deterministic identity.
+	return filepath.Clean(abs), nil
+}
+
+func promptIDForPath(path string) string {
+	return fmt.Sprintf("imported-%x", sha256.Sum256([]byte(path)))[:20]
+}
+
+func promptFingerprint(name, body string) string {
+	sum := sha256.Sum256([]byte(name + "\x00" + body))
+	return fmt.Sprintf("%x", sum)
+}
+
+func findVisibleImportedPromptByContent(database *sql.DB, name, body string) (string, error) {
+	var id string
+	err := database.QueryRow(`
+		SELECT id
+		FROM prompts
+		WHERE source = 'imported' AND hidden = 0 AND name = ? AND body = ?
+		ORDER BY updated_at DESC
+		LIMIT 1
+	`, name, body).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func hideDuplicateImportedPrompts(database *sql.DB) (int, error) {
+	rows, err := database.Query(`
+		SELECT id, name, body, hidden
+		FROM prompts
+		WHERE source = 'imported'
+		ORDER BY hidden ASC, updated_at DESC, created_at DESC, id ASC
+	`)
+	if err != nil {
+		return 0, err
+	}
+
+	seen := make(map[string]struct{})
+	var idsToHide []string
+
+	for rows.Next() {
+		var (
+			id     string
+			name   string
+			body   string
+			hidden bool
+		)
+		if err := rows.Scan(&id, &name, &body, &hidden); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+
+		fingerprint := promptFingerprint(name, body)
+		if _, ok := seen[fingerprint]; !ok {
+			seen[fingerprint] = struct{}{}
+			continue
+		}
+		if hidden {
+			continue
+		}
+		idsToHide = append(idsToHide, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	// Close rows before UPDATEs so single-connection SQLite test DBs don't
+	// deadlock while this scan is still holding the only open connection.
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	hiddenCount := 0
+	for _, id := range idsToHide {
+		if err := db.HidePrompt(database, id); err != nil {
+			return hiddenCount, err
+		}
+		hiddenCount++
+	}
+
+	return hiddenCount, nil
 }
