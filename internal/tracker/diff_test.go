@@ -1117,6 +1117,182 @@ func TestDiff_CompoundPoll_CIAndNewCommitsAndLabels(t *testing.T) {
 	}
 }
 
+// --- timelineItems source-time enrichment -----------------------------------
+
+func TestDiffPRSnapshots_LabelAddedUsesTimelineCreatedAt(t *testing.T) {
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN"}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN",
+		Labels:    []string{"needs-review"},
+		UpdatedAt: "2026-04-25T18:30:00Z", // would otherwise be the fallback
+		Timeline: []domain.TimelineEvent{
+			{Kind: "labeled", Label: "needs-review", CreatedAt: "2026-04-20T09:00:00Z"},
+		},
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
+	added := findEvent(evts, domain.EventGitHubPRLabelAdded)
+	if added == nil {
+		t.Fatalf("expected pr:label_added event")
+	}
+	if got := added.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-20T09:00:00Z" {
+		t.Errorf("OccurredAt = %v, want 2026-04-20T09:00:00Z (timeline win, not updatedAt)", got)
+	}
+}
+
+func TestDiffPRSnapshots_LabelRemovedUsesTimelineCreatedAt(t *testing.T) {
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN", Labels: []string{"wip"}}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN",
+		Labels:    []string{},
+		UpdatedAt: "2026-04-25T18:30:00Z",
+		Timeline: []domain.TimelineEvent{
+			{Kind: "unlabeled", Label: "wip", CreatedAt: "2026-04-22T11:30:00Z"},
+		},
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
+	removed := findEvent(evts, domain.EventGitHubPRLabelRemoved)
+	if removed == nil {
+		t.Fatalf("expected pr:label_removed event")
+	}
+	if got := removed.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-22T11:30:00Z" {
+		t.Errorf("OccurredAt = %v, want 2026-04-22T11:30:00Z", got)
+	}
+}
+
+func TestDiffPRSnapshots_ReviewRequestedUsesTimelineCreatedAt(t *testing.T) {
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN", Author: "someone-else"}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN", Author: "someone-else",
+		ReviewRequests: []string{testUser},
+		UpdatedAt:      "2026-04-25T18:30:00Z", // 4m ago equivalent — should be ignored
+		Timeline: []domain.TimelineEvent{
+			{Kind: "review_requested", Reviewer: testUser, CreatedAt: "2026-04-20T09:00:00Z"}, // 10h ago equivalent
+		},
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
+	req := findEvent(evts, domain.EventGitHubPRReviewRequested)
+	if req == nil {
+		t.Fatalf("expected pr:review_requested event")
+	}
+	if got := req.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-20T09:00:00Z" {
+		t.Errorf("OccurredAt = %v, want 2026-04-20T09:00:00Z (timeline beats updatedAt)", got)
+	}
+}
+
+func TestDiffPRSnapshots_ReviewRequestedMatchesTeamIdentity(t *testing.T) {
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN", Author: "someone-else"}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN", Author: "someone-else",
+		ReviewRequests: []string{"acme/platform"},
+		Timeline: []domain.TimelineEvent{
+			{Kind: "review_requested", Reviewer: "acme/platform", CreatedAt: "2026-04-20T09:00:00Z"},
+		},
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, []string{"acme/platform"})
+	req := findEvent(evts, domain.EventGitHubPRReviewRequested)
+	if req == nil {
+		t.Fatalf("expected pr:review_requested event matched via team identity")
+	}
+	if got := req.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-20T09:00:00Z" {
+		t.Errorf("OccurredAt = %v, want timeline timestamp via team match", got)
+	}
+}
+
+func TestDiffPRSnapshots_ReadyForReviewUsesTimelineCreatedAt(t *testing.T) {
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN", IsDraft: true}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN", IsDraft: false,
+		UpdatedAt: "2026-04-25T18:30:00Z",
+		Timeline: []domain.TimelineEvent{
+			{Kind: "ready_for_review", CreatedAt: "2026-04-23T14:15:00Z"},
+		},
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
+	rdy := findEvent(evts, domain.EventGitHubPRReadyForReview)
+	if rdy == nil {
+		t.Fatalf("expected pr:ready_for_review event")
+	}
+	if got := rdy.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-23T14:15:00Z" {
+		t.Errorf("OccurredAt = %v, want 2026-04-23T14:15:00Z", got)
+	}
+}
+
+func TestDiffPRSnapshots_TimelineMissDegradesToUpdatedAt(t *testing.T) {
+	// Empty timeline (e.g., the matching event slipped past the last:20
+	// window). Should fall back to updatedAt rather than detection time.
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN"}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN",
+		Labels:    []string{"old-label"},
+		UpdatedAt: "2026-04-25T18:30:00Z",
+		Timeline:  nil,
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
+	added := findEvent(evts, domain.EventGitHubPRLabelAdded)
+	if added == nil {
+		t.Fatalf("expected pr:label_added event")
+	}
+	if got := added.OccurredAt.Format("2006-01-02T15:04:05Z"); got != "2026-04-25T18:30:00Z" {
+		t.Errorf("OccurredAt = %v, want 2026-04-25T18:30:00Z (updatedAt fallback)", got)
+	}
+}
+
+// --- updatedAt fallback for source time -------------------------------------
+
+func TestDiffPRSnapshots_LabelEventsCarryUpdatedAtAsSourceTime(t *testing.T) {
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN"}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN",
+		Labels:    []string{"needs-review"},
+		UpdatedAt: "2026-04-25T18:30:00Z",
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
+	added := findEvent(evts, domain.EventGitHubPRLabelAdded)
+	if added == nil {
+		t.Fatalf("expected pr:label_added event")
+	}
+	if added.OccurredAt.IsZero() {
+		t.Errorf("expected OccurredAt populated from updatedAt, got zero")
+	}
+	if added.OccurredAt.Format("2006-01-02T15:04:05Z") != "2026-04-25T18:30:00Z" {
+		t.Errorf("OccurredAt = %v, want 2026-04-25T18:30:00Z", added.OccurredAt)
+	}
+}
+
+func TestDiffPRSnapshots_ConflictsHasNoSourceTime(t *testing.T) {
+	prev := domain.PRSnapshot{Number: 1, Repo: "o/r", State: "OPEN", Mergeable: "MERGEABLE"}
+	curr := domain.PRSnapshot{
+		Number: 1, Repo: "o/r", State: "OPEN",
+		Mergeable: "CONFLICTING",
+		UpdatedAt: "2026-04-25T18:30:00Z", // present, but should be ignored
+	}
+	evts := DiffPRSnapshots(prev, curr, testEntityID, testUser, nil)
+	conflicts := findEvent(evts, domain.EventGitHubPRConflicts)
+	if conflicts == nil {
+		t.Fatalf("expected pr:conflicts event")
+	}
+	if !conflicts.OccurredAt.IsZero() {
+		t.Errorf("pr:conflicts should leave OccurredAt zero (no honest source time), got %v", conflicts.OccurredAt)
+	}
+}
+
+func TestDiffJiraSnapshots_StatusChangeUsesUpdatedAtAsSourceTime(t *testing.T) {
+	prev := domain.JiraSnapshot{Key: "SKY-1", Status: "To Do"}
+	curr := domain.JiraSnapshot{
+		Key:       "SKY-1",
+		Status:    "In Progress",
+		UpdatedAt: "2026-04-25T18:30:00Z",
+	}
+	evts := DiffJiraSnapshots(prev, curr, testEntityID, testUser, testDoneStatuses)
+	change := findEvent(evts, domain.EventJiraIssueStatusChanged)
+	if change == nil {
+		t.Fatalf("expected jira:issue:status_changed event")
+	}
+	if change.OccurredAt.IsZero() {
+		t.Errorf("expected OccurredAt populated from updatedAt, got zero")
+	}
+}
+
 // --- extractProject helper --------------------------------------------------
 
 func TestExtractProject(t *testing.T) {
