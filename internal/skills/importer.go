@@ -258,15 +258,12 @@ func findVisibleImportedPromptByContent(database *sql.DB, name, body string) (st
 
 func hideDuplicateImportedPrompts(database *sql.DB) (int, error) {
 	rows, err := database.Query(`
-		SELECT p.id, p.name, p.body, p.hidden,
-		       (
-		           SELECT COUNT(*)
-		           FROM prompt_triggers t
-		           WHERE t.prompt_id = p.id
-		       ) AS trigger_count
+		SELECT p.id, p.name, p.body, COUNT(t.id) AS trigger_count
 		FROM prompts p
-		WHERE p.source = 'imported'
-		ORDER BY p.hidden ASC, trigger_count DESC, p.updated_at DESC, p.created_at DESC, p.id ASC
+		LEFT JOIN prompt_triggers t ON t.prompt_id = p.id
+		WHERE p.source = 'imported' AND p.hidden = 0
+		GROUP BY p.id, p.name, p.body, p.updated_at, p.created_at
+		ORDER BY trigger_count DESC, p.updated_at DESC, p.created_at DESC, p.id ASC
 	`)
 	if err != nil {
 		return 0, err
@@ -277,13 +274,12 @@ func hideDuplicateImportedPrompts(database *sql.DB) (int, error) {
 
 	for rows.Next() {
 		var (
-			id     string
-			name   string
-			body   string
-			hidden bool
-			refs   int
+			id   string
+			name string
+			body string
+			refs int
 		)
-		if err := rows.Scan(&id, &name, &body, &hidden, &refs); err != nil {
+		if err := rows.Scan(&id, &name, &body, &refs); err != nil {
 			_ = rows.Close()
 			return 0, err
 		}
@@ -291,9 +287,6 @@ func hideDuplicateImportedPrompts(database *sql.DB) (int, error) {
 		fingerprint := promptFingerprint(name, body)
 		if _, ok := seen[fingerprint]; !ok {
 			seen[fingerprint] = struct{}{}
-			continue
-		}
-		if hidden {
 			continue
 		}
 		// Keep prompts that are still bound to triggers visible so bindings
