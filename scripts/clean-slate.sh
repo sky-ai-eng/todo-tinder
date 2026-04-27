@@ -27,8 +27,12 @@ echo "  removed config"
 # storage; we materialized the session JSONL there during takeover).
 # Enumerate takeover dirs BEFORE removing them so we can compute the
 # encoded project-dir name from each absolute path. Encoding rule
-# matches Claude Code's: replace every '/' with '-' in the symlink-
-# resolved absolute path.
+# matches Claude Code's: replace every '/' AND every '.' with '-' in
+# the symlink-resolved absolute path. The dot replacement is the
+# easy-to-miss part — paths like ~/.triagefactory/... contain dots
+# and slash-only encoding would silently miss the project dir Claude
+# Code actually uses. See encodeClaudeProjectDir in
+# internal/worktree/worktree.go for the full story.
 if [ -d ~/.triagefactory/takeovers ]; then
   for dir in ~/.triagefactory/takeovers/run-*; do
     [ -d "$dir" ] || continue

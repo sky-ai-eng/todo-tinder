@@ -78,8 +78,12 @@ func Handle(args []string) {
 			os.Exit(1)
 		}
 		if err := os.Remove(target); err != nil {
+			// `rm -rf` so the hint works whether target is a regular
+			// file, a symlink, or a directory — `os.Remove` fails on
+			// non-empty dirs with "is a directory", and a plain
+			// `sudo rm` would fail the same way.
 			fmt.Fprintf(os.Stderr, "triagefactory install: cannot remove existing %s: %v\n", target, err)
-			fmt.Fprintf(os.Stderr, "\nTry:\n  sudo rm %q && sudo ln -s %q %q\n", target, src, target)
+			fmt.Fprintf(os.Stderr, "\nTry:\n  sudo rm -rf %q && sudo ln -s %q %q\n", target, src, target)
 			os.Exit(1)
 		}
 	}
