@@ -94,7 +94,7 @@ React 19 + Vite + TypeScript + Tailwind v4. Router routes live in `frontend/src/
 
 ## Conventions to know before editing
 
-- **Schema: no ALTER TABLE migrations.** `internal/db/db.go` is the source of truth. On breaking changes, update the pristine `CREATE TABLE` and assume the dev DB will be wiped (`scripts/clean-slate.sh`). Pre-release — backwards compatibility is deliberately not maintained.
+- **Schema: use proper forward migrations.** `internal/db/db.go` (especially `Migrate`) is the source of truth for upgrades. Preserve existing user data across releases: add explicit, idempotent migration steps for schema changes (including `ALTER TABLE` when needed), and keep fresh-install `CREATE TABLE` definitions in sync with the post-migration shape. `scripts/clean-slate.sh` is dev-only and not a production upgrade path.
 - **Events catalog** is a read-only system registry seeded from `domain.AllEventTypes()` via `db.SeedEventTypes`. New event types must be added there *and* the events_catalog table will reject emissions of unregistered types (FK from `events.event_type`).
 - **System triggers ship disabled.** They're reference examples — users opt in or replace them. See `seed.go`.
 - **Go module path:** `github.com/sky-ai-eng/triage-factory`. The GitHub org is `sky-ai-eng`.
