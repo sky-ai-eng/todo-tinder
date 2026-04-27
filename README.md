@@ -53,6 +53,7 @@ It runs as a single Go binary on your machine. No hosted service, no team rollou
 ### macOS/Linux — Homebrew (recommended)
 
 ```bash
+brew update
 brew tap sky-ai-eng/tap
 brew install triagefactory
 triagefactory
