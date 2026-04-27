@@ -27,10 +27,29 @@ func Open() (*sql.DB, error) {
 	}
 
 	dbPath := filepath.Join(dir, "triagefactory.db")
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)")
+	// busy_timeout(5000) is the safety net: modernc.org/sqlite returns
+	// SQLITE_BUSY immediately on lock contention unless this is set,
+	// unlike mattn/go-sqlite3 which had implicit driver-level retries.
+	// 5s gives any rare contention plenty of room to resolve before
+	// surfacing an error.
+	db, err := sql.Open("sqlite", dbPath+
+		"?_pragma=journal_mode(WAL)"+
+		"&_pragma=foreign_keys(on)"+
+		"&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
+
+	// Single connection serializes writes at the Go-pool layer, which
+	// makes SQLITE_BUSY structurally impossible — contention queues in
+	// Go rather than racing for SQLite's file lock. WAL still allows
+	// other processes (e.g. `triagefactory exec` invocations) to read
+	// concurrently against the same file. SetConnMaxLifetime(0) keeps
+	// the one connection alive for the process lifetime so we don't
+	// pay reconnect cost on idle gaps.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
 
 	if err := db.Ping(); err != nil {
 		db.Close()
