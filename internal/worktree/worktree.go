@@ -603,8 +603,20 @@ func CopyForTakeover(ctx context.Context, runID, srcWorktree, baseDir string) (s
 		args = append(args, destDir, branch)
 	} else {
 		// Detached HEAD on the source — give the destination a detached
-		// HEAD too. The user can branch off it themselves if they want.
-		args = append(args, "--detach", destDir)
+		// HEAD too. We pass the source's HEAD commit explicitly because
+		// `git worktree add --detach` without a commit-ish falls back
+		// to the bare's HEAD, which may not resolve to a valid commit
+		// for our partial-clone bare. Resolving from the source is
+		// always correct: that's the commit the agent was sitting on.
+		commitOut, err := gitOutputCtx(ctx, srcWorktree, "rev-parse", "HEAD")
+		if err != nil {
+			return "", fmt.Errorf("takeover: resolve source HEAD: %w", err)
+		}
+		commit := strings.TrimSpace(commitOut)
+		if commit == "" {
+			return "", fmt.Errorf("takeover: source HEAD resolved to empty commit")
+		}
+		args = append(args, "--detach", destDir, commit)
 	}
 	if err := gitRunCtx(ctx, bareDir, args...); err != nil {
 		return "", fmt.Errorf("takeover: worktree add: %w", err)

@@ -1,7 +1,9 @@
 package worktree
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -635,5 +637,481 @@ func TestWriteLocalExcludes_AppendsTrailingNewlineWhenMissing(t *testing.T) {
 	}
 	if !foundLine {
 		t.Errorf("original unterminated line was corrupted; file:\n%s", s)
+	}
+}
+
+// --- CopyForTakeover tests ---------------------------------------------
+//
+// These tests need a real git binary because CopyForTakeover shells out
+// to `git worktree add --force --no-checkout` and `git rev-parse
+// --git-common-dir`. Mocking those would just re-validate our own mock,
+// not the integration with git's actual behavior — and the headline bug
+// these tests guard against (`--force` letting the add succeed against
+// a branch the original worktree still has registered) is only
+// observable through real git.
+
+// gitCmd runs a git subprocess in dir, fatal-erroring on failure with
+// the combined output included so test failures are diagnosable.
+func gitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	// Disable hooks + global config so a developer's local git config
+	// (e.g. signing requirements, custom hooks) can't make these tests
+	// flaky.
+	cmd.Env = append(
+		append([]string(nil), os.Environ()...),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"HOME="+t.TempDir(),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+}
+
+// setupBareWithBranch creates a bare repo + a linked worktree on a
+// branch named "feature". Returns (bareDir, srcWorktreeDir). The
+// worktree contains one tracked file (README.md) and is left registered
+// with the bare so CopyForTakeover has to use --force to add a second
+// worktree on the same branch.
+func setupBareWithBranch(t *testing.T) (bareDir, srcWorktree string) {
+	t.Helper()
+	root := t.TempDir()
+	bareDir = filepath.Join(root, "bare.git")
+	gitCmd(t, root, "init", "--bare", bareDir)
+
+	// Seed the bare with one commit on "feature" via a temporary
+	// scratch worktree we throw away after pushing.
+	seed := filepath.Join(root, "seed")
+	gitCmd(t, root, "clone", bareDir, seed)
+	gitCmd(t, seed, "config", "user.email", "test@example.com")
+	gitCmd(t, seed, "config", "user.name", "Test")
+	gitCmd(t, seed, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("seed\n"), 0644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	gitCmd(t, seed, "add", "README.md")
+	gitCmd(t, seed, "commit", "-m", "seed")
+	gitCmd(t, seed, "push", "origin", "feature")
+
+	// The src worktree the agent would have been using. Linked off the
+	// bare on the "feature" branch — same shape Spawner.Delegate
+	// produces in production.
+	srcWorktree = filepath.Join(root, "src-wt")
+	gitCmd(t, bareDir, "worktree", "add", srcWorktree, "feature")
+	return bareDir, srcWorktree
+}
+
+// TestCopyForTakeover_HappyPath_Branch is the headline test: the source
+// worktree is on a branch and still registered with the bare repo (the
+// production scenario at the moment Takeover() runs). CopyForTakeover
+// must succeed and leave the destination on the same branch with the
+// agent's working tree contents.
+func TestCopyForTakeover_HappyPath_Branch(t *testing.T) {
+	_, srcWorktree := setupBareWithBranch(t)
+	baseDir := t.TempDir()
+
+	// Drop a tracked-modification + untracked file in src so we can
+	// verify both make it across to the destination via the overlay.
+	if err := os.WriteFile(filepath.Join(srcWorktree, "README.md"), []byte("modified\n"), 0644); err != nil {
+		t.Fatalf("modify README: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcWorktree, "untracked.txt"), []byte("hi\n"), 0644); err != nil {
+		t.Fatalf("write untracked: %v", err)
+	}
+
+	dest, err := CopyForTakeover(context.Background(), "abc123", srcWorktree, baseDir)
+	if err != nil {
+		t.Fatalf("CopyForTakeover: %v", err)
+	}
+
+	// The returned path is composed under baseDir as run-<id>.
+	wantSuffix := filepath.Join("run-abc123")
+	if !strings.HasSuffix(dest, wantSuffix) {
+		t.Errorf("dest %q should end with %q", dest, wantSuffix)
+	}
+
+	// Both files made it across.
+	if data, err := os.ReadFile(filepath.Join(dest, "README.md")); err != nil {
+		t.Fatalf("read README in dest: %v", err)
+	} else if string(data) != "modified\n" {
+		t.Errorf("README content = %q, want modified", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(dest, "untracked.txt")); err != nil {
+		t.Errorf("untracked file not copied: %v", err)
+	}
+
+	// Destination is a real git worktree, on the same branch, with the
+	// agent's modifications visible to git status.
+	branchOut, err := exec.Command("git", "-C", dest, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in dest: %v", err)
+	}
+	if got := strings.TrimSpace(string(branchOut)); got != "feature" {
+		t.Errorf("dest branch = %q, want feature", got)
+	}
+}
+
+// TestCopyForTakeover_ForceAllowsLiveOriginal is the explicit regression
+// guard for the bug we just fixed: without --force, `git worktree add`
+// against a branch that's already checked out elsewhere fails with
+// "branch is already checked out at <path>." The original /tmp worktree
+// is intentionally still registered when CopyForTakeover runs (the
+// agent's working files have to survive long enough for the overlay).
+// This test fails loudly if --force is ever removed from the args.
+func TestCopyForTakeover_ForceAllowsLiveOriginal(t *testing.T) {
+	bareDir, srcWorktree := setupBareWithBranch(t)
+	baseDir := t.TempDir()
+
+	// Sanity check: the original worktree IS registered with the bare,
+	// so a non-force add on the same branch should fail. If this
+	// precondition stops holding (e.g. someone changes
+	// setupBareWithBranch), the rest of the test stops being
+	// meaningful.
+	probeDest := filepath.Join(t.TempDir(), "probe")
+	probe := exec.Command("git", "-C", bareDir, "worktree", "add", "--no-checkout", probeDest, "feature")
+	probe.Env = append(append([]string(nil), os.Environ()...),
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "HOME="+t.TempDir())
+	if probe.Run() == nil {
+		t.Fatalf("precondition: non-force add on co-checked-out branch should fail; setup may be wrong (src=%s)", srcWorktree)
+	}
+
+	// Now the real call — must succeed because of --force.
+	dest, err := CopyForTakeover(context.Background(), "abc123", srcWorktree, baseDir)
+	if err != nil {
+		t.Fatalf("CopyForTakeover should succeed with --force, got: %v", err)
+	}
+
+	// Both worktrees are now registered on the same branch — confirm
+	// git sees both in `worktree list`. Spawner.Takeover removes the
+	// original right after this returns, but at this moment they
+	// coexist by design.
+	listOut, err := exec.Command("git", "-C", bareDir, "worktree", "list").Output()
+	if err != nil {
+		t.Fatalf("worktree list: %v", err)
+	}
+	list := string(listOut)
+	if !strings.Contains(list, srcWorktree) {
+		t.Errorf("worktree list missing original %q; output:\n%s", srcWorktree, list)
+	}
+	if !strings.Contains(list, dest) {
+		t.Errorf("worktree list missing takeover dest %q; output:\n%s", dest, list)
+	}
+}
+
+// TestCopyForTakeover_DetachedHead — a source worktree on a detached
+// HEAD (uncommon but possible) means currentBranch returns "" and the
+// dest gets --detach instead of a branch name. Verify that path.
+func TestCopyForTakeover_DetachedHead(t *testing.T) {
+	_, srcWorktree := setupBareWithBranch(t)
+	gitCmd(t, srcWorktree, "checkout", "--detach")
+	baseDir := t.TempDir()
+
+	dest, err := CopyForTakeover(context.Background(), "detached-run", srcWorktree, baseDir)
+	if err != nil {
+		t.Fatalf("CopyForTakeover detached: %v", err)
+	}
+
+	out, err := exec.Command("git", "-C", dest, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "HEAD" {
+		t.Errorf("dest HEAD = %q, want detached HEAD", got)
+	}
+}
+
+// TestCopyForTakeover_RelativeBaseDir guards review-comment fix #2: a
+// relative takeover_dir in config must produce an absolute destination
+// path so the resume command works regardless of the user's cwd.
+func TestCopyForTakeover_RelativeBaseDir(t *testing.T) {
+	_, srcWorktree := setupBareWithBranch(t)
+
+	// Switch to a known cwd so the relative path resolves predictably.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	scratch := t.TempDir()
+	if err := os.Chdir(scratch); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	dest, err := CopyForTakeover(context.Background(), "rel-run", srcWorktree, "./relative-base")
+	if err != nil {
+		t.Fatalf("CopyForTakeover: %v", err)
+	}
+	if !filepath.IsAbs(dest) {
+		t.Errorf("dest %q must be absolute when baseDir is relative", dest)
+	}
+	if !strings.HasPrefix(dest, scratch) {
+		t.Errorf("dest %q should resolve under cwd %q", dest, scratch)
+	}
+}
+
+// TestCopyForTakeover_ExistingDest — re-invocation against the same
+// runID returns the existing path without recreating. Important
+// because the user may have started editing the takeover dir; we must
+// not clobber it.
+func TestCopyForTakeover_ExistingDest(t *testing.T) {
+	_, srcWorktree := setupBareWithBranch(t)
+	baseDir := t.TempDir()
+
+	first, err := CopyForTakeover(context.Background(), "rerun", srcWorktree, baseDir)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	// Plant a marker file so we can verify the second call returns the
+	// existing dir untouched rather than re-creating.
+	marker := filepath.Join(first, "USER_EDIT.txt")
+	if err := os.WriteFile(marker, []byte("hands off\n"), 0644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	second, err := CopyForTakeover(context.Background(), "rerun", srcWorktree, baseDir)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if first != second {
+		t.Errorf("second call returned different path: %q vs %q", first, second)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("marker file removed by second call — destination was clobbered: %v", err)
+	}
+}
+
+// TestCopyForTakeover_Validation — early-return error cases that don't
+// need a real git repo.
+func TestCopyForTakeover_Validation(t *testing.T) {
+	cases := []struct {
+		name        string
+		runID       string
+		src         string
+		wantSubstr  string
+	}{
+		{"empty runID", "", "/some/path", "empty run id"},
+		{"empty source", "rid", "", "empty source"},
+		{"nonexistent source", "rid", filepath.Join(t.TempDir(), "does-not-exist"), "stat source"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := CopyForTakeover(context.Background(), tc.runID, tc.src, t.TempDir())
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error %q should contain %q", err.Error(), tc.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestCopyForTakeover_SourceIsAFile rejects a regular file passed as the
+// source worktree path. Distinct test from the validation table because
+// it needs filesystem setup.
+func TestCopyForTakeover_SourceIsAFile(t *testing.T) {
+	srcFile := filepath.Join(t.TempDir(), "regular-file")
+	if err := os.WriteFile(srcFile, []byte("not a worktree"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	_, err := CopyForTakeover(context.Background(), "rid", srcFile, t.TempDir())
+	if err == nil {
+		t.Fatal("expected error when src is a file")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("error %q should mention 'not a directory'", err.Error())
+	}
+}
+
+// TestCopyForTakeover_ManagedDirsSkipped — task_memory/, _scratch/, and
+// .git/ in the source must NOT be copied to the destination. The first
+// two are TF infrastructure that doesn't belong in the user's hands;
+// the third would clobber the linked-worktree gitdir pointer.
+func TestCopyForTakeover_ManagedDirsSkipped(t *testing.T) {
+	_, srcWorktree := setupBareWithBranch(t)
+	baseDir := t.TempDir()
+
+	for _, name := range []string{"task_memory", "_scratch"} {
+		dir := filepath.Join(srcWorktree, name)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("nope"), 0644); err != nil {
+			t.Fatalf("write secret: %v", err)
+		}
+	}
+
+	dest, err := CopyForTakeover(context.Background(), "skip-run", srcWorktree, baseDir)
+	if err != nil {
+		t.Fatalf("CopyForTakeover: %v", err)
+	}
+
+	for _, name := range []string{"task_memory", "_scratch"} {
+		if _, err := os.Stat(filepath.Join(dest, name, "secret.txt")); !os.IsNotExist(err) {
+			t.Errorf("%s/ should have been skipped, but file exists at dest (err=%v)", name, err)
+		}
+	}
+
+	// .git/ in the destination must be the linked-worktree pointer file
+	// git wrote during `worktree add`, not anything overlaid from src.
+	gitInfo, err := os.Stat(filepath.Join(dest, ".git"))
+	if err != nil {
+		t.Fatalf("stat dest .git: %v", err)
+	}
+	if gitInfo.IsDir() {
+		t.Errorf("dest .git is a directory — overlay clobbered the linked-worktree pointer")
+	}
+}
+
+// TestCopyForTakeover_NestedDirs verifies the walk recurses into
+// subdirectories rather than only handling the top level. Trivial bug
+// to introduce, expensive to debug in production.
+func TestCopyForTakeover_NestedDirs(t *testing.T) {
+	_, srcWorktree := setupBareWithBranch(t)
+	nested := filepath.Join(srcWorktree, "a", "b", "c")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "deep.txt"), []byte("found me"), 0644); err != nil {
+		t.Fatalf("write deep: %v", err)
+	}
+
+	dest, err := CopyForTakeover(context.Background(), "nested-run", srcWorktree, t.TempDir())
+	if err != nil {
+		t.Fatalf("CopyForTakeover: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "a", "b", "c", "deep.txt"))
+	if err != nil {
+		t.Fatalf("read nested file in dest: %v", err)
+	}
+	if string(got) != "found me" {
+		t.Errorf("nested file content = %q", string(got))
+	}
+}
+
+// --- CleanupWithOptions tests -----------------------------------------
+
+// TestCleanupWithOptions_PreservesProjectDirForTakenOver is the startup-
+// path safety: a taken_over run's ~/.claude/projects entry must survive
+// the orphan sweep so `claude --resume` keeps working after a binary
+// restart. The worktree dir under $TMPDIR still gets removed (it's
+// genuine garbage), but the JSONL stays.
+func TestCleanupWithOptions_PreservesProjectDirForTakenOver(t *testing.T) {
+	tmp := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("HOME", home)
+
+	// Three orphaned worktrees: one normal run, one taken-over run, one
+	// no-cwd Jira run that's also taken-over (covers the -nocwd suffix
+	// trim in CleanupWithOptions).
+	runs := []struct {
+		dirName     string
+		runID       string
+		preserve    bool
+	}{
+		{"run-normal", "run-normal", false},
+		{"run-taken", "run-taken", true},
+		{"run-jira-nocwd", "run-jira", true},
+	}
+
+	runsBase := filepath.Join(tmp, runsDir)
+	if err := os.MkdirAll(runsBase, 0755); err != nil {
+		t.Fatalf("mkdir runs base: %v", err)
+	}
+	for _, r := range runs {
+		dir := filepath.Join(runsBase, r.dirName)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir worktree %s: %v", r.dirName, err)
+		}
+		// Pre-create the ~/.claude/projects/<encoded> entry that
+		// Cleanup would otherwise nuke. Encoding matches what
+		// RemoveClaudeProjectDir computes (slashes → dashes,
+		// EvalSymlinks-resolved cwd).
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatalf("evalsymlinks %s: %v", dir, err)
+		}
+		encoded := strings.ReplaceAll(resolved, "/", "-")
+		projectDir := filepath.Join(home, claudeProjectsDir, encoded)
+		if err := os.MkdirAll(projectDir, 0755); err != nil {
+			t.Fatalf("mkdir project dir for %s: %v", r.runID, err)
+		}
+		if err := os.WriteFile(filepath.Join(projectDir, "session.jsonl"), []byte("data"), 0644); err != nil {
+			t.Fatalf("write jsonl: %v", err)
+		}
+	}
+
+	preserve := map[string]bool{}
+	for _, r := range runs {
+		if r.preserve {
+			preserve[r.runID] = true
+		}
+	}
+	CleanupWithOptions(CleanupOptions{PreserveClaudeProjectFor: preserve})
+
+	// All worktree dirs are removed regardless of preservation —
+	// preserve only protects the project dir.
+	for _, r := range runs {
+		if _, err := os.Stat(filepath.Join(runsBase, r.dirName)); !os.IsNotExist(err) {
+			t.Errorf("worktree dir %s should have been removed (err=%v)", r.dirName, err)
+		}
+	}
+
+	// Project dirs: preserved runs keep theirs, non-preserved lose
+	// theirs.
+	for _, r := range runs {
+		dir := filepath.Join(runsBase, r.dirName)
+		// Re-derive the encoded name from the dir we already removed
+		// — we have to rebuild it from scratch since the dir is gone.
+		// Use the parent's resolved tmp path joined with the dirName,
+		// which is what RemoveClaudeProjectDir would have computed
+		// before deletion.
+		tmpResolved, _ := filepath.EvalSymlinks(tmp)
+		encoded := strings.ReplaceAll(filepath.Join(tmpResolved, runsDir, r.dirName), "/", "-")
+		projectDir := filepath.Join(home, claudeProjectsDir, encoded)
+		_, err := os.Stat(projectDir)
+		if r.preserve {
+			if os.IsNotExist(err) {
+				t.Errorf("project dir for taken-over run %s was deleted; resume would break", r.runID)
+			}
+		} else {
+			if !os.IsNotExist(err) {
+				t.Errorf("project dir for non-preserved run %s should have been removed (err=%v)", r.runID, err)
+			}
+		}
+		_ = dir
+	}
+}
+
+// TestCleanupWithOptions_NilPreserveSet is safe (no panic) and behaves
+// like the legacy Cleanup() — every orphan's project dir gets nuked.
+// Map reads on nil maps return the zero value in Go, so the index
+// expression `opts.PreserveClaudeProjectFor[runID]` returns false and
+// every run is treated as non-preserved.
+func TestCleanupWithOptions_NilPreserveSet(t *testing.T) {
+	tmp := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("HOME", home)
+
+	runDir := filepath.Join(tmp, runsDir, "run-nil")
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CleanupWithOptions panicked on nil PreserveClaudeProjectFor: %v", r)
+		}
+	}()
+	CleanupWithOptions(CleanupOptions{}) // PreserveClaudeProjectFor is nil
+
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Errorf("run dir should have been removed (err=%v)", err)
 	}
 }
