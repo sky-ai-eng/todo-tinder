@@ -199,3 +199,82 @@ func TestWasTakenOver(t *testing.T) {
 		t.Error("expected true after set")
 	}
 }
+
+// TestAbortTakeover_KeepsFlagSticky is the regression guard for a
+// subtle race: clearing s.takenOver[runID] in abortTakeover would let
+// the runAgent goroutine's late-firing gates (handleCancelled, failRun,
+// the deferred RemoveClaudeProjectDir, the natural-completion block)
+// proceed with their normal cleanup the moment they re-read
+// wasTakenOver. The goroutine's unconditional db.CompleteAgentRun
+// would overwrite our 'takeover_failed' stop_reason with 'cancelled',
+// and its RemoveClaudeProjectDir would run alongside ours.
+//
+// Leaving the flag set keeps every gate closed and abortTakeover the
+// sole writer. This test pins that invariant down: after abortTakeover
+// runs, wasTakenOver(runID) must still return true.
+func TestAbortTakeover_KeepsFlagSticky(t *testing.T) {
+	database := newTakeoverTestDB(t)
+	seedRun(t, database, "run-abort", "sess-x", "/tmp/wt-abort")
+	s := newSpawnerWithActiveCancel(database, "run-abort")
+	s.takenOver["run-abort"] = true
+
+	s.abortTakeover("run-abort", "", "")
+
+	if !s.wasTakenOver("run-abort") {
+		t.Error("abortTakeover cleared the takenOver flag — late goroutine gates can now race the rollback")
+	}
+}
+
+// TestAbortTakeover_MarksRowTerminal: when the row is still in a
+// non-terminal status (the typical post-failure state because the
+// goroutine's gated handleCancelled didn't write anything), the
+// rollback marks it cancelled with stop_reason='takeover_failed' so
+// the UI sees a closed run instead of a phantom 'running'.
+func TestAbortTakeover_MarksRowTerminal(t *testing.T) {
+	database := newTakeoverTestDB(t)
+	seedRun(t, database, "run-mark", "sess-y", "/tmp/wt-mark")
+	s := newSpawnerWithActiveCancel(database, "run-mark")
+	s.takenOver["run-mark"] = true
+
+	s.abortTakeover("run-mark", "", "")
+
+	got, err := db.GetAgentRun(database, "run-mark")
+	if err != nil {
+		t.Fatalf("GetAgentRun: %v", err)
+	}
+	if got.Status != "cancelled" {
+		t.Errorf("Status = %q, want cancelled", got.Status)
+	}
+	if got.StopReason != "takeover_failed" {
+		t.Errorf("StopReason = %q, want takeover_failed", got.StopReason)
+	}
+}
+
+// TestAbortTakeover_PreservesTerminalRow: when the row already reached
+// a terminal status (race-loss path: goroutine wrote a real outcome
+// before our flag could land), the rollback must NOT overwrite it
+// with 'cancelled' — the agent's actual result has to survive.
+func TestAbortTakeover_PreservesTerminalRow(t *testing.T) {
+	database := newTakeoverTestDB(t)
+	seedRun(t, database, "run-already-done", "sess-z", "/tmp/wt-done")
+	// Simulate the goroutine winning the race: row is already
+	// 'completed' before we run abortTakeover.
+	if _, err := database.Exec(`UPDATE runs SET status = 'completed', stop_reason = 'end_turn' WHERE id = ?`, "run-already-done"); err != nil {
+		t.Fatalf("force completed status: %v", err)
+	}
+	s := newSpawnerWithActiveCancel(database, "run-already-done")
+	s.takenOver["run-already-done"] = true
+
+	s.abortTakeover("run-already-done", "", "")
+
+	got, err := db.GetAgentRun(database, "run-already-done")
+	if err != nil {
+		t.Fatalf("GetAgentRun: %v", err)
+	}
+	if got.Status != "completed" {
+		t.Errorf("Status changed from completed to %q — abortTakeover must preserve the agent's real outcome", got.Status)
+	}
+	if got.StopReason != "end_turn" {
+		t.Errorf("StopReason changed from end_turn to %q", got.StopReason)
+	}
+}

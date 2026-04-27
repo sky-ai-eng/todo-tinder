@@ -290,23 +290,32 @@ func (s *Spawner) Takeover(ctx context.Context, runID, baseDir string) (*Takeove
 }
 
 // abortTakeover unwinds the in-progress takeover state when CopyForTakeover
-// or the final DB mark fails. Without it, every cleanup path in runAgent
-// stays gated forever (because takenOver is sticky), the run row sits at
-// whatever non-terminal status it last had, future takeover attempts get
-// "already being taken over," and the ~/.claude/projects JSONL leaks.
+// or the final DB mark fails. Two things have to happen: the runAgent
+// goroutine's gated cleanup (worktree.Remove, RemoveClaudeProjectDir,
+// the natural-completion DB write) was suppressed because the
+// takenOver flag is set, so we have to do it ourselves; and the run
+// row needs to reach a terminal state so the UI and the active-run
+// gate don't see a phantom running run forever.
 //
-// The order is: clear the flag, then do the cleanup the gated defers
-// skipped (worktree.Remove + RemoveClaudeProjectDir), then mark the row
-// terminal — but only if it isn't already (race-loss path against
-// natural completion preserves the agent's real outcome).
+// Notably we DO NOT delete s.takenOver[runID]. The flag must stay
+// sticky-on for the rest of the goroutine's lifetime — its gates
+// (handleCancelled, failRun, the deferred RemoveClaudeProjectDir, the
+// natural-completion block) re-read wasTakenOver at unpredictable
+// times relative to abortTakeover. Clearing the flag would let any
+// late-firing gate proceed with normal cleanup, which races our own
+// rollback: the goroutine's unconditional db.CompleteAgentRun would
+// overwrite our 'takeover_failed' stop_reason with 'cancelled', and
+// its RemoveClaudeProjectDir would run alongside ours. Leaving the
+// flag on keeps every gate closed and abortTakeover the sole writer.
+//
+// The retry-unblocking concern that motivated the original delete is
+// moot anyway: once we've SIGKILLed the agent and reached this code
+// path, there's no live run left to take over. A user retry creates
+// a new delegated run, not a new takeover of the same run.
 //
 // destPath may be empty (copy never produced one) or may point at a
 // partial directory; either way we RemoveAll it.
 func (s *Spawner) abortTakeover(runID, claudeCwd, destPath string) {
-	s.mu.Lock()
-	delete(s.takenOver, runID)
-	s.mu.Unlock()
-
 	if destPath != "" {
 		if err := os.RemoveAll(destPath); err != nil {
 			log.Printf("[delegate] warning: abort takeover for %s: remove dest %s: %v", runID, destPath, err)
