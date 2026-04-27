@@ -35,7 +35,12 @@ if [ -d ~/.triagefactory/takeovers ]; then
     # `cd && pwd -P` is the POSIX-portable way to get the symlink-
     # resolved path; `realpath` isn't on default macOS.
     resolved=$(cd "$dir" && pwd -P) || continue
-    encoded=$(printf '%s' "$resolved" | tr '/' '-')
+    # Claude Code encoding: every '/' AND every '.' becomes '-'.
+    # Slash-only is wrong for paths like ~/.triagefactory/...
+    # because the dot in `.triagefactory` is collapsed by Claude
+    # too — see the comment on encodeClaudeProjectDir in
+    # internal/worktree/worktree.go for the full story.
+    encoded=$(printf '%s' "$resolved" | tr '/.' '-')
     rm -rf ~/.claude/projects/"$encoded"
   done
   rm -rf ~/.triagefactory/takeovers

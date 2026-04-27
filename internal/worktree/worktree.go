@@ -72,21 +72,43 @@ func RemoveRunCwd(runID string) {
 	os.RemoveAll(filepath.Join(os.TempDir(), runsDir, runID+"-nocwd"))
 }
 
-// claudeProjectEncoding returns the directory-name Claude Code uses
-// for a given cwd inside ~/.claude/projects/. Encoding rule: take the
-// symlink-resolved absolute path, replace every '/' with '-' (the
-// leading '/' becomes a leading '-'). Centralized here so callers
-// (RemoveClaudeProjectDir, MaterializeSessionForTakeover) compute
-// identical names. Returns the encoded name and the resolved path; on
-// EvalSymlinks failure, falls back to the input path so callers still
-// get a deterministic encoding for the typical no-symlinks case.
+// encodeClaudeProjectDir returns the directory name Claude Code uses
+// under ~/.claude/projects/ for a symlink-resolved absolute cwd.
+//
+// Encoding rule (verified empirically against Claude Code 2.1.119):
+// every '/' AND every '.' in the resolved path becomes '-'. The
+// dot-replacement is the part that's easy to miss — paths like
+// ~/.triagefactory/... contain dots, and only replacing slashes
+// produces a name Claude Code can't find. We discovered this when
+// `claude --resume <id>` from a takeover dir reported "No
+// conversation found": our materialized JSONL was at
+// `-Users-...-.triagefactory-takeovers-run-<id>` while Claude looked
+// at `-Users-...--triagefactory-takeovers-run-<id>` (note the `--`
+// where the dot got collapsed).
+//
+// Caveat: only `/` and `.` are verified. Claude Code may also rewrite
+// other characters (underscores, spaces). The paths Triage Factory
+// actually uses (/tmp/triagefactory-runs/<uuid> and
+// ~/.triagefactory/takeovers/run-<uuid>) only contain slashes and
+// dots, so this matches in practice; if takeover_dir is ever
+// configured to a path with other special characters, revisit.
+func encodeClaudeProjectDir(resolvedAbs string) string {
+	return strings.NewReplacer("/", "-", ".", "-").Replace(resolvedAbs)
+}
+
+// claudeProjectEncoding combines symlink resolution and encoding for
+// callers that have an unresolved cwd. Returns the encoded name and
+// the resolved path. On EvalSymlinks failure (typically because the
+// path doesn't exist anymore), falls back to the input — Claude Code
+// would have used the resolved path while it was running, so callers
+// that need the canonical encoding for an extant path should resolve
+// before the path goes away.
 func claudeProjectEncoding(cwd string) (encoded, resolved string) {
 	resolved = cwd
 	if r, err := filepath.EvalSymlinks(cwd); err == nil {
 		resolved = r
 	}
-	encoded = strings.ReplaceAll(resolved, "/", "-")
-	return encoded, resolved
+	return encodeClaudeProjectDir(resolved), resolved
 }
 
 // MaterializeSessionForTakeover copies the Claude Code session JSONL
@@ -121,7 +143,7 @@ func MaterializeSessionForTakeover(resolvedOldCwd, newCwd, sessionID string) err
 		return fmt.Errorf("materialize session: %w", err)
 	}
 
-	oldEncoded := strings.ReplaceAll(resolvedOldCwd, "/", "-")
+	oldEncoded := encodeClaudeProjectDir(resolvedOldCwd)
 	newEncoded, _ := claudeProjectEncoding(newCwd)
 
 	src := filepath.Join(home, claudeProjectsDir, oldEncoded, sessionID+".jsonl")
@@ -185,10 +207,7 @@ func RemoveClaudeProjectDir(cwd string) {
 	if err != nil {
 		return
 	}
-	// Claude Code encoding: replace every '/' in the absolute path with '-'.
-	// The leading '/' becomes a leading '-', matching the dir names Claude Code writes.
-	encoded := strings.ReplaceAll(resolved, "/", "-")
-	projectDir := filepath.Join(home, claudeProjectsDir, encoded)
+	projectDir := filepath.Join(home, claudeProjectsDir, encodeClaudeProjectDir(resolved))
 	if err := os.RemoveAll(projectDir); err != nil {
 		log.Printf("[worktree] remove ghost project dir %s: %v", projectDir, err)
 	}

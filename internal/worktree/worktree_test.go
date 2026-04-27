@@ -1182,7 +1182,7 @@ func TestCleanupWithOptions_PreservesProjectDirForTakenOver(t *testing.T) {
 		if err != nil {
 			t.Fatalf("evalsymlinks %s: %v", dir, err)
 		}
-		encoded := strings.ReplaceAll(resolved, "/", "-")
+		encoded := encodeClaudeProjectDir(resolved)
 		projectDir := filepath.Join(home, claudeProjectsDir, encoded)
 		if err := os.MkdirAll(projectDir, 0755); err != nil {
 			t.Fatalf("mkdir project dir for %s: %v", r.runID, err)
@@ -1218,7 +1218,7 @@ func TestCleanupWithOptions_PreservesProjectDirForTakenOver(t *testing.T) {
 		// which is what RemoveClaudeProjectDir would have computed
 		// before deletion.
 		tmpResolved, _ := filepath.EvalSymlinks(tmp)
-		encoded := strings.ReplaceAll(filepath.Join(tmpResolved, runsDir, r.dirName), "/", "-")
+		encoded := encodeClaudeProjectDir(filepath.Join(tmpResolved, runsDir, r.dirName))
 		projectDir := filepath.Join(home, claudeProjectsDir, encoded)
 		_, err := os.Stat(projectDir)
 		if r.preserve {
@@ -1257,7 +1257,7 @@ func TestCleanupWithOptions_SkipClaudeProjectCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("eval: %v", err)
 	}
-	encoded := strings.ReplaceAll(resolved, "/", "-")
+	encoded := encodeClaudeProjectDir(resolved)
 	projectDir := filepath.Join(home, claudeProjectsDir, encoded)
 	jsonlPath := filepath.Join(projectDir, "session.jsonl")
 	if err := os.MkdirAll(projectDir, 0755); err != nil {
@@ -1305,7 +1305,7 @@ func TestMaterializeSessionForTakeover_CopiesJSONL(t *testing.T) {
 	// written it: ~/.claude/projects/<encoded-oldCwd>/<sessionID>.jsonl.
 	sessionID := "abc123-def456"
 	resolved := ResolveClaudeProjectCwd(oldCwd)
-	srcEncoded := strings.ReplaceAll(resolved, "/", "-")
+	srcEncoded := encodeClaudeProjectDir(resolved)
 	srcDir := filepath.Join(home, claudeProjectsDir, srcEncoded)
 	if err := os.MkdirAll(srcDir, 0700); err != nil {
 		t.Fatalf("mkdir source project: %v", err)
@@ -1321,7 +1321,7 @@ func TestMaterializeSessionForTakeover_CopiesJSONL(t *testing.T) {
 
 	// Destination JSONL must exist with the same content.
 	newResolved := ResolveClaudeProjectCwd(newCwd)
-	destEncoded := strings.ReplaceAll(newResolved, "/", "-")
+	destEncoded := encodeClaudeProjectDir(newResolved)
 	destPath := filepath.Join(home, claudeProjectsDir, destEncoded, sessionID+".jsonl")
 	got, err := os.ReadFile(destPath)
 	if err != nil {
@@ -1329,6 +1329,39 @@ func TestMaterializeSessionForTakeover_CopiesJSONL(t *testing.T) {
 	}
 	if string(got) != jsonlContent {
 		t.Errorf("dest content = %q, want %q", string(got), jsonlContent)
+	}
+}
+
+// TestEncodeClaudeProjectDir_ReplacesDots is the headline regression
+// test for the encoding bug. Empirically (Claude Code 2.1.119) every
+// '/' AND every '.' in the resolved cwd becomes '-'. Triage Factory's
+// own paths almost always contain dots — the takeover destination is
+// ~/.triagefactory/takeovers/run-<id> — so a slash-only encoding
+// silently misses Claude Code's actual lookup path and resume fails
+// with "No conversation found." This test pins down both characters
+// so the rule can't quietly regress.
+func TestEncodeClaudeProjectDir_ReplacesDots(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"/private/tmp/repro-orig", "-private-tmp-repro-orig"},
+		{"/private/tmp/dot.in.middle", "-private-tmp-dot-in-middle"},
+		{"/private/tmp/v1.2.3-rc", "-private-tmp-v1-2-3-rc"},
+		// The case that actually broke in production: leading dot in
+		// `.triagefactory` produces a `--` (two dashes in a row) where
+		// the slash-after-dot used to live. Slash-only would have
+		// produced just `-.triagefactory-...`.
+		{"/Users/aidan/.triagefactory/takeovers/run-x", "-Users-aidan--triagefactory-takeovers-run-x"},
+		{"/home/user/.triagefactory/takeovers/run-x", "-home-user--triagefactory-takeovers-run-x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got := encodeClaudeProjectDir(tc.in)
+			if got != tc.want {
+				t.Errorf("encodeClaudeProjectDir(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
