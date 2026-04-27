@@ -103,7 +103,7 @@ func newSpawnerWithActiveCancel(database *sql.DB, runID string) *Spawner {
 // problem, and the handler routes uncategorized errors to 500.
 func TestTakeover_EmptyBaseDir(t *testing.T) {
 	s := NewSpawner(nil, nil, nil, "")
-	_, err := s.Takeover(context.Background(), "any-run", "")
+	_, err := s.Takeover("any-run", "")
 	if err == nil {
 		t.Fatal("expected error on empty baseDir")
 	}
@@ -120,7 +120,7 @@ func TestTakeover_NonexistentRun(t *testing.T) {
 	database := newTakeoverTestDB(t)
 	s := NewSpawner(database, nil, nil, "")
 
-	_, err := s.Takeover(context.Background(), "no-such-run", "/tmp/dest")
+	_, err := s.Takeover("no-such-run", "/tmp/dest")
 	if !errors.Is(err, ErrTakeoverInvalidState) {
 		t.Errorf("err = %v, want ErrTakeoverInvalidState", err)
 	}
@@ -134,7 +134,7 @@ func TestTakeover_NoSessionID(t *testing.T) {
 	seedRun(t, database, "run-no-sid", "", "/tmp/wt")
 	s := newSpawnerWithActiveCancel(database, "run-no-sid")
 
-	_, err := s.Takeover(context.Background(), "run-no-sid", "/tmp/dest")
+	_, err := s.Takeover("run-no-sid", "/tmp/dest")
 	if !errors.Is(err, ErrTakeoverInvalidState) {
 		t.Errorf("err = %v, want ErrTakeoverInvalidState", err)
 	}
@@ -147,7 +147,7 @@ func TestTakeover_NoWorktreePath(t *testing.T) {
 	seedRun(t, database, "run-no-wt", "sess-1", "")
 	s := newSpawnerWithActiveCancel(database, "run-no-wt")
 
-	_, err := s.Takeover(context.Background(), "run-no-wt", "/tmp/dest")
+	_, err := s.Takeover("run-no-wt", "/tmp/dest")
 	if !errors.Is(err, ErrTakeoverInvalidState) {
 		t.Errorf("err = %v, want ErrTakeoverInvalidState", err)
 	}
@@ -163,7 +163,7 @@ func TestTakeover_NoActiveRun(t *testing.T) {
 	// No cancels[runID] set.
 	s := NewSpawner(database, nil, nil, "")
 
-	_, err := s.Takeover(context.Background(), "run-not-active", "/tmp/dest")
+	_, err := s.Takeover("run-not-active", "/tmp/dest")
 	if !errors.Is(err, ErrTakeoverInvalidState) {
 		t.Errorf("err = %v, want ErrTakeoverInvalidState", err)
 	}
@@ -180,7 +180,7 @@ func TestTakeover_AlreadyInProgress(t *testing.T) {
 	s := newSpawnerWithActiveCancel(database, "run-double")
 	s.takenOver["run-double"] = true
 
-	_, err := s.Takeover(context.Background(), "run-double", "/tmp/dest")
+	_, err := s.Takeover("run-double", "/tmp/dest")
 	if !errors.Is(err, ErrTakeoverInProgress) {
 		t.Errorf("err = %v, want ErrTakeoverInProgress", err)
 	}

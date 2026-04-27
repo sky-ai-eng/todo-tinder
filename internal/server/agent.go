@@ -71,7 +71,11 @@ func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.spawner.Takeover(r.Context(), runID, baseDir)
+	// Note: Takeover does NOT take r.Context(). Once it commits
+	// (sets the takenOver flag and SIGKILLs the agent) the operation
+	// must run to completion or roll back cleanly; tying it to the
+	// request context would let a client disconnect destroy the run.
+	result, err := s.spawner.Takeover(runID, baseDir)
 	if err != nil {
 		writeJSON(w, takeoverErrorStatus(err), map[string]string{"error": err.Error()})
 		return
