@@ -587,7 +587,18 @@ func CopyForTakeover(ctx context.Context, runID, srcWorktree, baseDir string) (s
 	// empty and we fill it via overlayWorkingTree. Without --no-checkout
 	// git would lazy-fetch blobs from the partial-clone bare, which is
 	// the slow path we're explicitly avoiding.
-	args := []string{"worktree", "add", "--no-checkout"}
+	//
+	// --force bypasses git's "branch is already checked out at <path>"
+	// safety check. The original /tmp worktree IS still registered with
+	// the bare repo at this point: Spawner.Takeover SIGKILLs the agent
+	// before calling us but defers the worktree.Remove until after this
+	// returns (we need the source files for overlayWorkingTree). Without
+	// --force, git would refuse the add because the branch is co-checked
+	// out by the original. The safety the flag bypasses — "don't let two
+	// live worktrees fight over a branch" — doesn't apply here: the
+	// agent is dead, no process is writing to the original, and the
+	// dual-worktree state lasts only as long as the overlay copy.
+	args := []string{"worktree", "add", "--force", "--no-checkout"}
 	if branch != "" {
 		args = append(args, destDir, branch)
 	} else {
