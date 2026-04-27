@@ -454,7 +454,7 @@ func (s *Spawner) Delegate(task domain.Task, explicitPromptID string, triggerTyp
 
 		if setupErr != nil {
 			if ctx.Err() != nil {
-				s.handleCancelled(runID, startTime, cfg.hasWT)
+				s.handleCancelled(runID, startTime, cfg.wtPath)
 				return
 			}
 			s.failRun(runID, task.ID, triggerType, setupErr.Error())
@@ -604,7 +604,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 			if s.wasTakenOver(runID) {
 				return
 			}
-			_ = worktree.Remove(runID)
+			_ = worktree.RemoveAt(cfg.wtPath, runID)
 		}()
 	}
 
@@ -668,7 +668,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	s.updateStatus(runID, "agent_starting")
 	if ctx.Err() != nil {
-		s.handleCancelled(runID, startTime, cfg.hasWT)
+		s.handleCancelled(runID, startTime, cfg.wtPath)
 		return
 	}
 
@@ -825,7 +825,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() != nil {
-			s.handleCancelled(runID, startTime, cfg.hasWT)
+			s.handleCancelled(runID, startTime, cfg.wtPath)
 			return
 		}
 		stderr := stderrBuf.String()
@@ -1263,11 +1263,17 @@ func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID string) (stri
 	return p.ID, p.Body, nil
 }
 
-func (s *Spawner) handleCancelled(runID string, startTime time.Time, hasWT bool) {
+// handleCancelled finalizes a run that exited via context cancel. wtPath
+// is the worktree directory the run was using (empty for no-cwd Jira
+// runs); we clean it up explicitly here in addition to runAgent's
+// deferred cleanup so the bare-repo registration is pruned even if the
+// goroutine returns through one of the early paths that doesn't reach
+// the defer (e.g., setupErr before the defer is installed).
+func (s *Spawner) handleCancelled(runID string, startTime time.Time, wtPath string) {
 	if s.wasTakenOver(runID) {
 		// Takeover owns the DB row, the worktree, and the broadcast from
 		// here on — it needs the temp worktree to stay on disk until its
-		// copy completes, then will explicitly Remove() it. The cancel
+		// copy completes, then will explicitly remove it. The cancel
 		// that woke us up was just the mechanism for stopping the
 		// headless process; everything else is Takeover's job.
 		return
@@ -1277,9 +1283,9 @@ func (s *Spawner) handleCancelled(runID string, startTime time.Time, hasWT bool)
 		log.Printf("[delegate] warning: failed to record cancellation for run %s: %v", runID, err)
 	}
 	s.broadcastRunUpdate(runID, "cancelled")
-	if hasWT {
+	if wtPath != "" {
 		// Best-effort cleanup; same rationale as the defer in runAgent.
-		_ = worktree.Remove(runID)
+		_ = worktree.RemoveAt(wtPath, runID)
 	}
 }
 

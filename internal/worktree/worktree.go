@@ -235,13 +235,13 @@ func CreateForBranch(ctx context.Context, owner, repo, cloneURL, baseBranch, fea
 
 // addExcludesOrRollback wraps writeLocalExcludes with the rollback both
 // Create* functions need: if the exclude write fails, the worktree is
-// already registered with the bare repo and on disk, so we must call Remove
-// to unwind it before returning. Without rollback the caller sees an error
-// but has no handle to clean up with, leaking a half-configured worktree
+// already registered with the bare repo and on disk, so we must remove
+// it before returning. Without rollback the caller sees an error but
+// has no handle to clean up with, leaking a half-configured worktree
 // and its bare-repo registration.
 func addExcludesOrRollback(runID, wtDir string) error {
 	if err := writeLocalExcludes(wtDir); err != nil {
-		if rmErr := Remove(runID); rmErr != nil {
+		if rmErr := RemoveAt(wtDir, runID); rmErr != nil {
 			log.Printf("[worktree] rollback after exclude-write failure: %v", rmErr)
 		}
 		return fmt.Errorf("write local git excludes: %w", err)
@@ -953,22 +953,13 @@ func gitOutputCtx(ctx context.Context, dir string, args ...string) (string, erro
 	return string(out), nil
 }
 
-// Remove cleans up a run's worktree at the canonical /tmp location.
-// Used by the normal runAgent lifecycle where the worktree path is
-// always runDir(runID). For takeover (which has an explicit srcWorktree
-// path that may diverge from runDir(runID)) use RemoveAt instead —
-// that function takes the path directly so it can't mistakenly
-// remove a different runID's canonical dir.
-func Remove(runID string) error {
-	return RemoveAt(runDir(runID), runID)
-}
-
-// RemoveAt removes a specific worktree directory by path and prunes
-// the bare's stale registration. Caller passes the actual path rather
-// than deriving it from a runID so callers like CopyForTakeover
-// (which holds the source path explicitly) and abortTakeover (which
-// has the worktree path in its claudeCwd argument) operate on the
-// correct directory even if it's not at runDir(runID).
+// RemoveAt removes a worktree directory by path and prunes the bare's
+// stale registration. Callers pass the actual path rather than
+// deriving it from a runID — every previous "Remove(runID)" caller
+// had the path in scope already, and the runID-only convenience was
+// a footgun: it silently targeted runDir(runID) regardless of where
+// the worktree actually lived, which broke CopyForTakeover when the
+// source was passed in explicitly.
 //
 // runID is used only for the log line; pass "" if not available.
 func RemoveAt(path, runID string) error {
