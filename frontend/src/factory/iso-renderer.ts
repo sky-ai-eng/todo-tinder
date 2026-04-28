@@ -51,6 +51,7 @@ import {
   type Station,
   type StationMaterials,
 } from './iso-station'
+import type { PortHandle } from './iso-port'
 
 const DEFAULT_FLOOR_SIZE = 1200
 // Closest the camera can get before its near plane starts clipping
@@ -230,33 +231,35 @@ export class IsoScene {
     this.ground = ground
   }
 
-  addStation(spec: Station): TransformNode {
+  addStation(spec: Station): { root: TransformNode; ports: PortHandle[] } {
     if (!this.materials) {
       this.materials = createStationMaterials(this.scene)
     }
-    const root = buildStationMesh(this.scene, spec, this.materials)
+    const built = buildStationMesh(this.scene, spec, this.materials)
 
     // Register sub-meshes with the shadow generator. Opaque body
     // pieces both cast and receive; transparent shells cast only
-    // (so chips drop a soft shadow into the chamber); emissive
-    // trims/cores and the glass canopy are skipped — their shadows
-    // would be either invisible or noisy.
+    // (so chips drop a soft shadow into the chamber); port stubs
+    // cast (dark surfaces inside the recess); emissive trims/frames
+    // and the glass canopy are skipped — their shadows would be
+    // either invisible or noisy.
     if (this.shadowGenerator) {
-      for (const m of root.getChildMeshes()) {
+      for (const m of built.root.getChildMeshes()) {
         if (m.name === 'station-body' || m.name === 'chamber-floor' || m.name === 'landing-pad') {
           m.receiveShadows = true
           this.shadowGenerator.addShadowCaster(m)
         } else if (
           m.name.startsWith('queued-shell-') ||
           m.name.startsWith('wip-shell-') ||
-          m.name.startsWith('heatsink-')
+          m.name.startsWith('heatsink-') ||
+          m.name.startsWith('port-stub-')
         ) {
           this.shadowGenerator.addShadowCaster(m)
         }
       }
     }
 
-    return root
+    return built
   }
 
   destroy(): void {

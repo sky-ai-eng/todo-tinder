@@ -26,11 +26,22 @@ import {
   Color3,
   CSG,
   Material,
+  Mesh,
   MeshBuilder,
   PBRMaterial,
   Scene,
   TransformNode,
+  Vector3,
 } from '@babylonjs/core'
+
+import {
+  CONVEYOR_HEIGHT,
+  CONVEYOR_WIDTH,
+  PORT_RECESS_MARGIN_ABOVE,
+  PORT_RECESS_MARGIN_ACROSS,
+  type Port,
+  type PortHandle,
+} from './iso-port'
 
 export interface Station {
   /** World position of the station's bottom-back-left corner. */
@@ -45,6 +56,9 @@ export interface Station {
   queuedCount?: number
   /** Visible WIP chips standing in the chamber (capped at MAX_WIP). */
   wipCount?: number
+  /** Conveyor attach points on the station's walls. Each produces a
+   *  recess + LED frame + internal belt stub. */
+  ports?: Port[]
 }
 
 // ─── Layout fractions ───────────────────────────────────────────────────────
@@ -111,7 +125,7 @@ const HEATSINK_FIN_THICKNESS = 2.6
 const HEATSINK_FIN_HEIGHT_FRAC = 0.6
 const HEATSINK_FIN_SPACING = 7
 const HEATSINK_FIN_Z_FRAC = 0.5
-const HEATSINK_FIN_Y_FRAC = 0.78 // center of fin stack along body depth
+const HEATSINK_FIN_Y_FRAC = 0.88 // center of fin stack along body depth (back-corner)
 const HEATSINK_HOUSING_PADDING_Y = 5
 const HEATSINK_HOUSING_PADDING_Z = 5
 const HEATSINK_HOUSING_DEPTH = 3
@@ -295,16 +309,179 @@ export function createStationMaterials(scene: Scene): StationMaterials {
   }
 }
 
+// ─── Port mesh builder ────────────────────────────────────────────────────
+
+interface PortBuild {
+  /** Temporary cutout box, subtracted from the body in the CSG chain
+   *  then disposed. */
+  cutout: Mesh
+  /** LED frame bars (top + two sides) sitting on the wall surface
+   *  around the recess opening. Caller parents to the station root. */
+  frameMeshes: Mesh[]
+  /** Dark internal belt stub inside the recess. */
+  stub: Mesh
+  /** Snap point + outward direction in world space. */
+  handle: PortHandle
+}
+
+const FRAME_THICKNESS = 2
+const FRAME_PROTRUSION = 0.6
+const STUB_BACK_GAP = 2
+const STUB_FLOOR_LIFT = 0.1
+
+function buildPortMeshes(
+  scene: Scene,
+  station: Station,
+  port: Port,
+  materials: StationMaterials,
+  index: number,
+): PortBuild {
+  // Outward direction along x/y, plus the across axis (the one running
+  // along the face). For east/west the across axis is +y; for
+  // north/south it's +x.
+  const isXAxis = port.direction === 'east' || port.direction === 'west'
+  const outwardSign = port.direction === 'east' || port.direction === 'north' ? 1 : -1
+  const outwardX = isXAxis ? outwardSign : 0
+  const outwardY = isXAxis ? 0 : outwardSign
+  const acrossX = isXAxis ? 0 : 1
+  const acrossY = isXAxis ? 1 : 0
+  const acrossLen = isXAxis ? station.d : station.w
+
+  // Center of the face at floor level, in world coords.
+  let faceX: number
+  let faceY: number
+  switch (port.direction) {
+    case 'east':
+      faceX = station.x + station.w
+      faceY = station.y + station.d / 2
+      break
+    case 'west':
+      faceX = station.x
+      faceY = station.y + station.d / 2
+      break
+    case 'north':
+      faceX = station.x + station.w / 2
+      faceY = station.y + station.d
+      break
+    case 'south':
+      faceX = station.x + station.w / 2
+      faceY = station.y
+      break
+  }
+
+  // Snap point = face center shifted along the across axis by the
+  // port's offset, raised to the conveyor's vertical centerline.
+  const acrossDelta = (port.offset - 0.5) * acrossLen
+  const snapX = faceX + acrossX * acrossDelta
+  const snapY = faceY + acrossY * acrossDelta
+  const snapZ = station.z + CONVEYOR_HEIGHT / 2
+
+  // Recess opening: small frame across, generous head clearance above
+  // (items ride into the station on the belt and need room to fit).
+  const recessOpenW = CONVEYOR_WIDTH + 2 * PORT_RECESS_MARGIN_ACROSS
+  const recessOpenH = CONVEYOR_HEIGHT + PORT_RECESS_MARGIN_ABOVE
+
+  // ─── Cutout box ───
+  // Outward overshoots the wall face by 1 unit; bottom overshoots
+  // below the floor by 1 unit. Both overshoots break coplanar faces
+  // cleanly so CSG doesn't leave hairlines.
+  const cutoutOvershoot = 1
+  const cutoutAlong = port.recessDepth + cutoutOvershoot
+  const cutoutAlongOffset = (cutoutOvershoot - port.recessDepth) / 2
+  const cutoutVertical = recessOpenH + 1
+  const cutoutVerticalCenter = station.z + (recessOpenH - 1) / 2
+  const cutoutSize = isXAxis
+    ? { width: cutoutAlong, height: recessOpenW, depth: cutoutVertical }
+    : { width: recessOpenW, height: cutoutAlong, depth: cutoutVertical }
+
+  const cutout = MeshBuilder.CreateBox(`port-cut-${index}`, cutoutSize, scene)
+  cutout.position.set(
+    faceX + outwardX * cutoutAlongOffset + acrossX * acrossDelta,
+    faceY + outwardY * cutoutAlongOffset + acrossY * acrossDelta,
+    cutoutVerticalCenter,
+  )
+
+  // ─── LED frame (3 bars: top, left, right) ───
+  // Sit on the wall surface, protruding outward by FRAME_PROTRUSION.
+  // Bottom edge of the frame is the floor itself — no bottom bar.
+  const recessTopZ = station.z + recessOpenH
+  const frameOutwardCenter = FRAME_PROTRUSION / 2
+  const frameMeshes: Mesh[] = []
+
+  // Top bar — full outer width, sits above the recess opening.
+  const topAcrossLen = recessOpenW + 2 * FRAME_THICKNESS
+  const topZ = recessTopZ + FRAME_THICKNESS / 2
+  const topSize = isXAxis
+    ? { width: FRAME_PROTRUSION, height: topAcrossLen, depth: FRAME_THICKNESS }
+    : { width: topAcrossLen, height: FRAME_PROTRUSION, depth: FRAME_THICKNESS }
+  const topBar = MeshBuilder.CreateBox(`port-frame-${index}-top`, topSize, scene)
+  topBar.position.set(
+    faceX + outwardX * frameOutwardCenter + acrossX * acrossDelta,
+    faceY + outwardY * frameOutwardCenter + acrossY * acrossDelta,
+    topZ,
+  )
+  topBar.material = materials.ledTrim
+  frameMeshes.push(topBar)
+
+  // Side bars — span floor to top of recess opening (no overlap with
+  // top bar in volume; they share the line at z=recessTopZ).
+  const sideZ = station.z + recessOpenH / 2
+  const sideAcrossOffset = recessOpenW / 2 + FRAME_THICKNESS / 2
+  const sideSize = isXAxis
+    ? { width: FRAME_PROTRUSION, height: FRAME_THICKNESS, depth: recessOpenH }
+    : { width: FRAME_THICKNESS, height: FRAME_PROTRUSION, depth: recessOpenH }
+  for (const sign of [-1, 1] as const) {
+    const bar = MeshBuilder.CreateBox(
+      `port-frame-${index}-${sign < 0 ? 'left' : 'right'}`,
+      sideSize,
+      scene,
+    )
+    bar.position.set(
+      faceX + outwardX * frameOutwardCenter + acrossX * (acrossDelta + sign * sideAcrossOffset),
+      faceY + outwardY * frameOutwardCenter + acrossY * (acrossDelta + sign * sideAcrossOffset),
+      sideZ,
+    )
+    bar.material = materials.ledTrim
+    frameMeshes.push(bar)
+  }
+
+  // ─── Internal belt stub ───
+  // Outer face flush with the wall plane; back face stops short of the
+  // recess back wall so a small dark gap reads as depth. Lifted off
+  // the floor by a hair to avoid z-fighting with the ground plane.
+  const stubLength = port.recessDepth - STUB_BACK_GAP
+  const stubAlongOffset = -stubLength / 2
+  const stubSize = isXAxis
+    ? { width: stubLength, height: CONVEYOR_WIDTH, depth: CONVEYOR_HEIGHT }
+    : { width: CONVEYOR_WIDTH, height: stubLength, depth: CONVEYOR_HEIGHT }
+  const stub = MeshBuilder.CreateBox(`port-stub-${index}`, stubSize, scene)
+  stub.position.set(
+    faceX + outwardX * stubAlongOffset + acrossX * acrossDelta,
+    faceY + outwardY * stubAlongOffset + acrossY * acrossDelta,
+    station.z + CONVEYOR_HEIGHT / 2 + STUB_FLOOR_LIFT,
+  )
+  stub.material = materials.chamberFloor
+
+  const handle: PortHandle = {
+    port,
+    worldPos: new Vector3(snapX, snapY, snapZ),
+    outward: new Vector3(outwardX, outwardY, 0),
+  }
+
+  return { cutout, frameMeshes, stub, handle }
+}
+
 // ─── Builder ───────────────────────────────────────────────────────────────
 
-/** Build one station as a hierarchy of Babylon meshes. Returns a
- * TransformNode parent — move/animate it to translate the whole
- * station, dispose it to remove all sub-meshes at once. */
+/** Build one station as a hierarchy of Babylon meshes. Returns the
+ *  TransformNode parent (move/animate it to translate the whole
+ *  station, dispose it to remove all sub-meshes at once) plus a list
+ *  of port handles (snap points for connecting conveyors). */
 export function buildStationMesh(
   scene: Scene,
   station: Station,
   materials: StationMaterials,
-): TransformNode {
+): { root: TransformNode; ports: PortHandle[] } {
   const root = new TransformNode(`station_${station.x}_${station.y}`, scene)
 
   const cx = station.x + station.w / 2
@@ -419,9 +596,16 @@ export function buildStationMesh(
     finsCenterZ,
   )
 
+  // Port meshes — built before CSG so each port's cutout joins the
+  // single subtraction chain. Frames and stubs are independent meshes
+  // we'll parent to root after the body is materialized.
+  const portBuilds: PortBuild[] = (station.ports ?? []).map((p, i) =>
+    buildPortMeshes(scene, station, p, materials, i),
+  )
+
   // Single CSG chain — chamber, LED groove, vents, status panel,
-  // heatsink housing — so the body is computed once with all
-  // subtractions applied.
+  // heatsink housing, port recesses — so the body is computed once
+  // with all subtractions applied.
   let bodyCSG = CSG.FromMesh(bodyTmp)
     .subtract(CSG.FromMesh(cutoutTmp))
     .subtract(CSG.FromMesh(grooveTmp))
@@ -429,6 +613,9 @@ export function buildStationMesh(
     .subtract(CSG.FromMesh(housingTmp))
   for (const v of ventCutouts) {
     bodyCSG = bodyCSG.subtract(CSG.FromMesh(v))
+  }
+  for (const pb of portBuilds) {
+    bodyCSG = bodyCSG.subtract(CSG.FromMesh(pb.cutout))
   }
   const body = bodyCSG.toMesh('station-body', materials.body, scene, true)
   body.parent = root
@@ -439,6 +626,11 @@ export function buildStationMesh(
   panelTmp.dispose()
   housingTmp.dispose()
   for (const v of ventCutouts) v.dispose()
+  for (const pb of portBuilds) {
+    pb.cutout.dispose()
+    for (const f of pb.frameMeshes) f.parent = root
+    pb.stub.parent = root
+  }
 
   // Status screen — dark "tablet face" inset into the panel recess.
   // Sits at the back wall of the recess with a tiny lift to avoid
@@ -747,5 +939,5 @@ export function buildStationMesh(
     }
   }
 
-  return root
+  return { root, ports: portBuilds.map((pb) => pb.handle) }
 }

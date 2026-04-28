@@ -6,6 +6,7 @@
 // or ctrl+LMB = pan, wheel = zoom) — no custom pointer handlers.
 
 import { IsoScene } from './iso-renderer'
+import { DEFAULT_PORT_RECESS_DEPTH } from './iso-port'
 import type { Station } from './iso-station'
 
 const FLOOR_SIZE = 1200
@@ -13,7 +14,10 @@ const FLOOR_CELL = 120
 const INITIAL_ZOOM_RADIUS = FLOOR_SIZE / 2
 
 // Stage-1 test scene: a single station at the center of the floor with
-// a few queued + WIP chips.
+// a few queued + WIP chips. Two ports — input on the west face,
+// output on the east face — both centered on their faces. The
+// heatsink module is tucked into the back corner so it doesn't crowd
+// the centered output port.
 const TEST_STATION: Station = {
   x: 400,
   y: 480,
@@ -23,6 +27,10 @@ const TEST_STATION: Station = {
   h: 64,
   queuedCount: 4,
   wipCount: 2,
+  ports: [
+    { kind: 'input', direction: 'west', offset: 0.5, recessDepth: DEFAULT_PORT_RECESS_DEPTH },
+    { kind: 'output', direction: 'east', offset: 0.5, recessDepth: DEFAULT_PORT_RECESS_DEPTH },
+  ],
 }
 
 export interface CameraStateForHUD {
