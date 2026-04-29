@@ -8,6 +8,7 @@
 import { IsoScene } from './iso-renderer'
 import { DEFAULT_PORT_RECESS_DEPTH } from './iso-port'
 import type { Pole } from './iso-pole'
+import type { Router } from './iso-router'
 import type { Station } from './iso-station'
 
 const FLOOR_CELL = 80
@@ -45,9 +46,14 @@ const TEST_STATION: Station = {
 //
 //   source@(5,5) ──belt 720↑── turn@(5,15) ──belt 320→── station_W
 //
-// East chain: station east port → connecting belt → sink dead-end pole.
+// East chain (splitter): station east port → belt → 3-port splitter,
+// which fans the items north and south to two sink dead-end poles.
 //
-//   station_E ──belt 320→── sink@(19,15)
+//             sink_N@(18,19)
+//                  ↑ belt 240
+//   station_E ──belt 240→── splitter@(18,15) (W in, N+S out)
+//                  ↓ belt 240
+//             sink_S@(18,11)
 //
 // PathOffsets are anchored at the station wall planes (stub.pathOffset
 // = 0) and chained outward via mod-CHEVRON_SPACING_WORLD arithmetic.
@@ -88,19 +94,54 @@ const WEST_BELT1_PATH_OFFSET = mod(TURN_POLE_PATH_OFFSET - 720)
 // match belt 1W's UV at start.
 const SOURCE_POLE_PATH_OFFSET = mod(WEST_BELT1_PATH_OFFSET - CAP_PERIM - 40)
 
-// ─── East chain (single dead-end) ──────────────────────────────────
-const EAST_POLE: Pole = {
-  col: STATION_CELL_COL + STATION_CELL_W + 4, // col 19
+// ─── East chain (splitter feeding two dead-ends) ──────────────────
+//
+// The 3-port splitter sits 3 cells east of the station's east face.
+// Its west port consumes the station's output; its north and south
+// ports each feed a sink pole 4 cells away.
+const SPLITTER_COL = STATION_CELL_COL + STATION_CELL_W + 3 // col 18
+const SPLITTER: Router = {
+  col: SPLITTER_COL,
   row: STATION_MID_ROW,
-  ports: [{ direction: 'west', kind: 'input' }],
+  ports: [
+    { direction: 'west', kind: 'input' },
+    { direction: 'north', kind: 'output' },
+    { direction: 'south', kind: 'output' },
+  ],
 }
 
-// Station east stub: UV at wall plane (top end) = 58/54 = 0.074.
-// Belt's start UV must match → pathOffset mod 54 = 4. Belt's end UV
-// at sink pole west port = (58 + 320)/54 mod 1 = 0, so sink pole's
-// pathOffset = 0.
-const EAST_BELT_PATH_OFFSET = 58
-const EAST_POLE_PATH_OFFSET = 0
+const SINK_N_POLE: Pole = {
+  col: SPLITTER_COL,
+  row: STATION_MID_ROW + 4, // row 19
+  ports: [{ direction: 'south', kind: 'input' }],
+}
+
+const SINK_S_POLE: Pole = {
+  col: SPLITTER_COL,
+  row: STATION_MID_ROW - 4, // row 11
+  ports: [{ direction: 'north', kind: 'input' }],
+}
+
+// Belt 1 (station_E → splitter_W): station east stub end UV at wall
+// plane = 58/54 mod 1 = 4/54. Belt 1 pathOffset = 4 makes belt start
+// UV match. Belt length 240; end UV at splitter wall = (4+240)/54
+// mod 54 = 28/54 → splitter west stub pathOffset = 28.
+const EAST_BELT1_PATH_OFFSET = 4
+const SPLITTER_WEST_PATH_OFFSET = 28
+
+// Splitter's two output stubs (N, S) anchor at pathOffset = 0 each.
+// Their wall-plane UVs are 12/54 (output stub: start at recess back,
+// end at wall after stubLength=12).
+const SPLITTER_NORTH_PATH_OFFSET = 0
+const SPLITTER_SOUTH_PATH_OFFSET = 0
+
+// Belts 2 + 3 (splitter_N → sink_N, splitter_S → sink_S): start UV
+// must equal 12/54 → pathOffset = 12. Length 240; end UV =
+// (12+240)/54 mod 54 = 36/54 → sink pole pathOffset = 36.
+const EAST_BELT2_PATH_OFFSET = 12
+const EAST_BELT3_PATH_OFFSET = 12
+const SINK_N_PATH_OFFSET = 36
+const SINK_S_PATH_OFFSET = 36
 
 export interface CameraStateForHUD {
   /** Polar angle from +z axis, in radians. 0 = top-down. */
@@ -157,12 +198,32 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
     false,
   )
 
-  // East chain: station → belt → sink dead-end pole.
-  const eastPole = renderer.addPole(EAST_POLE, FLOOR_CELL, EAST_POLE_PATH_OFFSET)
+  // East chain: station → belt → splitter → 2 sink dead-end poles.
+  const splitter = renderer.addRouter(SPLITTER, FLOOR_CELL, {
+    west: SPLITTER_WEST_PATH_OFFSET,
+    north: SPLITTER_NORTH_PATH_OFFSET,
+    south: SPLITTER_SOUTH_PATH_OFFSET,
+  })
+  const sinkNPole = renderer.addPole(SINK_N_POLE, FLOOR_CELL, SINK_N_PATH_OFFSET)
+  const sinkSPole = renderer.addPole(SINK_S_POLE, FLOOR_CELL, SINK_S_PATH_OFFSET)
   renderer.addBelt(
     station.ports[1], // station east output
-    eastPole.ports.get('west')!,
-    EAST_BELT_PATH_OFFSET,
+    splitter.ports.get('west')!,
+    EAST_BELT1_PATH_OFFSET,
+    false,
+    false,
+  )
+  renderer.addBelt(
+    splitter.ports.get('north')!,
+    sinkNPole.ports.get('south')!,
+    EAST_BELT2_PATH_OFFSET,
+    false,
+    false,
+  )
+  renderer.addBelt(
+    splitter.ports.get('south')!,
+    sinkSPole.ports.get('north')!,
+    EAST_BELT3_PATH_OFFSET,
     false,
     false,
   )

@@ -47,7 +47,8 @@ import {
 
 import { buildBelt, type BeltBuild } from './iso-belt'
 import { buildPoleMesh, type Pole, type PoleBuild } from './iso-pole'
-import type { PortHandle } from './iso-port'
+import type { PortDirection, PortHandle } from './iso-port'
+import { buildRouterMesh, type Router, type RouterBuild } from './iso-router'
 import {
   buildStationMesh,
   createStationMaterials,
@@ -264,6 +265,40 @@ export class IsoScene {
   addPole(spec: Pole, cellSize: number, pathOffset: number = 0): PoleBuild {
     const materials = this.getMaterials()
     return buildPoleMesh(this.scene, spec, cellSize, materials.beltSurface, pathOffset)
+  }
+
+  addRouter(
+    spec: Router,
+    cellSize: number,
+    pathOffsets: Partial<Record<PortDirection, number>> = {},
+  ): RouterBuild {
+    const m = this.getMaterials()
+    const built = buildRouterMesh(
+      this.scene,
+      spec,
+      cellSize,
+      {
+        body: m.body,
+        ledTrim: m.ledTrim,
+        recessInterior: m.recessInterior,
+        beltSurface: m.beltSurface,
+      },
+      pathOffsets,
+    )
+
+    // Body and dome cast + receive shadows so the router grounds on
+    // the floor like the station does. Belts, frames, and recess
+    // walls don't add useful shadow contribution.
+    if (this.shadowGenerator) {
+      for (const mesh of built.meshes) {
+        if (mesh.name === 'router-body' || mesh.name === 'router-dome') {
+          mesh.receiveShadows = true
+          this.shadowGenerator.addShadowCaster(mesh)
+        }
+      }
+    }
+
+    return built
   }
 
   /** Build a connecting belt between two ports. Drops the snap point's
