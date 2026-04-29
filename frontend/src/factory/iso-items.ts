@@ -19,9 +19,10 @@
 // two CreateCylinder calls — fine for the dozen-item demo scale.
 
 import {
+  Color3,
   type Mesh,
   MeshBuilder,
-  type PBRMaterial,
+  PBRMaterial,
   type Scene,
   TransformNode,
 } from '@babylonjs/core'
@@ -41,6 +42,27 @@ const ITEM_CORE_HEIGHT_FRAC = 0.6
 // the chevrons under it move at the same rate. Override per-spawn if
 // we ever introduce slow conveyors or sprint sections.
 const DEFAULT_SPEED = BELT_WORLD_SPEED
+
+// Per-namespace core glow tuning. Status is conveyed by which station
+// an item is moving to/from (the factory layout IS the status), so
+// the chip's color channel is free to encode something stable per
+// entity — its namespace (GitHub repo or Jira project). Same hue
+// every time the user sees a chip from `triage-factory` or `SKY`,
+// no config UI required.
+const CORE_HUE_SATURATION = 0.78
+const CORE_HUE_VALUE = 1.0
+const CORE_EMISSIVE_INTENSITY = 1.4
+
+/** Deterministic string → hue ([0, 360)). djb2-derived; the exact
+ *  bit-mixing isn't important, just that the same input always gives
+ *  the same output and small input changes give large hue jumps. */
+function hashHue(s: string): number {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
+  }
+  return h % 360
+}
 
 interface FactoryItem {
   id: string
@@ -70,6 +92,26 @@ interface Spawner {
    *  `interval` we spawn one item and subtract `interval`. */
   accumulator: number
   speed: number
+  /** If set, the spawner round-robins through these on each spawn so
+   *  the demo scene shows a mix of repo/project colors. Real spawning
+   *  will pass per-entity namespaces, not cycle through a list. */
+  namespaces?: string[]
+  namespaceCursor: number
+}
+
+export interface SpawnerOptions {
+  speed?: number
+  /** Round-robin through these namespaces — one chip per spawn, then
+   *  advance the cursor. Mostly for demo purposes; production spawns
+   *  will use spawnItem directly with the entity's namespace. */
+  namespaces?: string[]
+}
+
+export interface SpawnOptions {
+  speed?: number
+  /** Repo (GH) or project (Jira) the entity belongs to. Hashed to a
+   *  hue for the chip's core; same name → same hue across sessions. */
+  namespace?: string
 }
 
 export class ItemSimulator {
@@ -80,6 +122,10 @@ export class ItemSimulator {
   private scene: Scene
   private shellMat: PBRMaterial
   private coreMat: PBRMaterial
+  /** One core material per namespace, lazily created and reused. The
+   *  shell stays shared across all items (glass-token language is
+   *  uniform); only the core hue varies. */
+  private coreMaterials: Map<string, PBRMaterial> = new Map()
 
   constructor(scene: Scene, shellMat: PBRMaterial, coreMat: PBRMaterial) {
     this.scene = scene
@@ -92,16 +138,21 @@ export class ItemSimulator {
    *  at the given segment's start. Multiple spawners can share a
    *  segment (no de-dup); items just stack up if the spawn rate
    *  exceeds the segment's throughput. */
-  startSpawner(segment: PathSegment, intervalSeconds: number, speed: number = DEFAULT_SPEED): void {
-    // Negative initial accumulator gives the first spawn a small
-    // delay; zero would spawn immediately, which is jarring.
-    this.spawners.push({ segment, interval: intervalSeconds, accumulator: 0, speed })
+  startSpawner(segment: PathSegment, intervalSeconds: number, options: SpawnerOptions = {}): void {
+    this.spawners.push({
+      segment,
+      interval: intervalSeconds,
+      accumulator: 0,
+      speed: options.speed ?? DEFAULT_SPEED,
+      namespaces: options.namespaces,
+      namespaceCursor: 0,
+    })
   }
 
   /** Spawn a single item at progress=0 of the given segment.
    *  Public so callers can manually trigger spawns (e.g., for
    *  per-entity emission once the data layer is wired). */
-  spawnItem(segment: PathSegment, speed: number = DEFAULT_SPEED): void {
+  spawnItem(segment: PathSegment, options: SpawnOptions = {}): void {
     const id = `item-${this.nextId++}`
     const root = new TransformNode(`${id}-root`, this.scene)
     const shell = MeshBuilder.CreateCylinder(
@@ -122,11 +173,34 @@ export class ItemSimulator {
       this.scene,
     )
     core.rotation.x = Math.PI / 2
-    core.material = this.coreMat
+    core.material = this.getCoreMaterial(options.namespace)
     core.parent = root
-    const item: FactoryItem = { id, segment, progress: 0, speed, root, shell, core }
+    const item: FactoryItem = {
+      id,
+      segment,
+      progress: 0,
+      speed: options.speed ?? DEFAULT_SPEED,
+      root,
+      shell,
+      core,
+    }
     this.items.push(item)
     this.updatePose(item)
+  }
+
+  private getCoreMaterial(namespace: string | undefined): PBRMaterial {
+    if (!namespace) return this.coreMat
+    const cached = this.coreMaterials.get(namespace)
+    if (cached) return cached
+    const hue = hashHue(namespace)
+    const m = new PBRMaterial(`item-core-${namespace}`, this.scene)
+    m.albedoColor = Color3.Black()
+    m.emissiveColor = Color3.FromHSV(hue, CORE_HUE_SATURATION, CORE_HUE_VALUE)
+    m.emissiveIntensity = CORE_EMISSIVE_INTENSITY
+    m.metallic = 0
+    m.roughness = 1
+    this.coreMaterials.set(namespace, m)
+    return m
   }
 
   private tick(): void {
@@ -138,7 +212,12 @@ export class ItemSimulator {
       sp.accumulator += dt
       while (sp.accumulator >= sp.interval) {
         sp.accumulator -= sp.interval
-        this.spawnItem(sp.segment, sp.speed)
+        let namespace: string | undefined
+        if (sp.namespaces && sp.namespaces.length > 0) {
+          namespace = sp.namespaces[sp.namespaceCursor]
+          sp.namespaceCursor = (sp.namespaceCursor + 1) % sp.namespaces.length
+        }
+        this.spawnItem(sp.segment, { speed: sp.speed, namespace })
       }
     }
 
@@ -194,6 +273,10 @@ export class ItemSimulator {
     for (const item of this.items) {
       this.disposeItem(item)
     }
+    for (const m of this.coreMaterials.values()) {
+      m.dispose()
+    }
+    this.coreMaterials.clear()
     this.items = []
     this.spawners = []
   }

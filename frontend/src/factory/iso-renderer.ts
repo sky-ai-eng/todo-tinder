@@ -46,7 +46,7 @@ import {
 } from '@babylonjs/core'
 
 import { buildBelt, type BeltBuild } from './iso-belt'
-import { ItemSimulator } from './iso-items'
+import { ItemSimulator, type SpawnerOptions } from './iso-items'
 import type { PathSegment } from './iso-path'
 import { buildPoleMesh, type Pole, type PoleBuild } from './iso-pole'
 import type { PortDirection, PortHandle } from './iso-port'
@@ -344,9 +344,14 @@ export class IsoScene {
   }
 
   /** Register a periodic spawner on a path segment. The first item
-   *  appears one interval after this call. */
-  startItemSpawner(segment: PathSegment, intervalSeconds: number, speed?: number): void {
-    this.getItemSimulator().startSpawner(segment, intervalSeconds, speed)
+   *  appears one interval after this call. Pass `namespaces` to
+   *  round-robin through repo/project hues for the demo scene. */
+  startItemSpawner(
+    segment: PathSegment,
+    intervalSeconds: number,
+    options: SpawnerOptions = {},
+  ): void {
+    this.getItemSimulator().startSpawner(segment, intervalSeconds, options)
   }
 
   destroy(): void {

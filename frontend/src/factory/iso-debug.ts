@@ -243,8 +243,11 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
   // Dummy spawner — emit one item every 1.5s at the source pole's
   // center. They flow source → turn → station west input and despawn
   // at the back of the recess. East chain stays empty until station
-  // processing is wired in.
-  renderer.startItemSpawner(sourcePole.internalSegment, 1.5)
+  // processing is wired in. Round-robin through a few fake namespaces
+  // so we can see different repo/project hues flow past.
+  renderer.startItemSpawner(sourcePole.internalSegment, 1.5, {
+    namespaces: ['triage-factory', 'claude-code', 'SKY', 'ENG'],
+  })
 
   const ro = new ResizeObserver(() => {
     renderer.resize()
