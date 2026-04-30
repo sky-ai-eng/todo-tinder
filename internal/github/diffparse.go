@@ -40,8 +40,8 @@ func DiffLines(diff string) map[string]map[int]bool {
 			// Added or context line — commentable on the new side.
 			result[currentFile][lineNum] = true
 			lineNum++
-		// "\ No newline at end of file" markers and the trailing empty string
-		// produced by strings.Split on a diff that ends with \n are silently skipped.
+		default:
+			// Skip "\ No newline at end of file" markers and trailing empty strings.
 		}
 	}
 
@@ -78,7 +78,8 @@ func parsePatchLines(patch string) map[int]bool {
 		case strings.HasPrefix(line, "+"), strings.HasPrefix(line, " "):
 			result[lineNum] = true
 			lineNum++
-		// "\ No newline" markers and trailing empty strings are silently skipped.
+		default:
+			// Skip "\ No newline at end of file" markers and trailing empty strings.
 		}
 	}
 	return result
