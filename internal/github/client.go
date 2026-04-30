@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-// HTTPError is returned by client methods when the server responds with a
-// non-2xx status. Callers can use errors.As to inspect the status code.
+// HTTPError is returned by GetRaw when the server responds with a non-2xx
+// status. Callers can use errors.As to inspect the status code.
 type HTTPError struct {
 	StatusCode int
 	Body       string
