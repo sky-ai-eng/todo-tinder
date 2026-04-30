@@ -61,95 +61,163 @@ export default function IsoDebug() {
       >
         Reset view
       </button>
-      <StationDrawer info={picked} onClose={() => setPicked(null)} />
+      <StationDrawer info={picked} />
     </div>
   )
 }
 
-// Bottom slide-up sheet — Halo-style HUD pane that takes the lower
-// third of the viewport when a station is clicked, leaving the
-// factory visible above. v1 placeholder content; the real run /
-// queue lists land when the data layer is wired in.
-function StationDrawer({
-  info,
-  onClose,
-}: {
-  info: ClickedStationInfo | null
-  onClose: () => void
-}) {
+// Bottom slide-up sheet — top-down view of the clicked station as
+// pure HTML. Reads as the station's chassis seen from above with
+// two recessed trays (intake left, main right), each ringed by a
+// cyan LED glow and a dark machined floor. Mirrors the 3D scene's
+// material palette so the drawer feels like a HUD readout of the
+// thing on screen, not a generic data panel.
+function StationDrawer({ info }: { info: ClickedStationInfo | null }) {
   const open = info != null
   return (
     <div
       className={`pointer-events-none absolute inset-x-0 bottom-0 z-40 transition-transform duration-300 ease-out ${
         open ? 'translate-y-0' : 'translate-y-full'
       }`}
-      style={{ height: '38vh' }}
+      style={{ height: '46vh' }}
       aria-hidden={!open}
     >
-      <div className="pointer-events-auto h-full bg-surface-raised/95 backdrop-blur-xl border-t border-border-glass shadow-2xl shadow-black/[0.12] flex flex-col">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border-subtle">
-          <div className="flex items-baseline gap-3">
-            <h2 className="text-lg font-semibold text-text-primary tracking-tight">
-              {info?.label ?? '—'}
-            </h2>
-            <span className="text-[11px] uppercase tracking-wider text-text-tertiary font-mono">
-              station
-            </span>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-md px-3 py-1.5 text-[11px] font-semibold text-text-secondary hover:bg-black/5 transition"
-          >
-            Close (esc)
-          </button>
-        </div>
-        <div className="flex-1 overflow-y-auto px-6 py-4 grid grid-cols-2 gap-6">
-          <DrawerSection title="Active runs" count={info?.runCount ?? 0} accent="#7aa3ff">
-            <div className="text-[12px] text-text-tertiary italic">
-              Run list lands when run-binding ships. For now: {info?.runCount ?? 0} chip
-              {info?.runCount === 1 ? '' : 's'} on the work tray.
-            </div>
-          </DrawerSection>
-          <DrawerSection title="Queued" count={info?.queuedCount ?? 0} accent="#ff9c3a">
-            <div className="text-[12px] text-text-tertiary italic">
-              Entity list lands with the data layer. {info?.queuedCount ?? 0} chip
-              {info?.queuedCount === 1 ? '' : 's'} on the intake tray.
-            </div>
-          </DrawerSection>
-        </div>
+      <div className="pointer-events-auto relative h-full bg-surface-raised/95 backdrop-blur-xl border-t border-border-glass shadow-2xl shadow-black/[0.12] flex items-stretch p-5">
+        <StationChassis info={info} />
       </div>
     </div>
   )
 }
 
-function DrawerSection({
-  title,
-  count,
+// Cream chassis carrying the two trays. Background color, rounded
+// edges, and inner padding mimic the 3D station body's silhouette
+// at a higher zoom. The trays inside are inset boxes with cyan LED
+// borders; the cream surrounding them carries the same warm
+// off-white as the station body material (`#ece6d8`).
+function StationChassis({ info }: { info: ClickedStationInfo | null }) {
+  const queueCount = info?.queuedCount ?? 0
+  const runCount = info?.runCount ?? 0
+  return (
+    <div
+      className="relative flex w-full gap-4 rounded-2xl p-4"
+      style={{
+        background: 'linear-gradient(180deg, #f1ebdc 0%, #e6e0d2 100%)',
+        boxShadow:
+          'inset 0 1px 0 rgba(255,255,255,0.8), inset 0 -2px 0 rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.05)',
+      }}
+    >
+      <Tray
+        label="Queue"
+        accent="#ff9c3a"
+        widthClass="w-[24%]"
+        emptyMessage="Idle — no entities waiting"
+        count={queueCount}
+        chipColor="#ff9c3a"
+        renderItem={(i) => (
+          <span className="font-mono text-[11px] text-white/80">entity-{i + 1}</span>
+        )}
+      />
+      <Tray
+        label={info?.label ?? '—'}
+        accent="#7cf7ec"
+        widthClass="flex-1"
+        emptyMessage="No runs in flight"
+        count={runCount}
+        chipColor="#7aa3ff"
+        renderItem={(i) => (
+          <div className="flex w-full items-baseline justify-between gap-3">
+            <span className="font-mono text-[11px] text-white/85">run-{i + 1}</span>
+            <span className="font-mono text-[10px] text-white/50">2m 14s · $0.18</span>
+          </div>
+        )}
+      />
+    </div>
+  )
+}
+
+// One inset tray panel — dark machined floor, cyan LED ring around
+// the rim, etched header at the top. The LED ring is two
+// box-shadows: a tight 1px line (the trim itself) and a soft outer
+// glow (the bloom). Combines with a dark interior to read like the
+// 3D tray opening seen from above.
+function Tray({
+  label,
   accent,
-  children,
+  widthClass,
+  count,
+  chipColor,
+  emptyMessage,
+  renderItem,
 }: {
-  title: string
-  count: number
+  label: string
   accent: string
-  children: React.ReactNode
+  widthClass: string
+  count: number
+  chipColor: string
+  emptyMessage: string
+  renderItem: (index: number) => React.ReactNode
 }) {
   return (
-    <section className="flex flex-col gap-2">
-      <header className="flex items-baseline gap-2">
+    <div
+      className={`relative flex flex-col rounded-xl ${widthClass}`}
+      style={{
+        background: 'linear-gradient(180deg, #14120d 0%, #0d0c08 100%)',
+        boxShadow: `
+          inset 0 0 0 1px ${hexToRgba(accent, 0.55)},
+          inset 0 1px 0 rgba(255,255,255,0.04),
+          0 0 0 2px ${hexToRgba(accent, 0.12)},
+          0 0 18px ${hexToRgba(accent, 0.28)}
+        `,
+      }}
+    >
+      <header
+        className="px-4 py-2.5 border-b text-center"
+        style={{ borderColor: hexToRgba(accent, 0.22) }}
+      >
         <span
-          aria-hidden
-          className="inline-block h-2 w-2 rounded-full"
-          style={{ background: accent }}
-        />
-        <span className="text-[11px] uppercase tracking-wider text-text-secondary font-semibold">
-          {title}
+          className="text-[12px] font-semibold uppercase tracking-[0.18em]"
+          style={{
+            color: '#ffffff',
+            textShadow: `0 0 10px ${hexToRgba(accent, 0.65)}, 0 0 2px rgba(255,255,255,0.6)`,
+          }}
+        >
+          {label}
         </span>
-        <span className="ml-auto font-mono text-[12px] text-text-primary">{count}</span>
       </header>
-      <div className="rounded-lg border border-border-subtle bg-white/40 p-3 min-h-[80px]">
-        {children}
-      </div>
-    </section>
+      <ul className="flex-1 overflow-y-auto px-3 py-3 flex flex-col gap-1.5">
+        {count === 0 ? (
+          <li className="px-2 py-1 text-[11px] italic text-white/35">{emptyMessage}</li>
+        ) : (
+          Array.from({ length: count }).map((_, i) => (
+            <li
+              key={i}
+              className="flex items-center gap-2.5 rounded-md px-2.5 py-1.5"
+              style={{
+                background: 'rgba(255,255,255,0.04)',
+                boxShadow: `inset 0 0 0 1px ${hexToRgba(chipColor, 0.18)}`,
+              }}
+            >
+              <span
+                aria-hidden
+                className="inline-block h-1.5 w-1.5 rounded-full"
+                style={{
+                  background: chipColor,
+                  boxShadow: `0 0 6px ${chipColor}`,
+                }}
+              />
+              {renderItem(i)}
+            </li>
+          ))
+        )}
+      </ul>
+    </div>
   )
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace('#', '')
+  const r = parseInt(h.slice(0, 2), 16)
+  const g = parseInt(h.slice(2, 4), 16)
+  const b = parseInt(h.slice(4, 6), 16)
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
 }

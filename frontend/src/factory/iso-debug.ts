@@ -1307,9 +1307,11 @@ export interface IsoDebugSceneHandle {
   /** Subscribe to camera state changes. The HUD uses this to render
    * pitch/yaw/zoom live. Returns an unsubscribe function. */
   onCameraChange: (cb: (s: CameraStateForHUD) => void) => () => void
-  /** Subscribe to station clicks. Fires once per tap on a station's
-   *  body / tray / chips. Returns an unsubscribe function. */
-  onStationClick: (cb: (info: ClickedStationInfo) => void) => () => void
+  /** Subscribe to station picks. Fires with the clicked station's
+   *  metadata, or `null` when the click landed off-station (empty
+   *  floor / belt / router). Drawers use the null signal to close.
+   *  Returns an unsubscribe function. */
+  onStationClick: (cb: (info: ClickedStationInfo | null) => void) => () => void
 }
 
 export async function createIsoDebugScene(container: HTMLDivElement): Promise<IsoDebugSceneHandle> {
@@ -2402,9 +2404,12 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
     },
     onStationClick: (cb) => {
       return renderer.onStationClick((stationId) => {
+        if (stationId == null) {
+          cb(null)
+          return
+        }
         const meta = stationMetaById.get(stationId)
-        if (!meta) return
-        cb(meta)
+        cb(meta ?? null)
       })
     },
   }

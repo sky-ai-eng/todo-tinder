@@ -227,11 +227,14 @@ export class IsoScene {
         const dt = performance.now() - downTime
         if (Math.hypot(dx, dy) > DRAG_PX || dt > TAP_MAX_MS) return
         const pick = this.scene.pick(this.scene.pointerX, this.scene.pointerY)
-        if (!pick?.hit || !pick.pickedMesh) return
-        const stationId = findStationId(pick.pickedMesh)
-        if (stationId) {
-          for (const cb of this.stationClickListeners) cb(stationId)
-        }
+        // Both "no hit at all" and "hit something that isn't part of
+        // a station" emit null so the React layer can dismiss any
+        // open station drawer. The canvas only receives this event
+        // when the click landed outside any HTML overlay (drawer
+        // clicks don't reach Babylon at all), so this is the right
+        // signal for "click off the station view to close."
+        const stationId = pick?.hit && pick.pickedMesh ? findStationId(pick.pickedMesh) : undefined
+        for (const cb of this.stationClickListeners) cb(stationId ?? null)
       }
     })
 
@@ -339,7 +342,12 @@ export class IsoScene {
   /** Subscribe to station-click events. Returns an unsubscribe
    *  function. Click hit-testing uses Babylon's pointer pick + a
    *  walk up the parent chain looking for a `metadata.stationId`. */
-  onStationClick(cb: (stationId: string) => void): () => void {
+  /** Subscribe to station picks. Receives the picked station's id,
+   *  or `null` when the click landed on empty floor / a non-station
+   *  mesh — the React layer uses null as the "close the drawer"
+   *  signal. Clicks that land on HTML overlays never reach Babylon,
+   *  so this only fires for canvas-level interactions. */
+  onStationClick(cb: (stationId: string | null) => void): () => void {
     this.stationClickListeners.add(cb)
     return () => {
       this.stationClickListeners.delete(cb)
@@ -347,7 +355,7 @@ export class IsoScene {
   }
 
   private stationHandles = new Map<string, StationHandle>()
-  private stationClickListeners = new Set<(stationId: string) => void>()
+  private stationClickListeners = new Set<(stationId: string | null) => void>()
 
   addPole(spec: Pole, cellSize: number, pathOffset: number = 0): PoleBuild {
     const materials = this.getMaterials()
