@@ -39,6 +39,8 @@
 // face — invisible at the splitter/router junctions but a tiny
 // phase shift at the CI Failed east wall.
 
+import { Vector3 } from '@babylonjs/core'
+
 import { DEFAULT_PORT_RECESS_DEPTH } from './iso-port'
 import type { Pole } from './iso-pole'
 import { IsoScene } from './iso-renderer'
@@ -159,6 +161,24 @@ const RFR_POLE1_ROW = 11
 const RFR_POLE2_COL = 34 // = RM_COL
 const RFR_POLE2_ROW = 11
 
+// Bridge — vertical north→south overpass at col 21 (column-aligned
+// with S1, the splitter just downstream of NC). Fed from S1.south
+// via a straight connector belt; crosses both south belts at once
+// (RFR intake at row 11, CI Failed loopback at row 12). 6 cells
+// total (1 ramp up + 4 flat peak + 1 ramp down) puts the flat span
+// over rows 10–13 with a 1-cell margin around each crossing. The
+// bridge's south end is a dead-end today; items entering get
+// despawned. S1's west fan still picks east at next[0], so the
+// bridge sits dormant until a routing decision flips items down it.
+const BRIDGE_COL = 21 // = S1_COL
+const BRIDGE_NORTH_ROW = 14 // northmost cell in the bridge span
+const BRIDGE_CELL_COUNT = 6 // 1 ramp up + 4 flat peak + 1 ramp down
+// Apex floor-z. Item top on a lower belt sits at z ≈ 22.5
+// (CONVEYOR_HEIGHT + ITEM_LIFT + ITEM_HEIGHT). The bridge surface
+// sits at peak + CONVEYOR_HEIGHT = 36, leaving ~13.5 wu of visible
+// clearance — enough to read as "above" without looking stilted.
+const BRIDGE_PEAK_HEIGHT = 28
+
 // ─── Path-offset math ─────────────────────────────────────────────
 
 const SPACING = 54 // CHEVRON_SPACING_WORLD
@@ -247,10 +267,19 @@ const BELT_POLE4_TO_RFR = mod(PRO_POLE4_OFFSET + TURN_ARC_LENGTH)
 const BELT_NC_TO_S1 = STATION_EAST_UV_AT_WALL
 const S1_WEST_OFFSET = mod(BELT_NC_TO_S1 + BELT_NC_TO_S1_LEN)
 const S1_EAST_OFFSET = mod(S1_WEST_OFFSET + ROUTER_STUB_LEN) // body-continuous
+const S1_SOUTH_OFFSET = S1_EAST_OFFSET // body-continuous (bridge feed)
 const BELT_S1_TO_S2 = mod(S1_EAST_OFFSET + ROUTER_STUB_LEN)
 const S2_WEST_OFFSET = mod(BELT_S1_TO_S2 + BELT_S1_TO_S2_LEN)
-// S1 south output is unwired; pathOffset is irrelevant.
-const S1_SOUTH_OFFSET = 0
+
+// S1.south → straight connector belt → bridge north entry. The
+// connector pathOffset comes off S1's south wall UV; the bridge
+// picks up where the connector ends. Chevrons stay continuous from
+// S1's body, through the connector, into the ramp-up, across the
+// flat peak, and down the south ramp — buildCurvedBelt computes
+// 3D arc length so the ramps don't break the tile.
+const BELT_S1_SOUTH_TO_BRIDGE_LEN = (SPLITTER_ROW - (BRIDGE_NORTH_ROW + 1)) * FLOOR_CELL // 320
+const BELT_S1_SOUTH_TO_BRIDGE = mod(S1_SOUTH_OFFSET + ROUTER_STUB_LEN)
+const BRIDGE_PATH_OFFSET = mod(BELT_S1_SOUTH_TO_BRIDGE + BELT_S1_SOUTH_TO_BRIDGE_LEN)
 
 // East destination: anchor at CI Passed (UV 0); S2.east adopts.
 const BELT_S2_TO_CI_PASSED = mod(-BELT_S2_TO_CI_PASSED_LEN)
@@ -954,6 +983,30 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
     false,
   )
 
+  // ─── Bridge ────────────────────────────────────────────────────
+  // S1.south → connector belt → flat-top overpass crossing the row-11
+  // RFR intake and the row-12 CI Failed loopback. Bridge's south end
+  // is a dead-end for now (items entering get despawned); the south
+  // exit will be wired into a downstream destination later.
+  const bridge = renderer.addBridge(
+    {
+      col: BRIDGE_COL,
+      northRow: BRIDGE_NORTH_ROW,
+      cellCount: BRIDGE_CELL_COUNT,
+      peakHeight: BRIDGE_PEAK_HEIGHT,
+      pathOffset: BRIDGE_PATH_OFFSET,
+    },
+    FLOOR_CELL,
+  )
+  const s1SouthHandle = splitter1.ports.get('south')!
+  const beltS1SouthToBridge = renderer.addBeltAt(
+    new Vector3(s1SouthHandle.worldPos.x, s1SouthHandle.worldPos.y, 0),
+    new Vector3((BRIDGE_COL + 0.5) * FLOOR_CELL, (BRIDGE_NORTH_ROW + 1) * FLOOR_CELL, 0),
+    BELT_S1_SOUTH_TO_BRIDGE,
+    false,
+    false,
+  )
+
   // ─── Item path graph ──────────────────────────────────────────
   // Spawn at intake splitter's west input. Every station the items
   // must transit (NC, CI Passed, CI Failed) is wired passthrough
@@ -1012,8 +1065,13 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
     splitter1.ports.get('south')!.segment!,
   ]
   splitter1.ports.get('east')!.segment!.next = [beltS1ToS2.segment]
-  // S1.south stays a dead-end stub (reserved for the future
-  // skip-build branch); no belt connects to it today.
+  // S1.south → connector belt → bridge. The bridge's segment ends in
+  // a dead-end today (no .next), so items reaching the south foot of
+  // the bridge despawn. Items only reach this branch if S1's west
+  // fan picks next[1]; today next[0] is east, so the bridge sits
+  // dormant until a routing-decision layer flips the order.
+  splitter1.ports.get('south')!.segment!.next = [beltS1SouthToBridge.segment]
+  beltS1SouthToBridge.segment.next = [bridge.segment]
 
   // S1 → S2.
   beltS1ToS2.segment.next = [splitter2.ports.get('west')!.segment!]

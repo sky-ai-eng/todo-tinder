@@ -45,11 +45,11 @@ import {
   Vector3,
 } from '@babylonjs/core'
 
-import { buildBelt, type BeltBuild } from './iso-belt'
+import { buildBelt, buildCurvedBelt, type BeltBuild } from './iso-belt'
 import { ItemSimulator, type SpawnerOptions } from './iso-items'
 import type { PathSegment } from './iso-path'
 import { buildPoleMesh, type Pole, type PoleBuild } from './iso-pole'
-import type { PortDirection, PortHandle } from './iso-port'
+import { CONVEYOR_HEIGHT, CONVEYOR_WIDTH, type PortDirection, type PortHandle } from './iso-port'
 import { buildRouterMesh, type Router, type RouterBuild } from './iso-router'
 import {
   buildStationMesh,
@@ -304,6 +304,125 @@ export class IsoScene {
     return built
   }
 
+  /** Build a vertical bridge that arches over perpendicular belts
+   *  beneath. The z-profile is piecewise: 1 cell smooth ramp up
+   *  (sin²(πs/2), s ∈ [0,1]) → (cellCount−2) cells flat at peak →
+   *  1 cell smooth ramp down. sin² ramps have zero slope at both
+   *  endpoints, so the path tangents into the floor and into the
+   *  flat top without a visible kink. Stilt cylinders sit at the
+   *  ramp/peak boundaries — two per boundary (left + right of the
+   *  belt edges) so the underside of the flat span stays clear of
+   *  clutter and items below remain visible.
+   *
+   *  Direction is north-to-south (high y → low y) at the given column.
+   *  No ports — the bridge is a freestanding chain; the caller wires
+   *  its returned segment manually if items should ride it.
+   *
+   *  cellCount must be ≥ 3: 1 ramp up + (cellCount-2) peak cells +
+   *  1 ramp down. */
+  addBridge(
+    spec: {
+      col: number
+      /** Northmost row of the bridge span (high y). */
+      northRow: number
+      /** Total cells the bridge spans, ≥ 3. */
+      cellCount: number
+      /** Apex floor-z; the rendered top surface sits CONVEYOR_HEIGHT
+       *  above this. */
+      peakHeight: number
+      /** Chevron continuity offset at the north (start) end. */
+      pathOffset: number
+    },
+    cellSize: number,
+  ): BeltBuild {
+    if (spec.cellCount < 3) {
+      throw new Error(`addBridge: cellCount must be ≥ 3, got ${spec.cellCount}`)
+    }
+    const materials = this.getMaterials()
+
+    const xCenter = (spec.col + 0.5) * cellSize
+    const yNorth = (spec.northRow + 1) * cellSize
+    const totalLen = spec.cellCount * cellSize
+
+    // Piecewise z-profile: smooth sin² ramp up over the first cell,
+    // flat at peakHeight across the middle cells, smooth ramp down
+    // over the last cell. Tessellation = cellCount * 8 puts ~8 points
+    // per cell — generous for the chevron tile and keeps the ramps
+    // visually smooth at any peakHeight.
+    const tess = spec.cellCount * 8
+    const rampFrac = 1 / spec.cellCount
+    const points: Vector3[] = []
+    for (let i = 0; i <= tess; i++) {
+      const t = i / tess
+      const y = yNorth - totalLen * t
+      let z: number
+      if (t <= rampFrac) {
+        const s = t / rampFrac // [0, 1] across the up-ramp
+        z = spec.peakHeight * Math.sin((Math.PI * s) / 2) ** 2
+      } else if (t >= 1 - rampFrac) {
+        const s = (t - (1 - rampFrac)) / rampFrac // [0, 1] across the down-ramp
+        z = spec.peakHeight * Math.cos((Math.PI * s) / 2) ** 2
+      } else {
+        z = spec.peakHeight
+      }
+      points.push(new Vector3(xCenter, y, z))
+    }
+
+    const built = buildCurvedBelt(this.scene, points, spec.pathOffset, materials.beltSurface)
+
+    // Stilts at the boundaries between ramp and peak cells, i.e.
+    // t = 1/cellCount (south end of north ramp) and t = (cellCount−1)/cellCount
+    // (north end of south ramp). User feedback: only support the top
+    // sides of the ramp cells so the underside of the peak stays clear
+    // of clutter and items below remain visible. Two stilts per
+    // boundary — one on each side of the belt — slim and matte black
+    // so they read as trellis pillars rather than structural columns.
+    const STILT_DIAMETER = 4
+    const STILT_OFFSET = CONVEYOR_WIDTH / 2
+    const stiltMat = this.getBridgeStiltMaterial()
+    // At the ramp/peak boundary the path z is exactly peakHeight (the
+    // sin² ramp lands at full peak with zero slope), so stilt height
+    // is the same on both ends regardless of cellCount.
+    const stiltHeight = spec.peakHeight + CONVEYOR_HEIGHT
+    for (const t of [1 / spec.cellCount, (spec.cellCount - 1) / spec.cellCount]) {
+      const y = yNorth - totalLen * t
+      for (const dx of [-STILT_OFFSET, STILT_OFFSET]) {
+        const stilt = MeshBuilder.CreateCylinder(
+          'bridge-stilt',
+          { diameter: STILT_DIAMETER, height: stiltHeight, tessellation: 12 },
+          this.scene,
+        )
+        // Babylon cylinders are y-axis aligned by default; stand them
+        // up in our z-up world by rotating around x. Position is the
+        // cylinder's center: x offset to either belt edge, z at half-
+        // height so the base sits on the floor.
+        stilt.rotation.x = Math.PI / 2
+        stilt.position.set(xCenter + dx, y, stiltHeight / 2)
+        stilt.material = stiltMat
+        stilt.parent = built.root
+        if (this.shadowGenerator) {
+          stilt.receiveShadows = true
+          this.shadowGenerator.addShadowCaster(stilt)
+        }
+        built.meshes.push(stilt)
+      }
+    }
+
+    return built
+  }
+
+  private bridgeStiltMat: PBRMaterial | null = null
+  private getBridgeStiltMaterial(): PBRMaterial {
+    if (!this.bridgeStiltMat) {
+      const m = new PBRMaterial('bridge-stilt', this.scene)
+      m.albedoColor = Color3.Black()
+      m.metallic = 0.2
+      m.roughness = 0.4
+      this.bridgeStiltMat = m
+    }
+    return this.bridgeStiltMat
+  }
+
   /** Build a connecting belt between two ports. Drops the snap point's
    *  z to floor level (BeltSpec expects floor-z; the snap's z is the
    *  conveyor centerline). */
@@ -320,6 +439,26 @@ export class IsoScene {
     return buildBelt(
       this.scene,
       { start: startPos, end: endPos, pathOffset, capStart, capEnd },
+      materials.beltSurface,
+    )
+  }
+
+  /** Build a straight belt between two raw world-space points. Used
+   *  when one or both endpoints aren't ports — e.g. connecting a
+   *  port-based station to the freestanding bridge. Both positions
+   *  must be at floor-z (z=0); the belt's top surface lifts to
+   *  CONVEYOR_HEIGHT internally. */
+  addBeltAt(
+    start: Vector3,
+    end: Vector3,
+    pathOffset: number,
+    capStart = false,
+    capEnd = false,
+  ): BeltBuild {
+    const materials = this.getMaterials()
+    return buildBelt(
+      this.scene,
+      { start, end, pathOffset, capStart, capEnd },
       materials.beltSurface,
     )
   }
@@ -361,6 +500,7 @@ export class IsoScene {
     this.groundMat?.dispose()
     this.glowLayer?.dispose()
     this.shadowGenerator?.dispose()
+    this.bridgeStiltMat?.dispose()
     if (this.materials) {
       for (const m of Object.values(this.materials)) {
         m.dispose()
