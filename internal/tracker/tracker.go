@@ -607,7 +607,7 @@ func issueToState(issue jiraclient.Issue, baseURL string, doneStatuses []string)
 	snap := domain.JiraSnapshot{
 		Key:     issue.Key,
 		Summary: issue.Fields.Summary,
-		URL:     fmt.Sprintf("%s/browse/%s", baseURL, issue.Key),
+		URL:     fmt.Sprintf("%s/browse/%s", strings.TrimRight(baseURL, "/"), issue.Key),
 	}
 	if issue.Fields.Status != nil {
 		snap.Status = issue.Fields.Status.Name
