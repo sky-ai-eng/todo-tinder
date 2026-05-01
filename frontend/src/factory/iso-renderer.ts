@@ -38,6 +38,7 @@ import {
   HemisphericLight,
   ImageProcessingConfiguration,
   LinesMesh,
+  Matrix,
   Mesh,
   MeshBuilder,
   PBRMaterial,
@@ -106,6 +107,7 @@ export class IsoScene {
   private glowLayer: GlowLayer | null = null
   private itemSim: ItemSimulator | null = null
   private snapshotChips: SnapshotChipController | null = null
+  private detachShiftPan: (() => void) | null = null
 
   constructor(canvas: HTMLCanvasElement) {
     this.engine = new Engine(canvas, true, {
@@ -200,6 +202,15 @@ export class IsoScene {
     this.camera.upperBetaLimit = Math.PI / 2 - 0.01
     this.camera.lowerRadiusLimit = DEFAULT_FLOOR_SIZE / 2 / MAX_ZOOM
     this.camera.upperRadiusLimit = 5000
+
+    // Shift+LMB pan, on top of Babylon's default RMB-only pan.
+    // ArcRotateCamera ships no shift modifier hook, so we listen at
+    // capture phase and feed the same `inertialPanning{X,Y}` state
+    // Babylon's built-in pan input writes to — that gives us free
+    // damping, sensitivity, and target-clamp behavior. When shift
+    // isn't held, the listener is a no-op and Babylon's normal LMB
+    // rotate handling runs unchanged.
+    this.detachShiftPan = attachShiftPan(canvas, this.camera)
 
     // GlowLayer blooms emissive contributions (LED trim, chip cores)
     // without affecting opaque PBR responses. Created before lights
@@ -699,6 +710,8 @@ export class IsoScene {
   }
 
   destroy(): void {
+    this.detachShiftPan?.()
+    this.detachShiftPan = null
     this.itemSim?.destroy()
     this.snapshotChips?.destroy()
     this.gridMesh?.dispose()
@@ -749,5 +762,138 @@ export class IsoScene {
     const rim = new DirectionalLight('rim', new Vector3(0.6, 0.5, -0.6).normalize(), this.scene)
     rim.diffuse = Color3.FromHexString('#9fc4ff')
     rim.intensity = 0.25
+  }
+}
+
+/** Wire shift+LMB drag-to-pan on the canvas, layered on top of
+ *  Babylon's default camera input.
+ *
+ *  Two halves to make this work cleanly:
+ *
+ *  1. **Suppress Babylon's LMB rotate while shift is held.** Listen
+ *     for shift keydown/keyup at the window level and toggle button
+ *     0 in/out of `pointersInput.buttons`. Babylon's rotate input
+ *     consults this list per pointerdown to decide whether to act,
+ *     so removing 0 cleanly disables LMB rotation *only* for the
+ *     duration of the keypress — releasing shift restores the
+ *     original buttons immediately.
+ *
+ *  2. **Pan via direct world-space unproject.** Shift the camera
+ *     target by the world delta between two adjacent screen points.
+ *     That gives a 1:1 drag feel regardless of zoom — the world
+ *     point under the cursor stays pinned to the cursor — without
+ *     having to tune Babylon's perspective-flavored panning
+ *     sensibility for ortho mode.
+ *
+ *  Returns a teardown function that detaches all listeners and
+ *  restores the original button list. */
+function attachShiftPan(canvas: HTMLCanvasElement, camera: ArcRotateCamera): () => void {
+  // ─── Half 1: gate Babylon's rotate input on shift-held state ────
+  // The `pointers` entry on `inputs.attached` is the
+  // ArcRotateCameraPointersInput; it exposes a public `buttons` array
+  // (default [0, 1, 2]) that the rotate handler consults per pointer
+  // event. We splice 0 out while shift is held and put it back on
+  // release, so rotation is only ever paused mid-keypress.
+  const pointersInput = camera.inputs.attached.pointers as { buttons?: number[] } | undefined
+  const originalButtons = pointersInput?.buttons ? [...pointersInput.buttons] : null
+
+  let shiftHeld = false
+  const setShift = (held: boolean) => {
+    if (held === shiftHeld) return
+    shiftHeld = held
+    if (!pointersInput || !originalButtons) return
+    pointersInput.buttons = held ? originalButtons.filter((b) => b !== 0) : [...originalButtons]
+  }
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Shift') setShift(true)
+  }
+  const onKeyUp = (e: KeyboardEvent) => {
+    if (e.key === 'Shift') setShift(false)
+  }
+  // Window blur clears any "stuck" shift state — if the user alt-tabs
+  // away while holding shift, we'd otherwise leave LMB-rotate disabled
+  // until they shift-tap to flush the state.
+  const onBlur = () => setShift(false)
+
+  // ─── Half 2: pan via unproject ──────────────────────────────────
+  let activePointerId: number | null = null
+  let lastX = 0
+  let lastY = 0
+  // Reused on every move to avoid allocating fresh Vector3s at
+  // 120Hz trackpad rates.
+  const tmpA = new Vector3()
+  const tmpB = new Vector3()
+
+  const onDown = (e: PointerEvent) => {
+    if (e.button !== 0 || !e.shiftKey) return
+    activePointerId = e.pointerId
+    lastX = e.clientX
+    lastY = e.clientY
+    canvas.setPointerCapture(e.pointerId)
+    e.preventDefault()
+  }
+
+  const onMove = (e: PointerEvent) => {
+    if (e.pointerId !== activePointerId) return
+    const dx = e.clientX - lastX
+    const dy = e.clientY - lastY
+    lastX = e.clientX
+    lastY = e.clientY
+
+    const rect = canvas.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return
+
+    // Unproject (0,0) and (dx,dy) at the same screen-space depth and
+    // take the world-space delta. The fixed z=0.5 is arbitrary in
+    // ortho — the projection's z range collapses to a single xy plane
+    // — so any value works, and the result is independent of zoom.
+    const view = camera.getViewMatrix()
+    const proj = camera.getProjectionMatrix()
+    const id = Matrix.IdentityReadOnly
+    tmpA.set(0, 0, 0.5)
+    tmpB.set(dx, dy, 0.5)
+    const a = Vector3.Unproject(tmpA, rect.width, rect.height, id, view, proj)
+    const b = Vector3.Unproject(tmpB, rect.width, rect.height, id, view, proj)
+    // Mutate the target Vector3 in place rather than going through the
+    // setter. ArcRotateCamera's `target` setter calls
+    // `rebuildAnglesAndRadius`, which re-derives alpha/beta/radius
+    // from the camera's *current* position relative to the *new*
+    // target — so position stays put and the view appears to swing
+    // (rotate-flavored), instead of rigidly translating. Direct
+    // mutation leaves alpha/beta/radius untouched; on the next
+    // `_checkInputs` tick Babylon recomputes position as
+    // `target + radius * (cosa*sinb, sina*sinb, cosb)`, giving the
+    // rigid pan we actually want.
+    camera.target.addInPlace(a.subtract(b))
+
+    e.preventDefault()
+  }
+
+  const onUp = (e: PointerEvent) => {
+    if (e.pointerId !== activePointerId) return
+    activePointerId = null
+    if (canvas.hasPointerCapture(e.pointerId)) {
+      canvas.releasePointerCapture(e.pointerId)
+    }
+  }
+
+  window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('keyup', onKeyUp)
+  window.addEventListener('blur', onBlur)
+  canvas.addEventListener('pointerdown', onDown)
+  canvas.addEventListener('pointermove', onMove)
+  canvas.addEventListener('pointerup', onUp)
+  canvas.addEventListener('pointercancel', onUp)
+
+  return () => {
+    setShift(false)
+    window.removeEventListener('keydown', onKeyDown)
+    window.removeEventListener('keyup', onKeyUp)
+    window.removeEventListener('blur', onBlur)
+    canvas.removeEventListener('pointerdown', onDown)
+    canvas.removeEventListener('pointermove', onMove)
+    canvas.removeEventListener('pointerup', onUp)
+    canvas.removeEventListener('pointercancel', onUp)
   }
 }
