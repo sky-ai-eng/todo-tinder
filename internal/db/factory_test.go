@@ -337,3 +337,107 @@ func TestListFactoryEntities_ClosedGraceLimitCapsBurst(t *testing.T) {
 			len(rows), FactoryClosedGraceLimit)
 	}
 }
+
+// TestLatestEventForEntityAndType_ReturnsMostRecentMatch pins the
+// drag-to-delegate handler's anchor: synthesized tasks need a real
+// event row to set primary_event_id, and the most recent matching
+// event is the right choice (older events for the same type may have
+// already been resolved).
+func TestLatestEventForEntityAndType_ReturnsMostRecentMatch(t *testing.T) {
+	database := newTestDB(t)
+	a := makeEntity(t, database, 1)
+	b := makeEntity(t, database, 2)
+
+	// Older matching event for entity A.
+	olderID := recordEvent(t, database, a.ID, domain.EventGitHubPRCICheckPassed)
+	// Different type for entity A — must not be returned.
+	recordEvent(t, database, a.ID, domain.EventGitHubPRReviewApproved)
+	// Latest matching event for entity A.
+	latestID := recordEvent(t, database, a.ID, domain.EventGitHubPRCICheckPassed)
+	// Same type for entity B — must not be returned.
+	recordEvent(t, database, b.ID, domain.EventGitHubPRCICheckPassed)
+
+	got, err := LatestEventForEntityAndType(database, a.ID, domain.EventGitHubPRCICheckPassed)
+	if err != nil {
+		t.Fatalf("LatestEventForEntityAndType: %v", err)
+	}
+	if got == nil {
+		t.Fatal("got nil, want event")
+	}
+	if got.ID != latestID {
+		t.Errorf("ID = %s, want %s (latest match), older match was %s", got.ID, latestID, olderID)
+	}
+}
+
+// TestLatestEventForEntityAndType_NoMatchReturnsNil — defensive: the
+// handler refuses to synthesize a task when the entity has never had
+// an event of that type. Confirm nil rather than an error.
+func TestLatestEventForEntityAndType_NoMatchReturnsNil(t *testing.T) {
+	database := newTestDB(t)
+	a := makeEntity(t, database, 1)
+	recordEvent(t, database, a.ID, domain.EventGitHubPROpened)
+
+	got, err := LatestEventForEntityAndType(database, a.ID, domain.EventGitHubPRMerged)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %+v, want nil (no matching event)", got)
+	}
+}
+
+// TestListActiveTasksForEntities_FiltersTerminalStatuses pins the
+// snapshot's pending_tasks contract: only non-terminal tasks ride
+// (otherwise the drawer would offer to delegate already-resolved
+// tasks). Active = NOT IN ('done', 'dismissed').
+func TestListActiveTasksForEntities_FiltersTerminalStatuses(t *testing.T) {
+	database := newTestDB(t)
+	a := makeEntity(t, database, 1)
+	b := makeEntity(t, database, 2)
+	evtA := recordEvent(t, database, a.ID, domain.EventGitHubPRCICheckPassed)
+	evtB := recordEvent(t, database, b.ID, domain.EventGitHubPRCICheckPassed)
+
+	// Active task on A — should be returned.
+	activeTask, _, err := FindOrCreateTask(database, a.ID, domain.EventGitHubPRCICheckPassed, "", evtA, 0.5)
+	if err != nil {
+		t.Fatalf("create active task: %v", err)
+	}
+	// Done task on B — must be filtered out.
+	doneTask, _, err := FindOrCreateTask(database, b.ID, domain.EventGitHubPRCICheckPassed, "", evtB, 0.5)
+	if err != nil {
+		t.Fatalf("create done task: %v", err)
+	}
+	if _, err := database.Exec(
+		`UPDATE tasks SET status = 'done', closed_at = ?, close_reason = 'manual' WHERE id = ?`,
+		time.Now(), doneTask.ID,
+	); err != nil {
+		t.Fatalf("close task: %v", err)
+	}
+
+	tasks, err := ListActiveTasksForEntities(database, []string{a.ID, b.ID})
+	if err != nil {
+		t.Fatalf("ListActiveTasksForEntities: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1 (only active)", len(tasks))
+	}
+	if tasks[0].ID != activeTask.ID {
+		t.Errorf("returned task ID = %s, want %s (active)", tasks[0].ID, activeTask.ID)
+	}
+}
+
+// TestListActiveTasksForEntities_EmptyInput — defensive: empty slice
+// returns no rows without hitting the DB. The factory snapshot's
+// entity list can legitimately be empty (fresh install, no
+// integrations configured), and a "WHERE id IN ()" query is invalid
+// in SQLite.
+func TestListActiveTasksForEntities_EmptyInput(t *testing.T) {
+	database := newTestDB(t)
+	tasks, err := ListActiveTasksForEntities(database, nil)
+	if err != nil {
+		t.Fatalf("nil entityIDs: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("got %d tasks, want 0", len(tasks))
+	}
+}

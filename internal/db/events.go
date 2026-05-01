@@ -102,6 +102,45 @@ func SetTaskEventType(db *sql.DB, taskID, eventType string) error {
 	return err
 }
 
+// LatestEventForEntityAndType returns the most recent event row for
+// (entityID, eventType), or (nil, nil) if none exists. Used by the
+// factory drag-to-delegate handler to anchor a synthesized task's
+// primary_event_id on a real event row that already drove the chip
+// to that station.
+//
+// Covered by idx_events_entity_created (entity_id, created_at DESC).
+// rowid DESC breaks ties on same-second inserts so the result is
+// stable when two events of the same type land in one poll burst —
+// matches the tiebreaker pattern in ListRecentEventsByEntity.
+func LatestEventForEntityAndType(database *sql.DB, entityID, eventType string) (*domain.Event, error) {
+	row := database.QueryRow(`
+		SELECT id, entity_id, event_type, dedup_key,
+		       COALESCE(metadata_json, ''), occurred_at, created_at
+		FROM events
+		WHERE entity_id = ? AND event_type = ?
+		ORDER BY created_at DESC, rowid DESC
+		LIMIT 1
+	`, entityID, eventType)
+	var evt domain.Event
+	var entID sql.NullString
+	var occurredAt sql.NullTime
+	if err := row.Scan(&evt.ID, &entID, &evt.EventType, &evt.DedupKey,
+		&evt.MetadataJSON, &occurredAt, &evt.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if entID.Valid {
+		s := entID.String
+		evt.EntityID = &s
+	}
+	if occurredAt.Valid {
+		evt.OccurredAt = occurredAt.Time
+	}
+	return &evt, nil
+}
+
 // GetPollerState returns the last-known state JSON for a source item, or "" if none.
 func GetPollerState(db *sql.DB, source, sourceID string) (string, error) {
 	var stateJSON string

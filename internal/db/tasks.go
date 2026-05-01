@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -184,6 +185,47 @@ func FindActiveTasksByEntity(db *sql.DB, entityID string) ([]domain.Task, error)
 		JOIN entities e ON t.entity_id = e.id
 		WHERE t.entity_id = ? AND t.status NOT IN ('done', 'dismissed')
 	`, entityID)
+}
+
+// ListActiveTasksForEntities returns non-terminal tasks (status NOT IN
+// 'done','dismissed') for any entity in entityIDs. One row per task;
+// callers group by (entity_id, event_type) as needed. Bounded by the
+// caller's entity set size — used by the factory snapshot to attach
+// pending_tasks per entity in a single round-trip instead of N.
+//
+// Chunks on SQLite's variable limit (500) the same way
+// ListRecentEventsByEntity does.
+func ListActiveTasksForEntities(database *sql.DB, entityIDs []string) ([]domain.Task, error) {
+	if len(entityIDs) == 0 {
+		return nil, nil
+	}
+	const chunkSize = 500
+	out := make([]domain.Task, 0, len(entityIDs))
+	for start := 0; start < len(entityIDs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(entityIDs) {
+			end = len(entityIDs)
+		}
+		chunk := entityIDs[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk))
+		for i, id := range chunk {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		tasks, err := queryTasks(database, `
+			SELECT `+taskColumnsWithEntity+`
+			FROM tasks t
+			JOIN entities e ON t.entity_id = e.id
+			WHERE t.entity_id IN (`+strings.Join(placeholders, ",")+`)
+			  AND t.status NOT IN ('done', 'dismissed')
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tasks...)
+	}
+	return out, nil
 }
 
 // EntityIDsWithActiveTasks returns the set of entity IDs that have at least
