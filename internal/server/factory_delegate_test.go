@@ -20,9 +20,9 @@ import (
 
 func TestHandleFactoryDelegate_ServiceUnavailableWithoutSpawner(t *testing.T) {
 	s := newTestServer(t)
-	// Seed a real entity + event so the request reaches the spawner
-	// gate (which sits after entity + state + event validation per
-	// the handler's progressive-validation order).
+	// Seed a real entity + event so the request is otherwise valid
+	// when it reaches the missing-spawner gate in the handler's
+	// progressive validation flow.
 	entity, _, err := db.FindOrCreateEntity(s.db, "github", "owner/repo#503", "pr", "", "")
 	if err != nil {
 		t.Fatalf("seed entity: %v", err)
