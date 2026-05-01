@@ -301,6 +301,36 @@ func TestFormatHumanFeedback_EmptyOriginalBodyIsRealSnapshot(t *testing.T) {
 	}
 }
 
+// TestFormatHumanFeedback_BodyCRLFNormalized is the regression for
+// the blockquote CRLF bug: GitHub's web textarea and Windows clients
+// deliver review bodies with "\r\n" line endings, and a naive split
+// on "\n" leaves a stray "\r" at the end of every quoted line. The
+// stored human_content must be byte-stable across platforms so
+// downstream parsers (and humans diffing run_memory rows) see clean
+// LF-terminated blockquote lines regardless of where the human typed
+// the review.
+func TestFormatHumanFeedback_BodyCRLFNormalized(t *testing.T) {
+	got := FormatHumanFeedback(HumanFeedbackInput{
+		OriginalBody:  strPtr("first line\r\nsecond line"),
+		FinalBody:     "rewritten first\r\nrewritten second\r\n",
+		OriginalEvent: strPtr("COMMENT"),
+		FinalEvent:    "COMMENT",
+	})
+	if strings.Contains(got, "\r") {
+		t.Errorf("output must not contain CR characters; got:\n%q", got)
+	}
+	for _, want := range []string{
+		"> rewritten first\n",
+		"> rewritten second\n",
+		"> first line\n",
+		"> second line\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in CRLF-normalized output:\n%s", want, got)
+		}
+	}
+}
+
 // TestFormatHumanFeedback_MultilineCommentBodyFoldsToSpaces pins the
 // inlineBody contract: review comments occasionally span multiple
 // lines, but the bullet-list rendering needs to stay single-line per

@@ -181,7 +181,16 @@ func writeVerdictLine(sb *strings.Builder, in HumanFeedbackInput) {
 // of a quoted string that could collide with quotes inside the
 // content. Empty input still emits a single "> " marker so the
 // downstream `>` separator line still composes correctly.
+//
+// CRLF-normalizes first: GitHub's web textarea and Windows clients
+// both deliver review bodies with "\r\n" line endings, and naively
+// splitting on "\n" would leave a stray "\r" at the end of every
+// quoted line. The stored human_content is meant to be byte-stable
+// and human-readable across platforms, so we collapse "\r\n" → "\n"
+// and strip any lone "\r" before quoting.
 func writeBlockquote(sb *strings.Builder, content string) {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "")
 	content = strings.TrimRight(content, "\n")
 	if content == "" {
 		sb.WriteString("> \n")
