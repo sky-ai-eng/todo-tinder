@@ -4,7 +4,7 @@
   <img src="docs/imgs/factory-page.png" alt="Factory" width="90%" />
 </p>
 
-<p align="center">An AI-powered software factory where humans decide what gets automated—and can take over anytime.</p>
+<p align="center">An AI-powered software factory where humans decide what gets automated and can take over at any time.</p>
 
 <p align="center">
   <a href="https://github.com/sky-ai-eng/triage-factory/releases">
