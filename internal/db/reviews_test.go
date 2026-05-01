@@ -80,26 +80,34 @@ func TestUpdatePendingReviewComment_PreservesOriginalBody(t *testing.T) {
 	}
 }
 
-// TestSetPendingReviewSubmission_WriteOnceOriginalBody pins the
-// COALESCE-encoded write-once contract for review bodies. First call
-// captures the agent draft; second call (typically a user-edited
-// resubmission) updates review_body but leaves original_review_body
-// pinned at the agent's original.
-func TestSetPendingReviewSubmission_WriteOnceOriginalBody(t *testing.T) {
+// TestSetPendingReviewSubmission_WriteOnceOriginals pins the
+// COALESCE-encoded write-once contract for both review body and
+// review event. First call captures the agent's drafted body +
+// event; second call (typically a user-edited resubmission via
+// handleReviewUpdate) updates review_body / review_event but
+// leaves both originals pinned at the agent's first draft.
+//
+// The original_review_event half is the SKY-205 addition — SKY-204
+// captured original_review_body but missed the parallel for the
+// verdict, leaving the human-feedback writer unable to detect
+// agent-drafted-APPROVE → human-submitted-REQUEST_CHANGES (the
+// highest-signal change the workstream is meant to preserve).
+func TestSetPendingReviewSubmission_WriteOnceOriginals(t *testing.T) {
 	db := newTestDB(t)
 	seedPendingReview(t, db, "rev3")
 
-	if err := SetPendingReviewSubmission(db, "rev3", "agent draft body", "COMMENT"); err != nil {
+	if err := SetPendingReviewSubmission(db, "rev3", "agent draft body", "APPROVE"); err != nil {
 		t.Fatalf("first SetPendingReviewSubmission: %v", err)
 	}
 	if err := SetPendingReviewSubmission(db, "rev3", "user edited body", "REQUEST_CHANGES"); err != nil {
 		t.Fatalf("second SetPendingReviewSubmission: %v", err)
 	}
 
-	var body, event, original sql.NullString
+	var body, event, origBody, origEvent sql.NullString
 	if err := db.QueryRow(
-		`SELECT review_body, review_event, original_review_body FROM pending_reviews WHERE id = ?`, "rev3",
-	).Scan(&body, &event, &original); err != nil {
+		`SELECT review_body, review_event, original_review_body, original_review_event
+		 FROM pending_reviews WHERE id = ?`, "rev3",
+	).Scan(&body, &event, &origBody, &origEvent); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	if body.String != "user edited body" {
@@ -108,7 +116,71 @@ func TestSetPendingReviewSubmission_WriteOnceOriginalBody(t *testing.T) {
 	if event.String != "REQUEST_CHANGES" {
 		t.Errorf("review_event = %q, want %q", event.String, "REQUEST_CHANGES")
 	}
-	if original.String != "agent draft body" {
-		t.Errorf("original_review_body = %q, want %q (must remain agent's first draft)", original.String, "agent draft body")
+	if origBody.String != "agent draft body" {
+		t.Errorf("original_review_body = %q, want %q (must remain agent's first draft)",
+			origBody.String, "agent draft body")
+	}
+	if origEvent.String != "APPROVE" {
+		t.Errorf("original_review_event = %q, want %q (must remain agent's first draft)",
+			origEvent.String, "APPROVE")
+	}
+}
+
+// TestGetPendingReview_ProjectsOriginals confirms the helper
+// surfaces the new write-once columns through the domain type so
+// the diff formatter has them to work with. Without this projection
+// SKY-205's writer would silently degrade to legacy mode (NULL
+// originals → no diff) on every submit.
+func TestGetPendingReview_ProjectsOriginals(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_project")
+	if err := SetPendingReviewSubmission(db, "rev_project", "draft", "APPROVE"); err != nil {
+		t.Fatalf("SetPendingReviewSubmission: %v", err)
+	}
+
+	got, err := GetPendingReview(db, "rev_project")
+	if err != nil {
+		t.Fatalf("GetPendingReview: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetPendingReview returned nil")
+	}
+	if got.OriginalReviewBody != "draft" {
+		t.Errorf("OriginalReviewBody = %q, want %q", got.OriginalReviewBody, "draft")
+	}
+	if got.OriginalReviewEvent != "APPROVE" {
+		t.Errorf("OriginalReviewEvent = %q, want %q", got.OriginalReviewEvent, "APPROVE")
+	}
+}
+
+// TestListPendingReviewComments_ProjectsOriginalBody mirrors the
+// review-side test for the comment list helper. Without this
+// projection the formatter sees Original = "" for every comment and
+// can't classify edits.
+func TestListPendingReviewComments_ProjectsOriginalBody(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_comments")
+	if err := AddPendingReviewComment(db, domain.PendingReviewComment{
+		ID: "c_proj", ReviewID: "rev_comments", Path: "x.go", Line: 1, Body: "agent draft",
+	}); err != nil {
+		t.Fatalf("AddPendingReviewComment: %v", err)
+	}
+	if err := UpdatePendingReviewComment(db, "c_proj", "user edit"); err != nil {
+		t.Fatalf("UpdatePendingReviewComment: %v", err)
+	}
+
+	got, err := ListPendingReviewComments(db, "rev_comments")
+	if err != nil {
+		t.Fatalf("ListPendingReviewComments: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	if got[0].Body != "user edit" {
+		t.Errorf("Body = %q, want %q", got[0].Body, "user edit")
+	}
+	if got[0].OriginalBody != "agent draft" {
+		t.Errorf("OriginalBody = %q, want %q (helper must project original_body)",
+			got[0].OriginalBody, "agent draft")
 	}
 }

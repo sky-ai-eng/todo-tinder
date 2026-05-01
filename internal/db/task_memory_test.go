@@ -214,6 +214,76 @@ func TestGetMemoriesForEntity_AgentOnlyHasNoSeparator(t *testing.T) {
 	}
 }
 
+// TestUpdateRunMemoryHumanContent_LandsOnExistingRow pins the
+// contract that SKY-205's writer assumes: the gate teardown's
+// upsert at termination guarantees a row exists keyed by run_id, so
+// the human-side write is a plain UPDATE that hits exactly one row.
+// A regression that drifts UpsertAgentMemory's ON CONFLICT(run_id)
+// would surface here as 0 rows affected.
+func TestUpdateRunMemoryHumanContent_LandsOnExistingRow(t *testing.T) {
+	db := newTestDB(t)
+	seedRunForMemoryTest(t, db, "r_human", "e_human")
+	if err := UpsertAgentMemory(db, "r_human", "e_human", "agent self-report"); err != nil {
+		t.Fatalf("UpsertAgentMemory: %v", err)
+	}
+
+	if err := UpdateRunMemoryHumanContent(db, "r_human", "## Human feedback (post-run)\n\nLooks good."); err != nil {
+		t.Fatalf("UpdateRunMemoryHumanContent: %v", err)
+	}
+
+	var agent, human sql.NullString
+	if err := db.QueryRow(
+		`SELECT agent_content, human_content FROM run_memory WHERE run_id = ?`, "r_human",
+	).Scan(&agent, &human); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if agent.String != "agent self-report" {
+		t.Errorf("agent_content trampled: got %q, want %q", agent.String, "agent self-report")
+	}
+	if !human.Valid || !strings.HasPrefix(human.String, "## Human feedback (post-run)") {
+		t.Errorf("human_content not landed: %v", human)
+	}
+}
+
+// TestUpdateRunMemoryHumanContent_EmptyCanonicalizesToNull mirrors
+// UpsertAgentMemory's whitespace handling — empty / whitespace-only
+// content collapses to NULL on the way in. This keeps the contract
+// symmetric: NULL means "no human verdict captured" rather than
+// "the human submitted a blank verdict".
+func TestUpdateRunMemoryHumanContent_EmptyCanonicalizesToNull(t *testing.T) {
+	db := newTestDB(t)
+	seedRunForMemoryTest(t, db, "r_blank", "e_blank")
+	if err := UpsertAgentMemory(db, "r_blank", "e_blank", "agent text"); err != nil {
+		t.Fatalf("UpsertAgentMemory: %v", err)
+	}
+
+	if err := UpdateRunMemoryHumanContent(db, "r_blank", "   \t  \n  "); err != nil {
+		t.Fatalf("UpdateRunMemoryHumanContent: %v", err)
+	}
+
+	var human sql.NullString
+	if err := db.QueryRow(
+		`SELECT human_content FROM run_memory WHERE run_id = ?`, "r_blank",
+	).Scan(&human); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if human.Valid {
+		t.Errorf("human_content = %q, want NULL (whitespace-only must canonicalize)", human.String)
+	}
+}
+
+// TestUpdateRunMemoryHumanContent_NoRowIsLoggedNotFatal guards the
+// non-agent-review path: the handler skips the call when run_id is
+// empty, but if some other caller hits it with a runID that has no
+// row, returning an error would push a 5xx after the GitHub submit
+// already succeeded. Logged-and-nil keeps the response correct.
+func TestUpdateRunMemoryHumanContent_NoRowIsLoggedNotFatal(t *testing.T) {
+	db := newTestDB(t)
+	if err := UpdateRunMemoryHumanContent(db, "no-such-run", "anything"); err != nil {
+		t.Errorf("expected nil error on missing row (logged warning); got %v", err)
+	}
+}
+
 // TestGetRunMemory_NilOnMissingRow keeps the nil-on-missing contract
 // from before the rewrite: callers (factory's run summary, the
 // resume picker) interpret `(nil, nil)` as "no memory recorded yet,"

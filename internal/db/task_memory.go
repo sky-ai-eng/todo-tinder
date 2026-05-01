@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"log"
 	"strings"
 	"time"
 
@@ -48,6 +49,50 @@ func UpsertAgentMemory(database *sql.DB, runID, entityID, content string) error 
 		ON CONFLICT(run_id) DO UPDATE SET agent_content = excluded.agent_content
 	`, uuid.New().String(), runID, entityID, agentContent, time.Now().UTC())
 	return err
+}
+
+// UpdateRunMemoryHumanContent records the human's verdict on a run's
+// agent draft into the run_memory row keyed by runID. SKY-204's
+// unconditional upsert at termination guarantees the row exists by
+// the time SKY-205's writers (review submit, future requeue/discard
+// in SKY-206) get here, so this is a plain UPDATE — no INSERT-or-
+// UPDATE branching, no transaction, just a single statement against
+// the UNIQUE(run_id) row.
+//
+// Empty / whitespace-only content collapses to NULL on the way in
+// (matching the canonicalization UpsertAgentMemory does for
+// agent_content), keeping the contract symmetric: NULL means "no
+// human verdict captured" rather than "the human submitted an empty
+// verdict."
+//
+// Returns nil on RowsAffected == 0 with a logged warning rather than
+// an error: the only way a runID with no row reaches here is a non-
+// agent review path (run_id empty, caller already skipped) or a
+// race where the run was cleaned up mid-submit. Either way, failing
+// the response after GitHub already accepted the review would be
+// worse than the missed memory write.
+func UpdateRunMemoryHumanContent(database *sql.DB, runID, content string) error {
+	var humanContent any
+	if strings.TrimSpace(content) != "" {
+		humanContent = content
+	}
+	res, err := database.Exec(
+		`UPDATE run_memory SET human_content = ? WHERE run_id = ?`,
+		humanContent, runID,
+	)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Logged-and-returned-nil is the right shape: the spawner's
+		// gate teardown should have written this row, but if the
+		// run_memory row genuinely doesn't exist (cleanup race,
+		// taken-over run, etc.), the human's submit shouldn't fail.
+		// The agent-side upsert path will surface its own warning if
+		// it failed earlier.
+		log.Printf("[memory] no run_memory row for run %s; human_content not recorded", runID)
+	}
+	return nil
 }
 
 // GetMemoriesForEntity returns all memories across all runs on this entity
