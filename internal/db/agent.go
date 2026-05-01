@@ -265,7 +265,7 @@ func MarkAgentRunDiscarded(database *sql.DB, runID, stopReason string) (bool, er
 		    stop_reason = ?,
 		    result_summary = COALESCE(NULLIF(result_summary, ''), ?)
 		WHERE id = ? AND status = 'pending_approval'
-	`, now, stopReason, "Review discarded by user; task returned to queue.", runID)
+	`, now, stopReason, "Review discarded by user.", runID)
 	if err != nil {
 		return false, err
 	}
