@@ -837,7 +837,7 @@ export function buildStationMesh(
     screenCtx.textBaseline = 'middle'
     screenCtx.save()
     screenCtx.translate(screenTexW / 2, screenTexH / 2)
-    screenCtx.rotate(-Math.PI / 2)
+    screenCtx.rotate(Math.PI / 2)
     screenCtx.fillText(text, 0, 0)
     screenCtx.restore()
     screenTex.update(true)
