@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -41,13 +43,16 @@ func TestHandleFactoryDelegate_400OnMissingFields(t *testing.T) {
 	}
 }
 
-func TestHandleFactoryDelegate_400OnInvalidJSON(t *testing.T) {
+func TestHandleFactoryDelegate_400OnMalformedJSON(t *testing.T) {
 	s := newTestServer(t)
-	// doJSON marshals — pass an unmarshalable input via raw httptest.
-	// Easier: hand a struct that produces empty fields and expect 400
-	// from the field validation. (The JSON-decoder branch is exercised
-	// at the framework level; we trust it.)
-	rec := doJSON(t, s, http.MethodPost, "/api/factory/delegate", map[string]string{})
+	// Bypass doJSON's json.Marshal so we can hand the handler raw
+	// bytes that won't decode. Hits the JSON-decoder error branch
+	// (separate from the empty-fields branch covered above).
+	req := httptest.NewRequest(http.MethodPost, "/api/factory/delegate",
+		bytes.NewReader([]byte("{not valid json")))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
