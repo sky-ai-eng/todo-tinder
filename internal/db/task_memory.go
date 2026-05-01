@@ -9,21 +9,29 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// humanFeedbackSeparator is the divider rendered between the agent's
-// own memory write and the human's verdict on it when a future run
-// materializes both into the worktree's task_memory file. Stable so
-// the next agent's prompt context can parse the boundary without
-// knowing which run wrote which half. Future writers (SKY-205 /
-// SKY-206) populate human_content; today every row has it NULL and
-// the separator never appears.
-const humanFeedbackSeparator = "\n\n---\n## Human feedback (post-run)\n\n"
+// humanFeedbackHeader marks the start of the human verdict in
+// materialized memory. Stable so the next agent's prompt context can
+// parse the boundary regardless of which run wrote which half.
+// Future writers (SKY-205 / SKY-206) populate human_content; today
+// every row has it NULL and this header never appears.
+const humanFeedbackHeader = "## Human feedback (post-run)\n\n"
+
+// humanFeedbackSeparator is the divider rendered when both halves of
+// a memory row are populated — leading newlines and HR push the
+// header onto its own visual block after the agent's text. The
+// agent-empty + human-set case uses humanFeedbackHeader alone (no
+// stray HR ahead of the only block of content).
+const humanFeedbackSeparator = "\n\n---\n" + humanFeedbackHeader
 
 // UpsertAgentMemory writes the agent-side memory row for a run. Called
-// unconditionally from the spawner's memory-gate teardown — empty
-// content is a valid signal ("agent didn't comply with the gate") and
-// is preserved as NULL so downstream consumers (factory's
-// memory_missing derivation) can distinguish "no row yet" from
-// "agent finished and wrote nothing."
+// unconditionally from the spawner's memory-gate teardown — content
+// that's empty or whitespace-only is the canonical "agent didn't
+// comply with the gate" signal and is stored as SQL NULL. That gives
+// downstream consumers (factory's memory_missing derivation) a single
+// truth condition (`agent_content IS NULL`) for the noncompliance
+// case while still preserving any meaningful surrounding whitespace
+// the agent wrote when there's actual content (the original string is
+// stored as-is, no trim).
 //
 // Idempotent on (run_id) via ON CONFLICT — re-running the gate after
 // a retry overwrites agent_content but preserves the row's id,
@@ -31,7 +39,7 @@ const humanFeedbackSeparator = "\n\n---\n## Human feedback (post-run)\n\n"
 // user has already attached.
 func UpsertAgentMemory(database *sql.DB, runID, entityID, content string) error {
 	var agentContent any
-	if content != "" {
+	if strings.TrimSpace(content) != "" {
 		agentContent = content
 	}
 	_, err := database.Exec(`
@@ -117,7 +125,11 @@ func materializeMemory(agentContent, humanContent string) string {
 	case agent != "" && human != "":
 		return agent + humanFeedbackSeparator + human
 	case human != "":
-		return humanFeedbackSeparator + human
+		// Agent-empty + human-set: render just the header + body, no
+		// leading HR. The HR only makes sense as a divider between
+		// two blocks; without an agent block it would just be visual
+		// noise that the next agent has to skip past.
+		return humanFeedbackHeader + human
 	default:
 		return agent
 	}

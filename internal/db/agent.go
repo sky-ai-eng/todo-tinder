@@ -50,7 +50,7 @@ func GetAgentRun(database *sql.DB, runID string) (*domain.AgentRun, error) {
 		SELECT r.id, r.task_id, r.status, r.model, r.started_at, r.completed_at,
 		       r.total_cost_usd, r.duration_ms, r.num_turns, r.stop_reason, r.worktree_path,
 		       r.result_summary, r.session_id,
-		       (NULLIF(TRIM(rm.agent_content), '') IS NULL) AS memory_missing
+		       (NULLIF(TRIM(rm.agent_content, ' ' || char(9) || char(10) || char(13)), '') IS NULL) AS memory_missing
 		FROM runs r
 		LEFT JOIN run_memory rm ON rm.run_id = r.id
 		WHERE r.id = ?
@@ -96,13 +96,17 @@ func GetAgentRun(database *sql.DB, runID string) (*domain.AgentRun, error) {
 }
 
 // AgentRunsForTask returns all runs for a given task. See GetAgentRun
-// for the MemoryMissing derivation.
+// for the MemoryMissing derivation. NULLIF(TRIM(...), ”) guards
+// against any row whose agent_content was written as the empty string
+// (legacy data carried over from before SKY-204, or a future writer
+// that bypasses UpsertAgentMemory) — both NULL and "" mean "agent
+// didn't comply with the gate."
 func AgentRunsForTask(database *sql.DB, taskID string) ([]domain.AgentRun, error) {
 	rows, err := database.Query(`
 		SELECT r.id, r.task_id, r.status, r.model, r.started_at, r.completed_at,
 		       r.total_cost_usd, r.duration_ms, r.num_turns, r.stop_reason, r.worktree_path,
 		       r.result_summary, r.session_id,
-		       (rm.agent_content IS NULL) AS memory_missing
+		       (NULLIF(TRIM(rm.agent_content, ' ' || char(9) || char(10) || char(13)), '') IS NULL) AS memory_missing
 		FROM runs r
 		LEFT JOIN run_memory rm ON rm.run_id = r.id
 		WHERE r.task_id = ?

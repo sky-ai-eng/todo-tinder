@@ -193,6 +193,23 @@ func TestMigrate_SKY204_DataCarryOver(t *testing.T) {
 		VALUES ('r1', 't1', 'p1', 'completed', 0);
 		INSERT INTO run_memory (id, run_id, entity_id, content)
 		VALUES ('m1', 'r1', 'e1', 'agent wrote this');
+		-- Legacy noncompliance row: pre-migration the column was NOT
+		-- NULL but the empty string was a valid value, so a few real
+		-- runs landed with content = ''. The migration must collapse
+		-- those onto NULL so the new contract (NULL === didn't
+		-- comply) actually catches them.
+		INSERT INTO runs (id, task_id, prompt_id, status, memory_missing)
+		VALUES ('r_empty', 't1', 'p1', 'completed', 1);
+		INSERT INTO run_memory (id, run_id, entity_id, content)
+		VALUES ('m_empty', 'r_empty', 'e1', '');
+		-- Whitespace-only is the same noncompliance state (an agent
+		-- that wrote a blank line is not actually conveying anything
+		-- to the next run). char(9)=tab, char(10)=newline, char(13)=CR
+		-- — the migration's TRIM expression must catch all four.
+		INSERT INTO runs (id, task_id, prompt_id, status, memory_missing)
+		VALUES ('r_ws', 't1', 'p1', 'completed', 1);
+		INSERT INTO run_memory (id, run_id, entity_id, content)
+		VALUES ('m_ws', 'r_ws', 'e1', '  ' || char(9) || char(10) || '  ');
 		INSERT INTO pending_reviews (id, pr_number, owner, repo, commit_sha, run_id, review_body, review_event)
 		VALUES ('pr1', 42, 'owner', 'repo', 'sha1', 'r1', 'pre-migration body', 'COMMENT');
 		INSERT INTO pending_review_comments (id, review_id, path, line, body)
@@ -205,7 +222,7 @@ func TestMigrate_SKY204_DataCarryOver(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	// run_memory: content carried into agent_content; human_content NULL.
+	// Real-content row: carried into agent_content unchanged.
 	var agentContent string
 	var humanContent sql.NullString
 	if err := database.QueryRow(
@@ -218,6 +235,22 @@ func TestMigrate_SKY204_DataCarryOver(t *testing.T) {
 	}
 	if humanContent.Valid {
 		t.Errorf("human_content = %q, want NULL", humanContent.String)
+	}
+
+	// Empty + whitespace-only legacy rows: must land as NULL post-
+	// migration so the noncompliance contract is uniform across
+	// fresh writes (UpsertAgentMemory already normalizes) and
+	// historical data.
+	for _, id := range []string{"m_empty", "m_ws"} {
+		var agent sql.NullString
+		if err := database.QueryRow(
+			`SELECT agent_content FROM run_memory WHERE id = ?`, id,
+		).Scan(&agent); err != nil {
+			t.Fatalf("scan run_memory[%s]: %v", id, err)
+		}
+		if agent.Valid {
+			t.Errorf("agent_content[%s] = %q, want NULL (legacy empty/whitespace must canonicalize)", id, agent.String)
+		}
 	}
 
 	// pending_reviews + pending_review_comments: original_* NULL on

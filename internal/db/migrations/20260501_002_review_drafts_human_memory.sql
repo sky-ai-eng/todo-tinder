@@ -49,8 +49,35 @@ CREATE TABLE run_memory_new (
     UNIQUE(run_id)
 );
 
+-- Canonicalize empty/whitespace-only `content` rows as NULL during
+-- the carry-over. The old NOT NULL TEXT column tolerated empty
+-- strings — a few legacy rows likely have them, including rows that
+-- are just spaces, tabs, or newlines. Post-migration, the contract
+-- everywhere (factory's memory_missing derivation, agent.go SELECT,
+-- materializeMemory) is "agent_content NULL OR all-whitespace ===
+-- agent didn't comply with the gate." Storing legacy whitespace
+-- as-is would leave those runs reading as "memory present" against
+-- that contract; collapsing them to NULL here keeps the canonical
+-- form NULL.
+--
+-- The TRIM call passes an explicit char set because SQLite's default
+-- TRIM only strips ASCII space (0x20), not tabs/newlines/CR. The Go
+-- side (UpsertAgentMemory) uses strings.TrimSpace which covers all
+-- Unicode whitespace; the four-char ASCII set here is a deliberately
+-- conservative match: every byte the agent could plausibly emit as
+-- "blank" memory while staying within ASCII. If a future agent
+-- writes only Unicode whitespace, the read-side NULLIF(TRIM(...))
+-- guards still catch it via the same logic.
 INSERT INTO run_memory_new (id, run_id, entity_id, agent_content, human_content, created_at)
-    SELECT id, run_id, entity_id, content, NULL, created_at FROM run_memory;
+    SELECT id, run_id, entity_id,
+           CASE
+             WHEN TRIM(content, ' ' || char(9) || char(10) || char(13)) = ''
+               THEN NULL
+             ELSE content
+           END,
+           NULL,
+           created_at
+    FROM run_memory;
 
 DROP TABLE run_memory;
 ALTER TABLE run_memory_new RENAME TO run_memory;

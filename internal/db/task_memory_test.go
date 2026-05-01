@@ -75,28 +75,42 @@ func TestUpsertAgentMemory_RealContent(t *testing.T) {
 }
 
 // TestUpsertAgentMemory_EmptySignalsNonCompliance is the regression
-// for the row-presence-as-signal contract: an empty content string
-// (the signal that the agent didn't pass through the gate) lands as
-// SQL NULL, not as a literal empty string. Downstream consumers
-// (factory's memory_missing derivation) rely on `agent_content IS
-// NULL` — encoding empty as "" would make every "didn't comply" run
-// look like it had memory.
+// for the row-presence-as-signal contract: empty and whitespace-only
+// content (the signals that the agent didn't pass through the gate)
+// both land as SQL NULL, not as a literal empty/whitespace string.
+// Downstream consumers (factory's memory_missing derivation) rely on
+// the canonical NULL form for "didn't comply" — encoding "" or "  "
+// as the actual string would leave them looking like they had real
+// memory unless every read site applied a TRIM. Canonicalizing at
+// the write side keeps the read side simple.
 func TestUpsertAgentMemory_EmptySignalsNonCompliance(t *testing.T) {
-	db := newTestDB(t)
-	seedRunForMemoryTest(t, db, "r2", "e2")
-
-	if err := UpsertAgentMemory(db, "r2", "e2", ""); err != nil {
-		t.Fatalf("UpsertAgentMemory: %v", err)
+	cases := []struct {
+		name    string
+		runID   string
+		content string
+	}{
+		{"empty", "r2_empty", ""},
+		{"whitespace_only", "r2_ws", "   \n\t  "},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+			seedRunForMemoryTest(t, db, tc.runID, "e2_"+tc.name)
 
-	var agent sql.NullString
-	if err := db.QueryRow(
-		`SELECT agent_content FROM run_memory WHERE run_id = ?`, "r2",
-	).Scan(&agent); err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	if agent.Valid {
-		t.Errorf("agent_content = %q, want NULL (empty input must serialize as NULL)", agent.String)
+			if err := UpsertAgentMemory(db, tc.runID, "e2_"+tc.name, tc.content); err != nil {
+				t.Fatalf("UpsertAgentMemory: %v", err)
+			}
+
+			var agent sql.NullString
+			if err := db.QueryRow(
+				`SELECT agent_content FROM run_memory WHERE run_id = ?`, tc.runID,
+			).Scan(&agent); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if agent.Valid {
+				t.Errorf("agent_content = %q, want NULL (empty/whitespace must canonicalize to NULL)", agent.String)
+			}
+		})
 	}
 }
 

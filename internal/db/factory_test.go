@@ -12,18 +12,23 @@ import (
 // TestListFactoryActiveRuns_MemoryMissingDerivedFromJoin pins the
 // SKY-204 contract that the factory's in-flight overlay reads
 // `memory_missing` as a derivation over run_memory rather than off
-// the (now-removed) runs.memory_missing column. Three cases:
+// the (now-removed) runs.memory_missing column. Four cases, all
+// must end up with the same noncompliance signal where applicable
+// despite differing on-disk shape:
 //
-//  1. Run with no run_memory row → memory_missing=true (the agent
-//     hasn't passed through the gate yet).
-//  2. Run with row but agent_content NULL → memory_missing=true (the
-//     agent terminated but didn't comply with the gate).
-//  3. Run with row + non-empty agent_content → memory_missing=false.
+//  1. No run_memory row at all → memory_missing=true (gate not
+//     reached yet).
+//  2. Row exists, agent_content NULL → memory_missing=true (the
+//     terminate-then-no-write path UpsertAgentMemory writes for
+//     gate-failed runs).
+//  3. Row exists, agent_content = "" → memory_missing=true (legacy
+//     carry-over from before SKY-204 normalized empty to NULL, or a
+//     direct INSERT that bypassed UpsertAgentMemory).
+//  4. Row exists, agent_content = real text → memory_missing=false.
 //
-// Without this regression, a future writer that bypasses
-// UpsertAgentMemory and INSERTs into run_memory directly with empty
-// content could silently drift the overlay back to the old broken
-// state.
+// The (3) row is what motivated the NULLIF(TRIM(...), ”) derivation
+// in the SELECT; without that guard the overlay would silently
+// regress to "memory present" for any legacy-empty row.
 func TestListFactoryActiveRuns_MemoryMissingDerivedFromJoin(t *testing.T) {
 	database := newTestDB(t)
 	entity := makeEntity(t, database, 200)
@@ -39,8 +44,7 @@ func TestListFactoryActiveRuns_MemoryMissingDerivedFromJoin(t *testing.T) {
 	`, entity.ID, domain.EventGitHubPROpened, eventID); err != nil {
 		t.Fatalf("seed task: %v", err)
 	}
-	// Three runs, all in an active status so they appear in the overlay.
-	for _, runID := range []string{"run_no_row", "run_null_agent", "run_with_content"} {
+	for _, runID := range []string{"run_no_row", "run_null_agent", "run_empty_agent", "run_with_content"} {
 		if _, err := database.Exec(`
 			INSERT INTO runs (id, task_id, prompt_id, status, trigger_type)
 			VALUES (?, 't_factory', 'p_factory', 'running', 'manual')
@@ -48,11 +52,18 @@ func TestListFactoryActiveRuns_MemoryMissingDerivedFromJoin(t *testing.T) {
 			t.Fatalf("seed run %s: %v", runID, err)
 		}
 	}
-	// run_null_agent: row exists, agent_content NULL.
 	if err := UpsertAgentMemory(database, "run_null_agent", entity.ID, ""); err != nil {
 		t.Fatalf("upsert null memory: %v", err)
 	}
-	// run_with_content: row exists with agent_content populated.
+	// Direct INSERT (bypassing UpsertAgentMemory) so the row carries
+	// agent_content = "" rather than NULL — simulates a legacy row or
+	// a future writer that doesn't go through the helper.
+	if _, err := database.Exec(`
+		INSERT INTO run_memory (id, run_id, entity_id, agent_content)
+		VALUES ('m_empty', 'run_empty_agent', ?, '')
+	`, entity.ID); err != nil {
+		t.Fatalf("seed empty agent_content: %v", err)
+	}
 	if err := UpsertAgentMemory(database, "run_with_content", entity.ID, "agent reasoning"); err != nil {
 		t.Fatalf("upsert real memory: %v", err)
 	}
@@ -68,6 +79,7 @@ func TestListFactoryActiveRuns_MemoryMissingDerivedFromJoin(t *testing.T) {
 	want := map[string]bool{
 		"run_no_row":       true,
 		"run_null_agent":   true,
+		"run_empty_agent":  true,
 		"run_with_content": false,
 	}
 	for id, expected := range want {
