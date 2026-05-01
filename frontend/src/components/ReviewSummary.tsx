@@ -222,11 +222,18 @@ export default function ReviewSummary({
         </span>
 
         <div className="flex items-center gap-2">
+          {/* Close vs Discard: this button only dismisses the review
+              popup (onDiscard → onClose, no destructive backend
+              effect). The genuinely destructive "throw the prepared
+              review away and re-queue the task" action lives on the
+              AgentCard's footer as "Return to queue" (SKY-207). The
+              earlier "Discard" label here misled users into thinking
+              this button did that. */}
           <button
             onClick={onDiscard}
-            className="text-[11px] font-medium text-text-tertiary hover:text-dismiss px-3 py-1.5 rounded-lg transition-colors"
+            className="text-[11px] font-medium text-text-tertiary hover:text-text-primary px-3 py-1.5 rounded-lg transition-colors"
           >
-            Discard
+            Close
           </button>
           <button
             onClick={onSubmit}

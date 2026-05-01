@@ -124,7 +124,16 @@ export default function Board() {
             }
             return updated
           })
-          if (['completed', 'failed', 'pending_approval'].includes(event.data.status)) {
+          // 'cancelled' triggers a task refetch so the
+          // pending_approval-cleanup broadcast (SKY-206) collapses
+          // the AgentCard and swaps in the queued SortableTaskCard
+          // even when the cleanup originated outside this tab —
+          // another browser session, a swipe-dismiss path, etc.
+          // The handleRequeue handler already calls fetchTasks()
+          // after its own POST, so this is the cross-source case.
+          if (
+            ['completed', 'failed', 'cancelled', 'pending_approval'].includes(event.data.status)
+          ) {
             fetchTasks()
           }
         }

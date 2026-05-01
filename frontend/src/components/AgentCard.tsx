@@ -216,7 +216,7 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
         </div>
 
         <div className="flex items-center gap-3">
-          {(isFailed || isCancelled) && onRequeue && (
+          {(isFailed || isCancelled || isPendingApproval) && onRequeue && (
             <button
               onClick={onRequeue}
               className="text-[12px] text-text-tertiary hover:text-text-primary font-medium transition-colors"
