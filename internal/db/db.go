@@ -132,6 +132,12 @@ CREATE TABLE IF NOT EXISTS entities (
 
 CREATE INDEX IF NOT EXISTS idx_entities_state ON entities(state);
 CREATE INDEX IF NOT EXISTS idx_entities_source_polled ON entities(source, last_polled_at);
+-- Partial index on closed_at: skips the active rows (NULL closed_at) so
+-- the index footprint stays proportional to closed-entity volume rather
+-- than the full table. Drives the factory snapshot's grace-window
+-- query (closed_at > ?).
+CREATE INDEX IF NOT EXISTS idx_entities_closed_at ON entities(closed_at)
+    WHERE closed_at IS NOT NULL;
 
 -- === Entity links =========================================================
 -- Cross-source or within-source relationships. Directional; memory and

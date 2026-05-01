@@ -384,39 +384,79 @@ func parseDBDatetime(s string) (time.Time, error) {
 // animation duration without being load-bearing.
 const FactoryClosedGracePeriod = 60 * time.Second
 
-// ListFactoryEntities returns up to `limit` entities with their
-// most-recent-event context: every active entity, plus any entity
-// closed within FactoryClosedGracePeriod so the chip can finish
-// animating to Merged/Closed before disappearing. Ordered by
-// entities.created_at DESC — a stable key that doesn't move as pollers
-// run, so the displayed set doesn't churn when GitHub and Jira pollers
-// alternate (which bumps last_polled_at on whichever side just
-// finished and would shove the other source out of the capped window).
+// FactoryClosedGraceLimit caps how many recently-closed entities ride
+// alongside the active set in a snapshot. Bounded separately from
+// `factoryEntityLimit` so a burst of closures can't crowd active
+// entities out of the displayed set — the active limit keeps its
+// original meaning regardless of close pressure. 64 is generous: even
+// a worst-case mass-merge of half a sprint's PRs in one poll cycle
+// fits within it without overflow.
+const FactoryClosedGraceLimit = 64
+
+const factoryEntitySelectColumns = `
+	e.id, e.source, e.source_id, e.kind,
+	COALESCE(e.title, ''), COALESCE(e.url, ''),
+	COALESCE(e.snapshot_json, ''), COALESCE(e.description, ''),
+	e.state, e.created_at, e.last_polled_at, e.closed_at,
+	(SELECT event_type FROM events WHERE entity_id = e.id ORDER BY created_at DESC LIMIT 1),
+	-- Direct column read (not COALESCE) so the SQLite driver keeps
+	-- the DATETIME column-type hint and scans into sql.NullTime.
+	-- The per-event source timestamps come via ListRecentEventsByEntity,
+	-- which does the COALESCE + string-parse dance.
+	(SELECT created_at FROM events WHERE entity_id = e.id ORDER BY created_at DESC LIMIT 1)
+`
+
+// ListFactoryEntities returns the active set of entities (up to `limit`)
+// plus any entity closed within FactoryClosedGracePeriod (up to
+// FactoryClosedGraceLimit) so the chip can finish animating to its
+// terminal station before disappearing.
 //
-// The latest-event subqueries use idx_events_entity_created, and the
-// source-time lookup additionally pulls occurred_at via COALESCE so the
-// factory chain animation orders by actual event time rather than
-// insertion time when the poller captured it.
+// Implemented as two separate queries instead of a single OR'd WHERE:
+//
+//   - The OR (`state='active' OR closed_at > ?`) spans two columns and
+//     prevents SQLite from choosing a single-index plan, forcing a
+//     filtered table scan on big entity tables.
+//   - A combined LIMIT also lets a burst of closures crowd the active
+//     set out of the snapshot, silently shrinking the meaning of
+//     `limit` — the active half should always get its full budget.
+//
+// Active side uses idx_entities_state and falls back to a small in-
+// memory sort by created_at; closed side uses idx_entities_closed_at
+// (partial, defined in db.go) and is bounded by both the time window
+// and the small grace limit, so the lookup is near-free even on
+// large entity tables.
 func ListFactoryEntities(database *sql.DB, limit int) ([]FactoryEntityRow, error) {
-	graceCutoff := time.Now().Add(-FactoryClosedGracePeriod)
-	rows, err := database.Query(`
-		SELECT
-			e.id, e.source, e.source_id, e.kind,
-			COALESCE(e.title, ''), COALESCE(e.url, ''),
-			COALESCE(e.snapshot_json, ''), COALESCE(e.description, ''),
-			e.state, e.created_at, e.last_polled_at, e.closed_at,
-			(SELECT event_type FROM events WHERE entity_id = e.id ORDER BY created_at DESC LIMIT 1),
-			-- Direct column read (not COALESCE) so the SQLite driver keeps
-			-- the DATETIME column-type hint and scans into sql.NullTime.
-			-- The per-event source timestamps come via ListRecentEventsByEntity,
-			-- which does the COALESCE + string-parse dance.
-			(SELECT created_at FROM events WHERE entity_id = e.id ORDER BY created_at DESC LIMIT 1)
+	active, err := queryFactoryEntities(database, `
+		SELECT `+factoryEntitySelectColumns+`
 		FROM entities e
 		WHERE e.state = 'active'
-		   OR (e.closed_at IS NOT NULL AND e.closed_at > ?)
 		ORDER BY e.created_at DESC
 		LIMIT ?
-	`, graceCutoff, limit)
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	graceCutoff := time.Now().Add(-FactoryClosedGracePeriod)
+	closed, err := queryFactoryEntities(database, `
+		SELECT `+factoryEntitySelectColumns+`
+		FROM entities e
+		WHERE e.closed_at IS NOT NULL AND e.closed_at > ?
+		ORDER BY e.closed_at DESC
+		LIMIT ?
+	`, graceCutoff, FactoryClosedGraceLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(closed) == 0 {
+		return active, nil
+	}
+	return append(active, closed...), nil
+}
+
+func queryFactoryEntities(database *sql.DB, query string, args ...any) ([]FactoryEntityRow, error) {
+	rows, err := database.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
