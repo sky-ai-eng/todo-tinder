@@ -2528,9 +2528,9 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
         row.handle.setRunCount(runCount)
         lastTrayState.set(eventType, { queuedCount, runCount })
       }
-      // Lifetime counter: setLifetimeCount is internally diff-gated and
-      // is a no-op on stations whose spec didn't request a counter, so
-      // we can call it unconditionally.
+      // Lifetime counter: the station-handle API exposes this for every
+      // station, so we update it unconditionally here with the latest
+      // snapshot value when present.
       row.handle.setLifetimeCount(fs?.items_lifetime ?? 0)
       row.data = {
         id: eventType,
