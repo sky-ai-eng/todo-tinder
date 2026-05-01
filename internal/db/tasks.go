@@ -203,8 +203,7 @@ type PendingTaskRef struct {
 // entity_id, event_type, dedup_key) for any entity in entityIDs. Used
 // by the factory snapshot to attach pending_tasks per entity in a
 // single round-trip — no entity JSON join, no json_extract for
-// open_subtask_count, no priority/scoring columns. Backed by the
-// (entity_id, status) index path.
+// open_subtask_count, no priority/scoring columns.
 //
 // Chunks on SQLite's variable limit (500) the same way
 // ListRecentEventsByEntity does.
