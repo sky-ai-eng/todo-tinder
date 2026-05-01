@@ -187,20 +187,33 @@ func FindActiveTasksByEntity(db *sql.DB, entityID string) ([]domain.Task, error)
 	`, entityID)
 }
 
-// ListActiveTasksForEntities returns non-terminal tasks (status NOT IN
-// 'done','dismissed') for any entity in entityIDs. One row per task;
-// callers group by (entity_id, event_type) as needed. Bounded by the
-// caller's entity set size — used by the factory snapshot to attach
-// pending_tasks per entity in a single round-trip instead of N.
+// PendingTaskRef is the minimal projection of a task used by snapshot
+// surfaces that only need to know "this entity has an active task at
+// this event_type, with this dedup_key" — no priority, no run linkage,
+// no entity-side metadata. Read-path equivalent of factoryEntityJSON's
+// pendingTaskRef on the wire.
+type PendingTaskRef struct {
+	ID        string
+	EntityID  string
+	EventType string
+	DedupKey  string
+}
+
+// ListActiveTaskRefsForEntities returns minimal active-task refs (id,
+// entity_id, event_type, dedup_key) for any entity in entityIDs. Used
+// by the factory snapshot to attach pending_tasks per entity in a
+// single round-trip — no entity JSON join, no json_extract for
+// open_subtask_count, no priority/scoring columns. Backed by the
+// (entity_id, status) index path.
 //
 // Chunks on SQLite's variable limit (500) the same way
 // ListRecentEventsByEntity does.
-func ListActiveTasksForEntities(database *sql.DB, entityIDs []string) ([]domain.Task, error) {
+func ListActiveTaskRefsForEntities(database *sql.DB, entityIDs []string) ([]PendingTaskRef, error) {
 	if len(entityIDs) == 0 {
 		return nil, nil
 	}
 	const chunkSize = 500
-	out := make([]domain.Task, 0, len(entityIDs))
+	out := make([]PendingTaskRef, 0, len(entityIDs))
 	for start := 0; start < len(entityIDs); start += chunkSize {
 		end := start + chunkSize
 		if end > len(entityIDs) {
@@ -213,18 +226,28 @@ func ListActiveTasksForEntities(database *sql.DB, entityIDs []string) ([]domain.
 			placeholders[i] = "?"
 			args = append(args, id)
 		}
-		tasks, err := queryTasks(database, `
-			SELECT `+taskColumnsWithEntity+`
-			FROM tasks t
-			JOIN entities e ON t.entity_id = e.id
-			WHERE t.entity_id IN (`+strings.Join(placeholders, ",")+`)
-			  AND t.status NOT IN ('done', 'dismissed')
-			ORDER BY t.entity_id, t.event_type, t.created_at DESC, t.id DESC
+		rows, err := database.Query(`
+			SELECT id, entity_id, event_type, dedup_key
+			FROM tasks
+			WHERE entity_id IN (`+strings.Join(placeholders, ",")+`)
+			  AND status NOT IN ('done', 'dismissed')
 		`, args...)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, tasks...)
+		for rows.Next() {
+			var ref PendingTaskRef
+			if err := rows.Scan(&ref.ID, &ref.EntityID, &ref.EventType, &ref.DedupKey); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, ref)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
 	return out, nil
 }

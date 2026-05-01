@@ -386,11 +386,11 @@ func TestLatestEventForEntityAndType_NoMatchReturnsNil(t *testing.T) {
 	}
 }
 
-// TestListActiveTasksForEntities_FiltersTerminalStatuses pins the
+// TestListActiveTaskRefsForEntities_FiltersTerminalStatuses pins the
 // snapshot's pending_tasks contract: only non-terminal tasks ride
 // (otherwise the drawer would offer to delegate already-resolved
 // tasks). Active = NOT IN ('done', 'dismissed').
-func TestListActiveTasksForEntities_FiltersTerminalStatuses(t *testing.T) {
+func TestListActiveTaskRefsForEntities_FiltersTerminalStatuses(t *testing.T) {
 	database := newTestDB(t)
 	a := makeEntity(t, database, 1)
 	b := makeEntity(t, database, 2)
@@ -414,9 +414,9 @@ func TestListActiveTasksForEntities_FiltersTerminalStatuses(t *testing.T) {
 		t.Fatalf("close task: %v", err)
 	}
 
-	tasks, err := ListActiveTasksForEntities(database, []string{a.ID, b.ID})
+	tasks, err := ListActiveTaskRefsForEntities(database, []string{a.ID, b.ID})
 	if err != nil {
-		t.Fatalf("ListActiveTasksForEntities: %v", err)
+		t.Fatalf("ListActiveTaskRefsForEntities: %v", err)
 	}
 	if len(tasks) != 1 {
 		t.Fatalf("len(tasks) = %d, want 1 (only active)", len(tasks))
@@ -426,14 +426,14 @@ func TestListActiveTasksForEntities_FiltersTerminalStatuses(t *testing.T) {
 	}
 }
 
-// TestListActiveTasksForEntities_EmptyInput — defensive: empty slice
+// TestListActiveTaskRefsForEntities_EmptyInput — defensive: empty slice
 // returns no rows without hitting the DB. The factory snapshot's
 // entity list can legitimately be empty (fresh install, no
 // integrations configured), and a "WHERE id IN ()" query is invalid
 // in SQLite.
-func TestListActiveTasksForEntities_EmptyInput(t *testing.T) {
+func TestListActiveTaskRefsForEntities_EmptyInput(t *testing.T) {
 	database := newTestDB(t)
-	tasks, err := ListActiveTasksForEntities(database, nil)
+	tasks, err := ListActiveTaskRefsForEntities(database, nil)
 	if err != nil {
 		t.Fatalf("nil entityIDs: %v", err)
 	}

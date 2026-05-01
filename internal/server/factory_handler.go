@@ -290,9 +290,12 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pending tasks per entity, grouped by event_type. Drives the
-	// drawer's drag-to-delegate flow: the frontend posts task_id +
-	// dedup_key to /api/factory/delegate, or empty for find-or-create.
-	pendingTasks, err := db.ListActiveTasksForEntities(s.db, entityIDs)
+	// drawer's drag-to-delegate flow. Uses the minimal
+	// ListActiveTaskRefsForEntities projection (id + entity_id +
+	// event_type + dedup_key) rather than the full Task struct so
+	// /api/factory/snapshot doesn't pay for the entity JOIN and the
+	// snapshot_json json_extract on every poll.
+	pendingTasks, err := db.ListActiveTaskRefsForEntities(s.db, entityIDs)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
