@@ -434,15 +434,12 @@ func (s *Server) cleanupPendingApprovalRun(taskID string, outcome discardOutcome
 // again, but not like that," dismissed says "this entity wasn't
 // worth pursuing."
 func buildDiscardHumanContent(outcome discardOutcome) string {
-	const header = "## Human feedback (post-run)\n\n"
 	switch outcome {
 	case discardOutcomeDismissed:
-		return header +
-			"**Outcome:** Human discarded the prepared review and dismissed the task entirely.\n" +
+		return "**Outcome:** Human discarded the prepared review and dismissed the task entirely.\n" +
 			"**Implication:** The verdict you proposed was not accepted, and the human chose to walk away from this entity rather than re-queue it. Future runs on similar entities should reconsider whether the situation warrants action at all."
 	default: // discardOutcomeRequeued
-		return header +
-			"**Outcome:** Human discarded the prepared review without submitting it; task returned to the triage queue.\n" +
+		return "**Outcome:** Human discarded the prepared review without submitting it; task returned to the triage queue.\n" +
 			"**Implication:** The verdict you proposed was not accepted. Reconsider whether this entity warrants any review at all, or whether a different framing is needed."
 	}
 }
