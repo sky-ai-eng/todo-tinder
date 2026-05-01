@@ -231,6 +231,7 @@ func ListActiveTaskRefsForEntities(database *sql.DB, entityIDs []string) ([]Pend
 			FROM tasks
 			WHERE entity_id IN (`+strings.Join(placeholders, ",")+`)
 			  AND status NOT IN ('done', 'dismissed')
+			ORDER BY entity_id, event_type, created_at DESC, rowid DESC
 		`, args...)
 		if err != nil {
 			return nil, err
