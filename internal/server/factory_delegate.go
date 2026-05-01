@@ -92,6 +92,20 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Flip task.status to 'delegated' and emit a swipe_events audit
+	// row, matching the swipe-to-delegate path on Board. Without this
+	// the task stays 'queued' even with an active run, which leaks a
+	// stale row into the queue surfaces (Board, factory drawer's own
+	// queue tray) until the run terminates.
+	//
+	// hesitation_ms = 0 because the drop itself is the action — the
+	// drag-to-delegate UX has no analogue to the Board's
+	// "time-to-commit" metric.
+	if _, err := db.RecordSwipe(s.db, task.ID, "delegate", 0); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
 	runID, err := s.spawner.Delegate(*task, req.PromptID, "manual", "")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
