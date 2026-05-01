@@ -16,13 +16,41 @@ func CreatePendingReview(database *sql.DB, r domain.PendingReview) error {
 }
 
 func GetPendingReview(database *sql.DB, reviewID string) (*domain.PendingReview, error) {
-	row := database.QueryRow(`SELECT id, pr_number, owner, repo, commit_sha, COALESCE(diff_lines, ''), COALESCE(run_id, ''), COALESCE(review_body, ''), COALESCE(review_event, '') FROM pending_reviews WHERE id = ?`, reviewID)
+	// original_review_body / original_review_event are deliberately
+	// NOT COALESCEd: SKY-205's diff formatter distinguishes "no
+	// snapshot exists" (NULL — legacy row predating the columns)
+	// from "snapshot of a legitimately empty value." Folding them
+	// together via COALESCE(..., '') would make a human-added body
+	// against an originally-empty draft look like legacy and
+	// silently suppress the diff section.
+	row := database.QueryRow(`
+		SELECT id, pr_number, owner, repo, commit_sha,
+		       COALESCE(diff_lines, ''), COALESCE(run_id, ''),
+		       COALESCE(review_body, ''), COALESCE(review_event, ''),
+		       original_review_body, original_review_event
+		FROM pending_reviews WHERE id = ?`, reviewID)
 	var r domain.PendingReview
-	err := row.Scan(&r.ID, &r.PRNumber, &r.Owner, &r.Repo, &r.CommitSHA, &r.DiffLines, &r.RunID, &r.ReviewBody, &r.ReviewEvent)
+	var origBody, origEvent sql.NullString
+	err := row.Scan(
+		&r.ID, &r.PRNumber, &r.Owner, &r.Repo, &r.CommitSHA,
+		&r.DiffLines, &r.RunID, &r.ReviewBody, &r.ReviewEvent,
+		&origBody, &origEvent,
+	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return &r, err
+	if err != nil {
+		return nil, err
+	}
+	if origBody.Valid {
+		s := origBody.String
+		r.OriginalReviewBody = &s
+	}
+	if origEvent.Valid {
+		s := origEvent.String
+		r.OriginalReviewEvent = &s
+	}
+	return &r, nil
 }
 
 // AddPendingReviewComment inserts a pending review comment, snapshotting
@@ -64,8 +92,14 @@ func DeletePendingReviewComment(database *sql.DB, commentID string) error {
 }
 
 func ListPendingReviewComments(database *sql.DB, reviewID string) ([]domain.PendingReviewComment, error) {
+	// original_body NOT COALESCEd — see GetPendingReview's note.
+	// nil OriginalBody === "legacy row, no snapshot," distinct from
+	// a non-nil pointer to "" which means "agent drafted an empty
+	// comment body" (rare, but the formatter must classify edits
+	// against the real value rather than dismissing the row).
 	rows, err := database.Query(
-		`SELECT id, review_id, path, line, start_line, body FROM pending_review_comments WHERE review_id = ? ORDER BY rowid`,
+		`SELECT id, review_id, path, line, start_line, body, original_body
+		 FROM pending_review_comments WHERE review_id = ? ORDER BY rowid`,
 		reviewID,
 	)
 	if err != nil {
@@ -77,12 +111,17 @@ func ListPendingReviewComments(database *sql.DB, reviewID string) ([]domain.Pend
 	for rows.Next() {
 		var c domain.PendingReviewComment
 		var startLine sql.NullInt64
-		if err := rows.Scan(&c.ID, &c.ReviewID, &c.Path, &c.Line, &startLine, &c.Body); err != nil {
+		var origBody sql.NullString
+		if err := rows.Scan(&c.ID, &c.ReviewID, &c.Path, &c.Line, &startLine, &c.Body, &origBody); err != nil {
 			return nil, err
 		}
 		if startLine.Valid {
 			v := int(startLine.Int64)
 			c.StartLine = &v
+		}
+		if origBody.Valid {
+			s := origBody.String
+			c.OriginalBody = &s
 		}
 		comments = append(comments, c)
 	}
@@ -107,19 +146,22 @@ func DeletePendingReview(database *sql.DB, reviewID string) error {
 
 // SetPendingReviewSubmission stores the deferred review body and event,
 // marking the review as ready for user approval rather than immediate
-// GitHub submission. The `original_review_body` column is populated
-// once via COALESCE: the first call captures the agent's drafted body,
-// later calls (which may carry user-edited bodies) leave the snapshot
-// untouched. Encoding the write-once contract in SQL — rather than a
-// SELECT-then-UPDATE in Go — keeps it race-free without a transaction.
+// GitHub submission. The `original_review_body` and
+// `original_review_event` columns are populated once via COALESCE: the
+// first call captures the agent's drafted body + event, later calls
+// (which may carry user-edited values from handleReviewUpdate) leave
+// the snapshots untouched. Encoding the write-once contract in SQL —
+// rather than a SELECT-then-UPDATE in Go — keeps it race-free without
+// a transaction.
 func SetPendingReviewSubmission(database *sql.DB, reviewID, body, event string) error {
 	_, err := database.Exec(
 		`UPDATE pending_reviews
 		 SET review_body = ?,
 		     review_event = ?,
-		     original_review_body = COALESCE(original_review_body, ?)
+		     original_review_body = COALESCE(original_review_body, ?),
+		     original_review_event = COALESCE(original_review_event, ?)
 		 WHERE id = ?`,
-		body, event, body, reviewID,
+		body, event, body, event, reviewID,
 	)
 	return err
 }

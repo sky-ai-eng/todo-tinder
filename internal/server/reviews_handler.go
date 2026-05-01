@@ -133,6 +133,20 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Persist the human's verdict to run_memory.human_content while
+	// the originals are still in scope (DeletePendingReview below
+	// removes them). SKY-205. Skipped for non-agent reviews
+	// (review.RunID empty — standalone CLI path) since there's no
+	// run_memory row to attach to. Logged-not-failed: the GitHub
+	// submit already succeeded, so a memory-write failure shouldn't
+	// surface as a 5xx and confuse the user about what landed.
+	if review.RunID != "" {
+		humanContent := FormatHumanFeedback(buildHumanFeedbackInput(review, comments, actualEvent))
+		if err := db.UpdateRunMemoryHumanContent(s.db, review.RunID, humanContent); err != nil {
+			log.Printf("[reviews] warning: failed to record human verdict for run %s: %v", review.RunID, err)
+		}
+	}
+
 	// Clean up local state
 	if err := db.DeletePendingReview(s.db, reviewID); err != nil {
 		log.Printf("[reviews] warning: failed to clean up review %s: %v", reviewID, err)

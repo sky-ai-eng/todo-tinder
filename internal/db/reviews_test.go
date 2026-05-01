@@ -80,26 +80,34 @@ func TestUpdatePendingReviewComment_PreservesOriginalBody(t *testing.T) {
 	}
 }
 
-// TestSetPendingReviewSubmission_WriteOnceOriginalBody pins the
-// COALESCE-encoded write-once contract for review bodies. First call
-// captures the agent draft; second call (typically a user-edited
-// resubmission) updates review_body but leaves original_review_body
-// pinned at the agent's original.
-func TestSetPendingReviewSubmission_WriteOnceOriginalBody(t *testing.T) {
+// TestSetPendingReviewSubmission_WriteOnceOriginals pins the
+// COALESCE-encoded write-once contract for both review body and
+// review event. First call captures the agent's drafted body +
+// event; second call (typically a user-edited resubmission via
+// handleReviewUpdate) updates review_body / review_event but
+// leaves both originals pinned at the agent's first draft.
+//
+// The original_review_event half is the SKY-205 addition — SKY-204
+// captured original_review_body but missed the parallel for the
+// verdict, leaving the human-feedback writer unable to detect
+// agent-drafted-APPROVE → human-submitted-REQUEST_CHANGES (the
+// highest-signal change the workstream is meant to preserve).
+func TestSetPendingReviewSubmission_WriteOnceOriginals(t *testing.T) {
 	db := newTestDB(t)
 	seedPendingReview(t, db, "rev3")
 
-	if err := SetPendingReviewSubmission(db, "rev3", "agent draft body", "COMMENT"); err != nil {
+	if err := SetPendingReviewSubmission(db, "rev3", "agent draft body", "APPROVE"); err != nil {
 		t.Fatalf("first SetPendingReviewSubmission: %v", err)
 	}
 	if err := SetPendingReviewSubmission(db, "rev3", "user edited body", "REQUEST_CHANGES"); err != nil {
 		t.Fatalf("second SetPendingReviewSubmission: %v", err)
 	}
 
-	var body, event, original sql.NullString
+	var body, event, origBody, origEvent sql.NullString
 	if err := db.QueryRow(
-		`SELECT review_body, review_event, original_review_body FROM pending_reviews WHERE id = ?`, "rev3",
-	).Scan(&body, &event, &original); err != nil {
+		`SELECT review_body, review_event, original_review_body, original_review_event
+		 FROM pending_reviews WHERE id = ?`, "rev3",
+	).Scan(&body, &event, &origBody, &origEvent); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	if body.String != "user edited body" {
@@ -108,7 +116,155 @@ func TestSetPendingReviewSubmission_WriteOnceOriginalBody(t *testing.T) {
 	if event.String != "REQUEST_CHANGES" {
 		t.Errorf("review_event = %q, want %q", event.String, "REQUEST_CHANGES")
 	}
-	if original.String != "agent draft body" {
-		t.Errorf("original_review_body = %q, want %q (must remain agent's first draft)", original.String, "agent draft body")
+	if origBody.String != "agent draft body" {
+		t.Errorf("original_review_body = %q, want %q (must remain agent's first draft)",
+			origBody.String, "agent draft body")
+	}
+	if origEvent.String != "APPROVE" {
+		t.Errorf("original_review_event = %q, want %q (must remain agent's first draft)",
+			origEvent.String, "APPROVE")
+	}
+}
+
+// TestGetPendingReview_ProjectsOriginals confirms the helper
+// surfaces the new write-once columns through the domain type so
+// the diff formatter has them to work with. Without this projection
+// SKY-205's writer would silently degrade to legacy mode (NULL
+// originals → no diff) on every submit.
+func TestGetPendingReview_ProjectsOriginals(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_project")
+	if err := SetPendingReviewSubmission(db, "rev_project", "draft", "APPROVE"); err != nil {
+		t.Fatalf("SetPendingReviewSubmission: %v", err)
+	}
+
+	got, err := GetPendingReview(db, "rev_project")
+	if err != nil {
+		t.Fatalf("GetPendingReview: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetPendingReview returned nil")
+	}
+	if got.OriginalReviewBody == nil || *got.OriginalReviewBody != "draft" {
+		t.Errorf("OriginalReviewBody = %v, want pointer to %q", got.OriginalReviewBody, "draft")
+	}
+	if got.OriginalReviewEvent == nil || *got.OriginalReviewEvent != "APPROVE" {
+		t.Errorf("OriginalReviewEvent = %v, want pointer to %q", got.OriginalReviewEvent, "APPROVE")
+	}
+}
+
+// TestGetPendingReview_LegacyOriginalsAreNil is the regression for
+// the COALESCE-collapses-snapshot-semantics bug. A row with NULL
+// original_review_body / original_review_event (legacy, mid-flight
+// when the columns landed) must surface as a nil pointer — not as
+// the empty string, which would be indistinguishable from a real
+// snapshot of an empty drafted body.
+func TestGetPendingReview_LegacyOriginalsAreNil(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_legacy")
+	// Direct UPDATE bypasses SetPendingReviewSubmission so the
+	// originals stay NULL (simulating a row that existed before the
+	// COALESCE writers were added).
+	if _, err := db.Exec(
+		`UPDATE pending_reviews SET review_body = ?, review_event = ? WHERE id = ?`,
+		"final", "APPROVE", "rev_legacy",
+	); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+
+	got, err := GetPendingReview(db, "rev_legacy")
+	if err != nil {
+		t.Fatalf("GetPendingReview: %v", err)
+	}
+	if got.OriginalReviewBody != nil {
+		t.Errorf("OriginalReviewBody = %v, want nil (legacy NULL must not collapse to empty string)", *got.OriginalReviewBody)
+	}
+	if got.OriginalReviewEvent != nil {
+		t.Errorf("OriginalReviewEvent = %v, want nil", *got.OriginalReviewEvent)
+	}
+}
+
+// TestGetPendingReview_EmptyOriginalIsRealSnapshot is the inverse:
+// a legitimately-empty agent-drafted body (e.g. the agent posted
+// only inline comments, no top-level prose) must surface as a
+// non-nil pointer to "". Folding it onto NULL via COALESCE would
+// suppress the diff section when a human later adds body text.
+func TestGetPendingReview_EmptyOriginalIsRealSnapshot(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_empty_orig")
+	if err := SetPendingReviewSubmission(db, "rev_empty_orig", "", "COMMENT"); err != nil {
+		t.Fatalf("SetPendingReviewSubmission: %v", err)
+	}
+
+	got, err := GetPendingReview(db, "rev_empty_orig")
+	if err != nil {
+		t.Fatalf("GetPendingReview: %v", err)
+	}
+	if got.OriginalReviewBody == nil {
+		t.Errorf("OriginalReviewBody = nil, want non-nil pointer to \"\" (real snapshot of empty draft)")
+	} else if *got.OriginalReviewBody != "" {
+		t.Errorf("OriginalReviewBody = %q, want %q", *got.OriginalReviewBody, "")
+	}
+}
+
+// TestListPendingReviewComments_ProjectsOriginalBody mirrors the
+// review-side test for the comment list helper. Without this
+// projection the formatter sees Original = "" for every comment and
+// can't classify edits.
+func TestListPendingReviewComments_ProjectsOriginalBody(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_comments")
+	if err := AddPendingReviewComment(db, domain.PendingReviewComment{
+		ID: "c_proj", ReviewID: "rev_comments", Path: "x.go", Line: 1, Body: "agent draft",
+	}); err != nil {
+		t.Fatalf("AddPendingReviewComment: %v", err)
+	}
+	if err := UpdatePendingReviewComment(db, "c_proj", "user edit"); err != nil {
+		t.Fatalf("UpdatePendingReviewComment: %v", err)
+	}
+
+	got, err := ListPendingReviewComments(db, "rev_comments")
+	if err != nil {
+		t.Fatalf("ListPendingReviewComments: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	if got[0].Body != "user edit" {
+		t.Errorf("Body = %q, want %q", got[0].Body, "user edit")
+	}
+	if got[0].OriginalBody == nil || *got[0].OriginalBody != "agent draft" {
+		t.Errorf("OriginalBody = %v, want pointer to %q (helper must project original_body)",
+			got[0].OriginalBody, "agent draft")
+	}
+}
+
+// TestListPendingReviewComments_LegacyOriginalBodyIsNil mirrors the
+// review-side legacy regression. A pre-SKY-204 comment row whose
+// original_body column is NULL must surface as nil so the
+// formatter folds it onto unchanged rather than emitting a
+// fabricated Was: "" diff entry against the user's current body.
+func TestListPendingReviewComments_LegacyOriginalBodyIsNil(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_legacy_c")
+	// Bypass AddPendingReviewComment (which writes original_body)
+	// so the row matches the pre-SKY-204 shape: original_body NULL.
+	if _, err := db.Exec(
+		`INSERT INTO pending_review_comments (id, review_id, path, line, body)
+		 VALUES (?, ?, ?, ?, ?)`,
+		"c_legacy", "rev_legacy_c", "x.go", 1, "legacy comment",
+	); err != nil {
+		t.Fatalf("seed legacy comment: %v", err)
+	}
+
+	got, err := ListPendingReviewComments(db, "rev_legacy_c")
+	if err != nil {
+		t.Fatalf("ListPendingReviewComments: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	if got[0].OriginalBody != nil {
+		t.Errorf("OriginalBody = %v, want nil (legacy NULL must not collapse to empty string)", *got[0].OriginalBody)
 	}
 }
