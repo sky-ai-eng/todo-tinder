@@ -2,10 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
 )
 
@@ -169,6 +171,15 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// So if it fails, no orphan run rows are left either.
 	runID, err := s.spawner.Delegate(*task, req.PromptID, "manual", "")
 	if err != nil {
+		// Client-correctable prompt errors → 400. The picker should
+		// have prevented an empty prompt id, but a deletion race
+		// between snapshot fetch and drop can produce a not-found.
+		// Anything else (DB error creating the run row, etc.) stays
+		// 500 — server-side problem the client can't fix.
+		if errors.Is(err, delegate.ErrPromptNotFound) || errors.Is(err, delegate.ErrPromptUnspecified) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}

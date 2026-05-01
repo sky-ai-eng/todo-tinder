@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
 // The drag-to-delegate handler chains an existing helper trio:
@@ -137,6 +139,38 @@ func TestHandleFactoryDelegate_400OnMalformedJSON(t *testing.T) {
 	s.mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// TestHandleFactoryDelegate_400OnMissingPrompt is the regression for the
+// previous blanket-500 error mapping: a Delegate failure caused by a
+// race-deleted or invalid prompt id is client-correctable, so the
+// handler should classify it as 400 rather than 500. Wire a real
+// Spawner so the request reaches Delegate; pass a prompt_id that
+// doesn't resolve. errors.Is on the sentinel routes the response.
+func TestHandleFactoryDelegate_400OnMissingPrompt(t *testing.T) {
+	s := newTestServer(t)
+	s.SetSpawner(delegate.NewSpawner(s.db, nil, websocket.NewHub(), "haiku"))
+
+	entity, _, err := db.FindOrCreateEntity(s.db, "github", "owner/repo#400p", "pr", "", "")
+	if err != nil {
+		t.Fatalf("seed entity: %v", err)
+	}
+	eid := entity.ID
+	if _, err := db.RecordEvent(s.db, domain.Event{
+		EntityID:  &eid,
+		EventType: domain.EventGitHubPRCICheckPassed,
+	}); err != nil {
+		t.Fatalf("record event: %v", err)
+	}
+
+	rec := doJSON(t, s, http.MethodPost, "/api/factory/delegate", map[string]string{
+		"entity_id":  entity.ID,
+		"event_type": domain.EventGitHubPRCICheckPassed,
+		"prompt_id":  "no-such-prompt",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (prompt-not-found is client-correctable)", rec.Code)
 	}
 }
 
