@@ -157,24 +157,34 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Flip task.status to 'delegated' and emit a swipe_events audit
-	// row, matching the swipe-to-delegate path on Board. Without this
-	// the task stays 'queued' even with an active run, which leaks a
-	// stale row into the queue surfaces (Board, factory drawer's own
-	// queue tray) until the run terminates.
+	// Spawn the run BEFORE committing the status flip. Delegate's
+	// failure modes (prompt not found, DB error creating the run row)
+	// don't touch task.status — they return cleanly with no run
+	// created. Doing RecordSwipe first would leave a "delegated" task
+	// without a run when Delegate fails, which is exactly the
+	// partially-applied state the client treats as a hard error.
 	//
-	// hesitation_ms = 0 because the drop itself is the action — the
-	// drag-to-delegate UX has no analogue to the Board's
-	// "time-to-commit" metric.
-	if _, err := db.RecordSwipe(s.db, task.ID, "delegate", 0); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
+	// Order matters: Delegate's only DB write before it can fail is
+	// CreateAgentRun, which is idempotent at the row level (UUID PK).
+	// So if it fails, no orphan run rows are left either.
 	runID, err := s.spawner.Delegate(*task, req.PromptID, "manual", "")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+
+	// Run is real; commit the status flip + swipe_events audit row.
+	// If RecordSwipe fails here (extremely unlikely — single INSERT +
+	// UPDATE under normal conditions), log it and return success
+	// anyway: the run is already in flight, returning an error would
+	// make the client think the delegate failed when it didn't.
+	// The status flicker self-heals when the run completes — the
+	// spawner's run-completion path unconditionally sets task.status
+	// to 'done' (spawner.go:829), so a missed queued→delegated
+	// transition still resolves correctly at the end.
+	if _, err := db.RecordSwipe(s.db, task.ID, "delegate", 0); err != nil {
+		log.Printf("[factory] failed to record delegate swipe for task %s after run %s started: %v",
+			task.ID, runID, err)
 	}
 
 	writeJSON(w, http.StatusOK, factoryDelegateResponse{
