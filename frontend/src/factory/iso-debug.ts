@@ -1368,6 +1368,13 @@ export interface IsoSceneHandle {
    *  landed off-station. Drawers use the null signal to close.
    *  Returns an unsubscribe function. */
   onStationClick: (cb: (info: ClickedStationInfo | null) => void) => () => void
+  /** Subscribe to live data changes for a single station — the
+   *  drawer's content stream while it's open. The reconciler fires
+   *  the callback whenever queued entities or runs at the station
+   *  change (count or content); idle frames are deduplicated by a
+   *  per-station hash so consumers don't re-render on no-ops.
+   *  Returns an unsubscribe function. */
+  onStationDataChange: (stationId: string, cb: (info: ClickedStationInfo) => void) => () => void
   /** Hand the scene the latest /api/factory/snapshot payload. The
    *  scene's per-frame reconciler then projects every entity to
    *  either a station (driving tray counts) or a transit (driving
@@ -2471,6 +2478,19 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
   let latestSnapshot: FactorySnapshot | null = null
   const lastTrayState = new Map<string, { queuedCount: number; runCount: number }>()
 
+  // Live drawer feed. Per-station observer sets fire when the
+  // station's content (queued entities + active runs) actually
+  // changes, deduped by a content hash so idle frames don't churn
+  // React re-renders. Empty observer sets short-circuit the hash
+  // computation, so non-picked stations cost nothing per frame.
+  const stationObservers = new Map<string, Set<(info: ClickedStationInfo) => void>>()
+  const lastFiredHash = new Map<string, string>()
+  const hashStationData = (data: ClickedStationInfo): string => {
+    const queuedIds = data.queued.map((e) => e.id).join(',')
+    const runIds = data.runs.map((r) => `${r.run.ID}:${r.run.Status}`).join(',')
+    return `${data.queuedCount}|${data.runCount}|${queuedIds}|${runIds}`
+  }
+
   const reconcile = (): void => {
     if (!latestSnapshot) return
     const now = Date.now()
@@ -2521,6 +2541,18 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
         runCount,
         queued,
         runs,
+      }
+
+      // Fire live-drawer observers for this station only if anyone
+      // is actually subscribed AND the content hash differs from
+      // last fire. Most frames hit the empty-observers short-circuit.
+      const observers = stationObservers.get(eventType)
+      if (observers && observers.size > 0) {
+        const key = hashStationData(row.data)
+        if (lastFiredHash.get(eventType) !== key) {
+          lastFiredHash.set(eventType, key)
+          for (const cb of observers) cb(row.data)
+        }
       }
     }
 
@@ -2574,6 +2606,26 @@ export async function createIsoDebugScene(container: HTMLDivElement): Promise<Is
         const row = stationsByEvent.get(stationId)
         cb(row?.data ?? null)
       })
+    },
+    onStationDataChange: (stationId, cb) => {
+      let set = stationObservers.get(stationId)
+      if (!set) {
+        set = new Set()
+        stationObservers.set(stationId, set)
+      }
+      set.add(cb)
+      return () => {
+        const s = stationObservers.get(stationId)
+        if (!s) return
+        s.delete(cb)
+        if (s.size === 0) {
+          // Drop the dedup hash too so a future re-subscription gets
+          // the next change cleanly rather than comparing against a
+          // hash from an old session.
+          stationObservers.delete(stationId)
+          lastFiredHash.delete(stationId)
+        }
+      }
     },
     applySnapshot: (snapshot) => {
       latestSnapshot = snapshot

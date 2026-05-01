@@ -118,6 +118,22 @@ export default function Factory() {
     return () => window.removeEventListener('keydown', onKey)
   }, [picked])
 
+  // While the drawer is open for a station, mirror live changes from
+  // the scene reconciler — entities entering or leaving the queue,
+  // runs starting or completing. The scene fires only on real
+  // content changes (per-station hash dedup), so this won't churn
+  // re-renders on idle frames. Re-subscribes on station change;
+  // unsubscribes when the drawer closes.
+  const pickedId = picked?.id
+  useEffect(() => {
+    if (!pickedId) return
+    const scene = sceneRef.current
+    if (!scene) return
+    return scene.onStationDataChange(pickedId, (info) => {
+      setPicked(info)
+    })
+  }, [pickedId])
+
   return (
     <div className="relative -mx-8 -my-8 overflow-hidden">
       <div
