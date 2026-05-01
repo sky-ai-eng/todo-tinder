@@ -29,11 +29,17 @@ type factoryStationJSON struct {
 	ActiveRuns   int    `json:"active_runs"`
 	// ItemsLifetime is the from-catalog-start distinct-entity count for
 	// this event_type — "PRs that ever reached this station," not
-	// "events fired here." It is populated only for stations already
-	// present in the snapshot (seeded by 24h activity and/or active runs);
-	// lifetime history alone must not cause an otherwise omitted station
-	// to be emitted. Drives the always-on numeric readout on the station's
-	// front-face screen.
+	// "events fired here." Drives the always-on numeric readout on the
+	// station's front-face screen.
+	//
+	// The lifetime merge can introduce stations into the snapshot that
+	// have no 24h activity and no active runs (a Merged station weeks
+	// after the last release still has a lifetime count). That's
+	// intentional: those stations need to render their counter even
+	// when otherwise quiet. The frontend ignores any event_type it
+	// doesn't have a station for, so the wider keyset is harmless;
+	// system events stay out because the lifetime counter never
+	// records nil-entity rows in the first place.
 	ItemsLifetime int              `json:"items_lifetime"`
 	Runs          []factoryRunJSON `json:"runs"`
 }
