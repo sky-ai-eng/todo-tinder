@@ -29,9 +29,11 @@ type factoryStationJSON struct {
 	ActiveRuns   int    `json:"active_runs"`
 	// ItemsLifetime is the from-catalog-start distinct-entity count for
 	// this event_type — "PRs that ever reached this station," not
-	// "events fired here." Populated for every station that has at least
-	// one event in history; absent stations report zero. Drives the
-	// always-on numeric readout on the station's front-face screen.
+	// "events fired here." It is populated only for stations already
+	// present in the snapshot (seeded by 24h activity and/or active runs);
+	// lifetime history alone must not cause an otherwise omitted station
+	// to be emitted. Drives the always-on numeric readout on the station's
+	// front-face screen.
 	ItemsLifetime int              `json:"items_lifetime"`
 	Runs          []factoryRunJSON `json:"runs"`
 }
