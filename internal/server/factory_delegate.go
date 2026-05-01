@@ -41,12 +41,15 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "entity_id, event_type, and prompt_id are required"})
 		return
 	}
-	if s.spawner == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "spawner not configured"})
-		return
-	}
 
-	// Entity must exist — guard against stale snapshot keys.
+	// Entity must exist and be active. The factory snapshot's 60s
+	// soft-close grace window means a chip can ride the final
+	// animation hop after its entity already flipped to closed; if the
+	// user drags during that window, we shouldn't synthesize a fresh
+	// task on a merged/closed entity (no second close-cascade would
+	// clean it up — it'd run to completion against a closed PR).
+	// Mirrors the router's "task creation requires active entity"
+	// contract at routing/router.go.
 	entity, err := db.GetEntity(s.db, req.EntityID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -54,6 +57,19 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	}
 	if entity == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "entity not found"})
+		return
+	}
+	if entity.State != "active" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "entity is closed; cannot delegate"})
+		return
+	}
+
+	// Spawner availability gate runs after request + state validation
+	// so callers learn about bad input before they hit infrastructure
+	// gaps. Tests rely on this ordering to exercise 404/409 paths
+	// without installing a spawner.
+	if s.spawner == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "spawner not configured"})
 		return
 	}
 

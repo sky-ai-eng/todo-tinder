@@ -20,14 +20,72 @@ import (
 
 func TestHandleFactoryDelegate_ServiceUnavailableWithoutSpawner(t *testing.T) {
 	s := newTestServer(t)
+	// Seed a real entity + event so the request reaches the spawner
+	// gate (which sits after entity + state + event validation per
+	// the handler's progressive-validation order).
+	entity, _, err := db.FindOrCreateEntity(s.db, "github", "owner/repo#503", "pr", "", "")
+	if err != nil {
+		t.Fatalf("seed entity: %v", err)
+	}
+	eid := entity.ID
+	if _, err := db.RecordEvent(s.db, domain.Event{
+		EntityID:  &eid,
+		EventType: domain.EventGitHubPRCICheckPassed,
+	}); err != nil {
+		t.Fatalf("record event: %v", err)
+	}
 	// No SetSpawner call — simulate startup-order or test-config gap.
 	rec := doJSON(t, s, http.MethodPost, "/api/factory/delegate", map[string]string{
-		"entity_id":  "any",
-		"event_type": "github:pr:ci_check_passed",
+		"entity_id":  entity.ID,
+		"event_type": domain.EventGitHubPRCICheckPassed,
 		"prompt_id":  "p1",
 	})
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
+	}
+}
+
+func TestHandleFactoryDelegate_404OnMissingEntity(t *testing.T) {
+	s := newTestServer(t)
+	rec := doJSON(t, s, http.MethodPost, "/api/factory/delegate", map[string]string{
+		"entity_id":  "no-such-entity",
+		"event_type": domain.EventGitHubPRCICheckPassed,
+		"prompt_id":  "p1",
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+// TestHandleFactoryDelegate_409OnClosedEntity is the regression for the
+// soft-close grace race: factory snapshots include entities for ~60s
+// after they close so the chip can ride into the terminal station, but
+// drag-to-delegate during that window should not start a fresh run on
+// a merged/closed entity. The router's task-creation path enforces the
+// same "active only" contract; this test pins it for the drag path.
+func TestHandleFactoryDelegate_409OnClosedEntity(t *testing.T) {
+	s := newTestServer(t)
+	entity, _, err := db.FindOrCreateEntity(s.db, "github", "owner/repo#409", "pr", "", "")
+	if err != nil {
+		t.Fatalf("seed entity: %v", err)
+	}
+	if err := db.MarkEntityClosed(s.db, entity.ID); err != nil {
+		t.Fatalf("close entity: %v", err)
+	}
+	eid := entity.ID
+	if _, err := db.RecordEvent(s.db, domain.Event{
+		EntityID:  &eid,
+		EventType: domain.EventGitHubPRMerged,
+	}); err != nil {
+		t.Fatalf("record event: %v", err)
+	}
+	rec := doJSON(t, s, http.MethodPost, "/api/factory/delegate", map[string]string{
+		"entity_id":  entity.ID,
+		"event_type": domain.EventGitHubPRMerged,
+		"prompt_id":  "p1",
+	})
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409 (closed entity)", rec.Code)
 	}
 }
 
