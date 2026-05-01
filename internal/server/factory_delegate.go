@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
 )
 
 // factoryDelegateRequest is the body for POST /api/factory/delegate.
@@ -93,17 +94,38 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default priority — mirrors internal/routing/router.go:210-215.
-	// Use the highest enabled task_rule's default_priority for this
-	// event type, or 0.5 if no rules match.
+	// Default priority — mirrors internal/routing/router.go:210-215,
+	// including the predicate-match filter. Iterating *all* enabled
+	// rules for the event type would inflate priority whenever a
+	// high-priority rule's scope_predicate doesn't actually match
+	// this event's metadata (e.g., a 0.9-priority rule scoped to a
+	// specific repo would lift priority for every event of that type
+	// even on unrelated entities). Empty predJSON always matches per
+	// the events package contract.
 	defaultPriority := 0.5
+	schema, schemaOK := events.Get(req.EventType)
 	rules, err := db.GetEnabledRulesForEvent(s.db, req.EventType)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	for _, rule := range rules {
-		if rule.DefaultPriority > defaultPriority {
+		if !schemaOK {
+			// No registered schema → predicate can't be evaluated.
+			// Mirrors matchPredicate's quietly-permissive behavior:
+			// the rule is skipped, falling back to 0.5.
+			continue
+		}
+		predJSON := ""
+		if rule.ScopePredicateJSON != nil {
+			predJSON = *rule.ScopePredicateJSON
+		}
+		matched, err := schema.Match(predJSON, primaryEvent.MetadataJSON)
+		if err != nil {
+			log.Printf("[factory] rule %s predicate error: %v", rule.ID, err)
+			continue
+		}
+		if matched && rule.DefaultPriority > defaultPriority {
 			defaultPriority = rule.DefaultPriority
 		}
 	}
