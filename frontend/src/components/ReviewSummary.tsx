@@ -11,7 +11,15 @@ interface Props {
   onUpdateBody: (body: string) => void
   onUpdateEvent: (event: string) => void
   onSubmit: () => void
-  onDiscard: () => void
+  // onClose dismisses the review popup without backend side
+  // effects. Was previously named onDiscard to match an old
+  // "Discard" button label that suggested destruction; renamed
+  // alongside the SKY-207 button text rename so the prop, the
+  // user-facing label, and the actual behavior all agree. The
+  // genuinely destructive "throw the prepared review away and
+  // re-queue the task" action lives on AgentCard's "Return to
+  // queue" button.
+  onClose: () => void
   submitting: boolean
 }
 
@@ -90,7 +98,7 @@ export default function ReviewSummary({
   onUpdateBody,
   onUpdateEvent,
   onSubmit,
-  onDiscard,
+  onClose,
   submitting,
 }: Props) {
   const [editingBody, setEditingBody] = useState(false)
@@ -223,10 +231,10 @@ export default function ReviewSummary({
 
         <div className="flex items-center gap-2">
           <button
-            onClick={onDiscard}
-            className="text-[11px] font-medium text-text-tertiary hover:text-dismiss px-3 py-1.5 rounded-lg transition-colors"
+            onClick={onClose}
+            className="text-[11px] font-medium text-text-tertiary hover:text-text-primary px-3 py-1.5 rounded-lg transition-colors"
           >
-            Discard
+            Close
           </button>
           <button
             onClick={onSubmit}
