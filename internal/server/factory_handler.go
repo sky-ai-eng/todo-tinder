@@ -132,10 +132,12 @@ type factoryEntityJSON struct {
 	// reads the dropped station's first entry and forwards its
 	// dedup_key (with entity_id + event_type) to /api/factory/delegate,
 	// which find-or-creates via the unique index on (entity_id,
-	// event_type, dedup_key). Absent event_type → handler synthesizes
-	// a task. For a dedup-discriminated event type (label_added,
-	// status_changed), the inner slice can have multiple entries; v1
-	// frontend uses the first.
+	// event_type, dedup_key). If pending_tasks has no entry for the
+	// dropped station's event_type yet, that means there is no existing
+	// task for that event_type; the request still carries event_type and
+	// the handler creates the task. For a dedup-discriminated event type
+	// (label_added, status_changed), the inner slice can have multiple
+	// entries; v1 frontend uses the first.
 	PendingTasks map[string][]pendingTaskRef `json:"pending_tasks,omitempty"`
 }
 
