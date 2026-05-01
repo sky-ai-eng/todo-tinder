@@ -9,6 +9,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
 // taskJSON is the API representation of a task. Maps entity-joined fields
@@ -145,14 +146,27 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	// than the AgentCard cancel button), the run must stop. Mirrors the
 	// inline-close and entity-close cascades: task state is authoritative;
 	// runs follow.
-	if req.Action == "dismiss" && s.spawner != nil {
-		ids, err := db.ActiveRunIDsForTask(s.db, id)
-		if err != nil {
-			log.Printf("[swipe] active-run lookup for task %s failed: %v", id, err)
-		} else {
-			for _, runID := range ids {
-				if err := s.spawner.Cancel(runID); err != nil {
-					log.Printf("[swipe] cancel run %s on dismiss of task %s: %v", runID, id, err)
+	//
+	// Two complementary paths here:
+	//   - ActiveRunIDsForTask + spawner.Cancel covers in-flight runs
+	//     (running, agent_starting, etc.) that still have a goroutine in
+	//     s.cancels.
+	//   - cleanupPendingApprovalRun covers pending_approval runs, which
+	//     ActiveRunIDsForTask deliberately excludes (the agent process
+	//     has exited, there's nothing to cancel — but the DB cleanup
+	//     is still needed). SKY-206 closed the gap that left
+	//     pending_reviews + a phantom run on a dismissed task.
+	if req.Action == "dismiss" {
+		s.cleanupPendingApprovalRun(id)
+		if s.spawner != nil {
+			ids, err := db.ActiveRunIDsForTask(s.db, id)
+			if err != nil {
+				log.Printf("[swipe] active-run lookup for task %s failed: %v", id, err)
+			} else {
+				for _, runID := range ids {
+					if err := s.spawner.Cancel(runID); err != nil {
+						log.Printf("[swipe] cancel run %s on dismiss of task %s: %v", runID, id, err)
+					}
 				}
 			}
 		}
@@ -241,6 +255,16 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "snoozed", "until": until.Format(time.RFC3339)})
 }
 
+// handleUndo backs the Cards swipe-toast UX: the user just swiped
+// claim/dismiss/delegate/snooze, sees the 5s "Undo" toast (or hits
+// Cmd-Z), and we reverse the swipe. This endpoint is specifically
+// for undoing a discrete user gesture — it records a swipe_events
+// row tagged 'undo' for the swipe analytics, then runs the same
+// requeue cleanup that /requeue does.
+//
+// State-driven requeue (Board's drag-to-Queue, SKY-207's "Return
+// to queue" button) lives at /requeue and skips the swipe row.
+// Same finalizer, same observable outcome — different audit shape.
 func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
@@ -251,44 +275,173 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Revert Jira ticket: unassign and transition back to original status.
-	// Undo guard: if someone else reassigned the issue or the status diverged
-	// from what we stored, don't step on their manual changes.
-	if task != nil && task.EntitySource == "jira" && task.SourceStatus != "" && s.jiraClient != nil {
-		go func(issueKey, originalStatus string) {
-			state := s.jiraClient.GetClaimState(issueKey)
-
-			// Three assignee cases:
-			//   - assigned to someone else -> skip undo entirely (manual reassignment)
-			//   - unassigned -> skip Unassign (already unassigned), still transition
-			//   - assigned to self -> proceed normally (unassign + transition)
-			if state != nil && !state.AssignedToSelf && !state.Unassigned {
-				log.Printf("[jira] undo guard: %s reassigned to someone else, skipping undo", issueKey)
-				return
-			}
-			// Skip undo if the ticket has moved out of the in-progress rule
-			// entirely — that means someone progressed it (to done, back to
-			// pickup, etc.) and we shouldn't yank it back. Membership rather
-			// than strict-canonical match, because a user moving Claim →
-			// "In Review" is still "working on it on my plate" and undo should
-			// still unwind to the original status.
-			if state != nil && len(s.jiraInProgressRule.Members) > 0 && !s.jiraInProgressRule.Contains(state.StatusName) {
-				log.Printf("[jira] undo guard: %s status is %q (not in in-progress members %v), skipping undo", issueKey, state.StatusName, s.jiraInProgressRule.Members)
-				return
-			}
-
-			if state == nil || state.AssignedToSelf {
-				if err := s.jiraClient.Unassign(issueKey); err != nil {
-					log.Printf("[jira] failed to unassign %s on undo: %v", issueKey, err)
-				}
-			}
-			if err := s.jiraClient.TransitionTo(issueKey, originalStatus); err != nil {
-				log.Printf("[jira] failed to transition %s back to %q on undo: %v", issueKey, originalStatus, err)
-			}
-		}(task.EntitySourceID, task.SourceStatus)
-	}
+	s.finalizeRequeue(task)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
+}
+
+// handleRequeue is the state-driven counterpart to handleUndo: same
+// task-back-to-queue outcome, no swipe_events row. Used by Board's
+// drag-to-Queue gesture and (once SKY-207 lands) the AgentCard's
+// "Return to queue" button on pending_approval runs. Both of those
+// are deliberate state changes, not "reverse my last swipe," so
+// audit-logging them as undo events would muddy the swipe-UX
+// analytics.
+func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	task, _ := db.GetTask(s.db, id)
+
+	if err := db.RequeueTask(s.db, id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	s.finalizeRequeue(task)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
+}
+
+// finalizeRequeue runs the side-effect cleanup that both /undo and
+// /requeue need after the task status flips back to queued:
+//
+//   - pending_approval cleanup: if the task had a delegated agent run
+//     in pending_approval (review prepared, awaiting human submit),
+//     write the discard verdict to run_memory.human_content, delete
+//     the pending_reviews row, mark the run cancelled, and broadcast
+//     the run-status change to the websocket. SKY-206 — closes the
+//     bug where a discarded review left a stale pending_reviews row
+//     and a phantom pending_approval run on a now-queued task.
+//
+//   - Jira reversal: if the task is Jira-backed and we have a
+//     SourceStatus snapshot (recorded at claim time), unassign and
+//     transition back. Guarded against external mutations: skip if
+//     someone else now owns the ticket, or if the ticket has
+//     progressed out of the in-progress rule entirely (done, back to
+//     pickup, etc.).
+//
+// Both halves are best-effort and logged-not-failed: the task is
+// already queued by the time we get here; failing the response would
+// confuse callers about what actually changed.
+func (s *Server) finalizeRequeue(task *domain.Task) {
+	if task == nil {
+		return
+	}
+	s.cleanupPendingApprovalRun(task.ID)
+	s.revertJiraStateIfApplicable(task)
+}
+
+// cleanupPendingApprovalRun handles the SKY-206 case: the user
+// returned a task to the queue while it had a pending_approval
+// agent run (i.e. the agent prepared a PR review and the user threw
+// it away rather than submitting). The agent process has long since
+// exited (pending_approval is reached after the spawner's runAgent
+// defer ran), so there's nothing to cancel at the process level —
+// this is purely a DB cleanup: write the discard outcome to
+// human_content, delete the pending_reviews + comments,  flip the
+// run row to cancelled with a discriminating stop_reason.
+//
+// Run-status broadcast lets the AgentCard collapse and the
+// requeued TaskCard appear without a manual refetch.
+//
+// All failures here are logged, not fatal: the calling handler has
+// already flipped the task back to queued and the response should
+// reflect that. Idempotent — a repeat call against an already-
+// cancelled run finds no pending_approval row and exits silently.
+func (s *Server) cleanupPendingApprovalRun(taskID string) {
+	runID, err := db.PendingApprovalRunIDForTask(s.db, taskID)
+	if err != nil {
+		log.Printf("[requeue] pending_approval lookup for task %s failed: %v", taskID, err)
+		return
+	}
+	if runID == "" {
+		return
+	}
+
+	// Write the discard outcome to run_memory.human_content BEFORE
+	// deleting the pending_reviews row. The next agent reading
+	// memory on this entity should see "the human discarded my
+	// review without submitting it" as the authoritative human
+	// signal — alongside the existing agent_content (the agent's
+	// self-report) — so it can recalibrate. Format mirrors the
+	// SKY-205 submit-time block so the parsing contract is uniform.
+	humanContent := "## Human feedback (post-run)\n\n" +
+		"**Outcome:** Human discarded the prepared review without submitting it; task returned to the triage queue.\n" +
+		"**Implication:** The verdict you proposed was not accepted. Reconsider whether this entity warrants any review at all, or whether a different framing is needed."
+	if err := db.UpdateRunMemoryHumanContent(s.db, runID, humanContent); err != nil {
+		log.Printf("[requeue] human_content write for run %s failed: %v", runID, err)
+	}
+
+	// Tear down the pending review (transactional: deletes
+	// comments and the review row together).
+	if review, _ := db.PendingReviewByRunID(s.db, runID); review != nil {
+		if err := db.DeletePendingReview(s.db, review.ID); err != nil {
+			log.Printf("[requeue] DeletePendingReview %s for run %s failed: %v", review.ID, runID, err)
+		}
+	}
+
+	// Flip the run row terminal. ok=false here means the row was
+	// already cancelled by a concurrent path (idempotent re-call,
+	// rare race) — skip the broadcast in that case so we don't
+	// double-fire.
+	ok, err := db.MarkAgentRunDiscarded(s.db, runID, "review_discarded_by_user")
+	if err != nil {
+		log.Printf("[requeue] MarkAgentRunDiscarded %s failed: %v", runID, err)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	s.ws.Broadcast(websocket.Event{
+		Type:  "agent_run_update",
+		RunID: runID,
+		Data:  map[string]string{"status": "cancelled"},
+	})
+}
+
+// revertJiraStateIfApplicable was the body of handleUndo's Jira
+// reversal block. Factored so /requeue picks up the same behavior —
+// dragging a claimed Jira-backed task back to Queue should unassign
+// and transition the ticket the same way Cmd-Z does. The guards
+// against external mutations (someone else claimed it, status has
+// progressed out of the in-progress rule) apply equally to both
+// entry points.
+func (s *Server) revertJiraStateIfApplicable(task *domain.Task) {
+	if task == nil || task.EntitySource != "jira" || task.SourceStatus == "" || s.jiraClient == nil {
+		return
+	}
+	go func(issueKey, originalStatus string) {
+		state := s.jiraClient.GetClaimState(issueKey)
+
+		// Three assignee cases:
+		//   - assigned to someone else -> skip undo entirely (manual reassignment)
+		//   - unassigned -> skip Unassign (already unassigned), still transition
+		//   - assigned to self -> proceed normally (unassign + transition)
+		if state != nil && !state.AssignedToSelf && !state.Unassigned {
+			log.Printf("[jira] requeue guard: %s reassigned to someone else, skipping", issueKey)
+			return
+		}
+		// Skip if the ticket has moved out of the in-progress rule
+		// entirely — that means someone progressed it (to done, back to
+		// pickup, etc.) and we shouldn't yank it back. Membership rather
+		// than strict-canonical match, because a user moving Claim →
+		// "In Review" is still "working on it on my plate" and the
+		// requeue should still unwind to the original status.
+		if state != nil && len(s.jiraInProgressRule.Members) > 0 && !s.jiraInProgressRule.Contains(state.StatusName) {
+			log.Printf("[jira] requeue guard: %s status is %q (not in in-progress members %v), skipping", issueKey, state.StatusName, s.jiraInProgressRule.Members)
+			return
+		}
+
+		if state == nil || state.AssignedToSelf {
+			if err := s.jiraClient.Unassign(issueKey); err != nil {
+				log.Printf("[jira] failed to unassign %s on requeue: %v", issueKey, err)
+			}
+		}
+		if err := s.jiraClient.TransitionTo(issueKey, originalStatus); err != nil {
+			log.Printf("[jira] failed to transition %s back to %q on requeue: %v", issueKey, originalStatus, err)
+		}
+	}(task.EntitySourceID, task.SourceStatus)
 }
 
 func parseSnoozeUntil(s string) (time.Time, error) {
