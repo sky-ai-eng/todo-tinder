@@ -452,6 +452,91 @@ func TestListTakenOverRunsForResume_SkipsMissingSessionOrWorktree(t *testing.T) 
 	}
 }
 
+// TestInsertAgentMessage_StampsZeroCreatedAt verifies the SKY-213 fix: when
+// msg.CreatedAt is zero, InsertAgentMessage stamps it with time.Now().UTC()
+// and writes that same value to the DB row, so the WS broadcast and the
+// persisted row share an authoritative timestamp without a re-read.
+func TestInsertAgentMessage_StampsZeroCreatedAt(t *testing.T) {
+	database := newTestDB(t)
+	runID := "run-stamp-zero-ts"
+	takeoverFixture(t, database, runID, "running", "")
+
+	before := time.Now().UTC()
+	msg := &domain.AgentMessage{
+		RunID:   runID,
+		Role:    "assistant",
+		Content: "hello world",
+		Subtype: "text",
+		// CreatedAt intentionally left zero — the function must stamp it.
+	}
+
+	id, err := InsertAgentMessage(database, msg)
+	if err != nil {
+		t.Fatalf("InsertAgentMessage: %v", err)
+	}
+	after := time.Now().UTC()
+
+	if msg.CreatedAt.IsZero() {
+		t.Fatal("msg.CreatedAt was not stamped — WS broadcast would carry zero time")
+	}
+	if msg.CreatedAt.Before(before) || msg.CreatedAt.After(after) {
+		t.Errorf("msg.CreatedAt = %v, want between %v and %v", msg.CreatedAt, before, after)
+	}
+
+	// DB row must carry the same instant as the stamped struct so the WS
+	// broadcast and the REST fetch agree without a reconciliation round-trip.
+	rows, err := MessagesForRun(database, runID)
+	if err != nil {
+		t.Fatalf("MessagesForRun: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(rows))
+	}
+	if rows[0].ID != int(id) {
+		t.Errorf("ID = %d, want %d", rows[0].ID, id)
+	}
+	if !rows[0].CreatedAt.Equal(msg.CreatedAt) {
+		t.Errorf("DB CreatedAt = %v, struct CreatedAt = %v — WS and DB are out of sync", rows[0].CreatedAt, msg.CreatedAt)
+	}
+}
+
+// TestInsertAgentMessage_PreservesExplicitCreatedAt confirms that an explicit
+// non-zero CreatedAt is written through unchanged so callers that timestamp
+// messages themselves (e.g., from a streaming event with its own clock) are
+// not silently overwritten.
+func TestInsertAgentMessage_PreservesExplicitCreatedAt(t *testing.T) {
+	database := newTestDB(t)
+	runID := "run-explicit-ts"
+	takeoverFixture(t, database, runID, "running", "")
+
+	explicit := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	msg := &domain.AgentMessage{
+		RunID:     runID,
+		Role:      "assistant",
+		Content:   "explicit timestamp",
+		Subtype:   "text",
+		CreatedAt: explicit,
+	}
+
+	if _, err := InsertAgentMessage(database, msg); err != nil {
+		t.Fatalf("InsertAgentMessage: %v", err)
+	}
+	if !msg.CreatedAt.Equal(explicit) {
+		t.Errorf("non-zero CreatedAt mutated to %v, want %v", msg.CreatedAt, explicit)
+	}
+
+	rows, err := MessagesForRun(database, runID)
+	if err != nil {
+		t.Fatalf("MessagesForRun: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(rows))
+	}
+	if !rows[0].CreatedAt.Equal(explicit) {
+		t.Errorf("DB CreatedAt = %v, want %v", rows[0].CreatedAt, explicit)
+	}
+}
+
 // contains is a small string-contains helper used by these tests so we
 // don't pull strings into the imports for one assertion. Faster to
 // inline than to round-trip through strings.Contains.
