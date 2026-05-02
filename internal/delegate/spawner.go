@@ -152,6 +152,34 @@ func (s *Spawner) Cancel(runID string) error {
 	// handles every non-terminal state, so this is also a defensive
 	// catch for any other "no goroutine but row not terminal"
 	// edge case.
+	//
+	// We also have to drain the per-entity firing queue ourselves on
+	// terminal exit. The active-goroutine cancel paths drain via
+	// their goroutine defer (Delegate's defer / ResumeAfterYield's
+	// defer); a Cancel() that hits this DB-only path has no defer to
+	// piggy-back on, so an auto-fired run cancelled while parked in
+	// awaiting_input would leave the entity's firing queue stuck
+	// until some other run on that entity terminated. Look up
+	// triggerType + entityID before the flip so a concurrent task
+	// delete can't strand us; drain only on a successful flip so we
+	// don't double-drain a row another path already terminated.
+	//
+	// Done as a direct query rather than via GetAgentRun + GetTask
+	// because GetAgentRun's SELECT doesn't include trigger_type
+	// (it's not part of the API/UI projection), and we need both
+	// fields atomically for the manual-run filter to work.
+	var triggerType, entityID string
+	if err := s.database.QueryRow(`
+		SELECT COALESCE(r.trigger_type, ''), COALESCE(t.entity_id, '')
+		FROM runs r LEFT JOIN tasks t ON t.id = r.task_id
+		WHERE r.id = ?
+	`, runID).Scan(&triggerType, &entityID); err != nil {
+		// Row missing or query error — let the flip below decide
+		// whether to surface that as "no active run" or proceed.
+		// Drain just won't fire if entityID stays empty.
+		_ = err
+	}
+
 	flipped, err := db.MarkAgentRunCancelledIfActive(s.database, runID, "user_cancelled", "Run cancelled by user")
 	if err != nil {
 		return fmt.Errorf("mark cancelled: %w", err)
@@ -160,6 +188,9 @@ func (s *Spawner) Cancel(runID string) error {
 		return fmt.Errorf("no active run %s", runID)
 	}
 	s.broadcastRunUpdate(runID, "cancelled")
+	if entityID != "" {
+		s.notifyDrainer(triggerType, entityID)
+	}
 	return nil
 }
 
@@ -1752,20 +1783,22 @@ type agentResult struct {
 // Two terminal shapes are accepted:
 //   - completion / task_unsolvable: Summary is non-empty (the legacy
 //     contract — every successful or unsolvable envelope has a summary)
-//   - yield: Status == "yield" and the yield payload has a known type
+//   - yield: Status == "yield" and the yield payload passes
+//     YieldRequest.Validate (known type, non-empty message, well-formed
+//     options for choice yields, no duplicate option ids)
 //
 // Anything else is treated as "didn't parse cleanly" — the parser
 // falls through to its markdown-fence and brace-extraction paths
-// before giving up.
+// before giving up. Rejecting malformed yield payloads at parse time
+// matters because once a yield parks the run in awaiting_input, the
+// user can't respond unless the modal can render meaningfully —
+// e.g. a choice yield with no options has no buttons to click.
 func (r *agentResult) isValid() bool {
 	if r.Summary != "" {
 		return true
 	}
 	if r.Status == "yield" && r.Yield != nil {
-		switch r.Yield.Type {
-		case domain.YieldTypeConfirmation, domain.YieldTypeChoice, domain.YieldTypePrompt:
-			return true
-		}
+		return r.Yield.Validate() == nil
 	}
 	return false
 }

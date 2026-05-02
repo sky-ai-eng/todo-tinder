@@ -57,6 +57,18 @@ func TestParseAgentResult_RejectsBadYield(t *testing.T) {
 		`{"status":"yield","yield":{"type":"plan_steps","message":"…"}}`,
 		// yield with empty type
 		`{"status":"yield","yield":{"message":"…"}}`,
+		// confirmation with empty message
+		`{"status":"yield","yield":{"type":"confirmation","message":""}}`,
+		// prompt with whitespace-only message
+		`{"status":"yield","yield":{"type":"prompt","message":"   "}}`,
+		// choice with no options
+		`{"status":"yield","yield":{"type":"choice","message":"pick","options":[]}}`,
+		// choice with empty option id
+		`{"status":"yield","yield":{"type":"choice","message":"pick","options":[{"id":"","label":"A"}]}}`,
+		// choice with empty option label
+		`{"status":"yield","yield":{"type":"choice","message":"pick","options":[{"id":"a","label":""}]}}`,
+		// choice with duplicate option ids
+		`{"status":"yield","yield":{"type":"choice","message":"pick","options":[{"id":"a","label":"A"},{"id":"a","label":"Also A"}]}}`,
 	}
 	for _, text := range bad {
 		if got := parseAgentResult(text); got != nil {

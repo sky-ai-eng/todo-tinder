@@ -7,6 +7,101 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
+// TestYieldRequest_Validate covers the malformed-payload guard that
+// keeps a run from parking in awaiting_input with a yield the modal
+// can't render meaningfully.
+func TestYieldRequest_Validate(t *testing.T) {
+	cases := []struct {
+		name    string
+		req     *YieldRequest
+		wantErr bool
+	}{
+		{
+			name:    "nil",
+			req:     nil,
+			wantErr: true,
+		},
+		{
+			name:    "unknown type",
+			req:     &YieldRequest{Type: "plan_steps", Message: "hi"},
+			wantErr: true,
+		},
+		{
+			name:    "confirmation missing message",
+			req:     &YieldRequest{Type: YieldTypeConfirmation, Message: ""},
+			wantErr: true,
+		},
+		{
+			name:    "confirmation whitespace message",
+			req:     &YieldRequest{Type: YieldTypeConfirmation, Message: "  \t\n  "},
+			wantErr: true,
+		},
+		{
+			name:    "prompt missing message",
+			req:     &YieldRequest{Type: YieldTypePrompt, Message: ""},
+			wantErr: true,
+		},
+		{
+			name:    "choice no options",
+			req:     &YieldRequest{Type: YieldTypeChoice, Message: "pick", Options: nil},
+			wantErr: true,
+		},
+		{
+			name: "choice option empty id",
+			req: &YieldRequest{
+				Type: YieldTypeChoice, Message: "pick",
+				Options: []YieldChoiceOption{{ID: "", Label: "A"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "choice option empty label",
+			req: &YieldRequest{
+				Type: YieldTypeChoice, Message: "pick",
+				Options: []YieldChoiceOption{{ID: "a", Label: " "}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "choice duplicate ids",
+			req: &YieldRequest{
+				Type: YieldTypeChoice, Message: "pick",
+				Options: []YieldChoiceOption{{ID: "a", Label: "A"}, {ID: "a", Label: "Also A"}},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "confirmation valid (labels optional)",
+			req:     &YieldRequest{Type: YieldTypeConfirmation, Message: "go?"},
+			wantErr: false,
+		},
+		{
+			name:    "prompt valid (placeholder optional)",
+			req:     &YieldRequest{Type: YieldTypePrompt, Message: "name?"},
+			wantErr: false,
+		},
+		{
+			name: "choice valid",
+			req: &YieldRequest{
+				Type: YieldTypeChoice, Message: "pick",
+				Options: []YieldChoiceOption{{ID: "a", Label: "A"}, {ID: "b", Label: "B"}},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.req.Validate()
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for %s, got nil", tc.name)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error for %s, got %v", tc.name, err)
+			}
+		})
+	}
+}
+
 func TestRenderYieldResponseForAgent_Confirmation(t *testing.T) {
 	req := &YieldRequest{Type: YieldTypeConfirmation, Message: "force push?"}
 	got := RenderYieldResponseForAgent(req, &YieldResponse{Type: YieldTypeConfirmation, Accepted: boolPtr(true)})

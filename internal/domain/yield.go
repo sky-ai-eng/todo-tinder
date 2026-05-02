@@ -1,5 +1,11 @@
 package domain
 
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
 // Yield types are the three shapes an agent can use to pause a run for
 // user input. SKY-139 — see internal/ai/prompts/envelope.txt for the
 // agent-facing contract. The frontend renders one of three components
@@ -39,6 +45,46 @@ type YieldRequest struct {
 type YieldChoiceOption struct {
 	ID    string `json:"id"`
 	Label string `json:"label"`
+}
+
+// Validate returns an error if the request is missing required fields
+// or has malformed shape. Once a run is parked in awaiting_input
+// the user can't recover without the modal being able to render
+// meaningfully — so we reject malformed yield envelopes at parse
+// time rather than persisting them and stranding the run. SKY-139.
+func (r *YieldRequest) Validate() error {
+	if r == nil {
+		return errors.New("yield: request is nil")
+	}
+	if strings.TrimSpace(r.Message) == "" {
+		return errors.New("yield: message is required")
+	}
+	switch r.Type {
+	case YieldTypeConfirmation:
+		return nil
+	case YieldTypeChoice:
+		if len(r.Options) == 0 {
+			return errors.New("yield: choice requires at least one option")
+		}
+		seen := make(map[string]struct{}, len(r.Options))
+		for i, o := range r.Options {
+			if strings.TrimSpace(o.ID) == "" {
+				return fmt.Errorf("yield: choice option %d has empty id", i)
+			}
+			if strings.TrimSpace(o.Label) == "" {
+				return fmt.Errorf("yield: choice option %d has empty label", i)
+			}
+			if _, dup := seen[o.ID]; dup {
+				return fmt.Errorf("yield: choice option id %q is duplicated", o.ID)
+			}
+			seen[o.ID] = struct{}{}
+		}
+		return nil
+	case YieldTypePrompt:
+		return nil
+	default:
+		return fmt.Errorf("yield: unknown type %q", r.Type)
+	}
 }
 
 // YieldResponse is the payload the user submits via POST /api/agent/runs/{runID}/respond.
