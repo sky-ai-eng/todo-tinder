@@ -1091,8 +1091,6 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage string) error {
 	s.mu.Unlock()
 
 	go func() {
-		startTime := time.Now()
-		_ = startTime
 		defer func() {
 			s.mu.Lock()
 			delete(s.cancels, runID)
