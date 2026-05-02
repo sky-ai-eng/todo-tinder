@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -266,5 +267,138 @@ func TestListPendingReviewComments_LegacyOriginalBodyIsNil(t *testing.T) {
 	}
 	if got[0].OriginalBody != nil {
 		t.Errorf("OriginalBody = %v, want nil (legacy NULL must not collapse to empty string)", *got[0].OriginalBody)
+	}
+}
+
+// TestLockPendingReviewSubmission_FirstCallSucceedsAndCapturesOriginals
+// pins the happy-path contract: first agent submit-review writes
+// review_body + review_event AND populates the originals (so the
+// SKY-205 diff has something to compare against if the human later
+// edits via handleReviewUpdate).
+func TestLockPendingReviewSubmission_FirstCallSucceedsAndCapturesOriginals(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_lock1")
+
+	if err := LockPendingReviewSubmission(db, "rev_lock1", "agent draft body", "APPROVE"); err != nil {
+		t.Fatalf("first LockPendingReviewSubmission: %v", err)
+	}
+
+	var body, event, origBody, origEvent sql.NullString
+	if err := db.QueryRow(
+		`SELECT review_body, review_event, original_review_body, original_review_event
+		 FROM pending_reviews WHERE id = ?`, "rev_lock1",
+	).Scan(&body, &event, &origBody, &origEvent); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if body.String != "agent draft body" {
+		t.Errorf("review_body = %q, want %q", body.String, "agent draft body")
+	}
+	if event.String != "APPROVE" {
+		t.Errorf("review_event = %q, want %q", event.String, "APPROVE")
+	}
+	if origBody.String != "agent draft body" {
+		t.Errorf("original_review_body = %q, want %q", origBody.String, "agent draft body")
+	}
+	if origEvent.String != "APPROVE" {
+		t.Errorf("original_review_event = %q, want %q", origEvent.String, "APPROVE")
+	}
+}
+
+// TestLockPendingReviewSubmission_SecondCallReturnsAlreadySubmitted
+// is the SKY-212 motivating regression: an agent calling
+// submit-review twice in the same run must hit a hard error on the
+// second attempt. The lock is keyed by original_review_event IS
+// NULL — true only on the first call, since LockPendingReviewSubmission
+// itself populates the originals — so subsequent attempts find the
+// gate closed and return ErrPendingReviewAlreadySubmitted.
+//
+// The first-call body/event must survive: the human reviewer in
+// the UI is going to see exactly what the agent submitted, even if
+// the agent then loops and tries to submit a different verdict.
+func TestLockPendingReviewSubmission_SecondCallReturnsAlreadySubmitted(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_lock2")
+
+	if err := LockPendingReviewSubmission(db, "rev_lock2", "first body", "APPROVE"); err != nil {
+		t.Fatalf("first LockPendingReviewSubmission: %v", err)
+	}
+
+	err := LockPendingReviewSubmission(db, "rev_lock2", "second body", "REQUEST_CHANGES")
+	if !errors.Is(err, ErrPendingReviewAlreadySubmitted) {
+		t.Fatalf("second LockPendingReviewSubmission err = %v, want ErrPendingReviewAlreadySubmitted", err)
+	}
+
+	// Row is still anchored to the first call — second call's body /
+	// event must NOT have leaked through despite the error.
+	var body, event sql.NullString
+	if err := db.QueryRow(
+		`SELECT review_body, review_event FROM pending_reviews WHERE id = ?`, "rev_lock2",
+	).Scan(&body, &event); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if body.String != "first body" {
+		t.Errorf("review_body = %q, want %q (first call must survive)", body.String, "first body")
+	}
+	if event.String != "APPROVE" {
+		t.Errorf("review_event = %q, want %q (first call must survive)", event.String, "APPROVE")
+	}
+}
+
+// TestLockPendingReviewSubmission_BogusIDIsDistinctFromAlreadySubmitted
+// guards the disambiguation between two RowsAffected=0 cases. A
+// missing review_id should surface as a "not found" error pointed
+// at the argument, not the SKY-212 lock message which would be
+// confusing if the agent typed the wrong id.
+func TestLockPendingReviewSubmission_BogusIDIsDistinctFromAlreadySubmitted(t *testing.T) {
+	db := newTestDB(t)
+
+	err := LockPendingReviewSubmission(db, "no-such-review", "body", "APPROVE")
+	if err == nil {
+		t.Fatal("LockPendingReviewSubmission on missing id returned nil; want a not-found error")
+	}
+	if errors.Is(err, ErrPendingReviewAlreadySubmitted) {
+		t.Errorf("err = %v, want NOT ErrPendingReviewAlreadySubmitted (the agent should see a different message)", err)
+	}
+}
+
+// TestSetPendingReviewSubmission_StillUnlockedByLockHelper guards
+// the human-edit path: handleReviewUpdate calls
+// SetPendingReviewSubmission to apply user edits to body/event
+// after the agent has already locked the review. The lock must NOT
+// gate that path — the existing COALESCE pattern preserves
+// originals through human edits, and the human's UI work would
+// silently fail if SetPendingReviewSubmission grew the lock check.
+func TestSetPendingReviewSubmission_StillUnlockedByLockHelper(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_split")
+
+	// Agent locks the review.
+	if err := LockPendingReviewSubmission(db, "rev_split", "agent body", "APPROVE"); err != nil {
+		t.Fatalf("LockPendingReviewSubmission: %v", err)
+	}
+
+	// Human edits via SetPendingReviewSubmission — must succeed.
+	if err := SetPendingReviewSubmission(db, "rev_split", "user-edited body", "REQUEST_CHANGES"); err != nil {
+		t.Fatalf("SetPendingReviewSubmission after lock: %v", err)
+	}
+
+	var body, event, origBody, origEvent sql.NullString
+	if err := db.QueryRow(
+		`SELECT review_body, review_event, original_review_body, original_review_event
+		 FROM pending_reviews WHERE id = ?`, "rev_split",
+	).Scan(&body, &event, &origBody, &origEvent); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if body.String != "user-edited body" {
+		t.Errorf("review_body = %q, want %q (human edit must apply)", body.String, "user-edited body")
+	}
+	if event.String != "REQUEST_CHANGES" {
+		t.Errorf("review_event = %q, want %q (human edit must apply)", event.String, "REQUEST_CHANGES")
+	}
+	if origBody.String != "agent body" {
+		t.Errorf("original_review_body = %q, want %q (agent's draft must survive human edit)", origBody.String, "agent body")
+	}
+	if origEvent.String != "APPROVE" {
+		t.Errorf("original_review_event = %q, want %q (agent's draft must survive human edit)", origEvent.String, "APPROVE")
 	}
 }
