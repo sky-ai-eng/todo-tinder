@@ -70,8 +70,13 @@ export default function Board() {
       setDelegated(delegatedRes)
       setDone(doneRes)
 
-      // Fetch agent runs for delegated and done tasks
-      for (const task of [...delegatedRes, ...doneRes]) {
+      // Fetch agent runs for any task that might carry one — claimed
+      // tasks count too once an AgentCard can land in You via Board's
+      // drag-to-claim path. Without claimed in this set, a hard reload
+      // would render those cards as plain TaskCards, losing the
+      // activity log + result summary that the You-column AgentCard
+      // rendering is meant to preserve.
+      for (const task of [...claimedRes, ...delegatedRes, ...doneRes]) {
         try {
           const runsRes = await fetch(`/api/agent/runs?task_id=${task.id}`)
           if (!runsRes.ok) continue

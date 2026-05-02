@@ -350,12 +350,18 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 }
 
 // discardOutcome describes how the task ended up after the user
-// rejected the agent's prepared review. The cleanup path is
-// identical for both, but the human_content note baked into
-// run_memory differs — the next agent reading prior memory needs
-// to know whether the human re-queued the task (still on the
-// docket) or dismissed it outright (the entity is done with). The
-// distinction is the load-bearing signal in the post-run memory.
+// rejected the agent's prepared review. The DB cleanup path is the
+// same across all three values, but the human_content note baked
+// into run_memory differs — the next agent reading prior memory
+// needs to know whether the human:
+//
+//   - re-queued the task (still on the docket; verdict was wrong),
+//   - dismissed it outright (the entity isn't worth pursuing),
+//   - or marked it complete (the entity was resolved, but not via
+//     the agent's prepared verdict).
+//
+// The distinction is the load-bearing signal in post-run memory:
+// each shape implies a different recalibration for future runs.
 type discardOutcome int
 
 const (
@@ -494,11 +500,17 @@ func (s *Server) cleanupPendingApprovalRun(taskID string, outcome discardOutcome
 }
 
 // buildDiscardHumanContent renders the post-run human verdict
-// recorded when the user rejects an agent-prepared review. The two
-// shapes — requeued vs. dismissed — give the next agent on this
-// entity different recalibration signals: requeued says "try
-// again, but not like that," dismissed says "this entity wasn't
-// worth pursuing."
+// recorded when the user rejects an agent-prepared review. The
+// three shapes — requeued, dismissed, completed — give the next
+// agent on this entity different recalibration signals:
+//
+//   - requeued: "try again, but not like that" (verdict was wrong;
+//     the task is back in the queue).
+//   - dismissed: "this entity wasn't worth pursuing" (the human
+//     walked away from the entity entirely).
+//   - completed: "you reached the right ballpark but I resolved
+//     this myself" (the human accepted the task as done without
+//     applying the agent's prepared review).
 func buildDiscardHumanContent(outcome discardOutcome) string {
 	switch outcome {
 	case discardOutcomeDismissed:

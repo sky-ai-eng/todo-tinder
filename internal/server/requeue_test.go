@@ -246,6 +246,32 @@ func TestHandleSwipe_DismissCleansUpPendingApprovalRun(t *testing.T) {
 		"dismissed", "dismissed the task entirely")
 }
 
+// TestHandleSwipe_CompleteCleansUpPendingApprovalRun is the fourth
+// entry point: the Board's drag-AgentCard-to-Done gesture for a
+// pending_approval run. The complete swipe action flips the task to
+// 'done' (so the card lands in the Done column rather than
+// disappearing from the board, the way dismiss makes it) but reuses
+// the same SKY-206 cleanup — pending_reviews row gone, run flipped
+// to cancelled, agent_content preserved, human_content recording
+// the user's verdict with a complete-flavored marker that's distinct
+// from both the requeue and dismiss shapes. Future agents reading
+// memory should be able to tell "the human resolved this themselves
+// without applying my prepared review" from "the human walked away
+// from the entity entirely."
+func TestHandleSwipe_CompleteCleansUpPendingApprovalRun(t *testing.T) {
+	s := newTestServer(t)
+	taskID, runID, reviewID := pendingApprovalFixture(t, s.db)
+
+	rec := doJSON(t, s, http.MethodPost, "/api/tasks/"+taskID+"/swipe",
+		map[string]any{"action": "complete", "hesitation_ms": 0})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	assertPendingApprovalCleanedUp(t, s.db, taskID, runID, reviewID,
+		"done", "marked the task complete without submitting")
+}
+
 // TestHandleUndo_404OnMissingTask pins the missing-id behavior:
 // /undo against a bogus task ID must return 404 with a clean error
 // body, not the SQLite FK violation surfaced as a 500. The
