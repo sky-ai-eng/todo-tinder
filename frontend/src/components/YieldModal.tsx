@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { toast } from './Toast/toastStore'
 import { readError } from '../lib/api'
 
@@ -29,7 +30,13 @@ interface Props {
 /** Modal that renders the right input for a yield_request and POSTs
  *  the response back to the agent. Sized 480x80vh max with internal
  *  scroll so a long message or option list doesn't overflow the
- *  viewport. */
+ *  viewport.
+ *
+ *  Rendered via a portal to document.body. The trigger lives inside
+ *  AgentCard, whose root has `backdrop-blur-xl`; that creates a
+ *  containing block for `fixed` descendants, which would otherwise
+ *  pin the "fixed inset-0" overlay to the card's bounds rather than
+ *  the viewport. TakeoverModal uses the same trick. */
 export default function YieldModal({ runID, request, open, onClose, onSubmitted }: Props) {
   // Internal state initializes fresh on every mount. Callers should
   // pass a `key` derived from the yield_request message id so a new
@@ -73,7 +80,7 @@ export default function YieldModal({ runID, request, open, onClose, onSubmitted 
     }
   }
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
       onClick={() => {
@@ -124,7 +131,8 @@ export default function YieldModal({ runID, request, open, onClose, onSubmitted 
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 
