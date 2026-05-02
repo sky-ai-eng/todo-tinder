@@ -19,8 +19,8 @@ type BootstrapTarget struct {
 }
 
 // BootstrapBareClones ensures every target has a bare clone with the
-// configured upstream URL and PR fetch refspec. Idempotent — repeat
-// calls are no-ops once the bare exists and is correctly configured.
+// configured upstream URL. Idempotent — repeat calls are no-ops once
+// the bare exists and origin is correctly configured.
 // Intended to run after repo profiling completes (so CloneURLs are
 // populated), removing the first-delegation clone latency that the
 // lazy path inside CreateForPR / CreateForBranch would otherwise pay.
