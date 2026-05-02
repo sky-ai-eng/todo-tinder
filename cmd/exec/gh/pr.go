@@ -132,7 +132,7 @@ func prReviewView(client *ghclient.Client, args []string) {
 	prFlag := flagVal(args, "--pr")
 	if prFlag == "" {
 		exitErr(fmt.Sprintf(
-			"review-view requires --pr <pr_number>. The positional argument %d is the review_id, not the PR number — they are different ids (review ids come from `pr view -v` -> reviews[].id). Canonical shape: gh pr review-view %d --pr <pr_number> [-v]",
+			"review-view requires --pr <pr_number>. The positional argument %d is the review_id, not the PR number — they are different ids (review ids come from `gh pr view <pr_number> -v` -> reviews[].id). Canonical shape: gh pr review-view %d --pr <pr_number> [-v]",
 			reviewID, reviewID,
 		))
 	}
