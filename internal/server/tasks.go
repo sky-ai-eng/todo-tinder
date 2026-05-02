@@ -128,10 +128,10 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch req.Action {
-	case "claim", "dismiss", "snooze", "delegate":
+	case "claim", "dismiss", "snooze", "delegate", "complete":
 		// valid
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid action: must be claim, dismiss, snooze, or delegate"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid action: must be claim, dismiss, snooze, delegate, or complete"})
 		return
 	}
 
@@ -156,8 +156,21 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	//     has exited, there's nothing to cancel — but the DB cleanup
 	//     is still needed). SKY-206 closed the gap that left
 	//     pending_reviews + a phantom run on a dismissed task.
-	if req.Action == "dismiss" {
-		s.cleanupPendingApprovalRun(id, discardOutcomeDismissed)
+	// Both dismiss and complete are terminal-from-the-user's-side: any
+	// in-flight run must stop and any pending_approval review gets torn
+	// down. The discard memory note differs (dismissed vs completed)
+	// so the next agent reading run_memory can tell whether the human
+	// rejected the task entirely or accepted it as resolved without
+	// using the agent's prepared review. complete is the Board's
+	// drag-to-Done landing for terminal-state AgentCards (failed,
+	// cancelled, taken_over) where the user wants the task in the
+	// Done column rather than removed from view.
+	if req.Action == "dismiss" || req.Action == "complete" {
+		outcome := discardOutcomeDismissed
+		if req.Action == "complete" {
+			outcome = discardOutcomeCompleted
+		}
+		s.cleanupPendingApprovalRun(id, outcome)
 		if s.spawner != nil {
 			ids, err := db.ActiveRunIDsForTask(s.db, id)
 			if err != nil {
@@ -165,7 +178,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			} else {
 				for _, runID := range ids {
 					if err := s.spawner.Cancel(runID); err != nil {
-						log.Printf("[swipe] cancel run %s on dismiss of task %s: %v", runID, id, err)
+						log.Printf("[swipe] cancel run %s on %s of task %s: %v", runID, req.Action, id, err)
 					}
 				}
 			}
@@ -348,6 +361,12 @@ type discardOutcome int
 const (
 	discardOutcomeRequeued discardOutcome = iota
 	discardOutcomeDismissed
+	// discardOutcomeCompleted: user marked the task done from a
+	// terminal-state AgentCard (failed, cancelled, taken_over) by
+	// dragging it to the Done column. The agent's prepared review,
+	// if any, is being discarded — the user is signalling "the work
+	// is finished" without applying the agent's verdict to GitHub.
+	discardOutcomeCompleted
 )
 
 // finalizeRequeue runs the side-effect cleanup that both /undo and
@@ -485,6 +504,9 @@ func buildDiscardHumanContent(outcome discardOutcome) string {
 	case discardOutcomeDismissed:
 		return "**Outcome:** Human discarded the prepared review and dismissed the task entirely.\n" +
 			"**Implication:** The verdict you proposed was not accepted, and the human chose to walk away from this entity rather than re-queue it. Future runs on similar entities should reconsider whether the situation warrants action at all."
+	case discardOutcomeCompleted:
+		return "**Outcome:** Human marked the task complete without submitting the prepared review.\n" +
+			"**Implication:** The human acknowledged the task as resolved but chose not to apply your verdict to the entity. They likely handled it manually or via a different framing. Future runs should consider whether the agent's path was the right one or whether the human's resolution implies a gap in the prompt's approach."
 	default: // discardOutcomeRequeued
 		return "**Outcome:** Human discarded the prepared review without submitting it; task returned to the triage queue.\n" +
 			"**Implication:** The verdict you proposed was not accepted. Reconsider whether this entity warrants any review at all, or whether a different framing is needed."

@@ -329,6 +329,57 @@ export default function Board() {
       return
     }
 
+    // Done → Agent: re-delegate. spawner.Delegate inserts a new run
+    // row with a fresh UUID; the prior run stays in the DB for
+    // history. The AgentCard reflects the newest run (the runs API
+    // returns newest-first and Board takes the first), so the card
+    // visually flips to the new run as soon as fetchTasks lands.
+    if (sourceCol === 'done' && targetCol === 'agent') {
+      pendingDelegateTask.current = task
+      setShowPromptPicker(true)
+      return
+    }
+
+    // Drag to Done from a non-queue source → complete. The
+    // 'complete' swipe action flips task.status to 'done' (so the
+    // card stays visible in the Done column) and runs the same
+    // cleanup as dismiss — cancels any in-flight run, tears down
+    // the pending review if one exists. Distinct from queue → done
+    // (dismiss), which removes the task from the board entirely:
+    // by the time a card is in You/Agent/Done, the user has
+    // engaged with it, and "I'm finished with this" is more
+    // truthful than "I'm walking away."
+    if (targetCol === 'done' && sourceCol !== 'queue') {
+      await fetch(`/api/tasks/${taskId}/swipe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'complete', hesitation_ms: 0 }),
+      })
+      fetchTasks()
+      return
+    }
+
+    // Agent/Done → You: claim. pending_approval cards need the
+    // SKY-206 cleanup first (tear down the prepared review, write
+    // the discard verdict to run_memory.human_content) so /swipe
+    // claim doesn't leave a stranded pending_reviews row pointing
+    // at a now-claimed task. The two awaits are sequenced so a
+    // single fetchTasks at the end lands the card directly in You,
+    // without an intermediate queued flicker.
+    if (targetCol === 'you' && (sourceCol === 'agent' || sourceCol === 'done')) {
+      const run = agentRuns[taskId]
+      if (run?.Status === 'pending_approval') {
+        await fetch(`/api/tasks/${taskId}/requeue`, { method: 'POST' })
+      }
+      await fetch(`/api/tasks/${taskId}/swipe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'claim', hesitation_ms: 0 }),
+      })
+      fetchTasks()
+      return
+    }
+
     // Any → Queue: state-driven requeue. Distinct from /undo (the
     // Cards swipe-toast UX): drag-to-queue isn't reversing the user's
     // last gesture, it's a deliberate state change. /requeue runs the
@@ -550,13 +601,24 @@ export default function Board() {
               {claimed.length === 0 ? (
                 <EmptyColumn>Nothing claimed</EmptyColumn>
               ) : (
-                claimed.map((task) => (
-                  <SortableTaskCard
-                    key={task.id}
-                    task={task}
-                    onRequeue={() => handleRequeue(task.id)}
-                  />
-                ))
+                claimed.map((task) =>
+                  agentRuns[task.id] ? (
+                    <SortableAgentCard
+                      key={task.id}
+                      task={task}
+                      run={agentRuns[task.id]}
+                      messages={agentMessages[agentRuns[task.id].ID] || []}
+                      onRequeue={() => handleRequeue(task.id)}
+                      onReview={() => setReviewRunID(agentRuns[task.id].ID)}
+                    />
+                  ) : (
+                    <SortableTaskCard
+                      key={task.id}
+                      task={task}
+                      onRequeue={() => handleRequeue(task.id)}
+                    />
+                  ),
+                )
               )}
             </SortableContext>
           </DroppableColumn>
@@ -569,7 +631,7 @@ export default function Board() {
             isOver={overColumn === 'agent'}
           >
             <SortableContext
-              items={agentItems.filter((t) => !agentRuns[t.id]).map((t) => t.id)}
+              items={agentItems.map((t) => t.id)}
               strategy={verticalListSortingStrategy}
             >
               {agentItems.length === 0 ? (
@@ -577,7 +639,7 @@ export default function Board() {
               ) : (
                 agentItems.map((task) =>
                   agentRuns[task.id] ? (
-                    <AgentCard
+                    <SortableAgentCard
                       key={task.id}
                       task={task}
                       run={agentRuns[task.id]}
@@ -604,16 +666,13 @@ export default function Board() {
             count={done.length}
             isOver={overColumn === 'done'}
           >
-            <SortableContext
-              items={done.filter((t) => !agentRuns[t.id]).map((t) => t.id)}
-              strategy={verticalListSortingStrategy}
-            >
+            <SortableContext items={done.map((t) => t.id)} strategy={verticalListSortingStrategy}>
               {done.length === 0 ? (
                 <EmptyColumn>No completed items</EmptyColumn>
               ) : (
                 done.map((task) =>
                   agentRuns[task.id] ? (
-                    <AgentCard
+                    <SortableAgentCard
                       key={task.id}
                       task={task}
                       run={agentRuns[task.id]}
@@ -622,7 +681,11 @@ export default function Board() {
                       onReview={() => setReviewRunID(agentRuns[task.id].ID)}
                     />
                   ) : (
-                    <SortableTaskCard key={task.id} task={task} />
+                    <SortableTaskCard
+                      key={task.id}
+                      task={task}
+                      onRequeue={() => handleRequeue(task.id)}
+                    />
                   ),
                 )
               )}
@@ -720,6 +783,70 @@ function SortableTaskCard({ task, onRequeue }: { task: Task; onRequeue?: () => v
       {...attributes}
       {...listeners}
     />
+  )
+}
+
+// Run statuses where the AgentCard is safe to drag between columns.
+// Active states (running, cloning, etc.) stay anchored — the cancel
+// button is the right intent there, and dragging mid-run would race
+// with the spawner's status transitions. taken_over and the various
+// terminal states all describe runs whose process has exited, so a
+// task-status flip is decoupled from any in-flight work.
+const draggableRunStatuses = new Set([
+  'pending_approval',
+  'failed',
+  'cancelled',
+  'taken_over',
+  'completed',
+  'task_unsolvable',
+])
+
+function SortableAgentCard({
+  task,
+  run,
+  messages,
+  onRequeue,
+  onReview,
+}: {
+  task: Task
+  run: AgentRun
+  messages: AgentMessage[]
+  onRequeue?: () => void
+  onReview?: () => void
+}) {
+  const draggable = draggableRunStatuses.has(run.Status)
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: task.id,
+    disabled: !draggable,
+  })
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.3 : 1,
+    cursor: draggable ? 'grab' : undefined,
+  }
+
+  // Spread listeners on the outer wrapper so the whole card surface is
+  // a drag handle — except buttons inside, which @dnd-kit's pointer
+  // sensor leaves alone via its 5px activation distance (a click stays
+  // a click). Active-state cards skip this entirely so the Cancel and
+  // Take over buttons keep their normal hover/click semantics.
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...(draggable ? attributes : {})}
+      {...(draggable ? listeners : {})}
+    >
+      <AgentCard
+        task={task}
+        run={run}
+        messages={messages}
+        onRequeue={onRequeue}
+        onReview={onReview}
+      />
+    </div>
   )
 }
 
