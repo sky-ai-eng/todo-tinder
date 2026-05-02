@@ -71,6 +71,26 @@ func TestCreateProject_EmptyPinnedRepos_RoundtripsAsArray(t *testing.T) {
 	}
 }
 
+// TestCreateProject_HonorsCallerSuppliedID pins the documented
+// behavior: an explicit ID on the input is preserved (useful for
+// tests / seed scripts), while an empty ID triggers server-side
+// uuid generation. The HTTP handler always passes empty, so
+// API clients can't supply an arbitrary ID.
+func TestCreateProject_HonorsCallerSuppliedID(t *testing.T) {
+	database := newTestDB(t)
+	id, err := CreateProject(database, domain.Project{ID: "fixed-id-for-test", Name: "P"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if id != "fixed-id-for-test" {
+		t.Errorf("returned id = %q, want %q", id, "fixed-id-for-test")
+	}
+	got, _ := GetProject(database, "fixed-id-for-test")
+	if got == nil {
+		t.Fatal("project not found at caller-supplied id")
+	}
+}
+
 func TestGetProject_MissingReturnsNil(t *testing.T) {
 	database := newTestDB(t)
 	got, err := GetProject(database, "no-such-id")

@@ -11,10 +11,15 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// CreateProject inserts a new project. ID is generated server-side
-// so callers don't have to thread one through; PinnedRepos is
-// JSON-marshalled into the pinned_repos column. Returns the
-// generated ID so the handler can echo it back to the client.
+// CreateProject inserts a new project and returns its id. PinnedRepos
+// is JSON-marshalled into the pinned_repos column.
+//
+// ID handling: if p.ID is non-empty it's used as-is; otherwise a uuid
+// is generated. The HTTP create handler always passes an empty ID, so
+// the API surface is server-generation-only. Internal callers (tests,
+// seed scripts) can pre-set an ID when deterministic IDs are useful;
+// no security concern because there is no client path that supplies
+// an arbitrary ID. The returned id is the one actually persisted.
 //
 // Empty PinnedRepos serializes as `[]` (not null) — matches the DB
 // default and keeps the JSON round-trip predictable.

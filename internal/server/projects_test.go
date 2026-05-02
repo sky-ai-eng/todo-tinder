@@ -220,6 +220,29 @@ func TestProjectDelete_MissingKnowledgeDir_NoError(t *testing.T) {
 	}
 }
 
+// TestProjectDelete_PathResolutionFailure_StillWarns pins the
+// no-silent-skip contract: if projectKnowledgeDir errors (e.g.
+// UserHomeDir fails), the handler must still log + set the
+// X-Cleanup-Warning header so the client knows on-disk state may
+// be stale. Forces UserHomeDir to fail by clearing HOME (and on
+// macOS, the user/$USER fallbacks).
+func TestProjectDelete_PathResolutionFailure_StillWarns(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("USER", "")
+	t.Setenv("LOGNAME", "")
+
+	s := newTestServer(t)
+	id, _ := db.CreateProject(s.db, domain.Project{Name: "P"})
+
+	rec := doJSON(t, s, http.MethodDelete, "/api/projects/"+id, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if rec.Header().Get("X-Cleanup-Warning") == "" {
+		t.Error("expected X-Cleanup-Warning header when path resolution fails; got empty")
+	}
+}
+
 // TestProjectDelete_CleanupWarningRedactsPath pins the path-leak
 // fix: when on-disk cleanup fails, the X-Cleanup-Warning header
 // must be a generic message, not rmErr.Error() (which would

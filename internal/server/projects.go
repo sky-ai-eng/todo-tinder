@@ -180,17 +180,28 @@ func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	// consistent once that runtime starts populating files. The
 	// DB delete is the source of truth and a stale on-disk dir is
 	// recoverable (next run that needs that path will recreate or
-	// surface the issue), so a removal failure surfaces as a
+	// surface the issue), so a cleanup failure surfaces as a
 	// non-fatal warning rather than a 5xx.
 	//
+	// Two failure modes both produce the same X-Cleanup-Warning so
+	// the client always learns that on-disk state may be stale:
+	//   - resolving the path failed (UserHomeDir error etc.) —
+	//     cleanup couldn't even be attempted
+	//   - resolving worked but RemoveAll failed
+	//
 	// The full error (with absolute path + OS-specific detail) is
-	// logged server-side; the X-Cleanup-Warning header is a
-	// generic message so we don't leak filesystem layout to the
-	// client.
-	if dir, err := projectKnowledgeDir(id); err == nil {
+	// logged server-side; the header is a generic message so we
+	// don't leak filesystem layout to the client.
+	const cleanupWarning = "on-disk cleanup of project knowledge dir failed; check server logs"
+	dir, dirErr := projectKnowledgeDir(id)
+	switch {
+	case dirErr != nil:
+		log.Printf("[projects] cannot resolve knowledge dir for project %s; on-disk cleanup skipped: %v", id, dirErr)
+		w.Header().Set("X-Cleanup-Warning", cleanupWarning)
+	default:
 		if rmErr := os.RemoveAll(dir); rmErr != nil && !os.IsNotExist(rmErr) {
 			log.Printf("[projects] cleanup of project %s knowledge dir %q failed: %v", id, dir, rmErr)
-			w.Header().Set("X-Cleanup-Warning", "on-disk cleanup of project knowledge dir failed; check server logs")
+			w.Header().Set("X-Cleanup-Warning", cleanupWarning)
 		}
 	}
 
