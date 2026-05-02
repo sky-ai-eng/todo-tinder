@@ -347,8 +347,22 @@ func makeWorktreeDir(runID string) (string, error) {
 }
 
 // CreateForPR sets up a worktree on the PR's head branch.
-// The agent can push commits to the branch. Fetches the PR ref and checks out
-// the head branch (not detached) so git push works.
+//
+// Fetches the PR head via refs/pull/<n>/head (GitHub's server-side
+// mirror of every PR's head commit, available on the upstream) into
+// a local branch named after the PR's head ref. This works uniformly
+// for own-repo and fork PRs: refs/pull/<n>/head exists on the
+// upstream regardless of whether the PR's actual branch lives in the
+// upstream or in a fork. Fetching refs/heads/<headBranch> directly
+// from origin would fail for fork PRs because that branch isn't on
+// the upstream.
+//
+// The local branch is named <headBranch> so `git push origin
+// <headBranch>` updates the right place for own-repo PRs. For fork
+// PRs the push semantics are still wrong (it would create a new
+// upstream branch instead of updating the fork's branch); that's
+// tracked as a separate concern. The worktree itself is read-correct
+// either way.
 func CreateForPR(ctx context.Context, owner, repo, cloneURL, headBranch string, prNumber int, runID string) (string, error) {
 	mu := lockRepo(owner, repo)
 	mu.Lock()
@@ -359,20 +373,27 @@ func CreateForPR(ctx context.Context, owner, repo, cloneURL, headBranch string, 
 		return "", err
 	}
 
-	// Fetch the PR's head branch
-	branchRef := fmt.Sprintf("+refs/heads/%s:refs/heads/%s", headBranch, headBranch)
+	branchRef := fmt.Sprintf("+refs/pull/%d/head:refs/heads/%s", prNumber, headBranch)
 	start := time.Now()
 	if err := gitRunCtx(ctx, bareDir, "fetch", "origin", branchRef); err != nil {
-		return "", fmt.Errorf("fetch PR branch %s: %w", headBranch, err)
+		return "", fmt.Errorf("fetch PR #%d head into %s: %w", prNumber, headBranch, err)
 	}
-	log.Printf("[worktree] fetch PR #%d branch %s completed in %s", prNumber, headBranch, time.Since(start).Round(time.Millisecond))
+	log.Printf("[worktree] fetch PR #%d (refs/pull/%d/head -> %s) completed in %s", prNumber, prNumber, headBranch, time.Since(start).Round(time.Millisecond))
 
 	wtDir, err := makeWorktreeDir(runID)
 	if err != nil {
 		return "", err
 	}
 
-	if err := gitRunCtx(ctx, bareDir, "worktree", "add", wtDir, "refs/heads/"+headBranch); err != nil {
+	// Pass the bare branch name (not refs/heads/<name>) so git
+	// attaches the worktree to the local branch instead of going
+	// detached. `git worktree add <path> refs/heads/<name>` treats
+	// the ref path as a commit-ish and detaches; `git worktree add
+	// <path> <name>` resolves it as a branch and attaches. The
+	// previous code's "(not detached) so git push works" claim only
+	// held by accident on git versions that interpreted full ref
+	// paths as branches; modern git detaches.
+	if err := gitRunCtx(ctx, bareDir, "worktree", "add", wtDir, headBranch); err != nil {
 		return "", fmt.Errorf("worktree add: %w", err)
 	}
 

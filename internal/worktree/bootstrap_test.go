@@ -41,11 +41,15 @@ func makeTestUpstream(t *testing.T) string {
 
 // withTestHome points $HOME at a tempdir for the duration of the test
 // so repoDir() returns paths under it instead of touching the user's
-// real ~/.triagefactory.
+// real ~/.triagefactory. Also overrides $TMPDIR so worktrees created
+// via runDir() land under a tempdir that t.TempDir() will auto-clean.
+// os.TempDir() honors $TMPDIR on Unix, so this isolation works without
+// any worktree-package changes.
 func withTestHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("TMPDIR", t.TempDir())
 	return home
 }
 
@@ -215,4 +219,142 @@ func TestBootstrapBareClones_SkipsEmptyCloneURL(t *testing.T) {
 func TestBootstrapBareClones_EmptyTargets(t *testing.T) {
 	BootstrapBareClones(context.Background(), nil)
 	BootstrapBareClones(context.Background(), []BootstrapTarget{})
+}
+
+// TestCreateForPR_ForkPR_FetchesViaPullRef is the regression test for
+// the fork-PR fetch path. It mirrors GitHub's actual setup: the PR's
+// head commit lives ONLY at refs/pull/<n>/head on the upstream — the
+// branch refs/heads/<headBranch> does NOT exist on origin (it lives
+// in the fork, which we deliberately don't clone). Pre-fix CreateForPR
+// fetched refs/heads/<headBranch> from origin, which fails outright
+// for fork PRs.
+//
+// Test setup builds a fake "fork PR" by making a commit elsewhere
+// and pushing it to upstream's refs/pull/42/head — exactly what
+// GitHub does server-side when a PR is opened from a fork. We do NOT
+// push to refs/heads/feature-branch on upstream, so any code path
+// that tries to fetch refs/heads/feature-branch will fail.
+func TestCreateForPR_ForkPR_FetchesViaPullRef(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+
+	// Build a "fork" working tree, make a commit, push it to upstream
+	// as refs/pull/42/head ONLY (no refs/heads/feature-branch on
+	// upstream). This is exactly the state GitHub sets up for a fork PR.
+	fork := filepath.Join(t.TempDir(), "fork-work")
+	if out, err := exec.Command("git", "init", "-b", "main", fork).CombinedOutput(); err != nil {
+		t.Fatalf("git init fork: %v: %s", err, out)
+	}
+	cmds := [][]string{
+		{"-C", fork, "config", "user.email", "fork@example.com"},
+		{"-C", fork, "config", "user.name", "Forker"},
+		{"-C", fork, "remote", "add", "origin", upstream},
+		{"-C", fork, "fetch", "origin", "main"},
+		{"-C", fork, "checkout", "-b", "feature-branch", "FETCH_HEAD"},
+		{"-C", fork, "commit", "--allow-empty", "-m", "fork PR commit"},
+		{"-C", fork, "push", "origin", "HEAD:refs/pull/42/head"},
+	}
+	for _, c := range cmds {
+		if out, err := exec.Command("git", c...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", c, err, out)
+		}
+	}
+	out, err := exec.Command("git", "-C", fork, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse fork HEAD: %v", err)
+	}
+	forkCommit := strings.TrimSpace(string(out))
+
+	// Sanity: the upstream does NOT have refs/heads/feature-branch.
+	// If this assertion ever fails, the test setup is wrong and we
+	// wouldn't be exercising the fork-PR path at all.
+	if out, err := exec.Command("git", "-C", upstream, "show-ref", "--verify", "refs/heads/feature-branch").CombinedOutput(); err == nil {
+		t.Fatalf("test setup: upstream unexpectedly has refs/heads/feature-branch: %s", out)
+	}
+
+	wtPath, err := CreateForPR(context.Background(), "owner-fork-test", "repo-fork-test", upstream, "feature-branch", 42, "fork-pr-test-run")
+	if err != nil {
+		t.Fatalf("CreateForPR for fork PR: %v", err)
+	}
+	t.Cleanup(func() { _ = RemoveAt(wtPath, "fork-pr-test-run") })
+
+	// Worktree HEAD must point at the fork's PR commit — the same
+	// commit refs/pull/42/head pointed to on upstream. Anything else
+	// means the fetch landed wrong content.
+	out, err = exec.Command("git", "-C", wtPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("worktree rev-parse HEAD: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != forkCommit {
+		t.Errorf("worktree HEAD = %q, want %q (the fork PR commit)", got, forkCommit)
+	}
+
+	// Worktree should be on the local feature-branch ref so the agent
+	// can push commits and have them flow back up to a sensible target
+	// (though for fork PRs that's still wrong — see CreateForPR doc).
+	out, err = exec.Command("git", "-C", wtPath, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("worktree rev-parse abbrev: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "feature-branch" {
+		t.Errorf("worktree branch = %q, want %q", got, "feature-branch")
+	}
+}
+
+// TestCreateForPR_OwnRepoPR_FetchesViaPullRef confirms the
+// refs/pull/<n>/head fetch path is also correct for the common case
+// where the PR is from a branch on the upstream itself. GitHub
+// maintains refs/pull/<n>/head for every PR regardless of fork
+// status, so the same code path should work uniformly.
+func TestCreateForPR_OwnRepoPR_FetchesViaPullRef(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+
+	// Push a feature branch directly to upstream AND mirror it as
+	// refs/pull/7/head — the state GitHub sets up for an own-repo PR.
+	work := filepath.Join(t.TempDir(), "work-own")
+	if out, err := exec.Command("git", "init", "-b", "main", work).CombinedOutput(); err != nil {
+		t.Fatalf("git init work: %v: %s", err, out)
+	}
+	cmds := [][]string{
+		{"-C", work, "config", "user.email", "me@example.com"},
+		{"-C", work, "config", "user.name", "Me"},
+		{"-C", work, "remote", "add", "origin", upstream},
+		{"-C", work, "fetch", "origin", "main"},
+		{"-C", work, "checkout", "-b", "my-feature", "FETCH_HEAD"},
+		{"-C", work, "commit", "--allow-empty", "-m", "own-repo PR commit"},
+		{"-C", work, "push", "origin", "my-feature:refs/heads/my-feature"},
+		{"-C", work, "push", "origin", "my-feature:refs/pull/7/head"},
+	}
+	for _, c := range cmds {
+		if out, err := exec.Command("git", c...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", c, err, out)
+		}
+	}
+	out, err := exec.Command("git", "-C", work, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse work HEAD: %v", err)
+	}
+	expected := strings.TrimSpace(string(out))
+
+	wtPath, err := CreateForPR(context.Background(), "owner-own-test", "repo-own-test", upstream, "my-feature", 7, "own-pr-test-run")
+	if err != nil {
+		t.Fatalf("CreateForPR for own-repo PR: %v", err)
+	}
+	t.Cleanup(func() { _ = RemoveAt(wtPath, "own-pr-test-run") })
+
+	out, err = exec.Command("git", "-C", wtPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("worktree rev-parse HEAD: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != expected {
+		t.Errorf("worktree HEAD = %q, want %q", got, expected)
+	}
+	out, err = exec.Command("git", "-C", wtPath, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("worktree rev-parse abbrev: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "my-feature" {
+		t.Errorf("worktree branch = %q, want %q (git push relies on attached branch, not detached HEAD)", got, "my-feature")
+	}
 }
