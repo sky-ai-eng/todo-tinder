@@ -345,6 +345,99 @@ func TestCleanupPRConfig_OwnRepoIsNoOp(t *testing.T) {
 	}
 }
 
+// TestCreateForPR_DeletedFork_NoTrackingConfigured covers the
+// deleted-fork PR edge case: head.repo is null, so headCloneURL is
+// empty and isFork is false — but the PR is also not own-repo, and
+// configuring origin as the push target would silently send commits
+// to the upstream's refs/heads/<headBranch> when the agent runs
+// `git push`. The right behavior is to skip tracking entirely so
+// `git push` (no args) errors with "no upstream branch" instead of
+// pushing to the wrong place.
+func TestCreateForPR_DeletedFork_NoTrackingConfigured(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+
+	// Stand up refs/pull/55/head on upstream (PR exists, head.repo is
+	// null in the API response).
+	work := filepath.Join(t.TempDir(), "deleted-work")
+	if out, err := exec.Command("git", "init", "-b", "main", work).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	cmds := [][]string{
+		{"-C", work, "config", "user.email", "x@y.z"},
+		{"-C", work, "config", "user.name", "x"},
+		{"-C", work, "remote", "add", "up", upstream},
+		{"-C", work, "fetch", "up", "main"},
+		{"-C", work, "checkout", "-b", "feature", "FETCH_HEAD"},
+		{"-C", work, "commit", "--allow-empty", "-m", "deleted-fork PR commit"},
+		{"-C", work, "push", "up", "HEAD:refs/pull/55/head"},
+	}
+	for _, c := range cmds {
+		if out, err := exec.Command("git", c...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", c, err, out)
+		}
+	}
+
+	// Empty headCloneURL — the spawner passes pr.CloneURL which is
+	// empty when GitHub returned head.repo = null.
+	wtPath, err := CreateForPR(context.Background(), "owner-deleted-test", "repo-deleted-test", upstream, "", "feature", 55, "deleted-test-run")
+	if err != nil {
+		t.Fatalf("CreateForPR for deleted-fork PR: %v", err)
+	}
+	t.Cleanup(func() { _ = RemoveAt(wtPath, "deleted-test-run") })
+
+	// No branch tracking should be configured — push must fail.
+	if _, err := exec.Command("git", "-C", wtPath, "config", "--get", "branch.feature.remote").Output(); err == nil {
+		t.Errorf("branch.feature.remote configured for deleted-fork PR; push would silently target upstream")
+	}
+	// Sanity: `git push` (no args) should fail loudly.
+	cmd := exec.Command("git", "-C", wtPath, "config", "user.email", "x@y.z")
+	_ = cmd.Run()
+	cmd = exec.Command("git", "-C", wtPath, "config", "user.name", "x")
+	_ = cmd.Run()
+	cmd = exec.Command("git", "-C", wtPath, "commit", "--allow-empty", "-m", "agent fix")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("commit in deleted-fork worktree: %v: %s", err, out)
+	}
+	pushCmd := exec.Command("git", "-C", wtPath, "push")
+	if out, err := pushCmd.CombinedOutput(); err == nil {
+		t.Errorf("git push succeeded for deleted-fork PR with no tracking — should have failed: %s", out)
+	}
+}
+
+// TestSweepStaleForkPRConfig_PreservesUserAddedRemotes locks down
+// the exact-match check: a user-added remote named like `head-42-mine`
+// would parse as head-<42> if Sscanf allowed trailing input. The
+// sweep must reject any remote whose canonical name doesn't equal
+// "head-<n>" exactly.
+func TestSweepStaleForkPRConfig_PreservesUserAddedRemotes(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+	if _, err := EnsureBareClone(context.Background(), "owner-strict-test", "repo-strict-test", upstream); err != nil {
+		t.Fatalf("EnsureBareClone: %v", err)
+	}
+	bareDir, _ := repoDir("owner-strict-test", "repo-strict-test")
+
+	// Two user-added remotes that prefix-match but aren't ours.
+	for _, name := range []string{"head-42-mine", "head-100x"} {
+		if out, err := exec.Command("git", "-C", bareDir, "remote", "add", name, upstream).CombinedOutput(); err != nil {
+			t.Fatalf("add %s: %v: %s", name, err, out)
+		}
+	}
+
+	SweepStaleForkPRConfig("owner-strict-test", "repo-strict-test")
+
+	out, err := exec.Command("git", "-C", bareDir, "remote").Output()
+	if err != nil {
+		t.Fatalf("list remotes: %v", err)
+	}
+	for _, name := range []string{"head-42-mine", "head-100x"} {
+		if !strings.Contains(string(out), name) {
+			t.Errorf("user-added remote %q removed by sweep; remotes: %s", name, out)
+		}
+	}
+}
+
 // TestSweepStaleForkPRConfig_RemovesOrphanedRemotes is the regression
 // test for the cancelled/taken-over leak path: when inline cleanup
 // in the runAgent defer doesn't fire, head-<n> remotes accumulate

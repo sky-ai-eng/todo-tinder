@@ -409,7 +409,8 @@ func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneUR
 		return "", fmt.Errorf("worktree add: %w", err)
 	}
 
-	if isFork {
+	switch {
+	case isFork:
 		if err := configureForkPRTracking(ctx, bareDir, prNumber, localBranch, headCloneURL, headBranch); err != nil {
 			// Fork tracking is part of the worktree's contract for fork
 			// PRs — without it, `git push` lands in the wrong place.
@@ -420,19 +421,30 @@ func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneUR
 			}
 			return "", fmt.Errorf("configure fork PR tracking: %w", err)
 		}
-	} else {
-		// Configure tracking for own-repo PRs too so `git push` (no
-		// remote argument) works, matching envelope guidance. With
-		// tracking unset, `git push` errors with "no upstream branch"
-		// and forces agents to fall back to `git push origin <branch>`
-		// — which is exactly the form we discourage because it's
-		// wrong for fork PRs and a bug magnet across the codebase.
+	case hasHeadRepo:
+		// Real own-repo PR (head URL == upstream URL). Configure
+		// tracking so `git push` (no remote argument) works, matching
+		// envelope guidance. With tracking unset, `git push` errors
+		// with "no upstream branch" and forces agents to fall back to
+		// `git push origin <branch>` — which is exactly the form we
+		// discourage because it's wrong for fork PRs and a bug magnet
+		// across the codebase.
 		if err := configureOwnRepoPRTracking(ctx, bareDir, localBranch); err != nil {
 			if rmErr := RemoveAt(wtDir, runID); rmErr != nil {
 				log.Printf("[worktree] rollback after own-repo tracking failure: %v", rmErr)
 			}
 			return "", fmt.Errorf("configure own-repo PR tracking: %w", err)
 		}
+	default:
+		// Deleted-fork PR (head.repo == null). The PR is reviewable
+		// — refs/pull/<n>/head still exists on the upstream — but
+		// there's no contributor remote to push back to. Skip tracking
+		// so `git push` (no args) errors with "no upstream branch" and
+		// surfaces the un-pushable state cleanly. Configuring origin
+		// as the push target here would silently push to upstream:
+		// refs/heads/<headBranch>, creating a stray branch that has
+		// nothing to do with the closed PR.
+		log.Printf("[worktree] PR #%d head repository is unavailable (deleted fork); worktree is read-only", prNumber)
 	}
 
 	if err := addExcludesOrRollback(runID, wtDir); err != nil {
@@ -565,10 +577,16 @@ func SweepStaleForkPRConfig(owner, repo string) {
 	for _, name := range strings.Split(remotesOut, "\n") {
 		name = strings.TrimSpace(name)
 		var prNumber int
-		// Sscanf returns 0 matches if the prefix doesn't fit, so
-		// `origin` and any user-added remote that doesn't follow the
-		// head-<n> naming gets skipped without a regex.
+		// Sscanf returns 0 matches if the "head-" prefix doesn't fit
+		// AND consumes the integer greedily — `head-42-mine` would
+		// match with prNumber=42 because Sscanf doesn't validate
+		// trailing input. Re-render the canonical name and require
+		// exact equality so user-added remotes like `head-42-mine`
+		// or `head-42x` aren't mistaken for ours and reclaimed.
 		if n, _ := fmt.Sscanf(name, "head-%d", &prNumber); n != 1 {
+			continue
+		}
+		if name != forkPRRemoteName(prNumber) {
 			continue
 		}
 		if inUse[forkPRLocalBranch(prNumber)] {
