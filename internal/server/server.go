@@ -78,6 +78,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/agent/runs/{runID}/respond", s.handleAgentRespond)
 	s.mux.HandleFunc("GET /api/agent/runs", s.handleAgentRuns)
 
+	// Projects (SKY-215). Pure CRUD over the projects table; the
+	// Curator runtime that populates designer_session_id and
+	// summary_md lands in later tickets.
+	s.mux.HandleFunc("POST /api/projects", s.handleProjectCreate)
+	s.mux.HandleFunc("GET /api/projects", s.handleProjectList)
+	s.mux.HandleFunc("GET /api/projects/{id}", s.handleProjectGet)
+	s.mux.HandleFunc("PATCH /api/projects/{id}", s.handleProjectUpdate)
+	s.mux.HandleFunc("DELETE /api/projects/{id}", s.handleProjectDelete)
+
 	// Websocket
 	s.mux.HandleFunc("GET /api/ws", s.ws.HandleWS)
 
