@@ -478,7 +478,11 @@ func rollbackPRSetupLocked(ctx context.Context, bareDir, wtDir, runID, headBranc
 	if rmErr := RemoveAt(wtDir, runID); rmErr != nil {
 		log.Printf("[worktree] rollback PR setup: remove worktree: %v", rmErr)
 	}
-	removePRConfigLocked(ctx, bareDir, headBranch, prNumber)
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	removePRConfigLocked(cleanupCtx, bareDir, headBranch, prNumber)
 }
 
 // forkPRLocalBranch returns the bare-local branch name we use for a
