@@ -213,15 +213,71 @@ func RemoveClaudeProjectDir(cwd string) {
 	}
 }
 
-// ensureBareClone creates a bare clone if it doesn't exist yet.
-// Must be called under the per-repo lock.
-func ensureBareClone(ctx context.Context, owner, repo, cloneURL string) (string, error) {
+// prFetchRefspec teaches the bare clone to mirror GitHub's server-side
+// pull-request refs into refs/remotes/pr/<n> on every fetch. With this
+// in place a worktree can check out the head of any PR — including
+// PRs from forks — without ever cloning the fork itself; GitHub
+// maintains refs/pull/<n>/head on the upstream side and we just pull
+// it down. Without this refspec, fetching `refs/heads/<branch>` for
+// a fork PR fails because the branch doesn't exist on origin.
+const prFetchRefspec = "+refs/pull/*/head:refs/remotes/pr/*"
+
+// EnsureBareClone is the exported entry point for callers that want a
+// bare clone of owner/repo materialized and configured. It's idempotent:
+// no-op when the bare already exists with the right origin URL and PR
+// refspec; otherwise clones and/or repairs in place. Bootstrap calls
+// this for every configured repo on startup so first-delegation
+// latency disappears.
+//
+// The cloneURL must be the upstream repository's URL (the URL stored
+// in repo_profiles.clone_url, populated during repo profiling). Passing
+// a fork's URL would clobber the bare's origin and is the historical
+// bug this function exists to prevent — see repairOriginURL.
+func EnsureBareClone(ctx context.Context, owner, repo, cloneURL string) (string, error) {
+	mu := lockRepo(owner, repo)
+	mu.Lock()
+	defer mu.Unlock()
+	return ensureBareCloneLocked(ctx, owner, repo, cloneURL)
+}
+
+// ensureBareCloneLocked clones the bare if missing, repairs a drifted
+// origin URL when one is configured, and configures the PR fetch
+// refspec. Caller must hold the per-repo lock.
+//
+// The clone-if-missing step is split into a separate helper so the
+// post-clone configuration runs whether or not the bare already
+// existed. A repo whose bare was created before this code shipped
+// won't have the PR refspec configured; calling this once corrects it.
+func ensureBareCloneLocked(ctx context.Context, owner, repo, cloneURL string) (string, error) {
+	bareDir, err := cloneBareIfMissing(ctx, owner, repo, cloneURL)
+	if err != nil {
+		return "", err
+	}
+	if cloneURL != "" {
+		if err := repairOriginURL(ctx, bareDir, cloneURL); err != nil {
+			return "", fmt.Errorf("repair origin url: %w", err)
+		}
+	}
+	if err := ensurePRFetchRefspec(ctx, bareDir); err != nil {
+		return "", fmt.Errorf("ensure pr refspec: %w", err)
+	}
+	return bareDir, nil
+}
+
+// cloneBareIfMissing performs the actual `git clone --bare` only when
+// the bare directory doesn't yet exist. Caller must hold the per-repo
+// lock. Does NOT configure origin URL or refspecs — see
+// ensureBareCloneLocked for the full lifecycle.
+func cloneBareIfMissing(ctx context.Context, owner, repo, cloneURL string) (string, error) {
 	bareDir, err := repoDir(owner, repo)
 	if err != nil {
 		return "", fmt.Errorf("resolve repo dir: %w", err)
 	}
 
 	if _, err := os.Stat(bareDir); os.IsNotExist(err) {
+		if cloneURL == "" {
+			return "", fmt.Errorf("bare clone for %s/%s missing and no cloneURL provided", owner, repo)
+		}
 		log.Printf("[worktree] cloning %s/%s (first time)...", owner, repo)
 		if err := os.MkdirAll(filepath.Dir(bareDir), 0755); err != nil {
 			return "", fmt.Errorf("mkdir: %w", err)
@@ -234,6 +290,51 @@ func ensureBareClone(ctx context.Context, owner, repo, cloneURL string) (string,
 	}
 
 	return bareDir, nil
+}
+
+// repairOriginURL sets remote.origin.url to wantURL when it differs
+// from the currently-configured value. Idempotent: returns immediately
+// when the URL already matches.
+//
+// This corrects the historical bug where a fork PR encountered before
+// the upstream itself caused the bare's origin to point at the fork
+// (the spawner used to pass pr.CloneURL — the head's URL — into the
+// initial clone). Calling EnsureBareClone with the upstream URL fixes
+// the drift on next bootstrap.
+func repairOriginURL(ctx context.Context, bareDir, wantURL string) error {
+	currentURL, err := gitOutputCtx(ctx, bareDir, "config", "--get", "remote.origin.url")
+	if err != nil {
+		// No origin configured (or read failed). Set it directly —
+		// a bare without an origin can't fetch, so we'd have to
+		// configure one anyway.
+		return gitRunCtx(ctx, bareDir, "remote", "set-url", "origin", wantURL)
+	}
+	currentURL = strings.TrimSpace(currentURL)
+	if currentURL == wantURL {
+		return nil
+	}
+	log.Printf("[worktree] repairing origin url for %s: %q -> %q", bareDir, currentURL, wantURL)
+	return gitRunCtx(ctx, bareDir, "remote", "set-url", "origin", wantURL)
+}
+
+// ensurePRFetchRefspec adds the PR fetch refspec to remote.origin.fetch
+// if it isn't already present. Idempotent: skips the add when the line
+// is already configured.
+//
+// Read uses --get-all (not --get) because remote.origin.fetch is a
+// multi-valued config key — `git clone --bare` configures one default
+// value (+refs/heads/*:refs/heads/*) and we add a second. --get would
+// either return only the first or fail with "multiple values"; --get-all
+// returns every value newline-separated, which is what we need to
+// detect prior installation.
+func ensurePRFetchRefspec(ctx context.Context, bareDir string) error {
+	out, _ := gitOutputCtx(ctx, bareDir, "config", "--get-all", "remote.origin.fetch")
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == prFetchRefspec {
+			return nil
+		}
+	}
+	return gitRunCtx(ctx, bareDir, "config", "--add", "remote.origin.fetch", prFetchRefspec)
 }
 
 // makeWorktreeDir creates the run directory for a worktree.
@@ -253,7 +354,7 @@ func CreateForPR(ctx context.Context, owner, repo, cloneURL, headBranch string, 
 	mu.Lock()
 	defer mu.Unlock()
 
-	bareDir, err := ensureBareClone(ctx, owner, repo, cloneURL)
+	bareDir, err := ensureBareCloneLocked(ctx, owner, repo, cloneURL)
 	if err != nil {
 		return "", err
 	}
@@ -290,7 +391,7 @@ func CreateForBranch(ctx context.Context, owner, repo, cloneURL, baseBranch, fea
 	mu.Lock()
 	defer mu.Unlock()
 
-	bareDir, err := ensureBareClone(ctx, owner, repo, cloneURL)
+	bareDir, err := ensureBareCloneLocked(ctx, owner, repo, cloneURL)
 	if err != nil {
 		return "", err
 	}
