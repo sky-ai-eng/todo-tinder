@@ -301,9 +301,12 @@ func cloneBareIfMissing(ctx context.Context, owner, repo, cloneURL string) (stri
 func repairOriginURL(ctx context.Context, bareDir, wantURL string) error {
 	currentURL, err := gitOutputCtx(ctx, bareDir, "config", "--get", "remote.origin.url")
 	if err != nil {
-		// No origin configured (or read failed). Set it directly —
-		// a bare without an origin can't fetch, so we'd have to
-		// configure one anyway.
+		// No origin configured (or read failed). Recreate the remote when
+		// it's missing; if it already exists but the config lookup failed,
+		// fall back to updating its URL in place.
+		if addErr := gitRunCtx(ctx, bareDir, "remote", "add", "origin", wantURL); addErr == nil {
+			return nil
+		}
 		return gitRunCtx(ctx, bareDir, "remote", "set-url", "origin", wantURL)
 	}
 	currentURL = strings.TrimSpace(currentURL)
