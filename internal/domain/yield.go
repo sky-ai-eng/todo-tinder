@@ -41,7 +41,7 @@ type YieldChoiceOption struct {
 	Label string `json:"label"`
 }
 
-// YieldResponse is the payload the user submits via POST /api/runs/{id}/respond.
+// YieldResponse is the payload the user submits via POST /api/agent/runs/{runID}/respond.
 // Same union pattern as YieldRequest — Type echoes the request's Type and the
 // per-type field carries the answer.
 type YieldResponse struct {
