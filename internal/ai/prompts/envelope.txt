@@ -66,7 +66,7 @@ Three yield shapes are supported. Each is a JSON object with `status: "yield"` a
 **Prompt** — free-text input. `placeholder` is optional UI hint:
 {"status": "yield", "yield": {"type": "prompt", "message": "What should the commit message say?", "placeholder": "fix: ..."}}
 
-When the user responds, you'll be resumed with a plain-text message describing their answer (e.g. `[user response] yield_type: confirmation, accepted: true`). Continue from there. You may yield again — there's no limit on the number of yields per run.
+When the user responds, you'll be resumed with a plain-text message describing their answer (e.g. `[user response] You asked: "About to force-push to main. Continue?" The user selected: Force push`). Continue from there. You may yield again — there's no limit on the number of yields per run.
 </yielding>
 
 <completion>
