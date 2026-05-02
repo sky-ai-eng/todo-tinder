@@ -225,11 +225,17 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
         </div>
         {isAwaiting && openYieldRequest && (
           <button
+            type="button"
             onClick={() => setYieldModalOpen(true)}
+            aria-label={`Respond to agent: ${openYieldRequest.message}`}
+            aria-haspopup="dialog"
             className="mt-2 w-full flex items-center justify-between gap-3 px-3 py-2 rounded-xl border border-snooze/40 bg-snooze/10 hover:bg-snooze/20 transition-colors text-left"
           >
             <span className="flex items-start gap-2 min-w-0">
-              <span className="shrink-0 mt-0.5 inline-block w-1.5 h-1.5 rounded-full bg-snooze animate-pulse" />
+              <span
+                className="shrink-0 mt-0.5 inline-block w-1.5 h-1.5 rounded-full bg-snooze animate-pulse"
+                aria-hidden="true"
+              />
               <span className="flex flex-col min-w-0">
                 <span className="text-[10px] font-semibold uppercase tracking-wider text-snooze">
                   Agent waiting for response
@@ -239,7 +245,9 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
                 </span>
               </span>
             </span>
-            <span className="shrink-0 text-[12px] font-semibold text-snooze">Respond →</span>
+            <span className="shrink-0 text-[12px] font-semibold text-snooze" aria-hidden="true">
+              Respond →
+            </span>
           </button>
         )}
         {takeoverPending && !pendingOverlayDismissed && (
