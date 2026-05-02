@@ -214,11 +214,25 @@ func SetPendingReviewSubmission(database *sql.DB, reviewID, body, event string) 
 // SetPendingReviewSubmission used by cmd/exec/gh's prSubmitReview.
 // It captures the agent's drafted body + event AND seals the
 // review against further agent submissions in a single atomic
-// UPDATE — gated by `original_review_event IS NULL`, which is true
-// only on the very first call (the COALESCE pattern in
-// SetPendingReviewSubmission populates originals on first agent
-// write, then preserves them through any handleReviewUpdate edits
-// the human makes from the UI).
+// UPDATE.
+//
+// The gate is `review_event IS NULL OR review_event = ”`: the
+// baseline schema leaves review_event empty on fresh
+// CreatePendingReview rows and any code path that finalizes a
+// submission populates it. That makes review_event the
+// era-independent "has been submitted" signal — which matters
+// because original_review_event was added later (SKY-205) and
+// pre-SKY-205 rows can sit in the DB with original_review_event
+// NULL even though they were already submitted (review_event +
+// original_review_body populated via the SKY-204 COALESCE writer).
+// Gating on original_review_event would falsely open the lock for
+// those rows.
+//
+// Originals use COALESCE so legacy rows with a SKY-204-era
+// original_review_body keep their snapshot if the gate ever lets a
+// write through (e.g. a fresh row from before either column
+// existed) — preserving the write-once contract regardless of
+// migration era.
 //
 // On second-and-later agent calls, RowsAffected is 0 and the
 // helper returns ErrPendingReviewAlreadySubmitted. SKY-212's
@@ -238,9 +252,9 @@ func LockPendingReviewSubmission(database *sql.DB, reviewID, body, event string)
 		`UPDATE pending_reviews
 		 SET review_body = ?,
 		     review_event = ?,
-		     original_review_body = ?,
-		     original_review_event = ?
-		 WHERE id = ? AND original_review_event IS NULL`,
+		     original_review_body = COALESCE(original_review_body, ?),
+		     original_review_event = COALESCE(original_review_event, ?)
+		 WHERE id = ? AND (review_event IS NULL OR review_event = '')`,
 		body, event, body, event, reviewID,
 	)
 	if err != nil {

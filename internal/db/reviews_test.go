@@ -344,6 +344,75 @@ func TestLockPendingReviewSubmission_SecondCallReturnsAlreadySubmitted(t *testin
 	}
 }
 
+// TestLockPendingReviewSubmission_LegacySKY204RowTreatedAsAlreadySubmitted
+// pins the migration-era guard the PR review flagged. Pre-SKY-205
+// rows can carry review_event populated AND original_review_body
+// populated (SKY-204's COALESCE writer ran before the
+// original_review_event column existed) but original_review_event
+// is NULL because the column was added later with a NULL default.
+//
+// Gating the lock on original_review_event IS NULL — as an earlier
+// draft did — would falsely open the gate for these rows, allowing
+// a second agent submission to overwrite the SKY-204 snapshot of
+// original_review_body and re-write review_body / review_event.
+// Gating on review_event (and switching the originals writes to
+// COALESCE) makes the lock era-agnostic: any row whose review_event
+// is non-empty has been submitted, regardless of when the row was
+// created.
+//
+// The assertion shape: lock attempt returns
+// ErrPendingReviewAlreadySubmitted, and the legacy
+// original_review_body must remain anchored at the SKY-204-era
+// agent draft (no clobber).
+func TestLockPendingReviewSubmission_LegacySKY204RowTreatedAsAlreadySubmitted(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingReview(t, db, "rev_legacy_lock")
+
+	// Simulate the pre-SKY-205 state: review_event + original_review_body
+	// set, but original_review_event NULL (the column existed in the
+	// schema but the row was submitted via the pre-SKY-205 writer that
+	// didn't populate it).
+	if _, err := db.Exec(
+		`UPDATE pending_reviews
+		   SET review_body = ?, review_event = ?, original_review_body = ?, original_review_event = NULL
+		   WHERE id = ?`,
+		"legacy agent body", "APPROVE", "legacy agent body", "rev_legacy_lock",
+	); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+
+	err := LockPendingReviewSubmission(db, "rev_legacy_lock", "second-call body", "REQUEST_CHANGES")
+	if !errors.Is(err, ErrPendingReviewAlreadySubmitted) {
+		t.Fatalf("LockPendingReviewSubmission on legacy submitted row err = %v, want ErrPendingReviewAlreadySubmitted",
+			err)
+	}
+
+	// Snapshot must NOT be clobbered. Legacy original_review_body is
+	// the only record of what the agent originally drafted; an
+	// unconditional write would erase it.
+	var body, event, origBody, origEvent sql.NullString
+	if err := db.QueryRow(
+		`SELECT review_body, review_event, original_review_body, original_review_event
+		 FROM pending_reviews WHERE id = ?`, "rev_legacy_lock",
+	).Scan(&body, &event, &origBody, &origEvent); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if body.String != "legacy agent body" {
+		t.Errorf("review_body = %q, want %q (legacy submission must survive)", body.String, "legacy agent body")
+	}
+	if event.String != "APPROVE" {
+		t.Errorf("review_event = %q, want %q (legacy submission must survive)", event.String, "APPROVE")
+	}
+	if origBody.String != "legacy agent body" {
+		t.Errorf("original_review_body = %q, want %q (SKY-204 snapshot must NOT be clobbered)",
+			origBody.String, "legacy agent body")
+	}
+	if origEvent.Valid {
+		t.Errorf("original_review_event = %q, want NULL (legacy row should remain in pre-SKY-205 shape after refused lock)",
+			origEvent.String)
+	}
+}
+
 // TestLockPendingReviewSubmission_BogusIDIsDistinctFromAlreadySubmitted
 // guards the disambiguation between two RowsAffected=0 cases. A
 // missing review_id should surface as a "not found" error pointed
