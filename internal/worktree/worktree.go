@@ -346,13 +346,20 @@ func makeWorktreeDir(runID string) (string, error) {
 // place because origin IS the upstream and <headBranch> is the same
 // branch on both ends.
 //
-// For fork PRs: local branch is named pr-<n> (avoids collisions
-// with own-repo branches that might share the head ref name across
-// concurrent runs). A bare-config remote `head-<n>` pointing at the
-// fork URL is added, and the local branch's tracking is configured
-// so `git push` (no remote argument) pushes pr-<n> -> the fork's
-// <headBranch>. Agents must use `git push` without a remote arg for
-// this to work; envelope.txt has the corresponding guidance.
+// For fork PRs: local branch is named triagefactory/pr-<n> (avoids
+// collisions with own-repo branches that might share the head ref
+// name across concurrent runs, AND with any literal contributor
+// branch named pr-<n> — the slash-prefix namespace is reserved for
+// triagefactory's synthetic refs). A bare-config remote `head-<n>`
+// pointing at the fork URL is added, and the local branch's
+// tracking is configured so `git push` (no remote argument) pushes
+// triagefactory/pr-<n> -> the fork's <headBranch>. Agents must use
+// `git push` without a remote arg for this to work; envelope.txt
+// has the corresponding guidance.
+//
+// CleanupPRConfig should be called after the run terminates to
+// remove the per-PR remote and config — they live in the bare's
+// shared config and would otherwise accumulate forever.
 func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneURL, headBranch string, prNumber int, runID string) (string, error) {
 	mu := lockRepo(owner, repo)
 	mu.Lock()
@@ -374,10 +381,13 @@ func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneUR
 	isFork := headCloneURL != upstreamCloneURL
 	localBranch := headBranch
 	if isFork {
-		// pr-<n> is unique per PR, so two concurrent fork-PR delegations
-		// from different forks with the same head ref name don't collide
-		// on refs/heads/<headBranch> in the bare.
-		localBranch = fmt.Sprintf("pr-%d", prNumber)
+		// triagefactory/pr-<n> is namespaced under a path-prefix that
+		// would only collide with a contributor's branch literally
+		// named "triagefactory/pr-<n>" (extremely unlikely). A bare
+		// "pr-<n>" name would have collided with any contributor
+		// using "pr-42" as a real branch name on an own-repo PR,
+		// silently overwriting their fetched tip and tracking config.
+		localBranch = forkPRLocalBranch(prNumber)
 	}
 
 	branchRef := fmt.Sprintf("+refs/pull/%d/head:refs/heads/%s", prNumber, localBranch)
@@ -435,6 +445,70 @@ func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneUR
 	return wtDir, nil
 }
 
+// forkPRLocalBranch returns the bare-local branch name we use for a
+// fork PR's checkout. Centralized so CreateForPR and CleanupPRConfig
+// can't drift from each other on the naming convention.
+func forkPRLocalBranch(prNumber int) string {
+	return fmt.Sprintf("triagefactory/pr-%d", prNumber)
+}
+
+// forkPRRemoteName returns the bare-config remote name we use for a
+// fork PR's contributor remote. Per-PR rather than per-fork-owner so
+// add/set-url is idempotent and stale URLs from one PR can't
+// contaminate another.
+func forkPRRemoteName(prNumber int) string {
+	return fmt.Sprintf("head-%d", prNumber)
+}
+
+// CleanupPRConfig removes the per-PR remote, branch tracking config,
+// and synthetic local branch that fork-PR delegations leave in the
+// bare repo. Idempotent: silently no-ops on own-repo PRs (where
+// these config keys never get set) and on previously-cleaned bares.
+//
+// Without this cleanup, every fork PR delegation would leak a
+// permanent `head-<n>` remote and `branch.triagefactory/pr-<n>.*`
+// config block into the bare. Long-lived repos with frequent fork
+// PRs would accumulate hundreds of stale entries over time, slowing
+// `git fetch --all` and bloating the config file.
+//
+// Should be called after the worktree has been removed (RemoveAt) so
+// `git branch -D` doesn't fight with an in-use checkout. Errors from
+// individual git invocations are logged but not returned — cleanup
+// is best-effort and a partial failure shouldn't propagate up the
+// run-finalization path.
+func CleanupPRConfig(ctx context.Context, owner, repo string, prNumber int) {
+	mu := lockRepo(owner, repo)
+	mu.Lock()
+	defer mu.Unlock()
+
+	bareDir, err := repoDir(owner, repo)
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(bareDir); err != nil {
+		return
+	}
+
+	remoteName := forkPRRemoteName(prNumber)
+	localBranch := forkPRLocalBranch(prNumber)
+
+	// `git remote remove` deletes both the remote.<name>.* config
+	// keys and the per-remote refs/remotes/<name>/* entries. Errors
+	// when the remote doesn't exist (own-repo PR, already cleaned).
+	_ = gitRunCtx(ctx, bareDir, "remote", "remove", remoteName)
+
+	// Branch config block lives at branch.<localBranch>.* — wipe
+	// the whole section in one shot. The dotted section name needs
+	// the full key path; --remove-section takes "section.subsection"
+	// where subsection is the quoted identifier.
+	_ = gitRunCtx(ctx, bareDir, "config", "--remove-section", "branch."+localBranch)
+
+	// The synthetic local branch in the bare. -D forces deletion
+	// even if not merged, which is the right semantics here — the
+	// PR run is done and we're not preserving its history locally.
+	_ = gitRunCtx(ctx, bareDir, "branch", "-D", localBranch)
+}
+
 // configureForkPRTracking sets up the worktree's local branch so
 // `git push` (no remote argument) sends commits to the contributor's
 // fork at the right branch name. Configures four pieces:
@@ -450,13 +524,14 @@ func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneUR
 //     refs/heads/<localBranch> -> refs/heads/<forkBranch>. Without
 //     this, `git push` (no args) under the default push.default
 //     ("simple") errors with "names don't match" because local
-//     pr-<n> and remote <forkBranch> differ. The explicit refspec
-//     bypasses the name-match check and pushes to the right place.
+//     triagefactory/pr-<n> and remote <forkBranch> differ. The
+//     explicit refspec bypasses the name-match check and pushes to
+//     the right place.
 //
 // Idempotent: re-running on an already-configured state updates URLs
 // and rewrites config keys to current values.
 func configureForkPRTracking(ctx context.Context, bareDir string, prNumber int, localBranch, forkCloneURL, forkBranch string) error {
-	remoteName := fmt.Sprintf("head-%d", prNumber)
+	remoteName := forkPRRemoteName(prNumber)
 
 	// Add or update the fork remote. `git remote add` errors when the
 	// remote already exists; fall through to set-url in that case so

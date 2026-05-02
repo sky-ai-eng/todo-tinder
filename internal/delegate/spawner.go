@@ -415,6 +415,7 @@ type runConfig struct {
 	hasWT    bool   // whether a worktree was created (controls cleanup)
 	owner    string // resolved GitHub owner (empty for no-repo Jira runs)
 	repo     string // resolved GitHub repo (empty for no-repo Jira runs)
+	prNumber int    // PR number (0 for non-PR runs); set so the runAgent defer can call worktree.CleanupPRConfig and reclaim the per-PR remote + branch tracking config the bare repo would otherwise accumulate
 }
 
 // Delegate kicks off an async agent run for any task type.
@@ -579,6 +580,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 		hasWT:    true,
 		owner:    owner,
 		repo:     repo,
+		prNumber: prNumber,
 	}, nil
 }
 
@@ -655,6 +657,14 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 				return
 			}
 			_ = worktree.RemoveAt(cfg.wtPath, runID)
+			// Fork-PR setup adds a per-PR remote and branch config to
+			// the shared bare repo. Reclaim those once the worktree is
+			// gone so they don't accumulate over the repo's lifetime.
+			// Idempotent and safe for non-fork PR runs (own-repo PRs and
+			// Jira runs hit the no-op path).
+			if cfg.prNumber > 0 && cfg.owner != "" && cfg.repo != "" {
+				worktree.CleanupPRConfig(ctx, cfg.owner, cfg.repo, cfg.prNumber)
+			}
 		}()
 	}
 
