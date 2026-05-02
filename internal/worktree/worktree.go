@@ -214,9 +214,9 @@ func RemoveClaudeProjectDir(cwd string) {
 }
 
 // EnsureBareClone is the exported entry point for callers that want a
-// bare clone of owner/repo materialized and configured. It's idempotent:
-// no-op when the bare already exists with the right origin URL and PR
-// refspec; otherwise clones and/or repairs in place. Bootstrap calls
+// bare clone of owner/repo materialized. It's idempotent: if the bare
+// already exists, it only repairs a drifted origin URL; otherwise it
+// clones the bare and then repairs origin if needed. Bootstrap calls
 // this for every configured repo on startup so first-delegation
 // latency disappears.
 //
