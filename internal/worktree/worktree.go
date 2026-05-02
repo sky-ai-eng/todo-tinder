@@ -350,35 +350,54 @@ func makeWorktreeDir(runID string) (string, error) {
 //
 // Fetches the PR head via refs/pull/<n>/head (GitHub's server-side
 // mirror of every PR's head commit, available on the upstream) into
-// a local branch named after the PR's head ref. This works uniformly
-// for own-repo and fork PRs: refs/pull/<n>/head exists on the
-// upstream regardless of whether the PR's actual branch lives in the
-// upstream or in a fork. Fetching refs/heads/<headBranch> directly
-// from origin would fail for fork PRs because that branch isn't on
-// the upstream.
+// a local branch in the bare. This works uniformly for own-repo and
+// fork PRs: refs/pull/<n>/head exists on the upstream regardless of
+// whether the PR's actual branch lives in the upstream or in a fork.
+// Fetching refs/heads/<headBranch> directly from origin would fail
+// for fork PRs because that branch isn't on the upstream.
 //
-// The local branch is named <headBranch> so `git push origin
-// <headBranch>` updates the right place for own-repo PRs. For fork
-// PRs the push semantics are still wrong (it would create a new
-// upstream branch instead of updating the fork's branch); that's
-// tracked as a separate concern. The worktree itself is read-correct
-// either way.
-func CreateForPR(ctx context.Context, owner, repo, cloneURL, headBranch string, prNumber int, runID string) (string, error) {
+// upstreamCloneURL is the base.repo.clone_url from the PR — where
+// the bare's origin points and where refs/pull/*/head lives.
+// headCloneURL is the head.repo.clone_url — the fork's URL when the
+// PR is from a fork, equal to upstreamCloneURL otherwise.
+//
+// For own-repo PRs (head URL == upstream URL): local branch is named
+// <headBranch>; `git push origin <headBranch>` updates the right
+// place because origin IS the upstream and <headBranch> is the same
+// branch on both ends.
+//
+// For fork PRs: local branch is named pr-<n> (avoids collisions
+// with own-repo branches that might share the head ref name across
+// concurrent runs). A bare-config remote `head-<n>` pointing at the
+// fork URL is added, and the local branch's tracking is configured
+// so `git push` (no remote argument) pushes pr-<n> -> the fork's
+// <headBranch>. Agents must use `git push` without a remote arg for
+// this to work; envelope.txt has the corresponding guidance.
+func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneURL, headBranch string, prNumber int, runID string) (string, error) {
 	mu := lockRepo(owner, repo)
 	mu.Lock()
 	defer mu.Unlock()
 
-	bareDir, err := ensureBareCloneLocked(ctx, owner, repo, cloneURL)
+	bareDir, err := ensureBareCloneLocked(ctx, owner, repo, upstreamCloneURL)
 	if err != nil {
 		return "", err
 	}
 
-	branchRef := fmt.Sprintf("+refs/pull/%d/head:refs/heads/%s", prNumber, headBranch)
+	isFork := headCloneURL != "" && headCloneURL != upstreamCloneURL
+	localBranch := headBranch
+	if isFork {
+		// pr-<n> is unique per PR, so two concurrent fork-PR delegations
+		// from different forks with the same head ref name don't collide
+		// on refs/heads/<headBranch> in the bare.
+		localBranch = fmt.Sprintf("pr-%d", prNumber)
+	}
+
+	branchRef := fmt.Sprintf("+refs/pull/%d/head:refs/heads/%s", prNumber, localBranch)
 	start := time.Now()
 	if err := gitRunCtx(ctx, bareDir, "fetch", "origin", branchRef); err != nil {
-		return "", fmt.Errorf("fetch PR #%d head into %s: %w", prNumber, headBranch, err)
+		return "", fmt.Errorf("fetch PR #%d head into %s: %w", prNumber, localBranch, err)
 	}
-	log.Printf("[worktree] fetch PR #%d (refs/pull/%d/head -> %s) completed in %s", prNumber, prNumber, headBranch, time.Since(start).Round(time.Millisecond))
+	log.Printf("[worktree] fetch PR #%d (refs/pull/%d/head -> %s) completed in %s", prNumber, prNumber, localBranch, time.Since(start).Round(time.Millisecond))
 
 	wtDir, err := makeWorktreeDir(runID)
 	if err != nil {
@@ -389,20 +408,112 @@ func CreateForPR(ctx context.Context, owner, repo, cloneURL, headBranch string, 
 	// attaches the worktree to the local branch instead of going
 	// detached. `git worktree add <path> refs/heads/<name>` treats
 	// the ref path as a commit-ish and detaches; `git worktree add
-	// <path> <name>` resolves it as a branch and attaches. The
-	// previous code's "(not detached) so git push works" claim only
-	// held by accident on git versions that interpreted full ref
-	// paths as branches; modern git detaches.
-	if err := gitRunCtx(ctx, bareDir, "worktree", "add", wtDir, headBranch); err != nil {
+	// <path> <name>` resolves it as a branch and attaches.
+	if err := gitRunCtx(ctx, bareDir, "worktree", "add", wtDir, localBranch); err != nil {
 		return "", fmt.Errorf("worktree add: %w", err)
+	}
+
+	if isFork {
+		if err := configureForkPRTracking(ctx, bareDir, prNumber, localBranch, headCloneURL, headBranch); err != nil {
+			// Fork tracking is part of the worktree's contract for fork
+			// PRs — without it, `git push` lands in the wrong place.
+			// Roll the worktree back so a half-configured state isn't
+			// returned.
+			if rmErr := RemoveAt(wtDir, runID); rmErr != nil {
+				log.Printf("[worktree] rollback after fork-tracking failure: %v", rmErr)
+			}
+			return "", fmt.Errorf("configure fork PR tracking: %w", err)
+		}
+	} else {
+		// Configure tracking for own-repo PRs too so `git push` (no
+		// remote argument) works, matching envelope guidance. With
+		// tracking unset, `git push` errors with "no upstream branch"
+		// and forces agents to fall back to `git push origin <branch>`
+		// — which is exactly the form we discourage because it's
+		// wrong for fork PRs and a bug magnet across the codebase.
+		if err := configureOwnRepoPRTracking(ctx, bareDir, localBranch); err != nil {
+			if rmErr := RemoveAt(wtDir, runID); rmErr != nil {
+				log.Printf("[worktree] rollback after own-repo tracking failure: %v", rmErr)
+			}
+			return "", fmt.Errorf("configure own-repo PR tracking: %w", err)
+		}
 	}
 
 	if err := addExcludesOrRollback(runID, wtDir); err != nil {
 		return "", err
 	}
 
-	log.Printf("[worktree] PR worktree at %s (branch: %s)", wtDir, headBranch)
+	log.Printf("[worktree] PR worktree at %s (local branch: %s, head: %s, fork: %v)", wtDir, localBranch, headBranch, isFork)
 	return wtDir, nil
+}
+
+// configureForkPRTracking sets up the worktree's local branch so
+// `git push` (no remote argument) sends commits to the contributor's
+// fork at the right branch name. Configures four pieces:
+//
+//   - A bare-config remote head-<prNumber> -> forkCloneURL. Per-PR
+//     naming (vs per-fork-owner) keeps add/set-url idempotent and
+//     prevents stale URLs from one PR contaminating another.
+//   - branch.<localBranch>.remote / .merge so `git pull` treats
+//     the fork as the upstream and the agent can refresh.
+//   - branch.<localBranch>.pushRemote so push specifically targets
+//     the fork even if remote.pushDefault changes elsewhere.
+//   - remote.<remoteName>.push as an explicit refspec mapping
+//     refs/heads/<localBranch> -> refs/heads/<forkBranch>. Without
+//     this, `git push` (no args) under the default push.default
+//     ("simple") errors with "names don't match" because local
+//     pr-<n> and remote <forkBranch> differ. The explicit refspec
+//     bypasses the name-match check and pushes to the right place.
+//
+// Idempotent: re-running on an already-configured state updates URLs
+// and rewrites config keys to current values.
+func configureForkPRTracking(ctx context.Context, bareDir string, prNumber int, localBranch, forkCloneURL, forkBranch string) error {
+	remoteName := fmt.Sprintf("head-%d", prNumber)
+
+	// Add or update the fork remote. `git remote add` errors when the
+	// remote already exists; fall through to set-url in that case so
+	// repeat calls (re-delegation, retries) are no-ops on URL match
+	// and corrective on URL drift.
+	if err := gitRunCtx(ctx, bareDir, "remote", "add", remoteName, forkCloneURL); err != nil {
+		if err := gitRunCtx(ctx, bareDir, "remote", "set-url", remoteName, forkCloneURL); err != nil {
+			return fmt.Errorf("add or set-url remote %s: %w", remoteName, err)
+		}
+	}
+
+	pushRefspec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", localBranch, forkBranch)
+	cfgs := [][]string{
+		{"config", fmt.Sprintf("branch.%s.remote", localBranch), remoteName},
+		{"config", fmt.Sprintf("branch.%s.merge", localBranch), "refs/heads/" + forkBranch},
+		{"config", fmt.Sprintf("branch.%s.pushRemote", localBranch), remoteName},
+		{"config", fmt.Sprintf("remote.%s.push", remoteName), pushRefspec},
+	}
+	for _, args := range cfgs {
+		if err := gitRunCtx(ctx, bareDir, args...); err != nil {
+			return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		}
+	}
+	return nil
+}
+
+// configureOwnRepoPRTracking sets branch.<localBranch>.remote = origin
+// and branch.<localBranch>.merge = refs/heads/<localBranch> so a
+// bare `git push` resolves to origin/<localBranch> — same target the
+// agent would have hit with `git push origin <localBranch>` before
+// the envelope started discouraging the explicit-remote form.
+//
+// No remote.origin.push refspec is needed: local and remote branch
+// names match, so push.default=simple (the default) is happy.
+func configureOwnRepoPRTracking(ctx context.Context, bareDir, localBranch string) error {
+	cfgs := [][]string{
+		{"config", fmt.Sprintf("branch.%s.remote", localBranch), "origin"},
+		{"config", fmt.Sprintf("branch.%s.merge", localBranch), "refs/heads/" + localBranch},
+	}
+	for _, args := range cfgs {
+		if err := gitRunCtx(ctx, bareDir, args...); err != nil {
+			return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		}
+	}
+	return nil
 }
 
 // CreateForBranch sets up a worktree on a new feature branch based off a given base.
