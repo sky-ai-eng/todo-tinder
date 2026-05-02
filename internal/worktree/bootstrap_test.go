@@ -482,6 +482,117 @@ func TestCreateForPR_DeletedFork_PushFailsAfterPriorOwnRepoPR(t *testing.T) {
 	}
 }
 
+// TestSweepStaleForkPRConfig_ReclaimsTakenOverOwnRepoPR is the
+// regression for the taken-over own-repo leak: when a run is taken
+// over by the user, the spawner's defer skips inline cleanup so the
+// takeover dir can keep using its tracking config. After the
+// takeover dir is destroyed, the sweep must reclaim
+// branch.<headRef>.* — which the older sweep that walked head-<n>
+// remotes would have missed, since own-repo PRs don't have one.
+func TestSweepStaleForkPRConfig_ReclaimsTakenOverOwnRepoPR(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+
+	work := filepath.Join(t.TempDir(), "own-work")
+	if out, err := exec.Command("git", "init", "-b", "main", work).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	cmds := [][]string{
+		{"-C", work, "config", "user.email", "x@y.z"},
+		{"-C", work, "config", "user.name", "x"},
+		{"-C", work, "remote", "add", "up", upstream},
+		{"-C", work, "fetch", "up", "main"},
+		{"-C", work, "checkout", "-b", "stale-feature", "FETCH_HEAD"},
+		{"-C", work, "commit", "--allow-empty", "-m", "stale tip"},
+		{"-C", work, "push", "up", "stale-feature:refs/heads/stale-feature"},
+		{"-C", work, "push", "up", "stale-feature:refs/pull/300/head"},
+	}
+	for _, c := range cmds {
+		if out, err := exec.Command("git", c...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", c, err, out)
+		}
+	}
+
+	wtPath, err := CreateForPR(context.Background(), "owner-takeover-test", "repo-takeover-test", upstream, upstream, "stale-feature", 300, "takeover-test-run")
+	if err != nil {
+		t.Fatalf("CreateForPR: %v", err)
+	}
+
+	// Simulate a taken-over run: the worktree dir gets removed
+	// (taken over → eventually the takeover dir is destroyed), but
+	// inline cleanup never ran. Just remove the worktree.
+	if err := RemoveAt(wtPath, "takeover-test-run"); err != nil {
+		t.Fatalf("RemoveAt: %v", err)
+	}
+
+	bareDir, _ := repoDir("owner-takeover-test", "repo-takeover-test")
+	// Sanity: tracking and ref are still in the bare pre-sweep.
+	if _, err := exec.Command("git", "-C", bareDir, "config", "--get", "branch.stale-feature.remote").Output(); err != nil {
+		t.Fatalf("setup: branch tracking missing pre-sweep: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", bareDir, "show-ref", "--verify", "refs/heads/stale-feature").CombinedOutput(); err != nil {
+		t.Fatalf("setup: stale-feature branch missing pre-sweep: %v / %s", err, out)
+	}
+
+	SweepStaleForkPRConfig("owner-takeover-test", "repo-takeover-test")
+
+	if _, err := exec.Command("git", "-C", bareDir, "config", "--get", "branch.stale-feature.remote").Output(); err == nil {
+		t.Errorf("branch.stale-feature.remote tracking survived sweep")
+	}
+	if out, err := exec.Command("git", "-C", bareDir, "show-ref", "--verify", "refs/heads/stale-feature").CombinedOutput(); err == nil {
+		t.Errorf("refs/heads/stale-feature ref survived sweep — would poison future Jira delegations: %s", out)
+	}
+}
+
+// TestCreateForPR_DeletedFork_CleanupRemovesStaleHeadBranch locks
+// down issue #2: deleted-fork PRs fetch into refs/heads/<headBranch>
+// but inline cleanup historically only deleted the synthetic
+// triagefactory/pr-<n> ref. The leftover refs/heads/<headBranch>
+// would cause CreateForBranch's branchExists path to reuse the stale
+// PR tip on a future Jira delegation that happened to use the same
+// branch name.
+func TestCreateForPR_DeletedFork_CleanupRemovesStaleHeadBranch(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+
+	work := filepath.Join(t.TempDir(), "deleted-work")
+	if out, err := exec.Command("git", "init", "-b", "main", work).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	cmds := [][]string{
+		{"-C", work, "config", "user.email", "x@y.z"},
+		{"-C", work, "config", "user.name", "x"},
+		{"-C", work, "remote", "add", "up", upstream},
+		{"-C", work, "fetch", "up", "main"},
+		{"-C", work, "checkout", "-b", "feature/SKY-X", "FETCH_HEAD"},
+		{"-C", work, "commit", "--allow-empty", "-m", "deleted-fork PR commit"},
+		{"-C", work, "push", "up", "HEAD:refs/pull/400/head"},
+	}
+	for _, c := range cmds {
+		if out, err := exec.Command("git", c...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", c, err, out)
+		}
+	}
+
+	wtPath, err := CreateForPR(context.Background(), "owner-stale-test", "repo-stale-test", upstream, "", "feature/SKY-X", 400, "stale-test-run")
+	if err != nil {
+		t.Fatalf("CreateForPR: %v", err)
+	}
+	bareDir, _ := repoDir("owner-stale-test", "repo-stale-test")
+	if out, err := exec.Command("git", "-C", bareDir, "show-ref", "--verify", "refs/heads/feature/SKY-X").CombinedOutput(); err != nil {
+		t.Fatalf("setup: feature/SKY-X branch missing pre-cleanup: %v / %s", err, out)
+	}
+
+	if err := RemoveAt(wtPath, "stale-test-run"); err != nil {
+		t.Fatalf("RemoveAt: %v", err)
+	}
+	CleanupPRConfig("owner-stale-test", "repo-stale-test", "feature/SKY-X", 400)
+
+	if out, err := exec.Command("git", "-C", bareDir, "show-ref", "--verify", "refs/heads/feature/SKY-X").CombinedOutput(); err == nil {
+		t.Errorf("refs/heads/feature/SKY-X survived cleanup — would poison future Jira delegations: %s", out)
+	}
+}
+
 // TestSweepStaleForkPRConfig_PreservesUserAddedRemotes locks down
 // the exact-match check: a user-added remote named like `head-42-mine`
 // would parse as head-<42> if Sscanf allowed trailing input. The
@@ -537,6 +648,9 @@ func TestSweepStaleForkPRConfig_RemovesOrphanedRemotes(t *testing.T) {
 
 	// Stand up the per-PR config that fork-PR setup would have
 	// produced for two PRs that are now orphaned (no worktree).
+	// The trackedBranchMarkerKey is what makes the sweep find these
+	// generically — without it, own-repo PRs would be invisible to
+	// the sweep too.
 	for _, n := range []int{50, 51} {
 		remote := fmt.Sprintf("head-%d", n)
 		branch := fmt.Sprintf("triagefactory/pr-%d", n)
@@ -545,6 +659,7 @@ func TestSweepStaleForkPRConfig_RemovesOrphanedRemotes(t *testing.T) {
 			{"-C", bareDir, "fetch", remote, "main:" + branch},
 			{"-C", bareDir, "config", fmt.Sprintf("branch.%s.remote", branch), remote},
 			{"-C", bareDir, "config", fmt.Sprintf("branch.%s.merge", branch), "refs/heads/main"},
+			{"-C", bareDir, "config", fmt.Sprintf("branch.%s.%s", branch, trackedBranchMarkerKey), fmt.Sprintf("%d", n)},
 		}
 		for _, c := range setup {
 			if out, err := exec.Command("git", c...).CombinedOutput(); err != nil {

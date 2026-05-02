@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -428,7 +429,7 @@ func CreateForPR(ctx context.Context, owner, repo, upstreamCloneURL, headCloneUR
 		// `git push origin <branch>` — which is exactly the form we
 		// discourage because it's wrong for fork PRs and a bug magnet
 		// across the codebase.
-		if err := configureOwnRepoPRTracking(ctx, bareDir, localBranch); err != nil {
+		if err := configureOwnRepoPRTracking(ctx, bareDir, localBranch, prNumber); err != nil {
 			rollbackPRSetupLocked(ctx, bareDir, wtDir, runID, headBranch, prNumber)
 			return "", fmt.Errorf("configure own-repo PR tracking: %w", err)
 		}
@@ -500,6 +501,21 @@ func forkPRRemoteName(prNumber int) string {
 	return fmt.Sprintf("head-%d", prNumber)
 }
 
+// trackedBranchMarkerKey is the per-branch config key that marks a
+// branch as triagefactory-managed. We write it from both
+// configureForkPRTracking and configureOwnRepoPRTracking; the sweep
+// reads it via `git config --get-regexp` to identify orphaned
+// branches that need cleanup, including own-repo branches the
+// fork-only sweep would otherwise miss after a takeover dir is
+// destroyed. The value is the PR number — preserved as the source
+// of truth for the head-<n> remote name when one exists.
+//
+// Git lower-cases config variable names internally, so the regex
+// in the sweep matches against `tfprnumber` even though we set
+// `tfPRNumber` here. Using the lowercase form everywhere keeps the
+// match logic obvious.
+const trackedBranchMarkerKey = "tfprnumber"
+
 // cleanupTimeout caps the time CleanupPRConfig and SweepStaleForkPRConfig
 // will spend on their detached-context git invocations. Reclamation is
 // best-effort; if a single config-rewrite hangs (locked file, slow disk),
@@ -553,13 +569,20 @@ func CleanupPRConfig(owner, repo, headBranch string, prNumber int) {
 // CleanupPRConfig (run finalization) and SweepStaleForkPRConfig
 // (bootstrap-time backstop) so the cleanup steps stay in lockstep.
 //
-// headBranch may be empty — the sweep doesn't have it. When set,
-// own-repo branch tracking (branch.<headBranch>.*) is also cleaned;
-// otherwise only the fork-specific artifacts (head-<n> remote,
-// triagefactory/pr-<n> branch + tracking) are touched. We never
-// `git branch -D` the headBranch itself because it's the user's
-// real branch — only the synthetic triagefactory/pr-<n> ref is
-// ours to delete.
+// headBranch may be empty — pass "" when only fork-specific artifacts
+// are known (e.g. when discovering an orphan via the triagefactory/
+// pr-<n> branch alone). When set, both the branch tracking
+// (branch.<headBranch>.*) and the local branch ref (refs/heads/
+// <headBranch>) are reclaimed too — important for deleted-fork PRs
+// (where the only local ref is refs/heads/<headBranch>) and to
+// prevent CreateForBranch from picking up a stale tip on a future
+// Jira delegation that happens to use the same branch name.
+//
+// Branch deletion is safe because we always call this AFTER RemoveAt
+// has destroyed the worktree dir; git refuses `branch -D` for a
+// branch checked out by any live worktree, so a takeover dir or
+// concurrent delegation would force this to no-op rather than
+// silently break a live checkout.
 //
 // All commands tolerate "already absent": git remote remove errors
 // when the remote isn't there, --remove-section errors when the
@@ -573,25 +596,41 @@ func removePRConfigLocked(ctx context.Context, bareDir, headBranch string, prNum
 	_ = gitRunCtx(ctx, bareDir, "branch", "-D", syntheticBranch)
 	if headBranch != "" && headBranch != syntheticBranch {
 		_ = gitRunCtx(ctx, bareDir, "config", "--remove-section", "branch."+headBranch)
+		// Delete the local copy of the head branch the fetch refspec
+		// created at refs/heads/<headBranch>. Required for deleted-fork
+		// PRs (their data lives there, not at the synthetic name) and
+		// for own-repo PRs to keep CreateForBranch's branchExists path
+		// from reusing a stale tip when a future Jira delegation
+		// happens to use the same branch name. Re-delegating the same
+		// PR re-fetches refs/pull/<n>/head, so deletion is reversible.
+		_ = gitRunCtx(ctx, bareDir, "branch", "-D", headBranch)
 	}
 }
 
-// SweepStaleForkPRConfig walks the bare's `head-<n>` remotes and
-// removes any whose corresponding `triagefactory/pr-<n>` branch is
-// not currently checked out by any live worktree. Backstop for the
-// two cases where inline CleanupPRConfig in the runAgent defer
-// doesn't fire:
+// SweepStaleForkPRConfig walks every branch the bare has marked as
+// triagefactory-managed (via the trackedBranchMarkerKey config we
+// write from configureForkPRTracking and configureOwnRepoPRTracking)
+// and removes any whose branch isn't currently checked out by a
+// live worktree. Backstop for the cases where inline CleanupPRConfig
+// in the runAgent defer doesn't fire:
 //
 //   - Run was taken over: the runAgent defer's wasTakenOver gate
-//     skips cleanup so the user's takeover dir can keep using
-//     head-<n> for push. Once the takeover dir is destroyed, this
-//     sweep reclaims the leak on the next bootstrap pass.
+//     skips cleanup so the user's takeover dir can keep using its
+//     tracking config for push. Once the takeover dir is destroyed,
+//     this sweep reclaims the leak on the next bootstrap pass —
+//     covers both fork PRs (head-<n>) and own-repo PRs
+//     (branch.<headRef>.*).
 //   - Run was cancelled at a layer above the runAgent defer (rare):
 //     inline cleanup never runs.
 //
+// Walking markers (rather than head-<n> remotes alone) is what makes
+// this cover own-repo PRs too — fork PRs have a head-<n> the old
+// approach could find, but own-repo PRs have only the branch config
+// block, which the marker exposes generically.
+//
 // Safe to call while takeovers are still in use because `git worktree
-// list` reports them and we only remove config for branches with no
-// live checkout. Best-effort: orphan-detection failures or partial
+// list` reports them and we only reclaim branches with no live
+// checkout. Best-effort: orphan-detection failures or partial
 // removes correct themselves on the next bootstrap.
 func SweepStaleForkPRConfig(owner, repo string) {
 	mu := lockRepo(owner, repo)
@@ -610,34 +649,45 @@ func SweepStaleForkPRConfig(owner, repo string) {
 	defer cancel()
 
 	inUse := liveWorktreeBranches(ctx, bareDir)
-	remotesOut, err := gitOutputCtx(ctx, bareDir, "remote")
-	if err != nil {
-		return
-	}
+
+	// `--get-regexp` returns "<key> <value>\n" per match and exits
+	// non-zero with no output when nothing matches; tolerate that
+	// here so a fresh repo with no managed branches isn't an error.
+	pattern := fmt.Sprintf(`^branch\..*\.%s$`, trackedBranchMarkerKey)
+	out, _ := gitOutputCtx(ctx, bareDir, "config", "--get-regexp", pattern)
+
+	keyPrefix := "branch."
+	keySuffix := "." + trackedBranchMarkerKey
 	reclaimed := 0
-	for _, name := range strings.Split(remotesOut, "\n") {
-		name = strings.TrimSpace(name)
-		var prNumber int
-		// Sscanf returns 0 matches if the "head-" prefix doesn't fit
-		// AND consumes the integer greedily — `head-42-mine` would
-		// match with prNumber=42 because Sscanf doesn't validate
-		// trailing input. Re-render the canonical name and require
-		// exact equality so user-added remotes like `head-42-mine`
-		// or `head-42x` aren't mistaken for ours and reclaimed.
-		if n, _ := fmt.Sscanf(name, "head-%d", &prNumber); n != 1 {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		if name != forkPRRemoteName(prNumber) {
+		// Each line: `branch.<branchName>.tfprnumber <prNumber>`.
+		// Branch names can contain spaces in theory, but git
+		// rejects them in practice, so a single-space split between
+		// key and value is safe.
+		key, value, ok := strings.Cut(line, " ")
+		if !ok {
 			continue
 		}
-		if inUse[forkPRLocalBranch(prNumber)] {
+		if !strings.HasPrefix(key, keyPrefix) || !strings.HasSuffix(key, keySuffix) {
 			continue
 		}
-		// Sweep doesn't know the original PR's head ref, so pass "" —
-		// own-repo branch tracking is bounded per-branch-name and not
-		// the sweep's job. The inline cleanup path in the spawner
-		// handles own-repo cleanup via cfg.headRef.
-		removePRConfigLocked(ctx, bareDir, "", prNumber)
+		branch := strings.TrimSuffix(strings.TrimPrefix(key, keyPrefix), keySuffix)
+		prNumber, err := strconv.Atoi(value)
+		if err != nil {
+			continue
+		}
+		if inUse[branch] {
+			continue
+		}
+		// Pass the marked branch as headBranch so removePRConfigLocked
+		// also wipes refs/heads/<branch> and the branch.<branch>.*
+		// section. The synthetic triagefactory/pr-<n> branch (if any)
+		// gets cleaned by the same call's fork-specific path.
+		removePRConfigLocked(ctx, bareDir, branch, prNumber)
 		reclaimed++
 	}
 	if reclaimed > 0 {
@@ -702,11 +752,16 @@ func configureForkPRTracking(ctx context.Context, bareDir string, prNumber int, 
 	}
 
 	pushRefspec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", localBranch, forkBranch)
+	prMarker := strconv.Itoa(prNumber)
 	cfgs := [][]string{
 		{"config", fmt.Sprintf("branch.%s.remote", localBranch), remoteName},
 		{"config", fmt.Sprintf("branch.%s.merge", localBranch), "refs/heads/" + forkBranch},
 		{"config", fmt.Sprintf("branch.%s.pushRemote", localBranch), remoteName},
 		{"config", fmt.Sprintf("remote.%s.push", remoteName), pushRefspec},
+		// Marker so SweepStaleForkPRConfig can find this branch
+		// generically (the head-<n> remote alone wouldn't cover
+		// own-repo PRs, but the marker covers both flows).
+		{"config", fmt.Sprintf("branch.%s.%s", localBranch, trackedBranchMarkerKey), prMarker},
 	}
 	for _, args := range cfgs {
 		if err := gitRunCtx(ctx, bareDir, args...); err != nil {
@@ -732,10 +787,16 @@ func configureForkPRTracking(ctx context.Context, bareDir string, prNumber int, 
 // config blocks accumulate, but bounded by unique head-ref names
 // across the repo's lifetime — a real concern only at repo scales
 // well beyond what this tool targets.
-func configureOwnRepoPRTracking(ctx context.Context, bareDir, localBranch string) error {
+//
+// Also writes the trackedBranchMarkerKey so the sweep can reclaim
+// this block after a takeover dir is destroyed without the spawner's
+// inline cleanup (which the wasTakenOver gate skips).
+func configureOwnRepoPRTracking(ctx context.Context, bareDir, localBranch string, prNumber int) error {
+	prMarker := strconv.Itoa(prNumber)
 	cfgs := [][]string{
 		{"config", fmt.Sprintf("branch.%s.remote", localBranch), "origin"},
 		{"config", fmt.Sprintf("branch.%s.merge", localBranch), "refs/heads/" + localBranch},
+		{"config", fmt.Sprintf("branch.%s.%s", localBranch, trackedBranchMarkerKey), prMarker},
 	}
 	for _, args := range cfgs {
 		if err := gitRunCtx(ctx, bareDir, args...); err != nil {
