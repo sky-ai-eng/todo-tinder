@@ -295,12 +295,20 @@ function ProjectImportModal({
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const dragDepth = useRef(0)
 
+  const clearSelectedFile = () => {
+    setFile(null)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }
+
   const selectBundle = (next: File | null) => {
     if (!next) {
-      setFile(null)
+      clearSelectedFile()
       return
     }
     if (!isTfprojectFile(next)) {
+      clearSelectedFile()
       setError({
         error: 'invalid_file',
         message: 'Only .tfproject files can be imported.',
@@ -433,6 +441,7 @@ function ProjectImportModal({
               setDragOver(false)
               const picked = pickTfprojectFile(e.dataTransfer.files)
               if (!picked) {
+                clearSelectedFile()
                 setError({
                   error: 'invalid_file',
                   message: 'Only .tfproject files can be imported.',

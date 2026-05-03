@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -260,22 +259,6 @@ func marshalJSONLines[T any](items []T) ([]byte, error) {
 		}
 	}
 	return buf.Bytes(), nil
-}
-
-func readJSONLines[T any](r io.Reader) ([]T, error) {
-	lines := make([]T, 0)
-	dec := json.NewDecoder(r)
-	for {
-		var item T
-		if err := dec.Decode(&item); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, err
-		}
-		lines = append(lines, item)
-	}
-	return lines, nil
 }
 
 func cloneStrings(in []string) []string {

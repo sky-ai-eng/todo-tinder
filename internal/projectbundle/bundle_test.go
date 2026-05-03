@@ -1,6 +1,7 @@
 package projectbundle
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"database/sql"
@@ -24,6 +25,10 @@ import (
 type fakeProbe struct {
 	cloneURLs map[string]string
 	errs      map[string]error
+}
+
+type jsonLineFixture struct {
+	ID string `json:"id"`
 }
 
 func (p fakeProbe) CloneURLForRepo(_ context.Context, owner, repo string) (string, error) {
@@ -188,6 +193,34 @@ func exportFixtureBundle(t *testing.T, database *sql.DB, projectID string) []byt
 		t.Fatalf("read export: %v", err)
 	}
 	return data
+}
+
+func buildZipEntries(t *testing.T, files map[string][]byte) map[string]*zip.File {
+	t.Helper()
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, body := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", name, err)
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("write zip entry %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("open zip reader: %v", err)
+	}
+	entries, err := indexZipEntries(zr.File)
+	if err != nil {
+		t.Fatalf("index zip entries: %v", err)
+	}
+	return entries
 }
 
 func TestImport_RoundTripSessionTreeAndCompactions(t *testing.T) {
@@ -357,6 +390,93 @@ func TestImport_DuplicateNameAborts(t *testing.T) {
 	}
 	if len(projects) != 1 {
 		t.Fatalf("duplicate-name import should not create rows, got %d", len(projects))
+	}
+}
+
+func TestDecodeZipJSONLines_EnforcesRowLimit(t *testing.T) {
+	entries := buildZipEntries(t, map[string][]byte{
+		curatorRequestsPath: []byte(`{"id":"r1"}` + "\n" + `{"id":"r2"}` + "\n"),
+	})
+	zf := entries[curatorRequestsPath]
+	if zf == nil {
+		t.Fatal("missing curator requests entry")
+	}
+	var seen int
+	err := decodeZipJSONLines(
+		zf,
+		1<<20,
+		1,
+		func(row jsonLineFixture) error {
+			seen++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "row limit") {
+		t.Fatalf("expected row-limit error, got %v", err)
+	}
+	if seen != 1 {
+		t.Fatalf("expected callback to run once before row-limit failure, got %d", seen)
+	}
+}
+
+func TestDecodeZipJSONLines_EnforcesByteLimit(t *testing.T) {
+	entries := buildZipEntries(t, map[string][]byte{
+		curatorMessagesPath: []byte(`{"id":"message-that-is-longer-than-limit"}` + "\n"),
+	})
+	zf := entries[curatorMessagesPath]
+	if zf == nil {
+		t.Fatal("missing curator messages entry")
+	}
+	err := decodeZipJSONLines[jsonLineFixture](
+		zf,
+		8,
+		10,
+		func(jsonLineFixture) error { return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "8-byte limit") {
+		t.Fatalf("expected byte-limit error, got %v", err)
+	}
+}
+
+func TestCopyZipEntryRaw_EnforcesTotalExtractionLimit(t *testing.T) {
+	entries := buildZipEntries(t, map[string][]byte{
+		knowledgePrefix + "big.bin": []byte("abcdef"),
+	})
+	zf := entries[knowledgePrefix+"big.bin"]
+	if zf == nil {
+		t.Fatal("missing knowledge entry")
+	}
+	dest := filepath.Join(t.TempDir(), "big.bin")
+	err := copyZipEntryRaw(zf, dest, 0o644, newZipExtractionBudget(5, 32))
+	if err == nil || !strings.Contains(err.Error(), "total limit") {
+		t.Fatalf("expected total-limit error, got %v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("destination file should not exist after limit failure; stat err=%v", statErr)
+	}
+}
+
+func TestCopyZipEntryRewritten_EnforcesPerFileLimit(t *testing.T) {
+	entries := buildZipEntries(t, map[string][]byte{
+		sessionTranscriptPath: []byte("abcdef"),
+	})
+	zf := entries[sessionTranscriptPath]
+	if zf == nil {
+		t.Fatal("missing session transcript entry")
+	}
+	dest := filepath.Join(t.TempDir(), "transcript.jsonl")
+	err := copyZipEntryRewritten(
+		zf,
+		dest,
+		[]byteReplacement{},
+		0o600,
+		newZipExtractionBudget(64, 5),
+	)
+	if err == nil || !strings.Contains(err.Error(), "5-byte limit") {
+		t.Fatalf("expected per-file limit error, got %v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("destination file should not exist after limit failure; stat err=%v", statErr)
 	}
 }
 

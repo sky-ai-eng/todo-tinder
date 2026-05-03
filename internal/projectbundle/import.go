@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -26,6 +27,56 @@ import (
 // GitHubProbe provides the preflight clone URL lookup used by import.
 type GitHubProbe interface {
 	CloneURLForRepo(ctx context.Context, owner, repo string) (string, error)
+}
+
+const (
+	maxImportJSONLEntryBytes    int64 = 64 << 20  // 64 MiB per curator JSONL payload.
+	maxImportJSONLRows                = 200_000   // Upper bound per curator JSONL file.
+	maxImportExtractEntryBytes  int64 = 512 << 20 // 512 MiB per extracted file.
+	maxImportExtractBundleBytes int64 = 2 << 30   // 2 GiB aggregate extracted payload.
+)
+
+type zipExtractionBudget struct {
+	remaining    int64
+	totalLimit   int64
+	perFileLimit int64
+}
+
+func newZipExtractionBudget(totalLimit, perFileLimit int64) *zipExtractionBudget {
+	return &zipExtractionBudget{
+		remaining:    totalLimit,
+		totalLimit:   totalLimit,
+		perFileLimit: perFileLimit,
+	}
+}
+
+func (b *zipExtractionBudget) reserve(zf *zip.File) (int64, error) {
+	declared, err := zipEntryDeclaredSize(zf, b.perFileLimit)
+	if err != nil {
+		return 0, err
+	}
+	if declared > b.remaining {
+		return 0, fmt.Errorf(
+			"bundle extraction exceeds %d-byte total limit (next entry %s is %d bytes, %d bytes remain)",
+			b.totalLimit,
+			zf.Name,
+			declared,
+			b.remaining,
+		)
+	}
+	b.remaining -= declared
+	return declared, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
 }
 
 // Import reads a .tfproject ZIP and materializes it into a new local project.
@@ -87,6 +138,7 @@ func Import(
 		return nil, nil, fmt.Errorf("resolve project root: %w", err)
 	}
 	kbRoot := filepath.Join(projectRoot, "knowledge-base")
+	extractionBudget := newZipExtractionBudget(maxImportExtractBundleBytes, maxImportExtractEntryBytes)
 
 	cleanup := &rollbackTracker{}
 	committed := false
@@ -124,12 +176,12 @@ func Import(
 		return nil, nil, fmt.Errorf("mkdir knowledge root: %w", err)
 	}
 	cleanup.Add(projectRoot)
-	if err := materializeKnowledge(entries, kbRoot); err != nil {
+	if err := materializeKnowledge(entries, kbRoot, extractionBudget); err != nil {
 		return nil, nil, err
 	}
 
 	if hasSession {
-		if err := materializeSession(entries, manifest.Session, projectRoot, newSessionID, cleanup); err != nil {
+		if err := materializeSession(entries, manifest.Session, projectRoot, newSessionID, extractionBudget, cleanup); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -294,93 +346,100 @@ func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID string, manif
 }
 
 func importCuratorRequests(tx *sql.Tx, projectID string, zf *zip.File) (map[string]string, error) {
-	rows, err := decodeZipJSONLines[domain.CuratorRequest](zf)
-	if err != nil {
-		return nil, fmt.Errorf("decode %s: %w", curatorRequestsPath, err)
-	}
-	idMap := make(map[string]string, len(rows))
-	for _, row := range rows {
-		oldID := strings.TrimSpace(row.ID)
-		if oldID == "" {
-			continue
-		}
-		idMap[oldID] = uuid.New().String()
-	}
-	for _, row := range rows {
-		oldID := strings.TrimSpace(row.ID)
-		if oldID == "" {
-			continue
-		}
-		newID := idMap[oldID]
-		_, err := tx.Exec(`
+	idMap := make(map[string]string)
+	err := decodeZipJSONLines(
+		zf,
+		maxImportJSONLEntryBytes,
+		maxImportJSONLRows,
+		func(row domain.CuratorRequest) error {
+			oldID := strings.TrimSpace(row.ID)
+			if oldID == "" {
+				return nil
+			}
+			newID := idMap[oldID]
+			if newID == "" {
+				newID = uuid.New().String()
+				idMap[oldID] = newID
+			}
+			_, err := tx.Exec(`
 			INSERT INTO curator_requests (
 				id, project_id, status, user_input, error_msg,
 				cost_usd, duration_ms, num_turns, started_at,
 				finished_at, created_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
-			newID,
-			projectID,
-			row.Status,
-			row.UserInput,
-			nullIfEmptyString(row.ErrorMsg),
-			row.CostUSD,
-			row.DurationMs,
-			row.NumTurns,
-			nullIfNilTime(row.StartedAt),
-			nullIfNilTime(row.FinishedAt),
-			row.CreatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("insert curator_request %s: %w", oldID, err)
-		}
+				newID,
+				projectID,
+				row.Status,
+				row.UserInput,
+				nullIfEmptyString(row.ErrorMsg),
+				row.CostUSD,
+				row.DurationMs,
+				row.NumTurns,
+				nullIfNilTime(row.StartedAt),
+				nullIfNilTime(row.FinishedAt),
+				row.CreatedAt,
+			)
+			if err != nil {
+				return fmt.Errorf("insert curator_request %s: %w", oldID, err)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", curatorRequestsPath, err)
 	}
 	return idMap, nil
 }
 
 func importCuratorMessages(tx *sql.Tx, requestIDMap map[string]string, zf *zip.File) error {
-	rows, err := decodeZipJSONLines[domain.CuratorMessage](zf)
-	if err != nil {
-		return fmt.Errorf("decode %s: %w", curatorMessagesPath, err)
-	}
-	for _, row := range rows {
-		requestID := requestIDMap[row.RequestID]
-		if requestID == "" {
-			return fmt.Errorf("curator message references unknown request_id %q", row.RequestID)
-		}
-		toolCallsJSON, err := marshalNullableJSON(row.ToolCalls)
-		if err != nil {
-			return fmt.Errorf("marshal tool_calls for request %s: %w", row.RequestID, err)
-		}
-		metadataJSON, err := marshalNullableJSON(row.Metadata)
-		if err != nil {
-			return fmt.Errorf("marshal metadata for request %s: %w", row.RequestID, err)
-		}
-		_, err = tx.Exec(`
+	err := decodeZipJSONLines(
+		zf,
+		maxImportJSONLEntryBytes,
+		maxImportJSONLRows,
+		func(row domain.CuratorMessage) error {
+			requestID := requestIDMap[row.RequestID]
+			if requestID == "" {
+				return fmt.Errorf("curator message references unknown request_id %q", row.RequestID)
+			}
+			toolCallsJSON, err := marshalNullableJSON(row.ToolCalls)
+			if err != nil {
+				return fmt.Errorf("marshal tool_calls for request %s: %w", row.RequestID, err)
+			}
+			metadataJSON, err := marshalNullableJSON(row.Metadata)
+			if err != nil {
+				return fmt.Errorf("marshal metadata for request %s: %w", row.RequestID, err)
+			}
+			_, err = tx.Exec(`
 			INSERT INTO curator_messages (
 				request_id, role, subtype, content, tool_calls, tool_call_id,
 				is_error, metadata, model, input_tokens, output_tokens,
 				cache_read_tokens, cache_creation_tokens, created_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
-			requestID,
-			row.Role,
-			row.Subtype,
-			row.Content,
-			toolCallsJSON,
-			nullIfEmptyString(row.ToolCallID),
-			row.IsError,
-			metadataJSON,
-			nullIfEmptyString(row.Model),
-			nullIfNilInt(row.InputTokens),
-			nullIfNilInt(row.OutputTokens),
-			nullIfNilInt(row.CacheReadTokens),
-			nullIfNilInt(row.CacheCreationTokens),
-			row.CreatedAt,
-		)
-		if err != nil {
-			return fmt.Errorf("insert curator_message for request %s: %w", row.RequestID, err)
-		}
+				requestID,
+				row.Role,
+				row.Subtype,
+				row.Content,
+				toolCallsJSON,
+				nullIfEmptyString(row.ToolCallID),
+				row.IsError,
+				metadataJSON,
+				nullIfEmptyString(row.Model),
+				nullIfNilInt(row.InputTokens),
+				nullIfNilInt(row.OutputTokens),
+				nullIfNilInt(row.CacheReadTokens),
+				nullIfNilInt(row.CacheCreationTokens),
+				row.CreatedAt,
+			)
+			if err != nil {
+				return fmt.Errorf("insert curator_message for request %s: %w", row.RequestID, err)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", curatorMessagesPath, err)
 	}
 	return nil
 }
@@ -392,40 +451,42 @@ func importPendingContext(
 	requestIDMap map[string]string,
 	zf *zip.File,
 ) error {
-	rows, err := decodeZipJSONLines[domain.CuratorPendingContext](zf)
-	if err != nil {
-		return fmt.Errorf("decode %s: %w", curatorPendingContextPath, err)
-	}
-	if len(rows) == 0 {
-		return nil
-	}
-	if strings.TrimSpace(newSessionID) == "" {
-		return errors.New("bundle has pending context rows but no session payload")
-	}
-	for _, row := range rows {
-		var consumedBy any
-		if row.ConsumedByRequestID != "" {
-			if mapped := requestIDMap[row.ConsumedByRequestID]; mapped != "" {
-				consumedBy = mapped
+	err := decodeZipJSONLines(
+		zf,
+		maxImportJSONLEntryBytes,
+		maxImportJSONLRows,
+		func(row domain.CuratorPendingContext) error {
+			if strings.TrimSpace(newSessionID) == "" {
+				return errors.New("bundle has pending context rows but no session payload")
 			}
-		}
-		_, err := tx.Exec(`
+			var consumedBy any
+			if row.ConsumedByRequestID != "" {
+				if mapped := requestIDMap[row.ConsumedByRequestID]; mapped != "" {
+					consumedBy = mapped
+				}
+			}
+			_, err := tx.Exec(`
 			INSERT INTO curator_pending_context (
 				project_id, curator_session_id, change_type, baseline_value,
 				consumed_at, consumed_by_request_id, created_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?)
 		`,
-			projectID,
-			newSessionID,
-			row.ChangeType,
-			row.BaselineValue,
-			nullIfNilTime(row.ConsumedAt),
-			consumedBy,
-			row.CreatedAt,
-		)
-		if err != nil {
-			return fmt.Errorf("insert pending context row: %w", err)
-		}
+				projectID,
+				newSessionID,
+				row.ChangeType,
+				row.BaselineValue,
+				nullIfNilTime(row.ConsumedAt),
+				consumedBy,
+				row.CreatedAt,
+			)
+			if err != nil {
+				return fmt.Errorf("insert pending context row: %w", err)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", curatorPendingContextPath, err)
 	}
 	return nil
 }
@@ -458,7 +519,7 @@ func ensureRepoProfiles(tx *sql.Tx, pinned []string, cloneURLs map[string]string
 	return nil
 }
 
-func materializeKnowledge(entries map[string]*zip.File, kbRoot string) error {
+func materializeKnowledge(entries map[string]*zip.File, kbRoot string, extractionBudget *zipExtractionBudget) error {
 	kbEntries, err := listEntriesWithPrefix(entries, knowledgePrefix)
 	if err != nil {
 		return err
@@ -475,7 +536,7 @@ func materializeKnowledge(entries map[string]*zip.File, kbRoot string) error {
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return fmt.Errorf("mkdir knowledge parent for %s: %w", dest, err)
 		}
-		if err := copyZipEntryRaw(e.File, dest, 0o644); err != nil {
+		if err := copyZipEntryRaw(e.File, dest, 0o644, extractionBudget); err != nil {
 			return err
 		}
 	}
@@ -487,6 +548,7 @@ func materializeSession(
 	manifestSession *ManifestSession,
 	projectRoot string,
 	newSessionID string,
+	extractionBudget *zipExtractionBudget,
 	cleanup *rollbackTracker,
 ) error {
 	newResolvedCwd := worktree.ResolveClaudeProjectCwd(projectRoot)
@@ -516,7 +578,7 @@ func materializeSession(
 	if !ok {
 		return fmt.Errorf("session is missing %s", sessionTranscriptPath)
 	}
-	if err := copyZipEntryRewritten(transcript, transcriptDest, reps, 0o600); err != nil {
+	if err := copyZipEntryRewritten(transcript, transcriptDest, reps, 0o600, extractionBudget); err != nil {
 		return err
 	}
 
@@ -533,7 +595,7 @@ func materializeSession(
 		if err := ensureUnderRoot(filepath.Join(sessionTreeRoot, "subagents"), dest); err != nil {
 			return err
 		}
-		if err := copyZipEntryRewritten(e.File, dest, reps, 0o600); err != nil {
+		if err := copyZipEntryRewritten(e.File, dest, reps, 0o600, extractionBudget); err != nil {
 			return err
 		}
 	}
@@ -551,7 +613,7 @@ func materializeSession(
 		if err := ensureUnderRoot(filepath.Join(sessionTreeRoot, "tool-results"), dest); err != nil {
 			return err
 		}
-		if err := copyZipEntryRewritten(e.File, dest, reps, 0o600); err != nil {
+		if err := copyZipEntryRewritten(e.File, dest, reps, 0o600, extractionBudget); err != nil {
 			return err
 		}
 	}
@@ -653,7 +715,11 @@ func ensureUnderRoot(root, target string) error {
 	return nil
 }
 
-func copyZipEntryRaw(zf *zip.File, dest string, mode os.FileMode) error {
+func copyZipEntryRaw(zf *zip.File, dest string, mode os.FileMode, extractionBudget *zipExtractionBudget) error {
+	declared, err := extractionBudget.reserve(zf)
+	if err != nil {
+		return err
+	}
 	rc, err := zf.Open()
 	if err != nil {
 		return fmt.Errorf("open bundle entry %s: %w", zf.Name, err)
@@ -667,13 +733,27 @@ func copyZipEntryRaw(zf *zip.File, dest string, mode os.FileMode) error {
 		return fmt.Errorf("create %s: %w", dest, err)
 	}
 	defer out.Close()
-	if _, err := io.Copy(out, rc); err != nil {
+	reader := &countingReader{r: io.LimitReader(rc, declared+1)}
+	if _, err := io.Copy(out, reader); err != nil {
 		return fmt.Errorf("copy %s to %s: %w", zf.Name, dest, err)
+	}
+	if err := verifyZipEntryBytes(zf.Name, reader.n, declared); err != nil {
+		return err
 	}
 	return nil
 }
 
-func copyZipEntryRewritten(zf *zip.File, dest string, reps []byteReplacement, mode os.FileMode) error {
+func copyZipEntryRewritten(
+	zf *zip.File,
+	dest string,
+	reps []byteReplacement,
+	mode os.FileMode,
+	extractionBudget *zipExtractionBudget,
+) error {
+	declared, err := extractionBudget.reserve(zf)
+	if err != nil {
+		return err
+	}
 	rc, err := zf.Open()
 	if err != nil {
 		return fmt.Errorf("open bundle entry %s: %w", zf.Name, err)
@@ -687,22 +767,88 @@ func copyZipEntryRewritten(zf *zip.File, dest string, reps []byteReplacement, mo
 		return fmt.Errorf("create %s: %w", dest, err)
 	}
 	defer out.Close()
-	if err := rewriteToFile(out, rc, reps); err != nil {
+	reader := &countingReader{r: io.LimitReader(rc, declared+1)}
+	if err := rewriteToFile(out, reader, reps); err != nil {
 		return fmt.Errorf("rewrite %s to %s: %w", zf.Name, dest, err)
+	}
+	if err := verifyZipEntryBytes(zf.Name, reader.n, declared); err != nil {
+		return err
 	}
 	return nil
 }
 
-func decodeZipJSONLines[T any](zf *zip.File) ([]T, error) {
+func decodeZipJSONLines[T any](
+	zf *zip.File,
+	maxBytes int64,
+	maxRows int,
+	onRow func(T) error,
+) error {
 	if zf == nil {
-		return []T{}, nil
+		return nil
+	}
+	declared, err := zipEntryDeclaredSize(zf, maxBytes)
+	if err != nil {
+		return err
 	}
 	rc, err := zf.Open()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rc.Close()
-	return readJSONLines[T](rc)
+	reader := &countingReader{r: io.LimitReader(rc, declared+1)}
+	dec := json.NewDecoder(reader)
+	rows := 0
+	for {
+		var item T
+		if err := dec.Decode(&item); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		rows++
+		if maxRows > 0 && rows > maxRows {
+			return fmt.Errorf("%s exceeds %d-row limit", zf.Name, maxRows)
+		}
+		if onRow != nil {
+			if err := onRow(item); err != nil {
+				return err
+			}
+		}
+	}
+	return verifyZipEntryBytes(zf.Name, reader.n, declared)
+}
+
+func zipEntryDeclaredSize(zf *zip.File, maxBytes int64) (int64, error) {
+	declared := zf.UncompressedSize64
+	if maxBytes > 0 && declared > uint64(maxBytes) {
+		return 0, fmt.Errorf("%s exceeds %d-byte limit", zf.Name, maxBytes)
+	}
+	if declared > uint64(math.MaxInt64-1) {
+		return 0, fmt.Errorf("%s declared uncompressed size is too large", zf.Name)
+	}
+	return int64(declared), nil
+}
+
+func verifyZipEntryBytes(name string, readBytes, declared int64) error {
+	switch {
+	case readBytes > declared:
+		return fmt.Errorf(
+			"%s exceeded its declared uncompressed size (%d > %d bytes)",
+			name,
+			readBytes,
+			declared,
+		)
+	case readBytes < declared:
+		return fmt.Errorf(
+			"%s ended before its declared uncompressed size (%d < %d bytes)",
+			name,
+			readBytes,
+			declared,
+		)
+	default:
+		return nil
+	}
 }
 
 func splitOwnerRepo(slug string) (owner, repo string, ok bool) {
