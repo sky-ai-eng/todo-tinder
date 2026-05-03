@@ -178,18 +178,31 @@ func TestKnowledgeDir_RequiresProjectID(t *testing.T) {
 	}
 }
 
-func TestBuildSystemPrompt_IncludesProjectName(t *testing.T) {
-	got := buildSystemPrompt("My Project")
+func TestRenderEnvelope_IncludesProjectName(t *testing.T) {
+	got := renderEnvelope(envelopeInputs{ProjectName: "My Project", BinaryPath: "/usr/bin/triagefactory"})
 	if got == "" {
 		t.Fatal("empty system prompt")
 	}
 	if !contains(got, "My Project") {
 		t.Errorf("system prompt missing project name: %q", got)
 	}
+	// Sanity: every templated placeholder must be substituted.
+	for _, placeholder := range []string{
+		"{{PROJECT_NAME}}",
+		"{{PROJECT_DESCRIPTION}}",
+		"{{PINNED_REPOS_BLOCK}}",
+		"{{TRACKERS_BLOCK}}",
+		"{{BINARY_PATH}}",
+		"{{TOOLS_REFERENCE}}",
+	} {
+		if contains(got, placeholder) {
+			t.Errorf("placeholder %s left unsubstituted in envelope", placeholder)
+		}
+	}
 }
 
-func TestBuildSystemPrompt_FallbackForEmptyName(t *testing.T) {
-	got := buildSystemPrompt("")
+func TestRenderEnvelope_FallbackForEmptyName(t *testing.T) {
+	got := renderEnvelope(envelopeInputs{BinaryPath: "/usr/bin/triagefactory"})
 	if got == "" {
 		t.Fatal("empty system prompt for empty name")
 	}

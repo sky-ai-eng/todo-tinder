@@ -11,6 +11,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // projectSession is the per-project goroutine handle. One queue, one
@@ -200,13 +201,62 @@ func (s *projectSession) dispatch(requestID string) {
 		return
 	}
 
-	systemPrompt := buildSystemPrompt(project.Name)
+	envelope := envelopeInputs{
+		ProjectName:        project.Name,
+		ProjectDescription: project.Description,
+		PinnedRepos:        project.PinnedRepos,
+		JiraProjectKey:     project.JiraProjectKey,
+		LinearProjectKey:   project.LinearProjectKey,
+		BinaryPath:         selfBin,
+	}
+	systemPrompt := renderEnvelope(envelope)
+
+	// Consume any pending context-change rows queued for this session
+	// since the last user message — pinned-repo or tracker edits the
+	// user made via PATCH while the conversation was idle. Empty
+	// session id (very first message of a fresh project) matches no
+	// rows; the call is a cheap no-op in that case.
+	//
+	// Two-phase consume: rows are *claimed* here (consumed_at +
+	// consumed_by_request_id stamped) but not deleted. On terminal
+	// `done` we finalize (purge); on `cancelled` or `failed` we
+	// revert (un-consume) so a transient agentproc failure doesn't
+	// silently lose the user's deltas. The merge logic in
+	// RevertPendingContext handles the case where a NEW PATCH lands
+	// during dispatch.
+	pending, err := db.ConsumePendingContext(s.curator.database, s.projectID, project.CuratorSessionID, requestID)
+	if err != nil {
+		s.failRequest(requestID, fmt.Sprintf("consume pending context: %v", err))
+		return
+	}
+
+	message := req.UserInput
+	contextNote := pendingChangesNote(pending, envelope)
+	if contextNote != "" {
+		message = contextNote + "\n\n" + message
+		// Persist the rendered note as a curator_messages audit row
+		// keyed to the consuming request. Frontend filters subtype
+		// `context_change` out of rendered chat (SKY-226), but having
+		// the row keyed to request_id makes the chat history
+		// reproducible: replay shows exactly what the agent saw.
+		// Best-effort — failing to write the audit row should not
+		// abort the dispatch.
+		auditMsg := &domain.CuratorMessage{
+			RequestID: requestID,
+			Role:      "system",
+			Subtype:   "context_change",
+			Content:   contextNote,
+		}
+		if _, auditErr := db.InsertCuratorMessage(s.curator.database, auditMsg); auditErr != nil {
+			log.Printf("[curator] warning: insert context_change audit row for %s: %v", requestID, auditErr)
+		}
+	}
 
 	outcome, runErr := agentproc.Run(msgCtx, agentproc.RunOptions{
 		Cwd:          cwd,
 		Model:        model,
 		SessionID:    project.CuratorSessionID,
-		Message:      req.UserInput,
+		Message:      message,
 		SystemPrompt: systemPrompt,
 		AllowedTools: agentproc.BuildAllowedTools(selfBin),
 		ExtraEnv: []string{
@@ -218,13 +268,15 @@ func (s *projectSession) dispatch(requestID string) {
 
 	// Cancellation observed → terminal cancelled status. Distinguish
 	// between request-level cancellation and broader session/project
-	// shutdown so the recorded terminal reason is accurate.
+	// shutdown so the recorded terminal reason is accurate. Pending
+	// rows are reverted so the next user message picks them up again.
 	if msgCtx.Err() != nil {
 		cancelReason := "user cancelled"
 		if s.ctx.Err() != nil {
 			cancelReason = "session cancelled"
 		}
 		s.markCancelled(requestID, cancelReason)
+		s.revertPendingFor(requestID)
 		return
 	}
 
@@ -234,11 +286,13 @@ func (s *projectSession) dispatch(requestID string) {
 			stderr = outcome.Stderr
 		}
 		s.failRequest(requestID, fmt.Sprintf("%v\nstderr: %s", runErr, stderr))
+		s.revertPendingFor(requestID)
 		return
 	}
 
 	if outcome == nil || outcome.Result == nil {
 		s.failRequest(requestID, "claude exited without producing a result event")
+		s.revertPendingFor(requestID)
 		return
 	}
 
@@ -254,6 +308,13 @@ func (s *projectSession) dispatch(requestID string) {
 	)
 	if err != nil {
 		log.Printf("[curator] warning: complete request %s: %v", requestID, err)
+		// We don't know whether the row landed terminal. Revert the
+		// pending rows on the conservative assumption that the agent
+		// did not see them — if the row turns out to be `done` after
+		// all, the worst case is the user gets a duplicate diff on
+		// their next message, which is far better than silently
+		// losing the deltas.
+		s.revertPendingFor(requestID)
 		return
 	}
 	if !flipped {
@@ -261,11 +322,50 @@ func (s *projectSession) dispatch(requestID string) {
 		// landed during agentproc.Run and the handler beat us to the
 		// DB. Don't broadcast a status change that doesn't match the
 		// row's actual state; the cancel handler already broadcast
-		// cancelled.
+		// cancelled. Pending rows: the cancel path will revert them
+		// when it observes msgCtx.Err() above, but we may have
+		// reached this branch from a successful agentproc with the
+		// cancel landing concurrently — revert here too as a
+		// belt-and-suspenders for the "row was already cancelled
+		// before our completion write" race.
 		log.Printf("[curator] request %s already terminal, skipping completion broadcast (intended status: %s)", requestID, status)
+		s.revertPendingFor(requestID)
 		return
 	}
+	if status == "done" {
+		s.finalizePendingFor(requestID)
+	} else {
+		// Terminal `failed` from agentproc's IsError result: the agent
+		// emitted a result event marking the turn as a failure. Treat
+		// the same as a process-level failure for pending-row
+		// purposes — user retry should re-see the deltas.
+		s.revertPendingFor(requestID)
+	}
 	s.curator.broadcastRequestUpdate(s.projectID, requestID, status)
+}
+
+// finalizePendingFor purges every pending-context row consumed by this
+// request. Best-effort logging — finalization failure leaves stale
+// rows that the next user message will skip (they are already marked
+// consumed) but does not poison the chat or block other dispatches.
+func (s *projectSession) finalizePendingFor(requestID string) {
+	if err := db.FinalizePendingContext(s.curator.database, requestID); err != nil {
+		log.Printf("[curator] warning: finalize pending context for %s: %v", requestID, err)
+	}
+}
+
+// revertPendingFor un-consumes every pending-context row claimed by
+// this request so the next user message picks them up again. Also
+// removes the curator_messages audit row keyed to this request so the
+// chat history doesn't show a phantom "context noted" entry for a
+// turn that never delivered the deltas.
+func (s *projectSession) revertPendingFor(requestID string) {
+	if err := db.RevertPendingContext(s.curator.database, requestID); err != nil {
+		log.Printf("[curator] warning: revert pending context for %s: %v", requestID, err)
+	}
+	if err := db.DeleteCuratorMessagesBySubtype(s.curator.database, requestID, "context_change"); err != nil {
+		log.Printf("[curator] warning: delete context_change audit for %s: %v", requestID, err)
+	}
 }
 
 // cancelInFlight fires the active message's ctx if one exists.
@@ -340,16 +440,4 @@ func (s *projectSession) failRequest(requestID, errMsg string) {
 		return
 	}
 	s.curator.broadcastRequestUpdate(s.projectID, requestID, "failed")
-}
-
-// buildSystemPrompt is intentionally minimal for v1 (SKY-216). The
-// per-entity classifier (SKY-220) and Curator tools (SKY-221) will
-// flesh this out with actual project context. Until then the prompt
-// just orients the agent — no knowledge files, no entity catalog,
-// no tools beyond the default toolbelt scoped to the project dir.
-func buildSystemPrompt(projectName string) string {
-	if projectName == "" {
-		return "You are the Curator for an unnamed project. Keep responses concise."
-	}
-	return fmt.Sprintf("You are the Curator for project %q. Keep responses concise.", projectName)
 }

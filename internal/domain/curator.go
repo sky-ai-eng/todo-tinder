@@ -35,6 +35,38 @@ func (r *CuratorRequest) IsTerminal() bool {
 	return false
 }
 
+// Curator pending-context change_type vocabulary. New change types are
+// added here, the PATCH handler that emits them, and the curator
+// renderer that turns baseline-vs-current into a human-readable diff.
+const (
+	ChangeTypePinnedRepos      = "pinned_repos"
+	ChangeTypeJiraProjectKey   = "jira_project_key"
+	ChangeTypeLinearProjectKey = "linear_project_key"
+)
+
+// CuratorPendingContext is a queued "the world changed since the agent
+// last saw it" delta — pinned-repos changed, tracker key changed, etc.
+// (SKY-224). The Curator dispatch loop drains pending rows for the
+// active session at the start of each turn, renders them as a hidden
+// [system note] block prepended to the user's message, and then either
+// finalizes (deletes) them on a successful run or reverts (un-consumes)
+// them on cancel/fail so the user's deltas are not lost on retry.
+//
+// BaselineValue is JSON-encoded — an array for pinned_repos, a scalar
+// (or JSON null) for the tracker key columns. The renderer diffs the
+// baseline against the project row's *current* value at consume time,
+// so A→B→A round-trip PATCHes naturally collapse to "no change."
+type CuratorPendingContext struct {
+	ID                  int64      `json:"id"`
+	ProjectID           string     `json:"project_id"`
+	CuratorSessionID    string     `json:"curator_session_id"`
+	ChangeType          string     `json:"change_type"`
+	BaselineValue       string     `json:"baseline_value"`
+	ConsumedAt          *time.Time `json:"consumed_at,omitempty"`
+	ConsumedByRequestID string     `json:"consumed_by_request_id,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+}
+
 // CuratorMessage mirrors run_messages but is keyed by request_id
 // instead of run_id. The on-the-wire shape is otherwise identical so
 // the frontend's existing message-rendering can be reused without
