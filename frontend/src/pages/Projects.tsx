@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
-import { Plus } from 'lucide-react'
+import { Plus, Trash2 } from 'lucide-react'
 import type { Project } from '../types'
 import { readError } from '../lib/api'
 import { toast } from '../components/Toast/toastStore'
@@ -51,6 +51,34 @@ export default function Projects() {
     [refresh],
   )
 
+  // handleDelete mirrors the confirm-then-DELETE flow in ProjectDetail
+  // so the grid-hover trash icon and the in-detail Delete button share
+  // identical semantics. We optimistically drop the row from local
+  // state on success rather than re-fetching the list — `refresh`'s
+  // round-trip would also be fine, but the optimistic path keeps the
+  // grid from briefly showing a stale entry.
+  const handleDelete = useCallback(async (project: Project) => {
+    if (!confirm(`Delete project "${project.name}"? This can't be undone.`)) return
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, {
+        method: 'DELETE',
+      })
+      if (!res.ok && res.status !== 204) {
+        toast.error(await readError(res, 'Failed to delete project'))
+        return
+      }
+      const cleanupWarning = res.headers.get('X-Cleanup-Warning')
+      if (cleanupWarning) {
+        toast.warning(cleanupWarning)
+      } else {
+        toast.success(`Deleted project "${project.name}"`)
+      }
+      setProjects((prev) => prev.filter((p) => p.id !== project.id))
+    } catch (err) {
+      toast.error(`Failed to delete project: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }, [])
+
   if (loading) {
     return (
       <div className="max-w-6xl mx-auto">
@@ -90,7 +118,7 @@ export default function Projects() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
           {projects.map((p) => (
-            <ProjectCard key={p.id} project={p} />
+            <ProjectCard key={p.id} project={p} onDelete={() => handleDelete(p)} />
           ))}
         </div>
       )}
@@ -126,8 +154,13 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
   )
 }
 
-function ProjectCard({ project }: { project: Project }) {
+function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => void }) {
   const desc = (project.description || '').trim()
+  // The card is a Link to the detail page. The trash button lives
+  // inside the link region but stops propagation + prevents default
+  // so clicking it deletes rather than navigating. Only the chrome
+  // around the icon swallows the click — the rest of the card still
+  // navigates as users expect.
   return (
     <Link
       to={`/projects/${encodeURIComponent(project.id)}`}
@@ -144,50 +177,39 @@ function ProjectCard({ project }: { project: Project }) {
         aria-hidden
         className="pointer-events-none absolute -left-8 -top-8 h-24 w-24 rounded-full bg-white/30 blur-2xl"
       />
+      <button
+        type="button"
+        onClick={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          onDelete()
+        }}
+        aria-label={`Delete project ${project.name}`}
+        className="
+          absolute top-3 right-3 z-10
+          inline-flex items-center justify-center
+          h-7 w-7 rounded-full
+          opacity-0 group-hover:opacity-100
+          text-text-tertiary hover:text-dismiss hover:bg-dismiss/[0.08]
+          transition-[opacity,color,background-color] duration-200
+        "
+      >
+        <Trash2 size={13} />
+      </button>
       <div className="relative">
-        <h3 className="text-[14px] font-semibold tracking-tight text-text-primary truncate">
+        <h3 className="text-[14px] font-semibold tracking-tight text-text-primary truncate pr-8">
           {project.name}
         </h3>
         {desc && (
-          <p className="mt-2 text-[12px] leading-relaxed text-text-secondary line-clamp-2">
+          <p className="mt-2 text-[12px] leading-relaxed text-text-secondary line-clamp-3">
             {desc}
           </p>
         )}
-        <div className="mt-3 flex flex-wrap gap-1.5">
-          {project.jira_project_key && (
-            <Chip label={`Jira: ${project.jira_project_key}`} tone="accent" />
-          )}
-          {project.linear_project_key && (
-            <Chip label={`Linear: ${project.linear_project_key}`} tone="accent" />
-          )}
-          {project.pinned_repos.map((slug) => (
-            <Chip key={slug} label={slug} tone="muted" />
-          ))}
-          {project.pinned_repos.length === 0 &&
-            !project.jira_project_key &&
-            !project.linear_project_key && (
-              <span className="text-[11px] text-text-tertiary italic">
-                No repos or tracker linked yet
-              </span>
-            )}
-        </div>
-        <div className="mt-4 text-[11px] text-text-tertiary tabular-nums">
+        <div className="mt-3 text-[11px] text-text-tertiary tabular-nums">
           Updated {formatAge(project.updated_at)}
         </div>
       </div>
     </Link>
-  )
-}
-
-function Chip({ label, tone }: { label: string; tone: 'accent' | 'muted' }) {
-  const cls =
-    tone === 'accent'
-      ? 'bg-accent-soft text-accent'
-      : 'bg-black/[0.03] text-text-secondary border border-border-subtle'
-  return (
-    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] ${cls}`}>
-      {label}
-    </span>
   )
 }
 

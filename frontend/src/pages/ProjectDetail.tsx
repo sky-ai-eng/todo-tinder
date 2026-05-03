@@ -1,24 +1,31 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Trash2, Pencil, Check, X } from 'lucide-react'
+import * as Popover from '@radix-ui/react-popover'
+import { ArrowLeft, Trash2, Pencil, Check, X, Plus } from 'lucide-react'
 import Markdown from 'react-markdown'
 import type { Project, KnowledgeFile } from '../types'
 import { readError } from '../lib/api'
 import { toast } from '../components/Toast/toastStore'
-import RepoMultiSelect from '../components/RepoMultiSelect'
 import TrackerProjectPickers from '../components/TrackerProjectPickers'
 
-// ProjectDetail is the per-project workspace. Three sections, top-to-
-// bottom:
-//   1. Header — name + description (inline-editable), summary chips.
-//   2. Configuration — pinned repos editor + tracker projects pickers.
+// ProjectDetail is the per-project workspace. Top-to-bottom on the
+// left:
+//   1. Header — name + description (inline-editable), pinned repos
+//      surfaced as interactive chips alongside tracker chips.
+//   2. Integrations — Jira / Linear pickers. Pinned repos lived here
+//      in an earlier draft but moved into the header so the user
+//      doesn't see two surfaces showing the same data.
 //   3. Knowledge base — markdown files under the project's
 //      knowledge-base directory, rendered read-only.
 //
-// The chat panel slot lives on the right side of the layout but isn't
-// implemented here — SKY-226 grafts in a streaming chat with renderers,
-// queueing, and cancellation. The placeholder column reserves the
-// space so SKY-226 doesn't trigger a re-layout when it lands.
+// The chat panel slot is the right column at a true 50/50 split. SKY-226
+// grafts in the streaming chat with renderers, queueing, and cancellation;
+// the placeholder reserves the column so SKY-226 doesn't trigger a
+// re-layout when it lands.
+//
+// Edits across the page are auto-saved — there's no explicit Save button.
+// The patch helper handles error toasts; on success the page resyncs from
+// the freshly-returned project row.
 export default function ProjectDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -53,7 +60,7 @@ export default function ProjectDetail() {
 
   const patch = useCallback(
     async (body: Record<string, unknown>) => {
-      if (!id) return
+      if (!id) return false
       try {
         const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, {
           method: 'PATCH',
@@ -144,15 +151,16 @@ export default function ProjectDetail() {
         </button>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="space-y-6">
           <ProjectHeader
             project={project}
             onPatchName={(name) => patch({ name })}
             onPatchDescription={(description) => patch({ description })}
+            onPatchPinnedRepos={(pinned_repos) => patch({ pinned_repos })}
           />
 
-          <ConfigPanel project={project} onPatch={patch} />
+          <IntegrationsPanel project={project} onPatch={patch} />
 
           <KnowledgePanel projectId={project.id} />
         </div>
@@ -163,28 +171,26 @@ export default function ProjectDetail() {
   )
 }
 
-// ProjectHeader handles inline edit for name + description. We use
-// dedicated edit modes rather than always-editable inputs so the
-// rendered project view feels read-y at rest.
+// ProjectHeader handles inline edit for name + description and embeds
+// the pinned-repos editor + tracker chips in one cohesive block. The
+// pinned-repos chips are interactive: hover surfaces an X to remove,
+// and a "+" affordance opens a popover of remaining configured repos
+// to add. Auto-saves on change.
 function ProjectHeader({
   project,
   onPatchName,
   onPatchDescription,
+  onPatchPinnedRepos,
 }: {
   project: Project
   onPatchName: (name: string) => Promise<boolean | undefined>
   onPatchDescription: (description: string) => Promise<boolean | undefined>
+  onPatchPinnedRepos: (pinned: string[]) => Promise<boolean | undefined>
 }) {
   const [editingName, setEditingName] = useState(false)
   const [editingDesc, setEditingDesc] = useState(false)
   const [draftName, setDraftName] = useState(project.name)
   const [draftDesc, setDraftDesc] = useState(project.description)
-
-  // The drafts are seeded when the user enters edit mode (via the
-  // click handlers below) and overwritten by user input from there.
-  // No effect-driven sync is needed: the at-rest path renders
-  // project.name / project.description directly, and entering edit
-  // mode is an explicit user action that captures the current value.
 
   const beginEditName = () => {
     setDraftName(project.name)
@@ -319,119 +325,250 @@ function ProjectHeader({
         )}
       </div>
 
-      <div className="mt-4 flex flex-wrap gap-1.5">
-        {project.jira_project_key && (
-          <Chip label={`Jira: ${project.jira_project_key}`} tone="accent" />
-        )}
-        {project.linear_project_key && (
-          <Chip label={`Linear: ${project.linear_project_key}`} tone="accent" />
-        )}
-        {project.pinned_repos.map((slug) => (
-          <Chip key={slug} label={slug} tone="muted" />
-        ))}
+      <div className="mt-4">
+        <PinnedReposInline
+          pinned={project.pinned_repos}
+          onChange={onPatchPinnedRepos}
+          jiraKey={project.jira_project_key}
+          linearKey={project.linear_project_key}
+        />
       </div>
     </Card>
   )
 }
 
-function ConfigPanel({
+// PinnedReposInline renders the pinned-repo chips alongside tracker
+// chips. Pinned chips are interactive: hovering surfaces an X to
+// remove the pin (auto-saved), and a trailing "+" button opens a
+// popover that lists remaining configured repos to add.
+//
+// The tracker chips render inline but aren't editable here — that's
+// the IntegrationsPanel's job. Co-locating them visually keeps the
+// "this project is X plus these things" narrative tight.
+function PinnedReposInline({
+  pinned,
+  onChange,
+  jiraKey,
+  linearKey,
+}: {
+  pinned: string[]
+  onChange: (next: string[]) => Promise<boolean | undefined>
+  jiraKey: string
+  linearKey: string
+}) {
+  const [available, setAvailable] = useState<string[]>([])
+  const [loading, setLoading] = useState(true)
+  const [adderOpen, setAdderOpen] = useState(false)
+  const [search, setSearch] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const res = await fetch('/api/repos')
+        if (!res.ok) {
+          await readError(res, 'load repos')
+          return
+        }
+        const data: Array<{ id: string }> = await res.json()
+        if (!cancelled) setAvailable(data.map((r) => r.id))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const remove = async (slug: string) => {
+    const next = pinned.filter((s) => s !== slug)
+    await onChange(next)
+  }
+
+  const add = async (slug: string) => {
+    if (pinned.includes(slug)) return
+    const next = [...pinned, slug].sort()
+    const ok = await onChange(next)
+    if (ok) {
+      setAdderOpen(false)
+      setSearch('')
+    }
+  }
+
+  const addable = available.filter(
+    (slug) =>
+      !pinned.includes(slug) &&
+      (!search.trim() || slug.toLowerCase().includes(search.trim().toLowerCase())),
+  )
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {jiraKey && <Chip label={`Jira: ${jiraKey}`} tone="accent" />}
+      {linearKey && <Chip label={`Linear: ${linearKey}`} tone="accent" />}
+      {pinned.map((slug) => (
+        <RepoChip key={slug} slug={slug} onRemove={() => remove(slug)} />
+      ))}
+      <Popover.Root open={adderOpen} onOpenChange={setAdderOpen}>
+        <Popover.Trigger asChild>
+          <button
+            type="button"
+            className="
+              inline-flex items-center gap-1 rounded-full
+              border border-dashed border-border-subtle
+              px-2 py-0.5 text-[11px] text-text-tertiary
+              hover:border-accent hover:text-accent hover:bg-accent-soft/40
+              transition-colors
+            "
+          >
+            <Plus size={10} />
+            Add repo
+          </button>
+        </Popover.Trigger>
+        <Popover.Portal>
+          <Popover.Content
+            sideOffset={6}
+            align="start"
+            className="
+              z-50 w-72 rounded-xl border border-border-subtle
+              bg-white shadow-lg shadow-black/[0.08] p-2
+            "
+          >
+            <input
+              type="text"
+              autoFocus
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search configured repos…"
+              className="
+                w-full rounded-lg border border-border-subtle
+                bg-white px-2.5 py-1.5 text-[12px] text-text-primary
+                placeholder:text-text-tertiary mb-1.5
+                focus:outline-none focus:border-accent
+              "
+            />
+            <div className="max-h-60 overflow-y-auto">
+              {loading ? (
+                <div className="text-[12px] text-text-tertiary px-2 py-1">Loading…</div>
+              ) : available.length === 0 ? (
+                <div className="text-[12px] text-text-tertiary px-2 py-1">
+                  No repos configured.{' '}
+                  <Link to="/repos" className="text-accent hover:underline">
+                    Add some
+                  </Link>
+                  .
+                </div>
+              ) : addable.length === 0 ? (
+                <div className="text-[12px] text-text-tertiary px-2 py-1 italic">
+                  {pinned.length === available.length
+                    ? 'All configured repos are pinned.'
+                    : 'No matches.'}
+                </div>
+              ) : (
+                addable.map((slug) => (
+                  <button
+                    key={slug}
+                    type="button"
+                    onClick={() => add(slug)}
+                    className="
+                      w-full text-left px-2 py-1.5 rounded-md
+                      text-[12px] text-text-primary
+                      hover:bg-black/[0.04] transition-colors
+                    "
+                  >
+                    {slug}
+                  </button>
+                ))
+              )}
+            </div>
+          </Popover.Content>
+        </Popover.Portal>
+      </Popover.Root>
+    </div>
+  )
+}
+
+function RepoChip({ slug, onRemove }: { slug: string; onRemove: () => void }) {
+  return (
+    <span
+      className="
+        group inline-flex items-center rounded-full
+        bg-black/[0.03] text-text-secondary border border-border-subtle
+        pl-2 pr-1 py-0.5 text-[11px]
+        hover:border-dismiss/40 hover:bg-dismiss/[0.04] transition-colors
+      "
+    >
+      {slug}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation()
+          onRemove()
+        }}
+        aria-label={`Remove ${slug}`}
+        className="
+          ml-1 inline-flex items-center justify-center
+          h-3.5 w-3.5 rounded-full
+          opacity-0 group-hover:opacity-100
+          text-text-tertiary hover:text-dismiss hover:bg-dismiss/10
+          transition-[opacity,color]
+        "
+      >
+        <X size={10} />
+      </button>
+    </span>
+  )
+}
+
+// IntegrationsPanel is now just the tracker-projects section. Pinned
+// repos live in the header. Auto-saves: each picker change triggers
+// an immediate PATCH; the upstream project state is the source of
+// truth and the panel re-renders from it on success.
+function IntegrationsPanel({
   project,
   onPatch,
 }: {
   project: Project
   onPatch: (body: Record<string, unknown>) => Promise<boolean | undefined>
 }) {
-  // Local state mirrors the server-side values; user edits are saved
-  // explicitly via the Save button rather than auto-saved on every
-  // toggle. Keeps the network traffic predictable and gives the user
-  // a single undo point per edit session.
-  const [pinnedRepos, setPinnedRepos] = useState(project.pinned_repos)
-  const [jiraKey, setJiraKey] = useState(project.jira_project_key)
-  const [linearKey, setLinearKey] = useState(project.linear_project_key)
-  const [saving, setSaving] = useState(false)
+  // We track whichever side the user is mid-changing in a ref so
+  // we can avoid clobbering the picker while the PATCH is in flight.
+  // The UI reads from the project prop on render — there's no local
+  // mirror state — so a slow network won't desync the dropdown.
+  const inflight = useRef(false)
 
-  // Resync if the project changes upstream (e.g. another tab edited it).
-  useEffect(() => setPinnedRepos(project.pinned_repos), [project.pinned_repos])
-  useEffect(() => setJiraKey(project.jira_project_key), [project.jira_project_key])
-  useEffect(() => setLinearKey(project.linear_project_key), [project.linear_project_key])
-
-  const dirty = useMemo(() => {
-    if (jiraKey !== project.jira_project_key) return true
-    if (linearKey !== project.linear_project_key) return true
-    if (pinnedRepos.length !== project.pinned_repos.length) return true
-    const a = [...pinnedRepos].sort()
-    const b = [...project.pinned_repos].sort()
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return true
-    return false
-  }, [pinnedRepos, jiraKey, linearKey, project])
-
-  const save = async () => {
-    setSaving(true)
+  const handleJiraChange = async (key: string) => {
+    if (inflight.current) return
+    inflight.current = true
     try {
-      await onPatch({
-        pinned_repos: pinnedRepos,
-        jira_project_key: jiraKey,
-        linear_project_key: linearKey,
-      })
+      await onPatch({ jira_project_key: key })
     } finally {
-      setSaving(false)
+      inflight.current = false
+    }
+  }
+
+  const handleLinearChange = async (key: string) => {
+    if (inflight.current) return
+    inflight.current = true
+    try {
+      await onPatch({ linear_project_key: key })
+    } finally {
+      inflight.current = false
     }
   }
 
   return (
     <Card>
       <h2 className="text-[13px] font-semibold tracking-tight text-text-primary uppercase mb-4">
-        Configuration
+        Integrations
       </h2>
-
-      <div className="space-y-5">
-        <div>
-          <span className="block text-[12px] font-medium text-text-secondary mb-1.5">
-            Pinned repos
-          </span>
-          <RepoMultiSelect value={pinnedRepos} onChange={setPinnedRepos} />
-        </div>
-
-        <div>
-          <span className="block text-[12px] font-medium text-text-secondary mb-1.5">
-            Tracker projects
-          </span>
-          <TrackerProjectPickers
-            jiraKey={jiraKey}
-            linearKey={linearKey}
-            onJiraChange={setJiraKey}
-            onLinearChange={setLinearKey}
-          />
-        </div>
-      </div>
-
-      {dirty && (
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              setPinnedRepos(project.pinned_repos)
-              setJiraKey(project.jira_project_key)
-              setLinearKey(project.linear_project_key)
-            }}
-            disabled={saving}
-            className="text-[12px] text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-full disabled:opacity-50"
-          >
-            Reset
-          </button>
-          <button
-            type="button"
-            onClick={save}
-            disabled={saving}
-            className="
-              text-[12px] bg-accent text-white
-              px-3 py-1.5 rounded-full hover:opacity-90 disabled:opacity-50
-            "
-          >
-            {saving ? 'Saving…' : 'Save changes'}
-          </button>
-        </div>
-      )}
+      <TrackerProjectPickers
+        jiraKey={project.jira_project_key}
+        linearKey={project.linear_project_key}
+        onJiraChange={handleJiraChange}
+        onLinearChange={handleLinearChange}
+      />
     </Card>
   )
 }
@@ -521,7 +658,7 @@ function KnowledgePanel({ projectId }: { projectId: string }) {
 
 function ChatSlotPlaceholder() {
   return (
-    <Card className="lg:sticky lg:top-24 lg:h-[calc(100vh-8rem)] flex flex-col">
+    <Card className="lg:sticky lg:top-24 lg:h-[calc(100vh-12rem)] flex flex-col">
       <h2 className="text-[13px] font-semibold tracking-tight text-text-primary uppercase mb-2">
         Curator chat
       </h2>
