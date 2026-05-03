@@ -55,7 +55,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 		return
 	}
-	pinned, errMsg := validatePinnedRepos(req.PinnedRepos)
+	pinned, errMsg := validatePinnedRepos(s.db, req.PinnedRepos)
 	if errMsg != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 		return
@@ -133,7 +133,7 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		updated.Description = *req.Description
 	}
 	if req.PinnedRepos != nil {
-		pinned, errMsg := validatePinnedRepos(*req.PinnedRepos)
+		pinned, errMsg := validatePinnedRepos(s.db, *req.PinnedRepos)
 		if errMsg != "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 			return
@@ -217,16 +217,17 @@ func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// validatePinnedRepos validates the "owner/repo" slug shape AND
-// returns the normalized (trimmed) slice that callers should
-// persist. Without the normalization step, " owner/repo " would
-// pass validation (which trims) but get stored padded, making
-// future lookups by slug miss the row. The shape is GitHub-specific
-// today; flagged in the SKY-215 ticket as not blocking v1 (no
-// second forge exists yet).
+// validatePinnedRepoShape checks the "owner/repo" slug format and
+// returns the normalized (trimmed) slice. Pure — does not touch the
+// DB — so it stays cheap to test in isolation and stays usable in
+// any future code path that just needs to canonicalize slug input.
+//
+// The trim-then-persist step matters: without it, " owner/repo "
+// would pass validation (the validator trims internally) but get
+// stored padded, breaking subsequent lookups by slug.
 //
 // Returns (normalized, "") on success and (nil, errMsg) on failure.
-func validatePinnedRepos(repos []string) ([]string, string) {
+func validatePinnedRepoShape(repos []string) ([]string, string) {
 	out := make([]string, len(repos))
 	for i, r := range repos {
 		trimmed := strings.TrimSpace(r)
@@ -241,6 +242,42 @@ func validatePinnedRepos(repos []string) ([]string, string) {
 			return nil, "pinned_repos[" + strconv.Itoa(i) + "] must be 'owner/repo'"
 		}
 		out[i] = trimmed
+	}
+	return out, ""
+}
+
+// validatePinnedRepos composes shape validation with the must-be-
+// configured existence check: every slug must correspond to a row in
+// repo_profiles. This pins the UX contract — the frontend (SKY-217)
+// presents pinned_repos as a multi-select over the configured-repos
+// list, so an unconfigured slug arriving here is either a stale
+// client (the user removed the repo from config after pinning) or
+// someone hand-crafting a curl. Rejecting it up front keeps the
+// Curator from later trying to materialize a worktree for a repo
+// the user can't authenticate against.
+//
+// Returns (normalized, "") on success and (nil, errMsg) on failure.
+func validatePinnedRepos(database *sql.DB, repos []string) ([]string, string) {
+	out, errMsg := validatePinnedRepoShape(repos)
+	if errMsg != "" {
+		return nil, errMsg
+	}
+	if len(out) == 0 {
+		return out, ""
+	}
+
+	configured, err := db.GetConfiguredRepoNames(database)
+	if err != nil {
+		return nil, "failed to load configured repos: " + err.Error()
+	}
+	known := make(map[string]struct{}, len(configured))
+	for _, name := range configured {
+		known[name] = struct{}{}
+	}
+	for _, slug := range out {
+		if _, ok := known[slug]; !ok {
+			return nil, "pinned_repos: " + slug + " is not a configured repo (add it on the GitHub config page first)"
+		}
 	}
 	return out, ""
 }

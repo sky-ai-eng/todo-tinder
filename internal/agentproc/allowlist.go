@@ -1,4 +1,4 @@
-package delegate
+package agentproc
 
 import (
 	"strings"
@@ -8,6 +8,14 @@ import (
 // headless `claude -p` process. We can't rely on an OS sandbox (Claude Code's
 // /sandbox is interactive-only, and `-p` has no kernel isolation), so the
 // allowlist IS the security boundary.
+//
+// Shared across runtimes — both delegate (per-task agents running in git
+// worktrees) and curator (per-project chat sessions running from
+// `~/.triagefactory/projects/<id>/`) feed this string to claude. The threat
+// model is identical: same keychain creds, same prompt-injection surface,
+// same network-exfil concerns. A future runtime that needs a meaningfully
+// different surface should still derive it from this base rather than
+// maintaining a parallel list.
 //
 // Two threat channels that only exist if we grant broader Bash than needed:
 //

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
@@ -170,6 +171,18 @@ func (s *projectSession) dispatch(requestID string) {
 		return
 	}
 
+	// Resolve selfBin so the allowlist's `Bash(<selfBin> exec *)`
+	// pattern matches the same absolute path the agent will invoke
+	// for SKY-221's "ticket as a spec" skill. Falling back to a
+	// hard fail rather than running with a broken allowlist —
+	// `os.Executable()` errors are vanishingly rare, but if one
+	// happens we'd silently disable curator tooling.
+	selfBin, err := os.Executable()
+	if err != nil {
+		s.failRequest(requestID, fmt.Sprintf("resolve own binary path: %v", err))
+		return
+	}
+
 	systemPrompt := buildSystemPrompt(project.Name)
 
 	outcome, runErr := agentproc.Run(msgCtx, agentproc.RunOptions{
@@ -178,7 +191,7 @@ func (s *projectSession) dispatch(requestID string) {
 		SessionID:    project.CuratorSessionID,
 		Message:      req.UserInput,
 		SystemPrompt: systemPrompt,
-		AllowedTools: BuildAllowedTools(),
+		AllowedTools: agentproc.BuildAllowedTools(selfBin),
 		ExtraEnv: []string{
 			"TRIAGE_FACTORY_CURATOR_PROJECT_ID=" + s.projectID,
 			"TRIAGE_FACTORY_CURATOR_REQUEST_ID=" + requestID,
