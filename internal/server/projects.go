@@ -991,7 +991,8 @@ func (s *Server) handleProjectKnowledgeDelete(w http.ResponseWriter, r *http.Req
 	}
 	_, full, errMsg := resolveKnowledgePath(id, r.PathValue("path"))
 	if errMsg != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		log.Printf("[projects] knowledge delete: resolve knowledge path for %s: %s", id, errMsg)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": errMsg})
 		return
 	}
 	if err := os.Remove(full); err != nil {
