@@ -139,6 +139,18 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-project lock around the read-merge-write window so two
+	// concurrent autosaves don't lost-update each other. Two quick
+	// edits from different widgets (pinned-repos chip + tracker
+	// picker) would otherwise both read pre-edit state, merge their
+	// own field, and serially overwrite the row — leaving whichever
+	// landed second as the only contribution. Holding the mutex
+	// across read+merge+write makes the whole sequence atomic from
+	// the perspective of other PATCHes for the same project.
+	mu := s.projectMutex(id)
+	mu.Lock()
+	defer mu.Unlock()
+
 	existing, err := db.GetProject(s.db, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -555,6 +567,16 @@ func readKnowledgeFiles(dir string) ([]knowledgeFile, error) {
 			continue
 		}
 		name := e.Name()
+		// Skip filenames that the per-file endpoints would reject.
+		// Otherwise the listing would surface entries the user can't
+		// open or delete from the UI — for instance, a leading-dot
+		// name written directly by the agent (`.cache.json`) shows
+		// up in the list but the DELETE endpoint refuses the path,
+		// leaving the user with phantom files. Filtering at list
+		// time keeps the visible set actionable.
+		if _, errMsg := sanitizeKnowledgeFilename(name); errMsg != "" {
+			continue
+		}
 		full := filepath.Join(dir, name)
 		info, err := os.Lstat(full)
 		if err != nil {
@@ -757,14 +779,24 @@ func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a regular file"})
 		return
 	}
-	f, err := os.Open(full)
+	// O_NOFOLLOW closes the TOCTOU window between Lstat and Open:
+	// even if the path was swapped for a symlink in the microseconds
+	// between, the kernel refuses to traverse it. Without this, the
+	// Lstat check above would be advisory rather than authoritative.
+	// See open_nofollow_unix.go / open_nofollow_other.go for the
+	// platform split.
+	f, err := openNoFollow(full)
 	if err != nil {
 		if os.IsNotExist(err) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 			return
 		}
+		// ELOOP from O_NOFOLLOW (Linux/macOS errno when the final
+		// component is a symlink) surfaces as a generic syscall
+		// error here; we return 400 rather than 500 since it
+		// indicates the path was a symlink, not an I/O failure.
 		log.Printf("[projects] knowledge fetch: open %s: %v", full, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read file"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a regular file"})
 		return
 	}
 	defer f.Close()

@@ -650,6 +650,42 @@ func TestProjectKnowledge_LargeTextNotInlined(t *testing.T) {
 	}
 }
 
+// TestProjectKnowledge_HidesUnsanitizableNames pins the filter that
+// keeps the listing in sync with what the per-file endpoints will
+// accept. A `.cache.json` file written directly by the agent has a
+// leading dot and would be rejected by the raw/delete endpoints, so
+// we skip it from the listing too — surfacing it would leave the
+// user with phantom entries they can't open or remove.
+func TestProjectKnowledge_HidesUnsanitizableNames(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	s := newTestServer(t)
+	id, _ := db.CreateProject(s.db, domain.Project{Name: "filter"})
+
+	kbDir := filepath.Join(home, ".triagefactory", "projects", id, "knowledge-base")
+	if err := os.MkdirAll(kbDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(kbDir, "ok.md"), []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write ok.md: %v", err)
+	}
+	// Leading-dot file — passes through the OS but would be rejected
+	// by sanitizeKnowledgeFilename in the raw/delete endpoints.
+	if err := os.WriteFile(filepath.Join(kbDir, ".cache.json"), []byte("[]"), 0o644); err != nil {
+		t.Fatalf("write .cache.json: %v", err)
+	}
+
+	rec := doJSON(t, s, http.MethodGet, "/api/projects/"+id+"/knowledge", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var got []knowledgeFile
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if len(got) != 1 || got[0].Path != "ok.md" {
+		t.Errorf("expected only [ok.md], got %d entries: %v", len(got), got)
+	}
+}
+
 // TestProjectKnowledge_SkipsSymlinks pins the symlink-skipping
 // defense. A malicious or careless upload that drops a symlink
 // pointing at ~/.ssh/id_rsa would otherwise be readable through
