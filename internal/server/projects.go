@@ -487,9 +487,15 @@ func readKnowledgeFiles(dir string) ([]knowledgeFile, error) {
 			continue
 		}
 		full := filepath.Join(dir, name)
-		info, err := e.Info()
+		info, err := os.Lstat(full)
 		if err != nil {
 			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
 		}
 		body, err := os.ReadFile(full)
 		if err != nil {
