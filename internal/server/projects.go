@@ -78,7 +78,8 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	if jiraKey != "" || linearKey != "" {
 		cfg, err := config.Load()
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
+			log.Printf("handleProjectCreate: failed to load config: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config"})
 			return
 		}
 		jiraKey, linearKey, errMsg = validateTrackerKeys(cfg, jiraKey, linearKey)
