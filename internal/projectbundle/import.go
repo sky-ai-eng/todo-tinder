@@ -172,10 +172,10 @@ func Import(
 		return nil, nil, err
 	}
 
+	cleanup.Add(projectRoot)
 	if err := os.MkdirAll(kbRoot, 0o755); err != nil {
 		return nil, nil, fmt.Errorf("mkdir knowledge root: %w", err)
 	}
-	cleanup.Add(projectRoot)
 	if err := materializeKnowledge(entries, kbRoot, extractionBudget); err != nil {
 		return nil, nil, err
 	}
