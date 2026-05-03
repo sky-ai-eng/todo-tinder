@@ -71,14 +71,33 @@ export function useCuratorChat(projectId: string | undefined): UseCuratorChatRes
       const data = (await res.json()) as CuratorRequestWithMessages[]
       if (myID !== liveProjectRef.current || mySeq !== fetchSeq.current) return
       setLoadError(null)
-      // Merge with any optimistic-only requests (those whose id starts
-      // with `optimistic-` and don't have a real counterpart yet) so a
-      // refetch mid-send doesn't drop the user's pending bubble.
+      // Merge by request_id rather than user_input. Earlier versions
+      // used user_input equality to decide whether an optimistic row
+      // had a server counterpart, which silently dropped the second
+      // of two identical-text sends — both optimistics matched the
+      // first server row's user_input, so the in-flight second one
+      // was filtered out.
+      //
+      // Per-row policy:
+      //   - Server returns a row with id X: it's authoritative for
+      //     status/cost/etc. Use the longer message list, since a
+      //     WS push that arrived after the GET snapshot was taken
+      //     would otherwise be silently discarded.
+      //   - Local row not in server's response: keep it. Two cases:
+      //     optimistic-prefixed (POST hasn't returned yet) and the
+      //     race where a real id was committed locally but the GET
+      //     snapshot pre-dates the insert. Both want preservation.
       setRequests((prev) => {
-        const optimisticOnly = prev.filter(
-          (r) => r.id.startsWith('optimistic-') && !data.some((d) => d.user_input === r.user_input),
-        )
-        return [...data, ...optimisticOnly]
+        const dataIds = new Set(data.map((d) => d.id))
+        const merged = data.map((serverReq) => {
+          const local = prev.find((r) => r.id === serverReq.id)
+          if (!local) return serverReq
+          const messages =
+            local.messages.length > serverReq.messages.length ? local.messages : serverReq.messages
+          return { ...serverReq, messages }
+        })
+        const localOnly = prev.filter((r) => !dataIds.has(r.id))
+        return [...merged, ...localOnly]
       })
     } catch (err) {
       if (myID !== liveProjectRef.current || mySeq !== fetchSeq.current) return

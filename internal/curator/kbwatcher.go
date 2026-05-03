@@ -156,6 +156,23 @@ func (kw *KnowledgeWatcher) handle(event fsnotify.Event) {
 				if err := kw.watcher.Add(event.Name); err != nil {
 					log.Printf("[kbwatcher] watch new project %s: %v", event.Name, err)
 				}
+				// The new project dir may already contain
+				// `knowledge-base/` — `os.MkdirAll(<id>/knowledge-base)`
+				// creates both levels in one shot, and project import
+				// tooling lays the entire tree down atomically before
+				// any of our fs events land. In both cases the inner
+				// dir's own Create event was emitted into a watch we
+				// hadn't installed yet, so a `len(parts) == 2` branch
+				// below would never fire for it. Detect it now and
+				// install the inner watch + fire so the panel picks
+				// up whatever's already inside.
+				kbDir := filepath.Join(event.Name, kbDirName)
+				if info2, statErr2 := os.Stat(kbDir); statErr2 == nil && info2.IsDir() {
+					if err := kw.watcher.Add(kbDir); err != nil {
+						log.Printf("[kbwatcher] watch new kb %s: %v", kbDir, err)
+					}
+					kw.fire(parts[0])
+				}
 			}
 		}
 		return

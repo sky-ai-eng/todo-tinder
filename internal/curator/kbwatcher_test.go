@@ -218,3 +218,41 @@ func TestKnowledgeWatcher_IgnoresChangesOutsideKnowledgeBase(t *testing.T) {
 		}
 	}
 }
+
+func TestKnowledgeWatcher_FiresWhenProjectAndKBImportedAtomically(t *testing.T) {
+	// Pin: project import tooling lays down `<root>/<id>/knowledge-base/`
+	// + files in one syscall burst. The Create event for `<id>/` arrives
+	// at our handler, but the inner Create event for `<id>/knowledge-base/`
+	// was emitted before we'd installed a watch on `<id>/`, so it never
+	// reaches us. Without this regression the watcher would never fire
+	// for an imported project until the user manually edited a file —
+	// the Knowledge panel would render empty even though the disk has
+	// content.
+	root := t.TempDir()
+	rec := &recordingHub{}
+	w, err := NewKnowledgeWatcher(rec, root)
+	if err != nil {
+		t.Fatalf("new watcher: %v", err)
+	}
+	defer w.Close()
+
+	projectID := "imported"
+	kbDir := filepath.Join(root, projectID, "knowledge-base")
+	// MkdirAll creates both <id>/ and <id>/knowledge-base/ in one
+	// shot. By the time our handler reacts to the <id>/ Create event,
+	// the inner dir already exists and its own Create event has
+	// already been (silently) dropped — there was no watch on <id>/
+	// to receive it.
+	if err := os.MkdirAll(kbDir, 0o755); err != nil {
+		t.Fatalf("mkdir all: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(kbDir, "imported.md"), []byte("from import"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	// Without the atomic-detection branch in handle(), we never fire.
+	// With it, handle() detects the pre-existing kb dir as it adds the
+	// project-dir watch and fires immediately so the panel picks up
+	// the imported content.
+	waitForEvent(t, rec, projectID, 1)
+}
