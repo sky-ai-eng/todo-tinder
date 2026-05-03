@@ -51,7 +51,9 @@ func BuildAllowedTools() string {
 		// Structured data.
 		"Bash(jq *)", "Bash(yq *)",
 
-		// Filesystem ops within the knowledge dir.
+		// Filesystem-mutating shell utilities. Curator normally runs with
+		// the knowledge directory as cwd, but these Bash patterns do not
+		// themselves enforce path confinement to that directory.
 		"Bash(mkdir *)", "Bash(touch *)",
 		"Bash(cp *)", "Bash(mv *)", "Bash(ln *)",
 	}
