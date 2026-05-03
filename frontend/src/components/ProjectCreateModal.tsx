@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { X } from 'lucide-react'
 import type { Project } from '../types'
 import { readError } from '../lib/api'
@@ -23,8 +23,18 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
   const [jiraKey, setJiraKey] = useState('')
   const [linearKey, setLinearKey] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  // Holds the in-flight POST's AbortController so the close path
+  // can cancel it. Without this, clicking the backdrop / hitting
+  // Escape after submit would dismiss the dialog while leaving the
+  // request in flight — and a successful response after dismissal
+  // would silently create a project the user thinks they cancelled,
+  // tempting a duplicate retry.
+  const abortRef = useRef<AbortController | null>(null)
 
-  // Escape closes unless a create request is in flight.
+  // Escape closes unless a create request is in flight. We could
+  // alternatively allow Escape to abort the request explicitly, but
+  // "block close while submitting" is the simpler contract — typical
+  // create takes <500ms locally, the user can wait.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !submitting) onClose()
@@ -32,6 +42,14 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose, submitting])
+
+  // If the modal unmounts mid-flight (e.g. parent forces close),
+  // abort the request so we don't end up with a phantom project.
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort()
+    }
+  }, [])
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -41,6 +59,8 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
         return
       }
       setSubmitting(true)
+      const controller = new AbortController()
+      abortRef.current = controller
       try {
         const res = await fetch('/api/projects', {
           method: 'POST',
@@ -52,6 +72,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
             jira_project_key: jiraKey,
             linear_project_key: linearKey,
           }),
+          signal: controller.signal,
         })
         if (!res.ok) {
           toast.error(await readError(res, 'Failed to create project'))
@@ -61,18 +82,32 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
         toast.success(`Created project "${created.name}"`)
         onCreated(created)
       } catch (err) {
+        // Ignore abort — the close path that triggered it is
+        // responsible for any user-facing feedback.
+        if ((err as { name?: string })?.name === 'AbortError') return
         toast.error(`Failed to create project: ${err instanceof Error ? err.message : String(err)}`)
       } finally {
+        abortRef.current = null
         setSubmitting(false)
       }
     },
     [name, description, pinnedRepos, jiraKey, linearKey, onCreated],
   )
 
+  // Backdrop click closes only when no submit is in flight. If a
+  // submit is in flight, ignoring the click is safer than trying
+  // to abort + close — the user might have clicked accidentally,
+  // and a half-second wait is cheaper than a wrongly-cancelled
+  // create that already wrote a row.
+  const handleBackdropClick = () => {
+    if (submitting) return
+    onClose()
+  }
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
-      onClick={onClose}
+      onClick={handleBackdropClick}
     >
       <div
         className="

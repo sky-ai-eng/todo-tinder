@@ -169,20 +169,32 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		updated.PinnedRepos = pinned
 	}
-	if req.JiraProjectKey != nil || req.LinearProjectKey != nil {
-		// Validate only the fields the client sent. Re-validating the
-		// untouched side against the current config would surface a
-		// confusing error if the config drifted (e.g. a Jira project
-		// got renamed in Settings) on an unrelated PATCH that's only
-		// touching, say, the Linear key. The handler's contract is
-		// "validate what the client asked to change," not "re-validate
-		// the whole row on every PATCH."
-		cfg, err := config.Load()
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
-			return
-		}
-		if req.JiraProjectKey != nil {
+	// Validate only the fields the client sent. Re-validating the
+	// untouched side against the current config would surface a
+	// confusing error if the config drifted (e.g. a Jira project
+	// got renamed in Settings) on an unrelated PATCH that's only
+	// touching, say, the Linear key. The handler's contract is
+	// "validate what the client asked to change," not "re-validate
+	// the whole row on every PATCH."
+	//
+	// Config is loaded lazily — and only when the Jira side is being
+	// set to a non-empty value. Clearing either tracker, or setting
+	// Linear at all, never reads config: validateTrackerKeys with an
+	// empty Jira input doesn't consult cfg, and Linear validation
+	// rejects non-empty regardless of cfg. This keeps a malformed
+	// config.yaml from 500-ing requests like `{"linear_project_key":""}`
+	// that have nothing to do with Jira.
+	if req.JiraProjectKey != nil {
+		jiraInput := strings.TrimSpace(*req.JiraProjectKey)
+		if jiraInput == "" {
+			updated.JiraProjectKey = ""
+		} else {
+			cfg, err := config.Load()
+			if err != nil {
+				log.Printf("[projects] patch: config load: %v", err)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config"})
+				return
+			}
 			jiraKey, _, errMsg := validateTrackerKeys(cfg, *req.JiraProjectKey, "")
 			if errMsg != "" {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
@@ -190,14 +202,19 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			updated.JiraProjectKey = jiraKey
 		}
-		if req.LinearProjectKey != nil {
-			_, linearKey, errMsg := validateTrackerKeys(cfg, "", *req.LinearProjectKey)
-			if errMsg != "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
-				return
-			}
-			updated.LinearProjectKey = linearKey
+	}
+	if req.LinearProjectKey != nil {
+		// Linear is rejected if non-empty regardless of config; the
+		// empty-cfg argument below makes the no-cfg-needed contract
+		// explicit. When the Linear integration ships, this branch
+		// will need a config.Load() of its own — but only when the
+		// input is non-empty, mirroring the Jira pattern above.
+		_, linearKey, errMsg := validateTrackerKeys(config.Config{}, "", *req.LinearProjectKey)
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+			return
 		}
+		updated.LinearProjectKey = linearKey
 	}
 	if req.SummaryMD != nil {
 		updated.SummaryMD = *req.SummaryMD
@@ -470,24 +487,23 @@ const knowledgeMaxUploadBytes = 5 * 1024 * 1024
 // files" doesn't lock up the process on disk + memory.
 const knowledgeMaxRequestBytes = 25 * 1024 * 1024
 
-// handleProjectKnowledge serves the curated markdown files that live
-// under the project's knowledge dir. SKY-217.
-//
-// The directory layout is `<KnowledgeDir>/knowledge-base/*.md` — the
-// outer directory is also where the Curator's CC subprocess runs from
-// and where pinned-repo worktrees materialize, so we deliberately
-// don't read the outer dir; it's full of agent scratch state, not
-// user-visible knowledge.
+// handleProjectKnowledge serves the files under the project's
+// knowledge-base directory. SKY-217.
 //
 // Returns an empty list (not 404) when the project exists but the
 // knowledge subdir doesn't, so the frontend can render an empty state
 // instead of a noisy error. A real I/O failure (permission denied,
-// etc.) is a 500.
+// etc.) is a 500 — but the response body is a generic message: the
+// underlying os.* errors include absolute paths under the user's
+// home dir, which would otherwise leak filesystem layout to the
+// browser. Detail goes to the server log where the operator can find
+// it; the client gets a stable string.
 func (s *Server) handleProjectKnowledge(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	project, err := db.GetProject(s.db, id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[projects] knowledge list: db get %s: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
 	}
 	if project == nil {
@@ -496,13 +512,15 @@ func (s *Server) handleProjectKnowledge(w http.ResponseWriter, r *http.Request) 
 	}
 	root, err := curator.KnowledgeDir(id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "resolve knowledge dir: " + err.Error()})
+		log.Printf("[projects] knowledge list: resolve dir for %s: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read knowledge base"})
 		return
 	}
 	kbDir := filepath.Join(root, "knowledge-base")
 	files, err := readKnowledgeFiles(kbDir)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[projects] knowledge list: read %s: %v", kbDir, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read knowledge base"})
 		return
 	}
 	writeJSON(w, http.StatusOK, files)
@@ -664,12 +682,18 @@ func sanitizeKnowledgeFilename(raw string) (string, string) {
 //     the result has kbDir as its prefix. Belt-and-suspenders against
 //     anything the sanitizer might miss on a future filesystem.
 //
+// Errors that include filesystem detail (KnowledgeDir's UserHomeDir
+// failure, etc.) are logged server-side; the returned message is
+// generic so the response body doesn't leak path layout to the
+// browser.
+//
 // Returns (kbDir, fullPath, "") on success and ("", "", errMsg) on
 // failure.
 func resolveKnowledgePath(projectID, rawPath string) (string, string, string) {
 	root, err := curator.KnowledgeDir(projectID)
 	if err != nil {
-		return "", "", "resolve knowledge dir: " + err.Error()
+		log.Printf("[projects] resolve knowledge dir for %s: %v", projectID, err)
+		return "", "", "failed to resolve knowledge dir"
 	}
 	kbDir := filepath.Join(root, "knowledge-base")
 	decoded, err := url.PathUnescape(rawPath)
@@ -698,7 +722,8 @@ func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Reque
 	id := r.PathValue("id")
 	project, err := db.GetProject(s.db, id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[projects] knowledge fetch: db get %s: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
 	}
 	if project == nil {
@@ -716,7 +741,8 @@ func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Reque
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[projects] knowledge fetch: stat %s: %v", full, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read file"})
 		return
 	}
 	if !info.Mode().IsRegular() {
@@ -755,7 +781,8 @@ func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Req
 	id := r.PathValue("id")
 	project, err := db.GetProject(s.db, id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[projects] knowledge upload: db get %s: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
 	}
 	if project == nil {
@@ -764,12 +791,14 @@ func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Req
 	}
 	root, err := curator.KnowledgeDir(id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "resolve knowledge dir: " + err.Error()})
+		log.Printf("[projects] knowledge upload: resolve dir for %s: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to resolve knowledge dir"})
 		return
 	}
 	kbDir := filepath.Join(root, "knowledge-base")
 	if err := os.MkdirAll(kbDir, 0o755); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "create knowledge dir: " + err.Error()})
+		log.Printf("[projects] knowledge upload: mkdir %s: %v", kbDir, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create knowledge dir"})
 		return
 	}
 
@@ -870,7 +899,8 @@ func (s *Server) handleProjectKnowledgeDelete(w http.ResponseWriter, r *http.Req
 	id := r.PathValue("id")
 	project, err := db.GetProject(s.db, id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[projects] knowledge delete: db get %s: %v", id, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
 	}
 	if project == nil {
@@ -887,7 +917,8 @@ func (s *Server) handleProjectKnowledgeDelete(w http.ResponseWriter, r *http.Req
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		log.Printf("[projects] knowledge delete: remove %s: %v", full, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to remove file"})
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

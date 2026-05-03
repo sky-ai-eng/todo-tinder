@@ -180,6 +180,108 @@ func TestUpdateProject_MissingReturnsNoRows(t *testing.T) {
 	}
 }
 
+// TestCreateGetProject_TrackerColumnsRoundtrip pins the SELECT/Scan
+// alignment for the SKY-217 tracker columns. The two new columns
+// (jira_project_key, linear_project_key) live between pinned_repos
+// and created_at in the Scan order; if a future change shifts that
+// order without updating both sides, this test catches it instead
+// of letting the bug surface as a runtime parse failure on the
+// timestamps that follow.
+func TestCreateGetProject_TrackerColumnsRoundtrip(t *testing.T) {
+	database := newTestDB(t)
+	id, err := CreateProject(database, domain.Project{
+		Name:             "Tracked",
+		JiraProjectKey:   "SKY",
+		LinearProjectKey: "tf-2026",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := GetProject(database, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got == nil {
+		t.Fatal("project not found")
+	}
+	if got.JiraProjectKey != "SKY" {
+		t.Errorf("jira_project_key roundtrip: got %q, want SKY", got.JiraProjectKey)
+	}
+	if got.LinearProjectKey != "tf-2026" {
+		t.Errorf("linear_project_key roundtrip: got %q, want tf-2026", got.LinearProjectKey)
+	}
+	// Surrounding fields must still parse — a misaligned Scan would
+	// stuff the tracker key into one of these instead.
+	if got.Name != "Tracked" {
+		t.Errorf("name = %q (Scan misalignment?)", got.Name)
+	}
+	if got.CreatedAt.IsZero() {
+		t.Error("created_at zero — Scan likely landed a string in a time field")
+	}
+}
+
+// TestUpdateProject_TrackerColumnsRoundtrip exercises the same alignment
+// on the UPDATE path. A PATCH that changes only tracker fields must
+// land in the right columns, and the read-back has to reflect them.
+func TestUpdateProject_TrackerColumnsRoundtrip(t *testing.T) {
+	database := newTestDB(t)
+	id, err := CreateProject(database, domain.Project{Name: "drift"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, _ := GetProject(database, id)
+	got.JiraProjectKey = "OPS"
+	got.LinearProjectKey = "ops-board"
+	if err := UpdateProject(database, *got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	after, _ := GetProject(database, id)
+	if after.JiraProjectKey != "OPS" {
+		t.Errorf("jira_project_key = %q after update, want OPS", after.JiraProjectKey)
+	}
+	if after.LinearProjectKey != "ops-board" {
+		t.Errorf("linear_project_key = %q after update, want ops-board", after.LinearProjectKey)
+	}
+	// Clear-the-tracker path: empty strings must persist as empty,
+	// not as NULL-rendered placeholder text.
+	after.JiraProjectKey = ""
+	after.LinearProjectKey = ""
+	if err := UpdateProject(database, *after); err != nil {
+		t.Fatalf("clear update: %v", err)
+	}
+	cleared, _ := GetProject(database, id)
+	if cleared.JiraProjectKey != "" || cleared.LinearProjectKey != "" {
+		t.Errorf("clear roundtrip: jira=%q linear=%q (want both empty)",
+			cleared.JiraProjectKey, cleared.LinearProjectKey)
+	}
+}
+
+// TestListProjects_TrackerColumnsRoundtrip exercises the LIST path
+// since it has its own SELECT statement (separate from GetProject).
+// A column-order mismatch between the two SELECTs would only surface
+// here, not in the get-roundtrip test above.
+func TestListProjects_TrackerColumnsRoundtrip(t *testing.T) {
+	database := newTestDB(t)
+	if _, err := CreateProject(database, domain.Project{
+		Name:             "list-me",
+		JiraProjectKey:   "LIST",
+		LinearProjectKey: "list-linear",
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	projects, err := ListProjects(database)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("got %d projects", len(projects))
+	}
+	if projects[0].JiraProjectKey != "LIST" || projects[0].LinearProjectKey != "list-linear" {
+		t.Errorf("list roundtrip: jira=%q linear=%q",
+			projects[0].JiraProjectKey, projects[0].LinearProjectKey)
+	}
+}
+
 func TestDeleteProject_Roundtrip(t *testing.T) {
 	database := newTestDB(t)
 	id, _ := CreateProject(database, domain.Project{Name: "doomed"})

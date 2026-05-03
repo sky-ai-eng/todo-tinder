@@ -44,30 +44,48 @@ export default function ProjectDetail() {
   const [loading, setLoading] = useState(true)
   const [missing, setMissing] = useState(false)
 
-  const refresh = useCallback(async () => {
+  // Load on mount and on id change. Resetting visible state at the
+  // top of the effect avoids a flash of the previous project's data
+  // when navigating between /projects/:id pages — React Router can
+  // reuse the component, so without the reset we briefly render the
+  // old project until the new fetch lands.
+  //
+  // The cancelled flag also gates state updates against out-of-order
+  // responses: if A→B→C navigation fires three fetches and they
+  // resolve in the wrong order, only the latest effect's setState
+  // path survives (each prior cleanup flips its `cancelled`).
+  useEffect(() => {
     if (!id) return
-    try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(id)}`)
-      if (res.status === 404) {
-        setMissing(true)
-        return
+    setProject(null)
+    setMissing(false)
+    setLoading(true)
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(id)}`)
+        if (cancelled) return
+        if (res.status === 404) {
+          setMissing(true)
+          return
+        }
+        if (!res.ok) {
+          toast.error(await readError(res, 'Failed to load project'))
+          return
+        }
+        const data: Project = await res.json()
+        if (cancelled) return
+        setProject(data)
+      } catch (err) {
+        if (cancelled) return
+        toast.error(`Failed to load project: ${err instanceof Error ? err.message : String(err)}`)
+      } finally {
+        if (!cancelled) setLoading(false)
       }
-      if (!res.ok) {
-        toast.error(await readError(res, 'Failed to load project'))
-        return
-      }
-      const data: Project = await res.json()
-      setProject(data)
-    } catch (err) {
-      toast.error(`Failed to load project: ${err instanceof Error ? err.message : String(err)}`)
-    } finally {
-      setLoading(false)
+    })()
+    return () => {
+      cancelled = true
     }
   }, [id])
-
-  useEffect(() => {
-    refresh()
-  }, [refresh])
 
   const patch = useCallback(
     async (body: Record<string, unknown>) => {
@@ -258,6 +276,7 @@ function ProjectHeader({
             <button
               type="button"
               onClick={saveName}
+              aria-label="Save project name"
               className="text-claim hover:bg-claim/10 p-1.5 rounded-full"
             >
               <Check size={14} />
@@ -268,6 +287,7 @@ function ProjectHeader({
                 setDraftName(project.name)
                 setEditingName(false)
               }}
+              aria-label="Cancel editing project name"
               className="text-text-tertiary hover:bg-black/[0.03] p-1.5 rounded-full"
             >
               <X size={14} />
@@ -385,6 +405,31 @@ function PinnedReposInline({
   const [adderOpen, setAdderOpen] = useState(false)
   const [search, setSearch] = useState('')
 
+  // Local intended state, updated synchronously on every user
+  // action. Without this, two quick clicks (e.g. remove A, then
+  // remove B before A's PATCH lands) compose against the stale
+  // `pinned` prop and the second click sends [B] instead of [],
+  // dropping the first removal.
+  const [local, setLocal] = useState<string[]>(pinned)
+
+  // pendingTarget holds the most recent intended state while a
+  // PATCH is in flight. The drain loop fires only the latest target
+  // — intermediate states get coalesced. This mirrors the typical
+  // "fire latest desired state" pattern: we don't care that
+  // intermediate states ever hit the server, only that the final
+  // one does.
+  const pendingTarget = useRef<string[] | null>(null)
+  const inflight = useRef(false)
+
+  // Re-sync local from the prop only when no PATCH is outstanding.
+  // While we have pending edits, the prop reflects pre-edit server
+  // state and would clobber the user's in-progress changes.
+  useEffect(() => {
+    if (!inflight.current && pendingTarget.current === null) {
+      setLocal(pinned)
+    }
+  }, [pinned])
+
   useEffect(() => {
     let cancelled = false
     const load = async () => {
@@ -411,24 +456,53 @@ function PinnedReposInline({
     }
   }, [])
 
-  const remove = async (slug: string) => {
-    const next = pinned.filter((s) => s !== slug)
-    await onChange(next)
+  // applyChange queues a target state and drains. Concurrent calls
+  // collapse: if the user clicks four removes quickly, the first
+  // PATCH fires immediately and only the final intent fires after
+  // it returns — intermediate states are skipped because they
+  // weren't the user's final answer.
+  const applyChange = async (next: string[]) => {
+    setLocal(next)
+    pendingTarget.current = next
+    if (inflight.current) return
+    inflight.current = true
+    try {
+      while (pendingTarget.current !== null) {
+        const target = pendingTarget.current
+        pendingTarget.current = null
+        const ok = await onChange(target)
+        if (!ok) {
+          // Parent already toasted the error. Roll back to the
+          // last known server state and drop any further pending
+          // intents — keeping them queued would re-send a
+          // probably-still-invalid state.
+          pendingTarget.current = null
+          setLocal(pinned)
+          break
+        }
+      }
+    } finally {
+      inflight.current = false
+    }
   }
 
-  const add = async (slug: string) => {
-    if (pinned.includes(slug)) return
-    const next = [...pinned, slug].sort()
-    const ok = await onChange(next)
-    if (ok) {
-      setAdderOpen(false)
-      setSearch('')
-    }
+  const remove = (slug: string) => {
+    applyChange(local.filter((s) => s !== slug))
+  }
+
+  const add = (slug: string) => {
+    if (local.includes(slug)) return
+    applyChange([...local, slug].sort())
+    // Close the picker optimistically — the PATCH may still be
+    // in flight, but the user's intent ("add this") is captured
+    // in pendingTarget and the chip already shows in `local`.
+    setAdderOpen(false)
+    setSearch('')
   }
 
   const addable = available.filter(
     (slug) =>
-      !pinned.includes(slug) &&
+      !local.includes(slug) &&
       (!search.trim() || slug.toLowerCase().includes(search.trim().toLowerCase())),
   )
 
@@ -436,7 +510,7 @@ function PinnedReposInline({
     <div className="flex flex-wrap items-center gap-1.5">
       {jiraKey && <Chip label={`Jira: ${jiraKey}`} tone="accent" />}
       {linearKey && <Chip label={`Linear: ${linearKey}`} tone="accent" />}
-      {pinned.map((slug) => (
+      {local.map((slug) => (
         <RepoChip key={slug} slug={slug} onRemove={() => remove(slug)} />
       ))}
       <Popover.Root open={adderOpen} onOpenChange={setAdderOpen}>
