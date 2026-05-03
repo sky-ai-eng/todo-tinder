@@ -785,14 +785,14 @@ func TestSanitizeKnowledgeFilename(t *testing.T) {
 	}{
 		{"notes.md", "notes.md"},
 		{"  notes.md  ", "notes.md"},
-		{"sub/dir/notes.md", "notes.md"}, // path stripped to base
-		{"..", ""},                       // dotdot rejected
-		{".", ""},                        // dot rejected
-		{"", ""},                         // empty rejected
-		{".hidden", ""},                  // leading dot rejected
-		{"folder\\file.md", "file.md"},   // windows-style stripped
-		{"a/../b.md", "b.md"},            // base of "../b.md" is "b.md"
-		{string([]byte{}), ""},           // truly empty
+		{"sub/dir/notes.md", "notes.md"},       // path stripped to base
+		{"..", ""},                             // dotdot rejected
+		{".", ""},                              // dot rejected
+		{"", ""},                               // empty rejected
+		{".hidden", ""},                        // leading dot rejected
+		{"folder\\file.md", "folder\\file.md"}, // unix: literal char (filepath.Base no-op)
+		{"a/../b.md", "b.md"},                  // base of "../b.md" is "b.md"
+		{string([]byte{}), ""},                 // truly empty
 	}
 	for _, tc := range cases {
 		got, errMsg := sanitizeKnowledgeFilename(tc.in)
