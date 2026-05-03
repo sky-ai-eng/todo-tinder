@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
+import { Link } from 'react-router-dom'
 import { Check, X } from 'lucide-react'
 import { readError } from '../lib/api'
 import { toast } from './Toast/toastStore'
@@ -81,9 +82,9 @@ export default function RepoMultiSelect({ value, onChange }: Props) {
     return (
       <div className="text-[12px] text-text-tertiary py-2">
         No repos configured.{' '}
-        <a href="/repos" className="text-accent hover:underline">
+        <Link to="/repos" className="text-accent hover:underline">
           Add repos
-        </a>{' '}
+        </Link>{' '}
         first.
       </div>
     )

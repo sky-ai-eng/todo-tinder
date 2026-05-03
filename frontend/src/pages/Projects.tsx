@@ -156,41 +156,45 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
 
 function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => void }) {
   const desc = (project.description || '').trim()
-  // The card is a Link to the detail page. The trash button lives
-  // inside the link region but stops propagation + prevents default
-  // so clicking it deletes rather than navigating. Only the chrome
-  // around the icon swallows the click — the rest of the card still
-  // navigates as users expect.
+  // Stretched-link pattern: the outer <article> is the visual card,
+  // a transparent <Link> overlay covers it for navigation, and the
+  // trash <button> is a sibling at higher z. This avoids the
+  // <a><button></a> nesting an earlier draft had — invalid HTML and
+  // unreliable for screen readers / keyboard nav. Tab order here is
+  // "card link → delete button," each focusable in its own right.
   return (
-    <Link
-      to={`/projects/${encodeURIComponent(project.id)}`}
+    <article
       className="
         group relative overflow-hidden rounded-2xl border border-border-glass
         bg-gradient-to-br from-white/70 via-white/50 to-white/35
         p-5 shadow-sm shadow-black/[0.03] backdrop-blur-xl
         transition-[box-shadow,border-color] duration-300
         hover:border-white/90 hover:shadow-md hover:shadow-black/[0.05]
-        block
       "
     >
       <span
         aria-hidden
         className="pointer-events-none absolute -left-8 -top-8 h-24 w-24 rounded-full bg-white/30 blur-2xl"
       />
+      <Link
+        to={`/projects/${encodeURIComponent(project.id)}`}
+        aria-label={`Open project ${project.name}`}
+        className="
+          absolute inset-0 z-10 rounded-2xl
+          focus:outline-none focus-visible:ring-2 focus-visible:ring-accent
+        "
+      />
       <button
         type="button"
-        onClick={(e) => {
-          e.preventDefault()
-          e.stopPropagation()
-          onDelete()
-        }}
+        onClick={onDelete}
         aria-label={`Delete project ${project.name}`}
         className="
-          absolute top-3 right-3 z-10
+          absolute top-3 right-3 z-20
           inline-flex items-center justify-center
           h-7 w-7 rounded-full
-          opacity-0 group-hover:opacity-100
+          opacity-0 group-hover:opacity-100 focus-visible:opacity-100
           text-text-tertiary hover:text-dismiss hover:bg-dismiss/[0.08]
+          focus:outline-none focus-visible:ring-2 focus-visible:ring-dismiss
           transition-[opacity,color,background-color] duration-200
         "
       >
@@ -209,7 +213,7 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
           Updated {formatAge(project.updated_at)}
         </div>
       </div>
-    </Link>
+    </article>
   )
 }
 

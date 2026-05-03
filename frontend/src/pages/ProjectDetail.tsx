@@ -311,9 +311,19 @@ function ProjectHeader({
             </div>
           </div>
         ) : (
-          <p
-            className="text-[13px] text-text-secondary leading-relaxed cursor-pointer group inline-flex items-start gap-2 hover:text-text-primary"
+          // Wrapped in a real <button> so keyboard users can tab to
+          // it and press Enter/Space to begin editing — the earlier
+          // <p onClick> path was mouse-only. text-left + items-start
+          // preserve the rendered look of the original paragraph.
+          <button
+            type="button"
             onClick={beginEditDesc}
+            className="
+              text-left text-[13px] text-text-secondary leading-relaxed
+              cursor-pointer group inline-flex items-start gap-2
+              hover:text-text-primary focus:outline-none
+              focus-visible:ring-2 focus-visible:ring-accent rounded
+            "
           >
             {project.description ? (
               project.description
@@ -324,7 +334,7 @@ function ProjectHeader({
               size={12}
               className="text-text-tertiary opacity-0 group-hover:opacity-100 mt-1 shrink-0"
             />
-          </p>
+          </button>
         )}
       </div>
 
