@@ -1129,17 +1129,24 @@ function KnowledgeRow({
     if (!needsLazyFetch) return
     let cancelled = false
     fetch(rawURL)
-      .then((r) => (r.ok ? r.text() : ''))
+      .then((r) => {
+        if (!r.ok) {
+          throw new Error(`Failed to load file preview (${r.status})`)
+        }
+        return r.text()
+      })
       .then((text) => {
         if (!cancelled) setLazyContent(text)
       })
-      .catch(() => {
-        if (!cancelled) setLazyContent('')
+      .catch((error) => {
+        if (cancelled) return
+        toast.error(readError(error) || 'Failed to load file preview.')
+        setLazyContent('Failed to load file preview.')
       })
     return () => {
       cancelled = true
     }
-  }, [needsLazyFetch, rawURL])
+  }, [file.path, needsLazyFetch, rawURL])
 
   const lazyLoading = needsLazyFetch
 
