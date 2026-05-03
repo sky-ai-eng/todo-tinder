@@ -811,6 +811,13 @@ func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "multipart parse: " + err.Error()})
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			if err := r.MultipartForm.RemoveAll(); err != nil {
+				log.Printf("[projects] knowledge upload: cleanup multipart form for %s: %v", id, err)
+			}
+		}
+	}()
 	files := r.MultipartForm.File["file"]
 	if len(files) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no files in upload (use form field 'file')"})
