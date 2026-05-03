@@ -14,6 +14,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -365,6 +366,24 @@ func main() {
 	spawner := delegate.NewSpawner(database, nil, wsHub, "")
 	srv.SetSpawner(spawner)
 
+	// Curator runtime (SKY-216) — per-project chat sessions. Any
+	// rows left non-terminal from a previous process are stranded:
+	// running rows lost their goroutine + agentproc subprocess,
+	// queued rows lost the goroutine that was supposed to pick them
+	// up. Cancel both classes so the user can re-send if they
+	// actually wanted that message processed. Auto-replaying a
+	// stale queued message after a restart would surprise the user
+	// more than dropping it. The model arg is empty until config
+	// loads; curator.UpdateCredentials hot-swaps the same way
+	// Spawner does.
+	if n, err := db.CancelOrphanedNonTerminalCuratorRequests(database); err != nil {
+		log.Printf("[curator] startup recovery failed: %v", err)
+	} else if n > 0 {
+		log.Printf("[curator] cancelled %d orphaned non-terminal curator requests from prior process", n)
+	}
+	curatorRuntime := curator.New(database, wsHub, "")
+	srv.SetCurator(curatorRuntime)
+
 	// Event router — records events, creates/bumps tasks, auto-delegates on
 	// matching triggers, runs inline close checks. Also handles post-scoring
 	// re-derive via the scorer callback wired above.
@@ -429,6 +448,7 @@ func main() {
 		if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) {
 			ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
 			spawner.UpdateCredentials(ghClient, cfg.AI.Model)
+			curatorRuntime.UpdateCredentials(cfg.AI.Model)
 			srv.SetGitHubClient(ghClient)
 
 			// Re-profile, then signal ready and restart all pollers
@@ -445,6 +465,7 @@ func main() {
 			}()
 		} else {
 			spawner.UpdateCredentials(nil, "")
+			curatorRuntime.UpdateCredentials("")
 			srv.SetGitHubClient(nil)
 			pollerMgr.RestartAll()
 		}
@@ -528,6 +549,7 @@ func main() {
 	if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) && repoCount > 0 {
 		ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
 		spawner.UpdateCredentials(ghClient, cfg.AI.Model)
+		curatorRuntime.UpdateCredentials(cfg.AI.Model)
 		srv.SetGitHubClient(ghClient)
 		log.Printf("[delegate] spawner ready (%d repos configured)", repoCount)
 
