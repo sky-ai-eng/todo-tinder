@@ -27,32 +27,43 @@ interface Props {
 export default function RepoMultiSelect({ value, onChange }: Props) {
   const [available, setAvailable] = useState<RepoProfile[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
 
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      try {
-        const res = await fetch('/api/repos')
-        if (!res.ok) {
-          toast.error(await readError(res, 'Failed to load repos'))
-          return
-        }
-        const data: RepoProfile[] = await res.json()
-        if (!cancelled) setAvailable(data)
-      } catch (err) {
-        if (!cancelled) {
-          toast.error(`Failed to load repos: ${err instanceof Error ? err.message : String(err)}`)
-        }
-      } finally {
-        if (!cancelled) setLoading(false)
+  // Track whether the load actually succeeded vs. just returned
+  // an empty list. Without this distinction, a network failure
+  // (which leaves available=[]) renders the "No repos configured"
+  // hint, telling users to go set up something they may already
+  // have configured.
+  const loadRepos = useCallback(async (signal: AbortSignal) => {
+    try {
+      setError(null)
+      const res = await fetch('/api/repos', { signal })
+      if (signal.aborted) return
+      if (!res.ok) {
+        const msg = await readError(res, 'Failed to load repos')
+        setError(msg)
+        toast.error(msg)
+        return
       }
-    }
-    load()
-    return () => {
-      cancelled = true
+      const data: RepoProfile[] = await res.json()
+      if (signal.aborted) return
+      setAvailable(data)
+    } catch (err) {
+      if (signal.aborted) return
+      const msg = `Failed to load repos: ${err instanceof Error ? err.message : String(err)}`
+      setError(msg)
+      toast.error(msg)
+    } finally {
+      if (!signal.aborted) setLoading(false)
     }
   }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    loadRepos(controller.signal)
+    return () => controller.abort()
+  }, [loadRepos])
 
   const selected = useMemo(() => new Set(value), [value])
   const filtered = useMemo(() => {
@@ -76,6 +87,29 @@ export default function RepoMultiSelect({ value, onChange }: Props) {
 
   if (loading) {
     return <div className="text-[12px] text-text-tertiary py-2">Loading repos…</div>
+  }
+
+  // Distinct from "no repos configured" — a transient failure to
+  // load shouldn't redirect the user to a setup screen they may
+  // have already completed.
+  if (error) {
+    return (
+      <div className="text-[12px] text-text-tertiary py-2">
+        Couldn&rsquo;t load configured repos.{' '}
+        <button
+          type="button"
+          onClick={() => {
+            setLoading(true)
+            const controller = new AbortController()
+            loadRepos(controller.signal)
+          }}
+          className="text-accent hover:underline"
+        >
+          Try again
+        </button>
+        .
+      </div>
+    )
   }
 
   if (available.length === 0) {

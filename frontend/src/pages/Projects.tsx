@@ -19,18 +19,27 @@ export default function Projects() {
   const [projects, setProjects] = useState<Project[]>([])
   const [loading, setLoading] = useState(true)
   const [createOpen, setCreateOpen] = useState(false)
+  // Distinguish "load failed" from "loaded but empty" so a transient
+  // network error doesn't render the "Create your first project"
+  // empty state — that would silently lie about the user's data.
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
+      setLoadError(null)
       const res = await fetch('/api/projects')
       if (!res.ok) {
-        toast.error(await readError(res, 'Failed to load projects'))
+        const msg = await readError(res, 'Failed to load projects')
+        setLoadError(msg)
+        toast.error(msg)
         return
       }
       const data: Project[] = await res.json()
       setProjects(data)
     } catch (err) {
-      toast.error(`Failed to load projects: ${err instanceof Error ? err.message : String(err)}`)
+      const msg = `Failed to load projects: ${err instanceof Error ? err.message : String(err)}`
+      setLoadError(msg)
+      toast.error(msg)
     } finally {
       setLoading(false)
     }
@@ -113,7 +122,9 @@ export default function Projects() {
         )}
       </header>
 
-      {projects.length === 0 ? (
+      {loadError ? (
+        <ErrorState message={loadError} onRetry={refresh} />
+      ) : projects.length === 0 ? (
         <EmptyState onCreate={() => setCreateOpen(true)} />
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
@@ -126,6 +137,26 @@ export default function Projects() {
       {createOpen && (
         <ProjectCreateModal onClose={() => setCreateOpen(false)} onCreated={handleCreated} />
       )}
+    </div>
+  )
+}
+
+function ErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-24">
+      <div className="text-text-secondary text-[13px] max-w-md text-center mb-6">{message}</div>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="
+          inline-flex items-center gap-2 rounded-full
+          bg-accent text-white text-[13px] font-medium
+          px-5 py-2.5 transition-all
+          hover:opacity-90
+        "
+      >
+        Try again
+      </button>
     </div>
   )
 }

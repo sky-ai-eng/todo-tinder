@@ -43,6 +43,44 @@ export default function ProjectDetail() {
   const [project, setProject] = useState<Project | null>(null)
   const [loading, setLoading] = useState(true)
   const [missing, setMissing] = useState(false)
+  // loadError distinguishes "really gone" (404 → missing=true) from
+  // "transient failure" (5xx, network drop). Without it, a flaky
+  // network request would land in the missing branch and the user
+  // would see "Project not found" for a project that very much
+  // still exists.
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // Monotonic counter that gates PATCH responses. Every successful
+  // response only sets project state if it carries the latest seq —
+  // an older slow response can't resurrect stale field values over
+  // a newer edit that already landed.
+  const patchSeq = useRef(0)
+
+  const loadProject = useCallback(
+    async (signal: AbortSignal) => {
+      if (!id) return
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, { signal })
+        if (signal.aborted) return
+        if (res.status === 404) {
+          setMissing(true)
+          return
+        }
+        if (!res.ok) {
+          setLoadError(await readError(res, 'Failed to load project'))
+          return
+        }
+        const data: Project = await res.json()
+        if (signal.aborted) return
+        setProject(data)
+      } catch (err) {
+        if (signal.aborted) return
+        setLoadError(`Failed to load project: ${err instanceof Error ? err.message : String(err)}`)
+      } finally {
+        if (!signal.aborted) setLoading(false)
+      }
+    },
+    [id],
+  )
 
   // Load on mount and on id change. Resetting visible state at the
   // top of the effect avoids a flash of the previous project's data
@@ -50,46 +88,31 @@ export default function ProjectDetail() {
   // reuse the component, so without the reset we briefly render the
   // old project until the new fetch lands.
   //
-  // The cancelled flag also gates state updates against out-of-order
+  // AbortController gates state updates against out-of-order
   // responses: if A→B→C navigation fires three fetches and they
   // resolve in the wrong order, only the latest effect's setState
-  // path survives (each prior cleanup flips its `cancelled`).
+  // path survives (each prior cleanup aborts its controller).
   useEffect(() => {
     if (!id) return
     setProject(null)
     setMissing(false)
+    setLoadError(null)
     setLoading(true)
-    let cancelled = false
-    ;(async () => {
-      try {
-        const res = await fetch(`/api/projects/${encodeURIComponent(id)}`)
-        if (cancelled) return
-        if (res.status === 404) {
-          setMissing(true)
-          return
-        }
-        if (!res.ok) {
-          toast.error(await readError(res, 'Failed to load project'))
-          return
-        }
-        const data: Project = await res.json()
-        if (cancelled) return
-        setProject(data)
-      } catch (err) {
-        if (cancelled) return
-        toast.error(`Failed to load project: ${err instanceof Error ? err.message : String(err)}`)
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [id])
+    const controller = new AbortController()
+    loadProject(controller.signal)
+    return () => controller.abort()
+  }, [id, loadProject])
 
   const patch = useCallback(
     async (body: Record<string, unknown>) => {
       if (!id) return false
+      // Capture the seq BEFORE the await so concurrent calls each
+      // hold their own "is my response still the latest" yardstick.
+      // Older responses landing after a newer one find seq has moved
+      // past them and skip the setState — no resurrection of stale
+      // field values from a slow response.
+      patchSeq.current += 1
+      const mySeq = patchSeq.current
       try {
         const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, {
           method: 'PATCH',
@@ -101,7 +124,9 @@ export default function ProjectDetail() {
           return false
         }
         const fresh: Project = await res.json()
-        setProject(fresh)
+        if (mySeq === patchSeq.current) {
+          setProject(fresh)
+        }
         return true
       } catch (err) {
         toast.error(`Failed to update project: ${err instanceof Error ? err.message : String(err)}`)
@@ -140,7 +165,13 @@ export default function ProjectDetail() {
     )
   }
 
-  if (missing || !project) {
+  // Distinguish three "no project to render" cases so the user
+  // gets accurate feedback rather than a generic "not found":
+  //   - missing: the API returned 404. Project really is gone.
+  //   - loadError: a non-404 failure (5xx, network). Show retry.
+  //   - !project: bare null with no error and no missing. Shouldn't
+  //     happen normally; treat like a transient error.
+  if (missing) {
     return (
       <div className="max-w-7xl mx-auto">
         <Link
@@ -152,6 +183,38 @@ export default function ProjectDetail() {
         <div className="text-text-secondary text-[13px]">
           Project not found. It may have been deleted.
         </div>
+      </div>
+    )
+  }
+
+  if (loadError || !project) {
+    return (
+      <div className="max-w-7xl mx-auto">
+        <Link
+          to="/projects"
+          className="inline-flex items-center gap-1 text-[13px] text-text-secondary hover:text-text-primary mb-6"
+        >
+          <ArrowLeft size={14} /> Projects
+        </Link>
+        <div className="text-text-secondary text-[13px] mb-3">
+          {loadError ?? 'Failed to load project.'}
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setLoadError(null)
+            setLoading(true)
+            const controller = new AbortController()
+            loadProject(controller.signal)
+          }}
+          className="
+            inline-flex items-center gap-1.5 rounded-full
+            bg-accent text-white text-[13px] font-medium
+            px-4 py-1.5 hover:opacity-90
+          "
+        >
+          Try again
+        </button>
       </div>
     )
   }
@@ -636,29 +699,64 @@ function IntegrationsPanel({
   project: Project
   onPatch: (body: Record<string, unknown>) => Promise<boolean | undefined>
 }) {
-  // We track whichever side the user is mid-changing in a ref so
-  // we can avoid clobbering the picker while the PATCH is in flight.
-  // The UI reads from the project prop on render — there's no local
-  // mirror state — so a slow network won't desync the dropdown.
-  const inflight = useRef(false)
+  // Coalesce overlapping changes per side. The earlier "skip if
+  // inflight" approach silently dropped the user's later selection
+  // — fast switches (Jira: SKY → OPS → INFRA) would land on SKY and
+  // ignore the rest. The queue-latest pattern guarantees the final
+  // intent reaches the server while still serializing the writes
+  // for each side independently.
+  //
+  // Per-side queues (jira vs. linear) so a slow Jira PATCH doesn't
+  // block an unrelated Linear edit; their server-side validation
+  // paths don't share state.
+  const jiraInflight = useRef(false)
+  const jiraTarget = useRef<string | null>(null)
+  const linearInflight = useRef(false)
+  const linearTarget = useRef<string | null>(null)
+
+  const drainJira = async () => {
+    while (jiraTarget.current !== null) {
+      const target = jiraTarget.current
+      jiraTarget.current = null
+      const ok = await onPatch({ jira_project_key: target })
+      if (!ok) {
+        jiraTarget.current = null
+        break
+      }
+    }
+  }
+
+  const drainLinear = async () => {
+    while (linearTarget.current !== null) {
+      const target = linearTarget.current
+      linearTarget.current = null
+      const ok = await onPatch({ linear_project_key: target })
+      if (!ok) {
+        linearTarget.current = null
+        break
+      }
+    }
+  }
 
   const handleJiraChange = async (key: string) => {
-    if (inflight.current) return
-    inflight.current = true
+    jiraTarget.current = key
+    if (jiraInflight.current) return
+    jiraInflight.current = true
     try {
-      await onPatch({ jira_project_key: key })
+      await drainJira()
     } finally {
-      inflight.current = false
+      jiraInflight.current = false
     }
   }
 
   const handleLinearChange = async (key: string) => {
-    if (inflight.current) return
-    inflight.current = true
+    linearTarget.current = key
+    if (linearInflight.current) return
+    linearInflight.current = true
     try {
-      await onPatch({ linear_project_key: key })
+      await drainLinear()
     } finally {
-      inflight.current = false
+      linearInflight.current = false
     }
   }
 
@@ -701,17 +799,27 @@ function KnowledgePanel({ projectId }: { projectId: string }) {
   // enter and decrements on leave; the visual state is "any drag in
   // progress" iff counter > 0.
   const dragDepth = useRef(0)
+  // Monotonic sequence for refreshFiles. Without it, an upload-
+  // triggered refresh kicked off after a slow initial load could
+  // resolve first, then the slow load lands and overwrites the
+  // newer listing with the old contents.
+  const refreshSeq = useRef(0)
 
   const refreshFiles = useCallback(async () => {
+    refreshSeq.current += 1
+    const mySeq = refreshSeq.current
     try {
       const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/knowledge`)
+      if (mySeq !== refreshSeq.current) return
       if (!res.ok) {
         toast.error(await readError(res, 'Failed to load knowledge base'))
         return
       }
       const data: KnowledgeFile[] = await res.json()
+      if (mySeq !== refreshSeq.current) return
       setFiles(data)
     } catch (err) {
+      if (mySeq !== refreshSeq.current) return
       toast.error(
         `Failed to load knowledge base: ${err instanceof Error ? err.message : String(err)}`,
       )
@@ -725,6 +833,9 @@ function KnowledgePanel({ projectId }: { projectId: string }) {
     })
     return () => {
       cancelled = true
+      // Bump the seq on unmount so any in-flight refresh that
+      // resolves later short-circuits before touching state.
+      refreshSeq.current += 1
     }
   }, [refreshFiles])
 

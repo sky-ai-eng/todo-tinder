@@ -718,6 +718,14 @@ func resolveKnowledgePath(projectID, rawPath string) (string, string, string) {
 // files. Sets Content-Disposition: inline so the browser previews
 // rather than downloads — this is a sidebar viewer, not a download
 // hub. Users who want to save a file can use Save As from there.
+//
+// Symlink defense: Lstat (not Stat) gates regular-file admission.
+// Stat follows symlinks and would happily green-light a symlink
+// whose target is a regular file outside the knowledge-base dir,
+// leaking arbitrary file contents through this endpoint. Also
+// switches from http.ServeFile (which re-opens the path and could
+// be raced) to http.ServeContent against an already-open file
+// handle so the file we serve is the one we just verified.
 func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	project, err := db.GetProject(s.db, id)
@@ -735,24 +743,35 @@ func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 		return
 	}
-	info, err := os.Stat(full)
+	linfo, err := os.Lstat(full)
 	if err != nil {
 		if os.IsNotExist(err) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 			return
 		}
-		log.Printf("[projects] knowledge fetch: stat %s: %v", full, err)
+		log.Printf("[projects] knowledge fetch: lstat %s: %v", full, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read file"})
 		return
 	}
-	if !info.Mode().IsRegular() {
+	if linfo.Mode()&os.ModeSymlink != 0 || !linfo.Mode().IsRegular() {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a regular file"})
 		return
 	}
+	f, err := os.Open(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+			return
+		}
+		log.Printf("[projects] knowledge fetch: open %s: %v", full, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read file"})
+		return
+	}
+	defer f.Close()
+
 	w.Header().Set("Content-Type", detectMimeType(filepath.Base(full)))
-	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.Header().Set("Content-Disposition", "inline; filename="+strconv.Quote(filepath.Base(full)))
-	http.ServeFile(w, r, full)
+	http.ServeContent(w, r, filepath.Base(full), linfo.ModTime(), f)
 }
 
 // handleProjectKnowledgeUpload accepts one or more files via
@@ -865,6 +884,13 @@ func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Req
 // the actual race-safe enforcement of the "reject conflict" policy:
 // a quick os.Stat check beforehand is racy because two uploads can
 // see "doesn't exist" and both proceed to write.
+//
+// On every cleanup path the destination is closed BEFORE os.Remove.
+// On Windows os.Remove fails on a still-open file, leaving the
+// partial upload on disk — which would also poison the next upload
+// of the same name (O_EXCL would still see the orphan and reject).
+// Unix tolerates remove-while-open but the explicit-close pattern
+// keeps the two platforms behaving the same.
 func writeUploadedFile(fh *multipart.FileHeader, dst string) string {
 	src, err := fh.Open()
 	if err != nil {
@@ -879,21 +905,37 @@ func writeUploadedFile(fh *multipart.FileHeader, dst string) string {
 		}
 		return "create file: " + err.Error()
 	}
-	defer out.Close()
+	closed := false
+	closeOnce := func() {
+		if !closed {
+			out.Close()
+			closed = true
+		}
+	}
+	defer closeOnce()
 
 	// Cap the per-file copy at knowledgeMaxUploadBytes + 1 so we
 	// detect oversize uploads even if the multipart header lied
-	// about Size. If we hit the cap, remove the partial file.
+	// about Size. If we hit the cap, remove the partial file —
+	// which means we have to close the handle first.
 	limited := io.LimitReader(src, knowledgeMaxUploadBytes+1)
 	written, err := io.Copy(out, limited)
 	if err != nil {
+		closeOnce()
 		_ = os.Remove(dst)
 		return "write file: " + err.Error()
 	}
 	if written > knowledgeMaxUploadBytes {
+		closeOnce()
 		_ = os.Remove(dst)
 		return fmt.Sprintf("file exceeds %d-byte limit", knowledgeMaxUploadBytes)
 	}
+	if err := out.Close(); err != nil {
+		closed = true
+		_ = os.Remove(dst)
+		return "close file: " + err.Error()
+	}
+	closed = true
 	return ""
 }
 

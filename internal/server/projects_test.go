@@ -877,6 +877,39 @@ func TestProjectKnowledgeFile_StreamsRaw(t *testing.T) {
 	}
 }
 
+// TestProjectKnowledgeFile_RejectsSymlink pins the per-file
+// symlink defense. The listing endpoint already skips symlinks; the
+// raw-fetch endpoint has to close the same hole independently
+// because os.Stat would happily follow a symlink whose target is a
+// regular file outside knowledge-base/, exposing arbitrary bytes
+// from the user's home directory.
+func TestProjectKnowledgeFile_RejectsSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	s := newTestServer(t)
+	id, _ := db.CreateProject(s.db, domain.Project{Name: "symlink-fetch"})
+
+	kbDir := filepath.Join(home, ".triagefactory", "projects", id, "knowledge-base")
+	if err := os.MkdirAll(kbDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(home, "secret.txt")
+	if err := os.WriteFile(target, []byte("don't expose me"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(kbDir, "leak.txt")); err != nil {
+		t.Skipf("symlink unsupported on this platform: %v", err)
+	}
+
+	rec := doJSON(t, s, http.MethodGet, "/api/projects/"+id+"/knowledge/leak.txt", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (symlink rejected)", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "don't expose me") {
+		t.Errorf("response body leaked target file contents")
+	}
+}
+
 // TestProjectKnowledgeFile_RejectsTraversal pins the path-traversal
 // defense. Even URL-encoded "../config.yaml" surfaces as a 400, not
 // a successful read of a sensitive file outside the knowledge-base.
