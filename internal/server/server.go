@@ -40,6 +40,31 @@ type Server struct {
 	jiraPollMu      sync.RWMutex
 	jiraRestartedAt time.Time
 	jiraLastPollAt  time.Time
+
+	// projectMutexes serializes PATCH-style read-merge-write
+	// operations per project ID so two concurrent autosaves from
+	// different widgets (e.g. pinned-repos editor and tracker
+	// picker) can't lost-update each other. SQLite serializes
+	// individual writes via MaxOpenConns=1, but that's not enough
+	// here — handler A reads pre-A state, handler B reads pre-A
+	// state, A writes, B writes B's merge over pre-A state, and
+	// A's contribution is lost. Holding the per-project mutex
+	// across the read+write window closes that hole.
+	projectMutexes sync.Map // map[string]*sync.Mutex
+}
+
+// projectMutex returns the per-project mutex for serializing
+// read-merge-write handlers. Created on demand via LoadOrStore; the
+// map grows monotonically with project count, which is fine — they
+// stay user-curated and small. Project deletion doesn't bother
+// removing the entry: a stale mutex on a missing project is just
+// unused memory, and the next call for that ID is a no-op.
+func (s *Server) projectMutex(id string) *sync.Mutex {
+	if v, ok := s.projectMutexes.Load(id); ok {
+		return v.(*sync.Mutex)
+	}
+	v, _ := s.projectMutexes.LoadOrStore(id, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // New creates a new server with the given database and registers all routes.
@@ -88,6 +113,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/projects/{id}", s.handleProjectGet)
 	s.mux.HandleFunc("PATCH /api/projects/{id}", s.handleProjectUpdate)
 	s.mux.HandleFunc("DELETE /api/projects/{id}", s.handleProjectDelete)
+	s.mux.HandleFunc("GET /api/projects/{id}/knowledge", s.handleProjectKnowledge)
+	s.mux.HandleFunc("POST /api/projects/{id}/knowledge", s.handleProjectKnowledgeUpload)
+	s.mux.HandleFunc("GET /api/projects/{id}/knowledge/{path}", s.handleProjectKnowledgeFile)
+	s.mux.HandleFunc("DELETE /api/projects/{id}/knowledge/{path}", s.handleProjectKnowledgeDelete)
 
 	// Curator chat per project (SKY-216). The Curator package owns the
 	// long-lived CC session lifecycle; these endpoints are the API

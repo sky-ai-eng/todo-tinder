@@ -147,6 +147,45 @@ export interface EventSchema {
   fields: FieldSchema[]
 }
 
+export interface Project {
+  id: string
+  name: string
+  description: string
+  summary_md?: string
+  summary_stale: boolean
+  curator_session_id?: string
+  pinned_repos: string[]
+  jira_project_key: string
+  linear_project_key: string
+  created_at: string
+  updated_at: string
+}
+
+export interface KnowledgeFile {
+  path: string
+  /** RFC 6838 content type detected from the filename extension —
+   *  drives the panel's render switch (markdown / image / text /
+   *  no-preview). "application/octet-stream" for unknown extensions. */
+  mime_type: string
+  /** Inlined for text-shaped files under ~256KB; empty otherwise.
+   *  Frontend lazy-fetches the raw endpoint when content is empty
+   *  and a preview is needed. */
+  content: string
+  updated_at: string
+  size_bytes: number
+}
+
+export interface KnowledgeUploadResult {
+  /** Sanitized server-side filename (may differ from the client's
+   *  original if path components were stripped). Empty when the
+   *  upload failed. */
+  path?: string
+  /** Original filename as the client sent it — used in error toasts
+   *  so the user can match a failure back to the file they dropped. */
+  original: string
+  error?: string
+}
+
 export interface ToastPayload {
   id: string
   level: 'info' | 'success' | 'warning' | 'error'
