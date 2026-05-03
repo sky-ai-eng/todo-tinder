@@ -15,13 +15,24 @@ import "time"
 // existing installs, with the new name carried through Go code in
 // the same release.
 type Project struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	Description      string    `json:"description"`
-	SummaryMD        string    `json:"summary_md,omitempty"`
-	SummaryStale     bool      `json:"summary_stale"`
-	CuratorSessionID string    `json:"curator_session_id,omitempty"`
-	PinnedRepos      []string  `json:"pinned_repos"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Description      string   `json:"description"`
+	SummaryMD        string   `json:"summary_md,omitempty"`
+	SummaryStale     bool     `json:"summary_stale"`
+	CuratorSessionID string   `json:"curator_session_id,omitempty"`
+	PinnedRepos      []string `json:"pinned_repos"`
+	// JiraProjectKey is the Jira project key (e.g. "SKY") this
+	// project is linked to, or empty if not linked. Validation at the
+	// API layer requires a non-empty value to be present in
+	// config.Jira.Projects. SKY-217.
+	JiraProjectKey string `json:"jira_project_key"`
+	// LinearProjectKey is the Linear project key/identifier this
+	// project is linked to, or empty if not linked. Independent of
+	// JiraProjectKey — both can be set on the same project. Linear
+	// integration is future work; until it ships, validation rejects
+	// any non-empty value at the API layer.
+	LinearProjectKey string    `json:"linear_project_key"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }

@@ -38,12 +38,13 @@ func CreateProject(database *sql.DB, p domain.Project) (string, error) {
 	}
 	now := time.Now().UTC()
 	_, err = database.Exec(`
-		INSERT INTO projects (id, name, description, summary_md, summary_stale, curator_session_id, pinned_repos, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO projects (id, name, description, summary_md, summary_stale, curator_session_id, pinned_repos, jira_project_key, linear_project_key, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		id, p.Name, p.Description,
 		nullIfEmpty(p.SummaryMD), p.SummaryStale,
 		nullIfEmpty(p.CuratorSessionID), string(pinnedJSON),
+		nullIfEmpty(p.JiraProjectKey), nullIfEmpty(p.LinearProjectKey),
 		now, now,
 	)
 	if err != nil {
@@ -55,7 +56,7 @@ func CreateProject(database *sql.DB, p domain.Project) (string, error) {
 // GetProject returns a project by id, or (nil, nil) if not found.
 func GetProject(database *sql.DB, id string) (*domain.Project, error) {
 	row := database.QueryRow(`
-		SELECT id, name, description, summary_md, summary_stale, curator_session_id, pinned_repos, created_at, updated_at
+		SELECT id, name, description, summary_md, summary_stale, curator_session_id, pinned_repos, jira_project_key, linear_project_key, created_at, updated_at
 		FROM projects WHERE id = ?
 	`, id)
 	return scanProject(row)
@@ -66,7 +67,7 @@ func GetProject(database *sql.DB, id string) (*domain.Project, error) {
 // in any plausible install).
 func ListProjects(database *sql.DB) ([]domain.Project, error) {
 	rows, err := database.Query(`
-		SELECT id, name, description, summary_md, summary_stale, curator_session_id, pinned_repos, created_at, updated_at
+		SELECT id, name, description, summary_md, summary_stale, curator_session_id, pinned_repos, jira_project_key, linear_project_key, created_at, updated_at
 		FROM projects ORDER BY LOWER(name) ASC
 	`)
 	if err != nil {
@@ -105,12 +106,14 @@ func UpdateProject(database *sql.DB, p domain.Project) error {
 		SET name = ?, description = ?,
 		    summary_md = ?, summary_stale = ?,
 		    curator_session_id = ?, pinned_repos = ?,
+		    jira_project_key = ?, linear_project_key = ?,
 		    updated_at = ?
 		WHERE id = ?
 	`,
 		p.Name, p.Description,
 		nullIfEmpty(p.SummaryMD), p.SummaryStale,
 		nullIfEmpty(p.CuratorSessionID), string(pinnedJSON),
+		nullIfEmpty(p.JiraProjectKey), nullIfEmpty(p.LinearProjectKey),
 		now, p.ID,
 	)
 	if err != nil {
@@ -163,12 +166,14 @@ func scanProject(row rowScanner) (*domain.Project, error) {
 		p           domain.Project
 		summaryMD   sql.NullString
 		sessionID   sql.NullString
+		jiraKey     sql.NullString
+		linearKey   sql.NullString
 		pinnedJSON  string
 		createdAt   time.Time
 		updatedAt   time.Time
 		summaryFlag int
 	)
-	err := row.Scan(&p.ID, &p.Name, &p.Description, &summaryMD, &summaryFlag, &sessionID, &pinnedJSON, &createdAt, &updatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.Description, &summaryMD, &summaryFlag, &sessionID, &pinnedJSON, &jiraKey, &linearKey, &createdAt, &updatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -178,6 +183,8 @@ func scanProject(row rowScanner) (*domain.Project, error) {
 	p.SummaryMD = summaryMD.String
 	p.SummaryStale = summaryFlag != 0
 	p.CuratorSessionID = sessionID.String
+	p.JiraProjectKey = jiraKey.String
+	p.LinearProjectKey = linearKey.String
 	p.CreatedAt = createdAt
 	p.UpdatedAt = updatedAt
 	if pinnedJSON == "" {

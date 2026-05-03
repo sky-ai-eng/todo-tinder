@@ -6,6 +6,7 @@ const navItems = [
   { to: '/triage', label: 'Triage' },
   { to: '/board', label: 'Board' },
   { to: '/prs', label: 'PRs' },
+  { to: '/projects', label: 'Projects' },
   { to: '/repos', label: 'Repos' },
   { to: '/prompts', label: 'Prompts' },
   { to: '/brief', label: 'Brief' },

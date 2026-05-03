@@ -7,9 +7,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -29,6 +32,8 @@ type createProjectRequest struct {
 	Name             string   `json:"name"`
 	Description      string   `json:"description"`
 	PinnedRepos      []string `json:"pinned_repos"`
+	JiraProjectKey   string   `json:"jira_project_key"`
+	LinearProjectKey string   `json:"linear_project_key"`
 	CuratorSessionID string   `json:"curator_session_id"` // optional; usually set by the runtime, not the user
 }
 
@@ -40,6 +45,8 @@ type patchProjectRequest struct {
 	Name             *string   `json:"name"`
 	Description      *string   `json:"description"`
 	PinnedRepos      *[]string `json:"pinned_repos"`
+	JiraProjectKey   *string   `json:"jira_project_key"`
+	LinearProjectKey *string   `json:"linear_project_key"`
 	SummaryMD        *string   `json:"summary_md"`
 	SummaryStale     *bool     `json:"summary_stale"`
 	CuratorSessionID *string   `json:"curator_session_id"`
@@ -61,11 +68,23 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 		return
 	}
+	cfg, err := config.Load()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
+		return
+	}
+	jiraKey, linearKey, errMsg := validateTrackerKeys(cfg, req.JiraProjectKey, req.LinearProjectKey)
+	if errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		return
+	}
 
 	id, err := db.CreateProject(s.db, domain.Project{
 		Name:             name,
 		Description:      req.Description,
 		PinnedRepos:      pinned,
+		JiraProjectKey:   jiraKey,
+		LinearProjectKey: linearKey,
 		CuratorSessionID: req.CuratorSessionID,
 	})
 	if err != nil {
@@ -140,6 +159,36 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		updated.PinnedRepos = pinned
+	}
+	if req.JiraProjectKey != nil || req.LinearProjectKey != nil {
+		// Validate only the fields the client sent. Re-validating the
+		// untouched side against the current config would surface a
+		// confusing error if the config drifted (e.g. a Jira project
+		// got renamed in Settings) on an unrelated PATCH that's only
+		// touching, say, the Linear key. The handler's contract is
+		// "validate what the client asked to change," not "re-validate
+		// the whole row on every PATCH."
+		cfg, err := config.Load()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
+			return
+		}
+		if req.JiraProjectKey != nil {
+			jiraKey, _, errMsg := validateTrackerKeys(cfg, *req.JiraProjectKey, "")
+			if errMsg != "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+				return
+			}
+			updated.JiraProjectKey = jiraKey
+		}
+		if req.LinearProjectKey != nil {
+			_, linearKey, errMsg := validateTrackerKeys(cfg, "", *req.LinearProjectKey)
+			if errMsg != "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+				return
+			}
+			updated.LinearProjectKey = linearKey
+		}
 	}
 	if req.SummaryMD != nil {
 		updated.SummaryMD = *req.SummaryMD
@@ -321,4 +370,138 @@ func validatePinnedRepos(database *sql.DB, repos []string) ([]string, string) {
 		}
 	}
 	return out, ""
+}
+
+// validateTrackerKeys validates jira_project_key and linear_project_key
+// independently. Each is optional; when non-empty, jira_project_key
+// must be present in cfg.Jira.Projects (the user-curated list set up
+// in Settings) and linear_project_key is rejected outright until the
+// Linear integration ships. Both fields are normalized via
+// strings.TrimSpace before the existence check so a value padded with
+// stray whitespace doesn't pass validation but get stored unmatched.
+//
+// Takes cfg as a parameter rather than calling config.Load() directly
+// so the function is testable in isolation and so a single PATCH/POST
+// only reads the config file once even when both fields need
+// validating.
+//
+// Returns the normalized values and an empty error string on success,
+// or two empty strings and an error message on failure.
+func validateTrackerKeys(cfg config.Config, jiraKey, linearKey string) (string, string, string) {
+	jiraNorm := strings.TrimSpace(jiraKey)
+	linearNorm := strings.TrimSpace(linearKey)
+
+	if linearNorm != "" {
+		// Linear integration is future work. Surfacing this as an
+		// explicit "not configured" error matches the UX contract:
+		// the frontend renders a disabled Linear picker, so a
+		// non-empty value arriving here is a bypass attempt or a
+		// stale client.
+		return "", "", "linear_project_key: Linear integration is not configured"
+	}
+
+	if jiraNorm == "" {
+		return "", "", ""
+	}
+	for _, p := range cfg.Jira.Projects {
+		if p == jiraNorm {
+			return jiraNorm, "", ""
+		}
+	}
+	return "", "", "jira_project_key: " + jiraNorm + " is not in the configured Jira projects list (add it on the Settings page first)"
+}
+
+// knowledgeFile is the per-file shape returned by the knowledge
+// endpoint. content is the raw markdown; the frontend renders it.
+// We surface the relative path (under <KnowledgeDir>/knowledge-base/)
+// rather than the absolute path so the API doesn't leak the user's
+// home directory layout.
+type knowledgeFile struct {
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	UpdatedAt string `json:"updated_at"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// handleProjectKnowledge serves the curated markdown files that live
+// under the project's knowledge dir. SKY-217.
+//
+// The directory layout is `<KnowledgeDir>/knowledge-base/*.md` — the
+// outer directory is also where the Curator's CC subprocess runs from
+// and where pinned-repo worktrees materialize, so we deliberately
+// don't read the outer dir; it's full of agent scratch state, not
+// user-visible knowledge.
+//
+// Returns an empty list (not 404) when the project exists but the
+// knowledge subdir doesn't, so the frontend can render an empty state
+// instead of a noisy error. A real I/O failure (permission denied,
+// etc.) is a 500.
+func (s *Server) handleProjectKnowledge(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	project, err := db.GetProject(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if project == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "project not found"})
+		return
+	}
+	root, err := curator.KnowledgeDir(id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "resolve knowledge dir: " + err.Error()})
+		return
+	}
+	kbDir := filepath.Join(root, "knowledge-base")
+	files, err := readKnowledgeFiles(kbDir)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, files)
+}
+
+// readKnowledgeFiles walks one level of the knowledge-base directory
+// and returns the markdown files in stable order. Single level by
+// design — the agent is supposed to keep a flat layout under
+// knowledge-base/, and recursing here would surface scratch state
+// from any nested dirs the agent created.
+//
+// "Doesn't exist" is not an error: a fresh project hasn't had any
+// knowledge written yet, so an empty list is the truthful response.
+func readKnowledgeFiles(dir string) ([]knowledgeFile, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []knowledgeFile{}, nil
+		}
+		return nil, err
+	}
+	out := make([]knowledgeFile, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".md") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		info, err := e.Info()
+		if err != nil {
+			return nil, err
+		}
+		body, err := os.ReadFile(full)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, knowledgeFile{
+			Path:      name,
+			Content:   string(body),
+			UpdatedAt: info.ModTime().UTC().Format("2006-01-02T15:04:05Z07:00"),
+			SizeBytes: info.Size(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
@@ -397,5 +398,237 @@ func TestProjectPatch_PaddedSlugsStoredTrimmed(t *testing.T) {
 	got, _ := db.GetProject(s.db, id)
 	if len(got.PinnedRepos) != 1 || got.PinnedRepos[0] != "only/one" {
 		t.Errorf("pinned_repos = %v, want [\"only/one\"]", got.PinnedRepos)
+	}
+}
+
+// TestValidateTrackerKeys_AcceptsConfigured verifies that a Jira
+// project key already in cfg.Jira.Projects is accepted as-is. This
+// is the happy path the create modal hits when a user picks a
+// project from the Settings-curated list.
+func TestValidateTrackerKeys_AcceptsConfigured(t *testing.T) {
+	cfg := config.Default()
+	cfg.Jira.Projects = []string{"SKY", "OPS"}
+	jira, linear, errMsg := validateTrackerKeys(cfg, "SKY", "")
+	if errMsg != "" {
+		t.Fatalf("expected no error, got %q", errMsg)
+	}
+	if jira != "SKY" {
+		t.Errorf("jira = %q, want SKY", jira)
+	}
+	if linear != "" {
+		t.Errorf("linear = %q, want empty", linear)
+	}
+}
+
+// TestValidateTrackerKeys_RejectsUnconfigured exercises the SKY-217
+// contract: a Jira key not in config gets rejected with a message
+// pointing at Settings. Stale clients (project removed from config
+// after pinning) and curl users both hit this path.
+func TestValidateTrackerKeys_RejectsUnconfigured(t *testing.T) {
+	cfg := config.Default()
+	cfg.Jira.Projects = []string{"SKY"}
+	_, _, errMsg := validateTrackerKeys(cfg, "OPS", "")
+	if errMsg == "" {
+		t.Fatal("expected error for unconfigured Jira key")
+	}
+	if !strings.Contains(errMsg, "OPS") {
+		t.Errorf("error should name the offending key, got %q", errMsg)
+	}
+	if !strings.Contains(errMsg, "Settings") {
+		t.Errorf("error should point at Settings, got %q", errMsg)
+	}
+}
+
+// TestValidateTrackerKeys_RejectsLinear pins the "Linear is future
+// work" decision: any non-empty Linear key is rejected outright.
+// Once Linear integration ships this assertion will need to flip.
+func TestValidateTrackerKeys_RejectsLinear(t *testing.T) {
+	cfg := config.Default()
+	_, _, errMsg := validateTrackerKeys(cfg, "", "TF")
+	if errMsg == "" {
+		t.Fatal("expected error for non-empty Linear key")
+	}
+	if !strings.Contains(errMsg, "Linear") {
+		t.Errorf("error should mention Linear, got %q", errMsg)
+	}
+}
+
+// TestValidateTrackerKeys_EmptyAcceptsBoth covers the "no tracker"
+// case — the user creates a project without picking either tracker.
+// Validation should pass with empty normalized values.
+func TestValidateTrackerKeys_EmptyAcceptsBoth(t *testing.T) {
+	cfg := config.Default()
+	jira, linear, errMsg := validateTrackerKeys(cfg, "", "")
+	if errMsg != "" {
+		t.Fatalf("empty input should pass, got %q", errMsg)
+	}
+	if jira != "" || linear != "" {
+		t.Errorf("expected both empty, got jira=%q linear=%q", jira, linear)
+	}
+}
+
+// TestValidateTrackerKeys_TrimsWhitespace mirrors the pinned-repos
+// whitespace handling: stray padding from a client passes validation
+// in normalized form rather than getting stored padded.
+func TestValidateTrackerKeys_TrimsWhitespace(t *testing.T) {
+	cfg := config.Default()
+	cfg.Jira.Projects = []string{"SKY"}
+	jira, _, errMsg := validateTrackerKeys(cfg, "  SKY  ", "")
+	if errMsg != "" {
+		t.Fatalf("padded input should validate, got %q", errMsg)
+	}
+	if jira != "SKY" {
+		t.Errorf("jira = %q, want trimmed SKY", jira)
+	}
+}
+
+// TestProjectKnowledge_404OnMissing covers the GET endpoint's
+// project-existence guard. A bogus id is a 404, distinct from the
+// "exists but no knowledge yet" empty-array path.
+func TestProjectKnowledge_404OnMissing(t *testing.T) {
+	s := newTestServer(t)
+	rec := doJSON(t, s, http.MethodGet, "/api/projects/no-such-id/knowledge", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+// TestProjectKnowledge_EmptyForFreshProject pins the "no knowledge
+// yet ≠ error" UX contract: a project that hasn't been chatted with
+// has no knowledge-base subdir, but the endpoint still returns []
+// rather than 500-ing. The frontend renders an empty state from
+// this response.
+func TestProjectKnowledge_EmptyForFreshProject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newTestServer(t)
+	id, _ := db.CreateProject(s.db, domain.Project{Name: "fresh"})
+	rec := doJSON(t, s, http.MethodGet, "/api/projects/"+id+"/knowledge", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "[]" {
+		t.Errorf("body = %q, want []", body)
+	}
+}
+
+// TestProjectKnowledge_ReturnsMarkdownFiles verifies the happy path:
+// markdown files in the project's knowledge-base/ subdir get
+// surfaced with relative path, content, and size.
+func TestProjectKnowledge_ReturnsMarkdownFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	s := newTestServer(t)
+	id, _ := db.CreateProject(s.db, domain.Project{Name: "with-knowledge"})
+
+	kbDir := filepath.Join(home, ".triagefactory", "projects", id, "knowledge-base")
+	if err := os.MkdirAll(kbDir, 0o755); err != nil {
+		t.Fatalf("mkdir knowledge-base: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(kbDir, "alpha.md"), []byte("# Alpha\n"), 0o644); err != nil {
+		t.Fatalf("write alpha.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(kbDir, "beta.md"), []byte("# Beta\nbody"), 0o644); err != nil {
+		t.Fatalf("write beta.md: %v", err)
+	}
+	// Non-markdown is filtered out.
+	if err := os.WriteFile(filepath.Join(kbDir, "ignored.txt"), []byte("nope"), 0o644); err != nil {
+		t.Fatalf("write ignored.txt: %v", err)
+	}
+
+	rec := doJSON(t, s, http.MethodGet, "/api/projects/"+id+"/knowledge", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var got []knowledgeFile
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d files, want 2 (txt should be excluded)", len(got))
+	}
+	if got[0].Path != "alpha.md" || got[1].Path != "beta.md" {
+		t.Errorf("paths = [%q, %q], want sorted [alpha.md beta.md]", got[0].Path, got[1].Path)
+	}
+	if got[0].Content != "# Alpha\n" {
+		t.Errorf("alpha content = %q", got[0].Content)
+	}
+	if got[1].SizeBytes != int64(len("# Beta\nbody")) {
+		t.Errorf("beta size = %d, want %d", got[1].SizeBytes, len("# Beta\nbody"))
+	}
+}
+
+// TestProjectCreate_AcceptsTrackerKeys verifies the create handler's
+// tracker validation is wired up. We point HOME at a temp dir,
+// write a config.yaml with a Jira project, and confirm the create
+// flow stores the key and read-back returns it.
+func TestProjectCreate_AcceptsTrackerKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := config.Default()
+	cfg.Jira.Projects = []string{"SKY"}
+	if err := config.Save(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	s := newTestServer(t)
+
+	rec := doJSON(t, s, http.MethodPost, "/api/projects", map[string]any{
+		"name":             "Tracked",
+		"jira_project_key": "SKY",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var got domain.Project
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.JiraProjectKey != "SKY" {
+		t.Errorf("jira_project_key = %q, want SKY", got.JiraProjectKey)
+	}
+}
+
+// TestProjectCreate_RejectsUnconfiguredJira verifies the e2e
+// validation path. Without the Jira key in config, create should
+// 400 with a hint pointing the user at Settings.
+func TestProjectCreate_RejectsUnconfiguredJira(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newTestServer(t)
+
+	rec := doJSON(t, s, http.MethodPost, "/api/projects", map[string]any{
+		"name":             "Bogus",
+		"jira_project_key": "NOPE",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestProjectPatch_PartialTrackerUpdateValidatesOnlyChangedSide
+// covers the "PATCH only the field the client sent" contract. A
+// project pre-populated with a now-invalid Jira key (e.g. config
+// drifted after creation) can still have its Linear key cleared
+// without re-validating the stale Jira side.
+func TestProjectPatch_PartialTrackerUpdateValidatesOnlyChangedSide(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newTestServer(t)
+	id, err := db.CreateProject(s.db, domain.Project{
+		Name:           "Drifted",
+		JiraProjectKey: "STALE", // not in (empty) config — set directly via DB
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// PATCH only linear_project_key (clearing it). Should succeed
+	// despite the Jira side being out of sync with config.
+	empty := ""
+	rec := doJSON(t, s, http.MethodPatch, "/api/projects/"+id, map[string]any{
+		"linear_project_key": empty,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	got, _ := db.GetProject(s.db, id)
+	if got.JiraProjectKey != "STALE" {
+		t.Errorf("jira preserved = %q, want STALE", got.JiraProjectKey)
 	}
 }

@@ -88,6 +88,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/projects/{id}", s.handleProjectGet)
 	s.mux.HandleFunc("PATCH /api/projects/{id}", s.handleProjectUpdate)
 	s.mux.HandleFunc("DELETE /api/projects/{id}", s.handleProjectDelete)
+	s.mux.HandleFunc("GET /api/projects/{id}/knowledge", s.handleProjectKnowledge)
 
 	// Curator chat per project (SKY-216). The Curator package owns the
 	// long-lived CC session lifecycle; these endpoints are the API

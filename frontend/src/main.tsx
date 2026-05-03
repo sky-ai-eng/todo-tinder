@@ -11,6 +11,8 @@ import Settings from './pages/Settings'
 import Prompts from './pages/Prompts'
 import Repos from './pages/Repos'
 import Factory from './pages/Factory'
+import Projects from './pages/Projects'
+import ProjectDetail from './pages/ProjectDetail'
 import Shell from './Shell'
 import AuthGate from './AuthGate'
 import ToastProvider from './components/Toast/ToastProvider'
@@ -33,6 +35,8 @@ createRoot(document.getElementById('root')!).render(
           <Route path="/prs" element={<PRDashboard />} />
           <Route path="/prompts" element={<Prompts />} />
           <Route path="/repos" element={<Repos />} />
+          <Route path="/projects" element={<Projects />} />
+          <Route path="/projects/:id" element={<ProjectDetail />} />
           <Route path="/brief" element={<Brief />} />
           <Route path="/settings" element={<Settings />} />
         </Route>

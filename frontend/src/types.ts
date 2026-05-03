@@ -147,6 +147,27 @@ export interface EventSchema {
   fields: FieldSchema[]
 }
 
+export interface Project {
+  id: string
+  name: string
+  description: string
+  summary_md?: string
+  summary_stale: boolean
+  curator_session_id?: string
+  pinned_repos: string[]
+  jira_project_key: string
+  linear_project_key: string
+  created_at: string
+  updated_at: string
+}
+
+export interface KnowledgeFile {
+  path: string
+  content: string
+  updated_at: string
+  size_bytes: number
+}
+
 export interface ToastPayload {
   id: string
   level: 'info' | 'success' | 'warning' | 'error'
