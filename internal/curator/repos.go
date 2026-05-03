@@ -15,7 +15,7 @@ import (
 // always reset hard to upstream HEAD on the user-configured branch
 // (profile.BaseBranch || profile.DefaultBranch). The agent's mental
 // model: "the canonical source for sky-ai-eng/sky lives at
-// ./repos/sky-ai-eng-sky and reflects current upstream."
+// ./repos/sky-ai-eng/sky and reflects current upstream."
 //
 // Per-repo failures are logged but do not fail the dispatch — the
 // curator should still be useful for a knowledge-base question even

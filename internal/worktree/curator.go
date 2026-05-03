@@ -9,21 +9,27 @@ import (
 	"time"
 )
 
-// CuratorRepoDirName is the per-pinned-repo directory name inside a
-// project's working directory. Exposed so the curator runtime + tests
-// agree on the layout — the agent's "the source for sky-ai-eng/sky
-// is at ./repos/sky-ai-eng-sky" mental model is encoded here.
+// CuratorRepoSubpath is the per-pinned-repo subpath (under
+// <projectDir>/repos/) for a given GitHub slug. Nested
+// <owner>/<repo> matches the GitHub convention and makes the
+// agent's path mental model match how it already thinks about
+// repos: ./repos/sky-ai-eng/sky.
 //
-// Slash-replacement (not '/') is intentional: a literal owner/repo
-// path would create a nested ./repos/sky-ai-eng/sky/ layout that
-// makes `cd repos/<TAB>` ambiguous and breaks the simple
-// "one entry per pinned repo" contract.
-func CuratorRepoDirName(owner, repo string) string {
-	return owner + "-" + repo
+// The nesting also closes a real correctness hole an earlier flat
+// "owner-repo" form had: GitHub allows hyphens in both halves of a
+// slug, so "a-b/c" and "a/b-c" both flatten to "a-b-c". Two such
+// pins in the same project would have silently shared one on-disk
+// worktree, with the second materialization either colliding with
+// the first dir or (worse) hitting the refresh path and resetting
+// the wrong repo's checkout. The slash is the actual GitHub
+// separator and can't appear inside either half, so the
+// (owner, repo) → subpath mapping is now injective.
+func CuratorRepoSubpath(owner, repo string) string {
+	return filepath.Join(owner, repo)
 }
 
 // EnsureCuratorWorktree materializes a per-project worktree of a
-// pinned repo at <projectDir>/repos/<owner>-<repo>/, refreshing it
+// pinned repo at <projectDir>/repos/<owner>/<repo>/, refreshing it
 // to upstream HEAD on every call. Used by the curator's dispatch
 // loop so each chat turn sees current code without the user having
 // to manage refresh state.
@@ -43,9 +49,10 @@ func CuratorRepoDirName(owner, repo string) string {
 //     agent wrote to a tracked file, that change is treated as
 //     ephemeral and dropped on the next dispatch.
 //
-// Returns the absolute worktree path. Holds the per-repo lock
-// throughout so concurrent curator dispatches that pin the same repo
-// queue rather than race on git state.
+// Returns the absolute worktree path (projectDir is forced absolute
+// via filepath.Abs so callers don't have to). Holds the per-repo
+// lock throughout so concurrent curator dispatches that pin the
+// same repo queue rather than race on git state.
 func EnsureCuratorWorktree(ctx context.Context, owner, repo, branch, projectDir string) (string, error) {
 	if owner == "" || repo == "" {
 		return "", fmt.Errorf("ensure curator worktree: owner/repo required")
@@ -55,6 +62,10 @@ func EnsureCuratorWorktree(ctx context.Context, owner, repo, branch, projectDir 
 	}
 	if projectDir == "" {
 		return "", fmt.Errorf("ensure curator worktree: projectDir required")
+	}
+	absProjectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return "", fmt.Errorf("absolute projectDir: %w", err)
 	}
 
 	mu := lockRepo(owner, repo)
@@ -76,7 +87,7 @@ func EnsureCuratorWorktree(ctx context.Context, owner, repo, branch, projectDir 
 		return "", fmt.Errorf("stat bare: %w", err)
 	}
 
-	wtDir := filepath.Join(projectDir, "repos", CuratorRepoDirName(owner, repo))
+	wtDir := filepath.Join(absProjectDir, "repos", CuratorRepoSubpath(owner, repo))
 	remoteRef := "refs/remotes/origin/" + branch
 
 	// Fetch into the remote-tracking ref rather than the local
@@ -99,7 +110,16 @@ func EnsureCuratorWorktree(ctx context.Context, owner, repo, branch, projectDir 
 	// the world match upstream HEAD; without it, a previous
 	// dispatch's agent edit to a tracked file would persist into
 	// the next dispatch.
-	if _, err := os.Stat(wtDir); err == nil {
+	//
+	// Distinguish "definitely missing" from "stat failed for some
+	// other reason": permission denied, broken symlink, etc.
+	// Falling through to first-materialization on a stat error
+	// would let `git worktree add` produce a confusing message
+	// ("'<path>' already exists") for what's really a filesystem
+	// problem the caller should hear about directly.
+	wtInfo, err := os.Stat(wtDir)
+	switch {
+	case err == nil && wtInfo.IsDir():
 		if err := gitRunCtx(ctx, wtDir, "reset", "--hard", remoteRef); err != nil {
 			return "", fmt.Errorf("reset --hard %s: %w", branch, err)
 		}
@@ -111,6 +131,14 @@ func EnsureCuratorWorktree(ctx context.Context, owner, repo, branch, projectDir 
 			log.Printf("[worktree] curator clean %s/%s: %v", owner, repo, err)
 		}
 		return wtDir, nil
+	case err == nil && !wtInfo.IsDir():
+		// Path exists but isn't a dir — someone replaced it with a
+		// regular file or a broken symlink target. We don't want to
+		// silently RemoveAll a user's accidental file, so surface
+		// the conflict.
+		return "", fmt.Errorf("worktree path %s exists but is not a directory", wtDir)
+	case !os.IsNotExist(err):
+		return "", fmt.Errorf("stat worktree %s: %w", wtDir, err)
 	}
 
 	// First materialization for this (project, repo) pair. -B

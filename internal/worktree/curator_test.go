@@ -26,7 +26,7 @@ func TestEnsureCuratorWorktree_FreshMaterializesAtExpectedPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureCuratorWorktree: %v", err)
 	}
-	want := filepath.Join(projectDir, "repos", "owner-repoA")
+	want := filepath.Join(projectDir, "repos", "owner", "repoA")
 	if wt != want {
 		t.Errorf("worktree path = %q, want %q", wt, want)
 	}
@@ -166,8 +166,35 @@ func TestPruneCuratorBare_NoOpOnMissingBare(t *testing.T) {
 	PruneCuratorBare("ghost", "repo")
 }
 
-func TestCuratorRepoDirName_FlattensSlash(t *testing.T) {
-	if got := CuratorRepoDirName("sky-ai-eng", "triage-factory"); got != "sky-ai-eng-triage-factory" {
-		t.Errorf("got %q", got)
+func TestCuratorRepoSubpath_NestedLayout(t *testing.T) {
+	// Pin: nested <owner>/<repo>, not flattened. Flattening with
+	// a dash created a collision class (TestCuratorRepoSubpath_NoCollisions
+	// covers that directly); nesting matches GitHub's URL convention
+	// and makes the (owner, repo) → subpath mapping injective.
+	got := CuratorRepoSubpath("sky-ai-eng", "triage-factory")
+	want := filepath.Join("sky-ai-eng", "triage-factory")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestCuratorRepoSubpath_NoCollisions guards the bug an earlier flat
+// "owner-repo" form had: GitHub allows hyphens in either half of a
+// slug, so "a-b/c" and "a/b-c" both flatten to "a-b-c" and would
+// silently share an on-disk path. The slash-separated form makes the
+// mapping injective by construction — the slash can't appear inside
+// either half of a real GitHub identifier.
+func TestCuratorRepoSubpath_NoCollisions(t *testing.T) {
+	pairs := [][2]string{
+		{"a-b", "c"},
+		{"a", "b-c"},
+	}
+	seen := make(map[string]string)
+	for _, p := range pairs {
+		got := CuratorRepoSubpath(p[0], p[1])
+		if prev, dup := seen[got]; dup {
+			t.Errorf("collision: %q produced by both %q and %q/%q", got, prev, p[0], p[1])
+		}
+		seen[got] = p[0] + "/" + p[1]
 	}
 }
