@@ -1002,12 +1002,13 @@ func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Req
 		}
 	}
 	if wroteAny {
-		if _, err := s.db.Exec(`UPDATE projects SET summary_stale = TRUE WHERE id = ?`, id); err != nil {
+		if _, err := s.db.Exec(`UPDATE projects SET summary_stale = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, id); err != nil {
 			// Log but don't fail the upload — the files are on disk
 			// and the user expects the response to reflect that.
-			// summary_stale is a hint to the regenerator, not part
-			// of the upload's correctness contract.
-			log.Printf("[projects] knowledge upload: mark summary_stale for %s: %v", id, err)
+			// The stale marker and activity timestamp are hints for
+			// follow-on processing / display, not part of the
+			// upload's correctness contract.
+			log.Printf("[projects] knowledge upload: mark summary_stale/update timestamp for %s: %v", id, err)
 		}
 	}
 
