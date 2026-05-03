@@ -82,12 +82,16 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
           shadow-xl shadow-black/[0.08] backdrop-blur-xl
           p-6
         "
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="project-create-modal-title"
+        aria-describedby="project-create-modal-description"
         onClick={(e) => e.stopPropagation()}
       >
         <header className="flex items-start justify-between mb-5">
           <div>
-            <h2 className="text-lg font-semibold tracking-tight text-text-primary">New project</h2>
-            <p className="text-[12px] text-text-tertiary mt-0.5">
+            <h2 id="project-create-modal-title" className="text-lg font-semibold tracking-tight text-text-primary">New project</h2>
+            <p id="project-create-modal-description" className="text-[12px] text-text-tertiary mt-0.5">
               You can add or change everything later.
             </p>
           </div>
