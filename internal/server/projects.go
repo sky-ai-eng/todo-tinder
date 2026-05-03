@@ -13,6 +13,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
 // SKY-215. Projects are the data layer underneath the Curator stack —
@@ -165,6 +166,18 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	// Snapshot pinned_repos BEFORE the cascade fires so we can prune
+	// each affected bare clone's worktree registration list after the
+	// project's repos/ subtree gets RemoveAll'd. Without the prune,
+	// stale entries accumulate in <bare>/worktrees/ — recoverable but
+	// noisy, and they block re-creating the same name in a future
+	// project's worktree. A read failure here is non-fatal: skip the
+	// prune step, the on-disk cleanup still happens.
+	var pinned []string
+	if existing, err := db.GetProject(s.db, id); err == nil && existing != nil {
+		pinned = existing.PinnedRepos
+	}
+
 	// Stop any in-flight Curator chat for this project BEFORE the DB
 	// delete: the goroutine writes terminal cancelled status into
 	// curator_requests rows, which the FK cascade is about to drop.
@@ -214,7 +227,35 @@ func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Prune the bare clone of each pinned repo — the per-project
+	// worktrees we just RemoveAll'd would otherwise leave behind
+	// dangling entries in <bare>/worktrees/ that block re-creating
+	// the same name in a future project. Best-effort, post-RemoveAll
+	// because prune is what reads the now-missing dirs.
+	for _, slug := range pinned {
+		owner, repo, ok := splitOwnerRepo(slug)
+		if !ok {
+			continue
+		}
+		worktree.PruneCuratorBare(owner, repo)
+	}
+
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// splitOwnerRepo splits "owner/repo" once. Mirrors the helper in
+// internal/curator; duplicated here rather than imported to avoid
+// pulling the curator package's surface into the projects handler.
+func splitOwnerRepo(slug string) (owner, repo string, ok bool) {
+	for i := 0; i < len(slug); i++ {
+		if slug[i] == '/' {
+			if i == 0 || i == len(slug)-1 {
+				return "", "", false
+			}
+			return slug[:i], slug[i+1:], true
+		}
+	}
+	return "", "", false
 }
 
 // validatePinnedRepoShape checks the "owner/repo" slug format and

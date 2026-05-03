@@ -156,6 +156,23 @@ func (s *projectSession) dispatch(requestID string) {
 		return
 	}
 
+	// Refresh pinned-repo worktrees before spawning the agent so its
+	// view of the world matches upstream HEAD on the user-configured
+	// branch (profile.BaseBranch || profile.DefaultBranch). One fetch
+	// + reset --hard per repo per dispatch — bounded by the bare's
+	// per-repo lock so concurrent dispatches in different projects
+	// pinning the same repo queue rather than race. Per-repo
+	// failures are non-fatal: the agent still gets the project's
+	// knowledge files plus whatever subset of repos materialized.
+	materializePinnedRepos(msgCtx, s.curator.database, s.projectID, cwd, project.PinnedRepos)
+	if msgCtx.Err() != nil {
+		// Cancel fired during repo refresh (one big bare clone can
+		// take seconds on a fresh fetch). Don't waste cycles spawning
+		// claude only to immediately cancel it.
+		s.markCancelled(requestID, "user cancelled")
+		return
+	}
+
 	s.curator.mu.Lock()
 	model := s.curator.model
 	s.curator.mu.Unlock()
