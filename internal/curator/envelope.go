@@ -37,19 +37,23 @@ type envelopeInputs struct {
 // keep the envelope current too so the values never go further out
 // of date than one turn.
 func renderEnvelope(in envelopeInputs) string {
-	out := curatorEnvelopeTemplate
-	out = strings.ReplaceAll(out, "{{PROJECT_NAME}}", projectNameOrFallback(in.ProjectName))
-	out = strings.ReplaceAll(out, "{{PROJECT_DESCRIPTION}}", projectDescriptionOrFallback(in.ProjectDescription))
-	out = strings.ReplaceAll(out, "{{PINNED_REPOS_BLOCK}}", renderPinnedReposBlock(in.PinnedRepos))
-	out = strings.ReplaceAll(out, "{{TRACKERS_BLOCK}}", renderTrackersBlock(in.JiraProjectKey, in.LinearProjectKey))
-	// {{TOOLS_REFERENCE}} is inlined BEFORE {{BINARY_PATH}} because the
-	// gh-tools / jira-tools templates contain their own {{BINARY_PATH}}
-	// placeholders (delegated agents see them too). Substituting the
-	// tools text in first means the trailing BINARY_PATH pass also
-	// resolves the placeholders nested inside the tools docs.
-	out = strings.ReplaceAll(out, "{{TOOLS_REFERENCE}}", renderToolsReference())
-	out = strings.ReplaceAll(out, "{{BINARY_PATH}}", in.BinaryPath)
-	return out
+	// Resolve nested placeholders only within trusted template-derived
+	// content before rendering the outer envelope. This preserves the
+	// existing TOOLS_REFERENCE behavior without allowing later
+	// substitutions to rewrite user-provided fields such as project name
+	// or description.
+	toolsReference := strings.NewReplacer(
+		"{{BINARY_PATH}}", in.BinaryPath,
+	).Replace(renderToolsReference())
+
+	return strings.NewReplacer(
+		"{{PROJECT_NAME}}", projectNameOrFallback(in.ProjectName),
+		"{{PROJECT_DESCRIPTION}}", projectDescriptionOrFallback(in.ProjectDescription),
+		"{{PINNED_REPOS_BLOCK}}", renderPinnedReposBlock(in.PinnedRepos),
+		"{{TRACKERS_BLOCK}}", renderTrackersBlock(in.JiraProjectKey, in.LinearProjectKey),
+		"{{TOOLS_REFERENCE}}", toolsReference,
+		"{{BINARY_PATH}}", in.BinaryPath,
+	).Replace(curatorEnvelopeTemplate)
 }
 
 func projectNameOrFallback(name string) string {
