@@ -856,21 +856,21 @@ func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Reque
 // accumulate empty directories.
 //
 // Conflict policy: REJECT. If a file with the same sanitized name
-// already exists, the upload returns 409 with a message naming the
-// conflict — the user explicitly picked "delete the old one first"
+// already exists, that file is reported as a conflict in the per-file
+// results — the user explicitly picked "delete the old one first"
 // over auto-rename or overwrite. Implementation uses O_CREATE|O_EXCL
 // so the check + write is atomic against a concurrent upload of the
 // same name.
 //
-// Per-file size limit and total request limit are enforced via
-// http.MaxBytesReader at the wrapper level; a multipart file that
-// blows past knowledgeMaxUploadBytes during streaming surfaces as a
-// "request body too large" error and the partially-written file is
-// removed.
+// Per-file size limit and total request limit are enforced during
+// upload handling. If a file exceeds knowledgeMaxUploadBytes while
+// streaming, that file is reported as a failed per-file result and any
+// partially-written file is removed.
 //
 // Multi-file requests are partial-success: each file is processed
-// independently, and the response includes a per-file outcome. A
-// duplicate filename failing doesn't block siblings from succeeding.
+// independently, and the response is HTTP 200 with per-file results.
+// A duplicate filename or oversize-file failure doesn't block
+// siblings from succeeding.
 func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	project, err := db.GetProject(s.db, id)
