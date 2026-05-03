@@ -83,7 +83,11 @@ func (s *projectSession) dispatch(requestID string) {
 			// pickup. Skip; the canceller already wrote the row.
 			return
 		}
+		// The request has already been dequeued from the in-memory
+		// project queue. If we return here without a terminal state,
+		// the row remains stuck in queued with no retry path.
 		log.Printf("[curator] warning: mark request %s running: %v", requestID, err)
+		s.failRequest(requestID, fmt.Sprintf("mark running: %v", err))
 		return
 	}
 	s.curator.broadcastRequestUpdate(s.projectID, requestID, "running")
