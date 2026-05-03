@@ -21,12 +21,13 @@ type runSink struct {
 	spawner *Spawner
 	runID   string
 
-	// sessionDelivered guards against double-write on resume — a
-	// resumed stream re-emits system/init for the same session_id,
-	// and while SetAgentRunSession is idempotent at the DB layer,
-	// skipping the redundant write also avoids a second running-
-	// status broadcast that the historical inline implementation
-	// gated on this being a first-time event.
+	// sessionDelivered suppresses repeated OnSession handling within
+	// this runSink instance. Some streams can emit system/init more
+	// than once for the same session_id; while SetAgentRunSession is
+	// idempotent at the DB layer, skipping duplicate handling also
+	// avoids an extra running-status broadcast from the same stream.
+	// Because each agentproc.Run call gets a fresh sink, this does
+	// not deduplicate across separate resume invocations.
 	sessionDelivered bool
 }
 
