@@ -11,17 +11,17 @@ import "time"
 // in curator_messages — that table holds only the agent's side of the
 // exchange, same way run_messages does.
 type CuratorRequest struct {
-	ID         string
-	ProjectID  string
-	Status     string // queued | running | done | cancelled | failed
-	UserInput  string
-	ErrorMsg   string
-	CostUSD    float64
-	DurationMs int
-	NumTurns   int
-	StartedAt  *time.Time
-	FinishedAt *time.Time
-	CreatedAt  time.Time
+	ID         string     `json:"id"`
+	ProjectID  string     `json:"project_id"`
+	Status     string     `json:"status"` // queued | running | done | cancelled | failed
+	UserInput  string     `json:"user_input"`
+	ErrorMsg   string     `json:"error_msg,omitempty"`
+	CostUSD    float64    `json:"cost_usd"`
+	DurationMs int        `json:"duration_ms"`
+	NumTurns   int        `json:"num_turns"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 // IsTerminal reports whether the request has reached a final status.
@@ -40,19 +40,19 @@ func (r *CuratorRequest) IsTerminal() bool {
 // the frontend's existing message-rendering can be reused without
 // branching on which table the row came from.
 type CuratorMessage struct {
-	ID                  int
-	RequestID           string
-	Role                string
-	Subtype             string
-	Content             string
-	ToolCalls           []ToolCall
-	ToolCallID          string
-	IsError             bool
-	Metadata            map[string]any
-	Model               string
-	InputTokens         *int
-	OutputTokens        *int
-	CacheReadTokens     *int
-	CacheCreationTokens *int
-	CreatedAt           time.Time
+	ID                  int            `json:"id"`
+	RequestID           string         `json:"request_id"`
+	Role                string         `json:"role"`
+	Subtype             string         `json:"subtype"`
+	Content             string         `json:"content"`
+	ToolCalls           []ToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID          string         `json:"tool_call_id,omitempty"`
+	IsError             bool           `json:"is_error,omitempty"`
+	Metadata            map[string]any `json:"metadata,omitempty"`
+	Model               string         `json:"model,omitempty"`
+	InputTokens         *int           `json:"input_tokens,omitempty"`
+	OutputTokens        *int           `json:"output_tokens,omitempty"`
+	CacheReadTokens     *int           `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens *int           `json:"cache_creation_tokens,omitempty"`
+	CreatedAt           time.Time      `json:"created_at"`
 }
