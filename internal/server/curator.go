@@ -175,7 +175,7 @@ func (s *Server) handleCuratorCancel(w http.ResponseWriter, r *http.Request) {
 //
 // 409 with a clear hint if there's an in-flight turn — caller should
 // cancel first. The DB op + the WS broadcast are decoupled because a
-// failed broadcast (e.g. hub paniced) shouldn't roll back the wipe.
+// failed broadcast (e.g. hub panicked) shouldn't roll back the wipe.
 func (s *Server) handleCuratorReset(w http.ResponseWriter, r *http.Request) {
 	projectID := r.PathValue("id")
 	project, err := db.GetProject(s.db, projectID)
