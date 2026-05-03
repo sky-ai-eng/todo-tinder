@@ -49,11 +49,15 @@ export default function ProjectDetail() {
   // would see "Project not found" for a project that very much
   // still exists.
   const [loadError, setLoadError] = useState<string | null>(null)
-  // Monotonic counter that gates PATCH responses. Every successful
-  // response only sets project state if it carries the latest seq —
-  // an older slow response can't resurrect stale field values over
-  // a newer edit that already landed.
+  // Two seqs: patchSeq increments on every PATCH issued; lastLandedSeq
+  // tracks the highest seq whose response actually got applied. The
+  // "skip stale response" check uses lastLandedSeq, not patchSeq, so a
+  // newer-but-failed PATCH doesn't suppress an earlier-but-successful
+  // one. Without this split, two concurrent autosaves where the later
+  // one returned 4xx would leave the page rendering pre-edit data even
+  // though the earlier edit persisted server-side.
   const patchSeq = useRef(0)
+  const lastLandedSeq = useRef(0)
 
   const loadProject = useCallback(
     async (signal: AbortSignal) => {
@@ -107,10 +111,11 @@ export default function ProjectDetail() {
     async (body: Record<string, unknown>) => {
       if (!id) return false
       // Capture the seq BEFORE the await so concurrent calls each
-      // hold their own "is my response still the latest" yardstick.
-      // Older responses landing after a newer one find seq has moved
-      // past them and skip the setState — no resurrection of stale
-      // field values from a slow response.
+      // hold their own "am I newer than what's currently on screen"
+      // yardstick. The check at apply time compares against
+      // lastLandedSeq (the highest seq we've actually rendered), not
+      // patchSeq.current, so a newer-but-failed sibling can't suppress
+      // an older-but-successful response.
       patchSeq.current += 1
       const mySeq = patchSeq.current
       try {
@@ -124,7 +129,13 @@ export default function ProjectDetail() {
           return false
         }
         const fresh: Project = await res.json()
-        if (mySeq === patchSeq.current) {
+        // Only apply if we'd be moving the rendered seq forward — an
+        // older response arriving after a newer one already rendered
+        // gets dropped, but an older response arriving after a newer
+        // *failure* still lands (lastLandedSeq stayed at the prior
+        // success).
+        if (mySeq > lastLandedSeq.current) {
+          lastLandedSeq.current = mySeq
           setProject(fresh)
         }
         return true
@@ -799,25 +810,36 @@ function KnowledgePanel({ projectId }: { projectId: string }) {
   // enter and decrements on leave; the visual state is "any drag in
   // progress" iff counter > 0.
   const dragDepth = useRef(0)
-  // Monotonic sequence for refreshFiles. Without it, an upload-
-  // triggered refresh kicked off after a slow initial load could
-  // resolve first, then the slow load lands and overwrites the
-  // newer listing with the old contents.
+  // Two seqs mirroring the patch helper above: refreshSeq counts
+  // every fetch issued, lastLandedSeq tracks the highest seq whose
+  // response actually got applied. The "skip stale response" check
+  // uses lastLandedSeq so a later-but-failed refresh doesn't
+  // suppress an earlier-but-successful one — without this, an
+  // upload-triggered refresh that errors would mask the newly-
+  // uploaded files indefinitely if the prior in-flight refresh
+  // landed first with stale data.
   const refreshSeq = useRef(0)
+  const lastLandedRefreshSeq = useRef(0)
 
   const refreshFiles = useCallback(async () => {
     refreshSeq.current += 1
     const mySeq = refreshSeq.current
     try {
       const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/knowledge`)
-      if (mySeq !== refreshSeq.current) return
       if (!res.ok) {
-        toast.error(await readError(res, 'Failed to load knowledge base'))
+        // Only surface the error if it's the most recent fetch in
+        // flight; otherwise a newer fetch's success is still on the
+        // way and the toast would be misleading.
+        if (mySeq === refreshSeq.current) {
+          toast.error(await readError(res, 'Failed to load knowledge base'))
+        }
         return
       }
       const data: KnowledgeFile[] = await res.json()
-      if (mySeq !== refreshSeq.current) return
-      setFiles(data)
+      if (mySeq > lastLandedRefreshSeq.current) {
+        lastLandedRefreshSeq.current = mySeq
+        setFiles(data)
+      }
     } catch (err) {
       if (mySeq !== refreshSeq.current) return
       toast.error(

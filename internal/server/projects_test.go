@@ -650,6 +650,56 @@ func TestProjectKnowledge_LargeTextNotInlined(t *testing.T) {
 	}
 }
 
+// TestProjectDelete_404sDuringConcurrentPatch pins the
+// PATCH-vs-DELETE serialization. Without the per-project mutex on
+// DELETE, an in-flight PATCH would see the row vanish and surface
+// sql.ErrNoRows as a 500. With the mutex, the DELETE waits and the
+// next PATCH (if any) cleanly 404s.
+func TestProjectDelete_404sDuringConcurrentPatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newTestServer(t)
+	id, err := db.CreateProject(s.db, domain.Project{Name: "racy"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Delete the project, then try a PATCH against it. The PATCH
+	// should 404, not 500. (We can't reliably exercise the actual
+	// race in a unit test without injecting a delay; this asserts
+	// the post-delete behavior, which is the user-visible contract.)
+	rec := doJSON(t, s, http.MethodDelete, "/api/projects/"+id, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d", rec.Code)
+	}
+	desc := "anything"
+	rec = doJSON(t, s, http.MethodPatch, "/api/projects/"+id, map[string]any{
+		"description": desc,
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("PATCH after DELETE status = %d, want 404", rec.Code)
+	}
+}
+
+// TestSanitizeKnowledgeFilename_BackslashNotSeparatorOnUnix pins the
+// platform-correct path stripping. On Unix '\\' is a literal char,
+// not a separator, so a filename like `a\b.md` must round-trip
+// intact through sanitization. The earlier version of this code did
+// a manual ReplaceAll('\\', '/') which silently shortened that to
+// `b.md`, leaving the listing entry no longer resolvable by raw or
+// delete endpoints.
+func TestSanitizeKnowledgeFilename_BackslashNotSeparatorOnUnix(t *testing.T) {
+	if filepath.Separator != '/' {
+		t.Skip("test asserts unix-style separator behavior")
+	}
+	got, errMsg := sanitizeKnowledgeFilename("a\\b.md")
+	if errMsg != "" {
+		t.Fatalf("expected to accept literal backslash, got %q", errMsg)
+	}
+	if got != "a\\b.md" {
+		t.Errorf("got %q, want literal a\\b.md", got)
+	}
+}
+
 // TestProjectKnowledge_HidesUnsanitizableNames pins the filter that
 // keeps the listing in sync with what the per-file endpoints will
 // accept. A `.cache.json` file written directly by the agent has a

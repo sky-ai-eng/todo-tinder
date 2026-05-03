@@ -253,6 +253,17 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	// Take the same per-project lock that PATCH uses. Without this,
+	// an in-flight autosave (holding the mutex, mid read-merge-write)
+	// races a DELETE: DELETE drops the row out from under PATCH, and
+	// PATCH's UPDATE returns sql.ErrNoRows which the handler maps to
+	// a 500. With the lock, DELETE waits for PATCH to finish
+	// committing, then deletes — and a PATCH that arrives after the
+	// DELETE finds the row gone and 404s cleanly.
+	mu := s.projectMutex(id)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Snapshot pinned_repos BEFORE the cascade fires so we can prune
 	// each affected bare clone's worktree registration list after the
 	// project's repos/ subtree gets RemoveAll'd. Without the prune,
@@ -663,14 +674,23 @@ func isTextMime(mimeType string) bool {
 // system files.
 //
 // Rules:
-//   - Strip any path component (clients sometimes send full paths).
+//   - Strip any path component via filepath.Base (platform-aware:
+//     uses '/' on Unix, '/' or '\\' on Windows).
 //   - Reject empty results, "..", "." segments.
 //   - Reject leading dot (no hidden files — the agent's own scratch
 //     state lives at the project root with leading dots, and we don't
 //     want uploads colliding with it).
-//   - Reject path separators in the final name (defense in depth
-//     after the strip — Windows-style backslashes can survive
-//     filepath.Base on a Unix host).
+//   - Reject the OS path separator post-Base (defense in depth).
+//
+// We deliberately don't normalize backslash to slash before Base: on
+// Unix '\\' is a legitimate filename character (e.g. `a\b.md` is one
+// file, not two path components), and the manual replace would have
+// turned that filename into `b.md` for upload but left it alone in
+// the listing — leaving the user with a listing entry that the raw
+// and delete endpoints can't resolve. Browsers strip path components
+// from multipart filenames before sending them, so the cross-platform
+// case the manual replace was guarding against doesn't actually arise
+// in practice.
 //
 // Returns the sanitized base name and an error message string for
 // the handler to surface as a 400.
@@ -679,9 +699,6 @@ func sanitizeKnowledgeFilename(raw string) (string, string) {
 	if trimmed == "" {
 		return "", "filename is required"
 	}
-	// filepath.Base on Unix doesn't strip Windows separators, so do
-	// it manually first to handle clients that send "folder\\file.md".
-	trimmed = strings.ReplaceAll(trimmed, "\\", "/")
 	base := filepath.Base(trimmed)
 	if base == "." || base == ".." || base == "/" || base == "" {
 		return "", "filename is invalid"
@@ -689,7 +706,11 @@ func sanitizeKnowledgeFilename(raw string) (string, string) {
 	if strings.HasPrefix(base, ".") {
 		return "", "filename cannot start with a dot"
 	}
-	if strings.ContainsAny(base, "/\\") {
+	// Reject only the OS's actual path separator — '\\' is a literal
+	// character on Unix, not a separator, and stripping it from a
+	// legitimate filename would desync the listing from the per-file
+	// endpoints.
+	if strings.ContainsRune(base, filepath.Separator) {
 		return "", "filename cannot contain path separators"
 	}
 	return base, ""
@@ -709,29 +730,33 @@ func sanitizeKnowledgeFilename(raw string) (string, string) {
 // generic so the response body doesn't leak path layout to the
 // browser.
 //
-// Returns (kbDir, fullPath, "") on success and ("", "", errMsg) on
-// failure.
-func resolveKnowledgePath(projectID, rawPath string) (string, string, string) {
+// Returns (kbDir, fullPath, status, errMsg). status is 0 on success,
+// http.StatusBadRequest for client-side mistakes (bad input, path
+// traversal), and http.StatusInternalServerError for server-side
+// failures (UserHomeDir, etc.). Earlier versions collapsed both
+// cases to a 400, which misclassified internal failures as bad
+// input and made operator triage harder.
+func resolveKnowledgePath(projectID, rawPath string) (string, string, int, string) {
 	root, err := curator.KnowledgeDir(projectID)
 	if err != nil {
 		log.Printf("[projects] resolve knowledge dir for %s: %v", projectID, err)
-		return "", "", "failed to resolve knowledge dir"
+		return "", "", http.StatusInternalServerError, "failed to resolve knowledge dir"
 	}
 	kbDir := filepath.Join(root, "knowledge-base")
 	decoded, err := url.PathUnescape(rawPath)
 	if err != nil {
-		return "", "", "invalid path encoding"
+		return "", "", http.StatusBadRequest, "invalid path encoding"
 	}
 	name, errMsg := sanitizeKnowledgeFilename(decoded)
 	if errMsg != "" {
-		return "", "", errMsg
+		return "", "", http.StatusBadRequest, errMsg
 	}
 	full := filepath.Join(kbDir, name)
 	rel, err := filepath.Rel(kbDir, full)
 	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
-		return "", "", "path escapes knowledge-base directory"
+		return "", "", http.StatusBadRequest, "path escapes knowledge-base directory"
 	}
-	return kbDir, full, ""
+	return kbDir, full, 0, ""
 }
 
 // handleProjectKnowledgeFile streams the raw bytes of a single
@@ -760,9 +785,9 @@ func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "project not found"})
 		return
 	}
-	_, full, errMsg := resolveKnowledgePath(id, r.PathValue("path"))
+	_, full, status, errMsg := resolveKnowledgePath(id, r.PathValue("path"))
 	if errMsg != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+		writeJSON(w, status, map[string]string{"error": errMsg})
 		return
 	}
 	linfo, err := os.Lstat(full)
@@ -989,10 +1014,9 @@ func (s *Server) handleProjectKnowledgeDelete(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "project not found"})
 		return
 	}
-	_, full, errMsg := resolveKnowledgePath(id, r.PathValue("path"))
+	_, full, status, errMsg := resolveKnowledgePath(id, r.PathValue("path"))
 	if errMsg != "" {
-		log.Printf("[projects] knowledge delete: resolve knowledge path for %s: %s", id, errMsg)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": errMsg})
+		writeJSON(w, status, map[string]string{"error": errMsg})
 		return
 	}
 	if err := os.Remove(full); err != nil {
