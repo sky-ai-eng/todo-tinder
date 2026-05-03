@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
@@ -155,6 +156,23 @@ func (s *projectSession) dispatch(requestID string) {
 		return
 	}
 
+	// Refresh pinned-repo worktrees before spawning the agent so its
+	// view of the world matches upstream HEAD on the user-configured
+	// branch (profile.BaseBranch || profile.DefaultBranch). One fetch
+	// + reset --hard per repo per dispatch — bounded by the bare's
+	// per-repo lock so concurrent dispatches in different projects
+	// pinning the same repo queue rather than race. Per-repo
+	// failures are non-fatal: the agent still gets the project's
+	// knowledge files plus whatever subset of repos materialized.
+	materializePinnedRepos(msgCtx, s.curator.database, s.projectID, cwd, project.PinnedRepos)
+	if msgCtx.Err() != nil {
+		// Cancel fired during repo refresh (one big bare clone can
+		// take seconds on a fresh fetch). Don't waste cycles spawning
+		// claude only to immediately cancel it.
+		s.markCancelled(requestID, "user cancelled")
+		return
+	}
+
 	s.curator.mu.Lock()
 	model := s.curator.model
 	s.curator.mu.Unlock()
@@ -170,6 +188,18 @@ func (s *projectSession) dispatch(requestID string) {
 		return
 	}
 
+	// Resolve selfBin so the allowlist's `Bash(<selfBin> exec *)`
+	// pattern matches the same absolute path the agent will invoke
+	// for SKY-221's "ticket as a spec" skill. Falling back to a
+	// hard fail rather than running with a broken allowlist —
+	// `os.Executable()` errors are vanishingly rare, but if one
+	// happens we'd silently disable curator tooling.
+	selfBin, err := os.Executable()
+	if err != nil {
+		s.failRequest(requestID, fmt.Sprintf("resolve own binary path: %v", err))
+		return
+	}
+
 	systemPrompt := buildSystemPrompt(project.Name)
 
 	outcome, runErr := agentproc.Run(msgCtx, agentproc.RunOptions{
@@ -178,7 +208,7 @@ func (s *projectSession) dispatch(requestID string) {
 		SessionID:    project.CuratorSessionID,
 		Message:      req.UserInput,
 		SystemPrompt: systemPrompt,
-		AllowedTools: BuildAllowedTools(),
+		AllowedTools: agentproc.BuildAllowedTools(selfBin),
 		ExtraEnv: []string{
 			"TRIAGE_FACTORY_CURATOR_PROJECT_ID=" + s.projectID,
 			"TRIAGE_FACTORY_CURATOR_REQUEST_ID=" + requestID,

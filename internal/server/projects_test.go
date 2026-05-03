@@ -14,6 +14,7 @@ import (
 
 func TestProjectCreate_Happy(t *testing.T) {
 	s := newTestServer(t)
+	seedConfiguredRepo(t, s, "sky-ai-eng", "triage-factory")
 	rec := doJSON(t, s, http.MethodPost, "/api/projects", map[string]any{
 		"name":         "Triage Factory",
 		"description":  "Local-first triage UI",
@@ -286,7 +287,7 @@ func TestProjectDelete_CleanupWarningRedactsPath(t *testing.T) {
 	}
 }
 
-func TestValidatePinnedRepos_Slugs(t *testing.T) {
+func TestValidatePinnedRepoShape_Slugs(t *testing.T) {
 	good := [][]string{
 		nil,
 		{},
@@ -294,7 +295,7 @@ func TestValidatePinnedRepos_Slugs(t *testing.T) {
 		{"sky-ai-eng/triage-factory", "owner/repo"},
 	}
 	for _, repos := range good {
-		if _, errMsg := validatePinnedRepos(repos); errMsg != "" {
+		if _, errMsg := validatePinnedRepoShape(repos); errMsg != "" {
 			t.Errorf("repos=%v should pass, got %q", repos, errMsg)
 		}
 	}
@@ -307,20 +308,20 @@ func TestValidatePinnedRepos_Slugs(t *testing.T) {
 		{"x/"},
 	}
 	for _, repos := range bad {
-		if _, errMsg := validatePinnedRepos(repos); errMsg == "" {
+		if _, errMsg := validatePinnedRepoShape(repos); errMsg == "" {
 			t.Errorf("repos=%v should reject", repos)
 		}
 	}
 }
 
-// TestValidatePinnedRepos_NormalizesWhitespace pins the
+// TestValidatePinnedRepoShape_NormalizesWhitespace pins the
 // trim-and-persist contract: validation strips whitespace AND the
 // caller persists the trimmed slugs. Without normalization,
 // " owner/repo " would pass (validator trims) but get stored
 // padded, breaking later lookups by slug.
-func TestValidatePinnedRepos_NormalizesWhitespace(t *testing.T) {
+func TestValidatePinnedRepoShape_NormalizesWhitespace(t *testing.T) {
 	in := []string{"  owner/repo  ", "\tother/repo\n"}
-	out, errMsg := validatePinnedRepos(in)
+	out, errMsg := validatePinnedRepoShape(in)
 	if errMsg != "" {
 		t.Fatalf("expected pass, got %q", errMsg)
 	}
@@ -335,12 +336,40 @@ func TestValidatePinnedRepos_NormalizesWhitespace(t *testing.T) {
 	}
 }
 
+// TestValidatePinnedRepos_RejectsUnconfigured pins the existence-check
+// contract: a slug that's well-formed but doesn't have a row in
+// repo_profiles is rejected at the API layer. This is what stops a
+// curl-crafted POST from pinning a repo the user has never set up
+// (no creds, no clone URL, nothing for the Curator to materialize).
+func TestValidatePinnedRepos_RejectsUnconfigured(t *testing.T) {
+	srv := newTestServer(t)
+	seedConfiguredRepo(t, srv, "sky-ai-eng", "configured")
+
+	// All-configured passes.
+	if _, errMsg := validatePinnedRepos(srv.db, []string{"sky-ai-eng/configured"}); errMsg != "" {
+		t.Errorf("configured slug should pass, got %q", errMsg)
+	}
+
+	// Mix of configured + unconfigured rejects on the unconfigured one.
+	if _, errMsg := validatePinnedRepos(srv.db, []string{"sky-ai-eng/configured", "stranger/repo"}); errMsg == "" {
+		t.Error("unconfigured slug should reject")
+	} else if !strings.Contains(errMsg, "stranger/repo") {
+		t.Errorf("error should name the offending slug, got %q", errMsg)
+	}
+
+	// Empty input still passes (no profiles needed).
+	if _, errMsg := validatePinnedRepos(srv.db, nil); errMsg != "" {
+		t.Errorf("nil input should pass, got %q", errMsg)
+	}
+}
+
 // TestProjectCreate_PaddedSlugsStoredTrimmed is the end-to-end
 // regression: padded input from a client must round-trip back as
 // trimmed. Without the normalization fix this test fails because
 // the original padded string gets persisted.
 func TestProjectCreate_PaddedSlugsStoredTrimmed(t *testing.T) {
 	s := newTestServer(t)
+	seedConfiguredRepo(t, s, "owner", "repo")
 	rec := doJSON(t, s, http.MethodPost, "/api/projects", map[string]any{
 		"name":         "P",
 		"pinned_repos": []string{"  owner/repo  "},
@@ -357,6 +386,7 @@ func TestProjectCreate_PaddedSlugsStoredTrimmed(t *testing.T) {
 
 func TestProjectPatch_PaddedSlugsStoredTrimmed(t *testing.T) {
 	s := newTestServer(t)
+	seedConfiguredRepo(t, s, "only", "one")
 	id, _ := db.CreateProject(s.db, domain.Project{Name: "P"})
 	rec := doJSON(t, s, http.MethodPatch, "/api/projects/"+id, map[string]any{
 		"pinned_repos": []string{" \tonly/one  "},

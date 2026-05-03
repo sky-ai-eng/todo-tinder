@@ -1,0 +1,76 @@
+package curator
+
+import (
+	"context"
+	"database/sql"
+	"log"
+
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/worktree"
+)
+
+// materializePinnedRepos refreshes a worktree of every pinned repo
+// inside the project's knowledge dir before each curator dispatch.
+// One worktree per (project, repo) at <projectDir>/repos/<owner>/<repo>/,
+// always reset hard to upstream HEAD on the user-configured branch
+// (profile.BaseBranch || profile.DefaultBranch). The agent's mental
+// model: "the canonical source for sky-ai-eng/sky lives at
+// ./repos/sky-ai-eng/sky and reflects current upstream."
+//
+// Per-repo failures are logged but do not fail the dispatch — the
+// curator should still be useful for a knowledge-base question even
+// if one repo's bare clone is busted or its branch was renamed. The
+// agent will see whichever subset of repos materialized successfully.
+//
+// pinned_repos is validated at the API layer to require a row in
+// repo_profiles (validatePinnedRepos), so a missing profile here
+// indicates a race: the user removed the repo from configured-repos
+// AFTER pinning. Same handling — log + skip.
+func materializePinnedRepos(ctx context.Context, database *sql.DB, projectID, projectDir string, pinnedRepos []string) {
+	for _, slug := range pinnedRepos {
+		if ctx.Err() != nil {
+			return
+		}
+		owner, repo, ok := splitOwnerRepo(slug)
+		if !ok {
+			log.Printf("[curator] project %s: malformed pinned repo %q (skipping)", projectID, slug)
+			continue
+		}
+		profile, err := db.GetRepoProfile(database, slug)
+		if err != nil {
+			log.Printf("[curator] project %s: load profile for %s: %v (skipping)", projectID, slug, err)
+			continue
+		}
+		if profile == nil {
+			log.Printf("[curator] project %s: no profile for pinned repo %s — repo was removed from config after pinning (skipping)", projectID, slug)
+			continue
+		}
+		branch := profile.BaseBranch
+		if branch == "" {
+			branch = profile.DefaultBranch
+		}
+		if branch == "" {
+			log.Printf("[curator] project %s: %s has no branch in profile (skipping)", projectID, slug)
+			continue
+		}
+		if _, err := worktree.EnsureCuratorWorktree(ctx, owner, repo, branch, projectDir); err != nil {
+			log.Printf("[curator] project %s: materialize %s @ %s failed: %v (skipping)", projectID, slug, branch, err)
+			continue
+		}
+	}
+}
+
+// splitOwnerRepo splits "owner/repo" once. Defensive — pinned_repos
+// is shape-validated at the API layer, but this code path also runs
+// against historical rows so don't trust the slice.
+func splitOwnerRepo(slug string) (owner, repo string, ok bool) {
+	for i := 0; i < len(slug); i++ {
+		if slug[i] == '/' {
+			if i == 0 || i == len(slug)-1 {
+				return "", "", false
+			}
+			return slug[:i], slug[i+1:], true
+		}
+	}
+	return "", "", false
+}

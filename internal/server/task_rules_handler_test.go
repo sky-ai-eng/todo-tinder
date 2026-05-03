@@ -59,6 +59,23 @@ func doJSON(t *testing.T, s *Server, method, path string, body any) *httptest.Re
 	return rec
 }
 
+// seedConfiguredRepo inserts a minimal repo_profiles row so tests that
+// pin repos pass the validatePinnedRepos existence check. The Curator's
+// repo-materialization eventually wants more (clone_url, default_branch),
+// but for HTTP-handler tests this is the smallest seed that satisfies
+// the validation contract.
+func seedConfiguredRepo(t *testing.T, s *Server, owner, repo string) {
+	t.Helper()
+	if err := db.UpsertRepoProfile(s.db, domain.RepoProfile{
+		ID:            owner + "/" + repo,
+		Owner:         owner,
+		Repo:          repo,
+		DefaultBranch: "main",
+	}); err != nil {
+		t.Fatalf("seed configured repo %s/%s: %v", owner, repo, err)
+	}
+}
+
 // TestTaskRuleCreate_NullPredicate_Accepted is a regression test for a
 // suggested-but-wrong review finding. A client reading a seeded rule back
 // from GET gets `"scope_predicate_json": null` for match-all rules, and
