@@ -341,6 +341,22 @@ func scanCuratorMessageRow(rows *sql.Rows) (domain.CuratorMessage, error) {
 	return m, nil
 }
 
+// DeleteCuratorMessagesBySubtype removes every curator_messages row
+// for a request with the given subtype. Used by the curator runtime
+// to drop a `context_change` audit row after a revert: the chat
+// history must not show a "context noted" entry for a turn that
+// never delivered the deltas.
+//
+// Idempotent — zero-row deletes are fine. Returns no count; the
+// caller doesn't currently care.
+func DeleteCuratorMessagesBySubtype(database *sql.DB, requestID, subtype string) error {
+	_, err := database.Exec(`
+		DELETE FROM curator_messages
+		 WHERE request_id = ? AND subtype = ?
+	`, requestID, subtype)
+	return err
+}
+
 // ListCuratorMessagesByRequest returns the agent-side stream rows for
 // a request in chronological order. Used by the websocket replay path
 // and tests; the GET history handler uses the batched

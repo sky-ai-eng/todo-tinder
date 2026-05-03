@@ -253,6 +253,26 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+
+	// Queue context-change deltas for the Curator session, if any. This
+	// only fires when the project already has an active session
+	// (CuratorSessionID populated) — there is no point queueing a delta
+	// for a project the user has never chatted with: the next session's
+	// static envelope will render fresh values directly. Failures here
+	// are logged but do not abort the PATCH; the user's settings change
+	// has already been persisted, and the worst case is the agent
+	// missing one delta on its next turn (which a follow-up PATCH or
+	// the user's next message itself can correct).
+	//
+	// Coalescing on (project, session, change_type) is enforced by the
+	// partial unique index on curator_pending_context — the
+	// InsertPendingContext helper uses ON CONFLICT DO NOTHING so a
+	// second PATCH between user messages preserves the *earliest*
+	// baseline_value, which is the correct anchor for diffing at
+	// consume time. SKY-224.
+	if existing.CuratorSessionID != "" {
+		queuePendingContextChanges(s.db, *existing, updated)
+	}
 	fresh, err := db.GetProject(s.db, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "updated but read-back failed: " + err.Error()})
@@ -469,6 +489,85 @@ func validateTrackerKeys(cfg config.Config, jiraKey, linearKey string) (string, 
 		}
 	}
 	return "", "", "jira_project_key: " + jiraNorm + " is not in the configured Jira projects list (add it on the Settings page first)"
+}
+
+// queuePendingContextChanges diffs the project's pre-PATCH state
+// against the freshly-merged value and writes a curator_pending_context
+// row for each field that meaningfully changed. Caller has already
+// confirmed CuratorSessionID is non-empty — there's no point queuing
+// for a session that doesn't exist yet.
+//
+// Failures are logged, not returned. The PATCH itself has already
+// committed (queueing is best-effort context decoration), and the
+// agent will at worst miss a delta on its next turn — recoverable
+// from the user's next message or a follow-up PATCH. Surfacing the
+// failure as a 500 would imply the settings change failed, which is
+// strictly worse.
+//
+// SKY-224.
+func queuePendingContextChanges(database *sql.DB, before, after domain.Project) {
+	sessionID := after.CuratorSessionID
+	if sessionID == "" {
+		return
+	}
+	if !pinnedReposSetEqual(before.PinnedRepos, after.PinnedRepos) {
+		baseline, err := curator.EncodeStringSliceBaseline(before.PinnedRepos)
+		if err != nil {
+			log.Printf("[projects] encode pinned-repos baseline for %s: %v", before.ID, err)
+		} else if err := db.InsertPendingContext(database, before.ID, sessionID, domain.ChangeTypePinnedRepos, baseline); err != nil {
+			log.Printf("[projects] queue pinned-repos pending context for %s: %v", before.ID, err)
+		}
+	}
+	if before.JiraProjectKey != after.JiraProjectKey {
+		baseline, err := curator.EncodeNullableStringBaseline(before.JiraProjectKey)
+		if err != nil {
+			log.Printf("[projects] encode jira baseline for %s: %v", before.ID, err)
+		} else if err := db.InsertPendingContext(database, before.ID, sessionID, domain.ChangeTypeJiraProjectKey, baseline); err != nil {
+			log.Printf("[projects] queue jira pending context for %s: %v", before.ID, err)
+		}
+	}
+	if before.LinearProjectKey != after.LinearProjectKey {
+		baseline, err := curator.EncodeNullableStringBaseline(before.LinearProjectKey)
+		if err != nil {
+			log.Printf("[projects] encode linear baseline for %s: %v", before.ID, err)
+		} else if err := db.InsertPendingContext(database, before.ID, sessionID, domain.ChangeTypeLinearProjectKey, baseline); err != nil {
+			log.Printf("[projects] queue linear pending context for %s: %v", before.ID, err)
+		}
+	}
+}
+
+// pinnedReposSetEqual compares two pinned-repo slices as sets — order
+// AND multiplicity are irrelevant. The diff renderer in the curator
+// package treats pinned_repos as a set (added/removed semantics), so
+// a PATCH that only reorders OR re-emits the same elements with
+// duplicates collapsed (e.g. ["a","a"] → ["a"]) produces no rendered
+// diff; without dedup-aware equality here we'd queue a pending row
+// that goes through claim/render/finalize and produces an empty note,
+// which is wasted I/O and a noisy audit trail.
+//
+// validatePinnedRepoShape currently does not dedupe, so duplicates
+// can in principle land in the column. Comparing as sets here means
+// the queue-side check stays correct even if the validator never
+// tightens; if the validator does tighten in the future, the dedup
+// here is a cheap no-op.
+func pinnedReposSetEqual(a, b []string) bool {
+	aset := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		aset[v] = struct{}{}
+	}
+	bset := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		bset[v] = struct{}{}
+	}
+	if len(aset) != len(bset) {
+		return false
+	}
+	for k := range aset {
+		if _, ok := bset[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // knowledgeFile is the per-file shape returned by the knowledge
