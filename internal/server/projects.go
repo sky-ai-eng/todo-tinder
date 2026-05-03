@@ -73,15 +73,19 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 		return
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
-		return
-	}
-	jiraKey, linearKey, errMsg := validateTrackerKeys(cfg, req.JiraProjectKey, req.LinearProjectKey)
-	if errMsg != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
-		return
+	jiraKey := req.JiraProjectKey
+	linearKey := req.LinearProjectKey
+	if strings.TrimSpace(jiraKey) != "" || strings.TrimSpace(linearKey) != "" {
+		cfg, err := config.Load()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
+			return
+		}
+		jiraKey, linearKey, errMsg = validateTrackerKeys(cfg, jiraKey, linearKey)
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+			return
+		}
 	}
 
 	id, err := db.CreateProject(s.db, domain.Project{
