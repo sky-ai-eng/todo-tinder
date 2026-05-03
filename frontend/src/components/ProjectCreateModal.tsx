@@ -140,8 +140,11 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
           </div>
           <button
             type="button"
-            onClick={onClose}
-            className="text-text-tertiary hover:text-text-secondary p-1 rounded-full hover:bg-black/[0.03]"
+            onClick={() => {
+              if (!submitting) onClose()
+            }}
+            disabled={submitting}
+            className="text-text-tertiary hover:text-text-secondary p-1 rounded-full hover:bg-black/[0.03] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-text-tertiary disabled:hover:bg-transparent"
             aria-label="Close"
           >
             <X size={16} />
