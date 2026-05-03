@@ -48,7 +48,7 @@ export default function TrackerProjectPickers({
         const data: SettingsResponse = await res.json()
         if (!cancelled) {
           const projects = data.jira.projects || []
-          setJiraEnabled(data.jira.enabled)
+          setJiraEnabled(data.jira.enabled || projects.length > 0)
           setJiraProjects(projects)
         }
       } finally {
