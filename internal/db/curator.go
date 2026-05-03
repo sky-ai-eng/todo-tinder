@@ -144,7 +144,7 @@ func InFlightCuratorRequestForProject(database *sql.DB, projectID string) (*doma
 		       started_at, finished_at, created_at
 		FROM curator_requests
 		WHERE project_id = ? AND status IN ('queued', 'running')
-		ORDER BY (status = 'running') DESC, created_at ASC
+		ORDER BY (status = 'running') DESC, created_at ASC, id ASC
 		LIMIT 1
 	`, projectID)
 	return scanCuratorRequest(row)
