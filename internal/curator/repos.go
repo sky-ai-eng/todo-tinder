@@ -11,7 +11,7 @@ import (
 
 // materializePinnedRepos refreshes a worktree of every pinned repo
 // inside the project's knowledge dir before each curator dispatch.
-// One worktree per (project, repo) at <projectDir>/repos/<owner>-<repo>/,
+// One worktree per (project, repo) at <projectDir>/repos/<owner>/<repo>/,
 // always reset hard to upstream HEAD on the user-configured branch
 // (profile.BaseBranch || profile.DefaultBranch). The agent's mental
 // model: "the canonical source for sky-ai-eng/sky lives at

@@ -65,7 +65,7 @@ func BuildAllowedTools(selfBin string) string {
 		//
 		// Each subcommand has a parallel `git -C * <sub>` form. The Curator
 		// runtime materializes a worktree per pinned repo at
-		// <projectDir>/repos/<owner>-<repo>/, and the agent navigates them
+		// <projectDir>/repos/<owner>/<repo>/, and the agent navigates them
 		// with `git -C ./repos/<x> log` rather than `cd`-ing — that's the
 		// stateless pattern an LLM is way better at maintaining across
 		// turns. We deliberately don't add a catchall `Bash(git -C *)`:
