@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.5.0](https://github.com/sky-ai-eng/triage-factory/compare/v1.4.0...v1.5.0) (2026-05-04)
+
+
+### Features
+
+* **curator:** chat panel + live KB watcher + reset ([#92](https://github.com/sky-ai-eng/triage-factory/issues/92)) ([9bfcbb3](https://github.com/sky-ai-eng/triage-factory/commit/9bfcbb3d1bba2e9aa016228566f50485f47cba14))
+* **curator:** envelope + hidden context-change channel ([#90](https://github.com/sky-ai-eng/triage-factory/issues/90)) ([8523521](https://github.com/sky-ai-eng/triage-factory/commit/852352144de78639151ab85a9875a462c42ec5bd))
+* **curator:** per-project Claude Code chat sessions ([#87](https://github.com/sky-ai-eng/triage-factory/issues/87)) ([1e9fb2e](https://github.com/sky-ai-eng/triage-factory/commit/1e9fb2e6916e2b7249ad111ad5f5612018595b7d))
+* **curator:** per-project ticket-spec skill ([#94](https://github.com/sky-ai-eng/triage-factory/issues/94)) ([ea1e617](https://github.com/sky-ai-eng/triage-factory/commit/ea1e617d5997dd52d67aa68f4148f5b59ff78d82))
+* **delegate:** yield-to-user pause/resume for agents (SKY-139) ([#84](https://github.com/sky-ai-eng/triage-factory/issues/84)) ([82e8dc8](https://github.com/sky-ai-eng/triage-factory/commit/82e8dc81680e90bea0705ab92c23eabffb1e9171))
+* **projects:** /projects page + tracker links + knowledge sidebar ([#89](https://github.com/sky-ai-eng/triage-factory/issues/89)) ([5f1d4a1](https://github.com/sky-ai-eng/triage-factory/commit/5f1d4a1b3f7a57508986d47e21d81c6372ac4fb0))
+* **projects:** add SKY-222 project export/import bundles ([#91](https://github.com/sky-ai-eng/triage-factory/issues/91)) ([25744f5](https://github.com/sky-ai-eng/triage-factory/commit/25744f50c005d164881d9d08b0021b010fd6e05e))
+* **projects:** schema + CRUD API (SKY-215) ([#85](https://github.com/sky-ai-eng/triage-factory/issues/85)) ([62bbe02](https://github.com/sky-ai-eng/triage-factory/commit/62bbe020083bc481c138bb697c72584d4b38a120))
+* **worktree:** bootstrap bare clones + PR refspec + origin URL repair (SKY-214) ([#82](https://github.com/sky-ai-eng/triage-factory/issues/82)) ([b9e1bd4](https://github.com/sky-ai-eng/triage-factory/commit/b9e1bd4f3290825aa871ee93493c74ba09d3e003))
+
+
+### Bug Fixes
+
+* **curator:** repo materialization + shared allowlist + git -C support ([#88](https://github.com/sky-ai-eng/triage-factory/issues/88)) ([688785b](https://github.com/sky-ai-eng/triage-factory/commit/688785b3caa60cd86ee0de0f60d99f195138e45a))
+* **delegate:** extract agentproc package ([#86](https://github.com/sky-ai-eng/triage-factory/issues/86)) ([e8b3468](https://github.com/sky-ai-eng/triage-factory/commit/e8b346844a6b681241c6d5cc9454092895dd1d46))
+* **tracker:** updatedAt-gated PR refresh for monorepo scale ([#93](https://github.com/sky-ai-eng/triage-factory/issues/93)) ([d6f5d2d](https://github.com/sky-ai-eng/triage-factory/commit/d6f5d2d18abeeb3144b26b04f390ea5c301a2483))
+
 ## [1.4.0](https://github.com/sky-ai-eng/triage-factory/compare/v1.3.0...v1.4.0) (2026-05-02)
 
 
