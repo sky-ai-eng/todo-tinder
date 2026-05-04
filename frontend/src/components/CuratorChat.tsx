@@ -84,9 +84,14 @@ export default function CuratorChat({ project, onPatch }: Props) {
   // then nothing. Mirrors the backend resolution order in
   // internal/curator/skill.go so the badge matches what the next
   // dispatch will materialize.
-  const effectiveSpecPromptID =
-    project.spec_authorship_prompt_id ||
-    (prompts.some((p) => p.id === SYSTEM_TICKET_SPEC_PROMPT_ID) ? SYSTEM_TICKET_SPEC_PROMPT_ID : '')
+  const hasProjectSpecPrompt =
+    !!project.spec_authorship_prompt_id &&
+    prompts.some((p) => p.id === project.spec_authorship_prompt_id)
+  const effectiveSpecPromptID = hasProjectSpecPrompt
+    ? project.spec_authorship_prompt_id
+    : prompts.some((p) => p.id === SYSTEM_TICKET_SPEC_PROMPT_ID)
+      ? SYSTEM_TICKET_SPEC_PROMPT_ID
+      : ''
   const activeSpecPrompt = prompts.find((p) => p.id === effectiveSpecPromptID)
   const skillButtonLabel = activeSpecPrompt?.name ?? 'Spec skill'
 
