@@ -1,10 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
-import { Send, Square, ChevronDown, ChevronRight, AlertCircle, RotateCcw } from 'lucide-react'
+import {
+  Send,
+  Square,
+  ChevronDown,
+  ChevronRight,
+  AlertCircle,
+  RotateCcw,
+  BookOpen,
+} from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { useCuratorChat } from '../hooks/useCuratorChat'
 import { linkifyMarkdown, type LinkifyContext } from '../lib/linkify'
 import { toast } from './Toast/toastStore'
-import type { CuratorMessage, CuratorRequestWithMessages, ToolCall } from '../types'
+import PromptPicker from './PromptPicker'
+import type {
+  CuratorMessage,
+  CuratorRequestWithMessages,
+  Project,
+  Prompt,
+  ToolCall,
+} from '../types'
+
+const SYSTEM_TICKET_SPEC_PROMPT_ID = 'system-ticket-spec'
 
 // CuratorChat renders the streamed conversation for one project on
 // the right column of /projects/:id. Backend wiring lives in the
@@ -22,11 +40,63 @@ import type { CuratorMessage, CuratorRequestWithMessages, ToolCall } from '../ty
 //     user.
 
 interface Props {
-  projectId: string
+  project: Project
+  /** Patches the project. Used by the spec-skill picker in the header
+   *  to write the new prompt id; the parent's PATCH handler is what
+   *  actually validates + persists. Returns undefined / true on
+   *  success, false on failure (the parent toasts on error). */
+  onPatch: (body: Record<string, unknown>) => Promise<boolean | undefined>
 }
 
-export default function CuratorChat({ projectId }: Props) {
+export default function CuratorChat({ project, onPatch }: Props) {
+  const projectId = project.id
   const chat = useCuratorChat(projectId)
+  const navigate = useNavigate()
+
+  // Lazy-fetch the prompts list so the header button can show the
+  // active prompt's name without waiting for the picker to open. Same
+  // per-mount AbortController pattern as the linkifier's settings
+  // fetch — module-scope caching here would freeze the active-name
+  // display past edits made on the /prompts page.
+  const [prompts, setPrompts] = useState<Prompt[]>([])
+  const refetchPrompts = useMemo(
+    () => () => {
+      const ac = new AbortController()
+      fetch('/api/prompts', { signal: ac.signal })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: Prompt[] | null) => {
+          if (ac.signal.aborted) return
+          if (Array.isArray(d)) setPrompts(d)
+        })
+        .catch(() => {
+          // Header button degrades to "Spec skill" without a name.
+        })
+      return () => ac.abort()
+    },
+    [],
+  )
+  useEffect(() => refetchPrompts(), [refetchPrompts])
+
+  const [pickerOpen, setPickerOpen] = useState(false)
+
+  // Effective spec prompt: project's choice, then the seeded default,
+  // then nothing. Mirrors the backend resolution order in
+  // internal/curator/skill.go so the badge matches what the next
+  // dispatch will materialize.
+  const effectiveSpecPromptID =
+    project.spec_authorship_prompt_id ||
+    (prompts.some((p) => p.id === SYSTEM_TICKET_SPEC_PROMPT_ID) ? SYSTEM_TICKET_SPEC_PROMPT_ID : '')
+  const activeSpecPrompt = prompts.find((p) => p.id === effectiveSpecPromptID)
+  const skillButtonLabel = activeSpecPrompt?.name ?? 'Spec skill'
+
+  const handleSpecSelect = async (promptId: string) => {
+    setPickerOpen(false)
+    if (promptId === project.spec_authorship_prompt_id) return
+    const ok = await onPatch({ spec_authorship_prompt_id: promptId })
+    if (ok === false) {
+      toast.error('Failed to update Curator spec skill')
+    }
+  }
 
   // Per-mount fetch of the Jira base URL for the linkifier. Earlier
   // versions cached at module scope, but that turned a transient fetch
@@ -134,7 +204,11 @@ export default function CuratorChat({ projectId }: Props) {
         className="pointer-events-none absolute -left-8 -top-8 h-24 w-24 rounded-full bg-white/30 blur-2xl"
       />
 
-      <ChatHeader chat={chat} />
+      <ChatHeader
+        chat={chat}
+        skillButtonLabel={skillButtonLabel}
+        onOpenSkillPicker={() => setPickerOpen(true)}
+      />
 
       <div
         ref={scrollRef}
@@ -173,11 +247,28 @@ export default function CuratorChat({ projectId }: Props) {
         sendError={chat.sendError}
         totalCostUSD={chat.totalCostUSD}
       />
+      <PromptPicker
+        open={pickerOpen}
+        title="Curator spec skill"
+        subtitle="The Curator uses this prompt as a Claude Code skill when authoring tickets. Edits take effect on the next turn."
+        selectedId={effectiveSpecPromptID}
+        onSelect={handleSpecSelect}
+        onClose={() => setPickerOpen(false)}
+        onEditPrompts={() => navigate('/prompts')}
+      />
     </section>
   )
 }
 
-function ChatHeader({ chat }: { chat: ReturnType<typeof useCuratorChat> }) {
+function ChatHeader({
+  chat,
+  skillButtonLabel,
+  onOpenSkillPicker,
+}: {
+  chat: ReturnType<typeof useCuratorChat>
+  skillButtonLabel: string
+  onOpenSkillPicker: () => void
+}) {
   const status = chat.inFlight?.status ?? 'idle'
   const tone =
     status === 'running'
@@ -231,7 +322,7 @@ function ChatHeader({ chat }: { chat: ReturnType<typeof useCuratorChat> }) {
         <h2 className="text-[13px] font-semibold tracking-tight text-text-primary uppercase">
           Curator
         </h2>
-        <div className="flex items-center gap-3 text-[11px]">
+        <div className="flex items-center gap-2 text-[11px]">
           <span className={`inline-flex items-center gap-1 ${tone}`}>
             <span aria-hidden>{dot}</span>
             <span>{label}</span>
@@ -242,6 +333,22 @@ function ChatHeader({ chat }: { chat: ReturnType<typeof useCuratorChat> }) {
           {chat.totalCostUSD > 0 && (
             <span className="text-text-tertiary tabular-nums">${chat.totalCostUSD.toFixed(3)}</span>
           )}
+          <button
+            type="button"
+            onClick={onOpenSkillPicker}
+            aria-label="Choose ticket-spec skill"
+            title={`Curator ticket-spec skill: ${skillButtonLabel}`}
+            className="
+              inline-flex items-center gap-1.5
+              h-6 px-2 rounded-full
+              text-text-secondary hover:text-text-primary hover:bg-black/[0.04]
+              border border-border-subtle/70
+              transition-colors max-w-[180px]
+            "
+          >
+            <BookOpen size={11} className="shrink-0" />
+            <span className="truncate">{skillButtonLabel}</span>
+          </button>
           <button
             type="button"
             onClick={onReset}

@@ -7,9 +7,27 @@ interface Props {
   onSelect: (promptId: string) => void
   onClose: () => void
   onEditPrompts: () => void
+  /** Optional override for the modal title. Defaults to "Choose a prompt"
+   *  for backward compatibility with the delegation-strategy callers. */
+  title?: string
+  /** Optional override for the subtitle line under the title. */
+  subtitle?: string
+  /** When set, the matching tile renders with an "active" treatment so
+   *  users coming back to a settings-style picker see what's currently
+   *  in effect. The delegation-strategy callers leave this undefined
+   *  because their picker fires once per task with no prior selection. */
+  selectedId?: string
 }
 
-export default function PromptPicker({ open, onSelect, onClose, onEditPrompts }: Props) {
+export default function PromptPicker({
+  open,
+  onSelect,
+  onClose,
+  onEditPrompts,
+  title = 'Choose a prompt',
+  subtitle = 'Select a delegation strategy for this task',
+  selectedId,
+}: Props) {
   const [prompts, setPrompts] = useState<Prompt[]>([])
   const [fetchFailed, setFetchFailed] = useState(false)
   // Derived: "loading" means open, no prompts cached yet, AND the last fetch
@@ -63,10 +81,8 @@ export default function PromptPicker({ open, onSelect, onClose, onEditPrompts }:
               {/* Header */}
               <div className="px-5 pt-5 pb-3 flex items-center justify-between shrink-0">
                 <div>
-                  <h2 className="text-[15px] font-semibold text-text-primary">Choose a prompt</h2>
-                  <p className="text-[12px] text-text-tertiary mt-0.5">
-                    Select a delegation strategy for this task
-                  </p>
+                  <h2 className="text-[15px] font-semibold text-text-primary">{title}</h2>
+                  <p className="text-[12px] text-text-tertiary mt-0.5">{subtitle}</p>
                 </div>
                 <button
                   onClick={onClose}
@@ -90,7 +106,11 @@ export default function PromptPicker({ open, onSelect, onClose, onEditPrompts }:
                       <button
                         key={prompt.id}
                         onClick={() => onSelect(prompt.id)}
-                        className="group text-left p-4 rounded-xl border border-border-subtle bg-white/50 hover:bg-white/80 hover:border-accent/30 hover:shadow-sm transition-all duration-150"
+                        className={`group text-left p-4 rounded-xl border hover:shadow-sm transition-all duration-150 ${
+                          selectedId === prompt.id
+                            ? 'border-accent/60 bg-accent/[0.06] ring-1 ring-accent/20'
+                            : 'border-border-subtle bg-white/50 hover:bg-white/80 hover:border-accent/30'
+                        }`}
                       >
                         <div className="flex items-center gap-2 mb-1.5">
                           <span className="text-[13px] font-semibold text-text-primary group-hover:text-accent transition-colors truncate">
