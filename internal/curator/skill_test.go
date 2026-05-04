@@ -89,7 +89,10 @@ func TestMaterializeSpecSkill_StaleReferenceFallsBack(t *testing.T) {
 	if err := materializeSpecSkill(database, project, cwd); err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
-	data, _ := os.ReadFile(filepath.Join(cwd, ".claude", "skills", "ticket-spec", "SKILL.md"))
+	data, err := os.ReadFile(filepath.Join(cwd, ".claude", "skills", "ticket-spec", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read SKILL.md: %v", err)
+	}
 	if !strings.Contains(string(data), "fallback body") {
 		t.Error("expected fallback to system default body when configured id is stale")
 	}
@@ -112,11 +115,15 @@ func TestMaterializeSpecSkill_OverwritesOnEachCall(t *testing.T) {
 	}
 
 	cwd := t.TempDir()
+	skillPath := filepath.Join(cwd, ".claude", "skills", "ticket-spec", "SKILL.md")
 	project := &domain.Project{ID: "p1", SpecAuthorshipPromptID: "v1"}
 	if err := materializeSpecSkill(database, project, cwd); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	first, _ := os.ReadFile(filepath.Join(cwd, ".claude", "skills", "ticket-spec", "SKILL.md"))
+	first, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read SKILL.md after first dispatch: %v", err)
+	}
 	if !strings.Contains(string(first), "first version") {
 		t.Fatal("first dispatch did not write v1 body")
 	}
@@ -126,7 +133,10 @@ func TestMaterializeSpecSkill_OverwritesOnEachCall(t *testing.T) {
 	if err := materializeSpecSkill(database, project, cwd); err != nil {
 		t.Fatalf("second: %v", err)
 	}
-	second, _ := os.ReadFile(filepath.Join(cwd, ".claude", "skills", "ticket-spec", "SKILL.md"))
+	second, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read SKILL.md after second dispatch: %v", err)
+	}
 	if strings.Contains(string(second), "first version") {
 		t.Error("v1 body still present after swap to v2")
 	}
