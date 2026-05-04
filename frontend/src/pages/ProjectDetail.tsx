@@ -341,7 +341,7 @@ export default function ProjectDetail() {
           <KnowledgePanel projectId={project.id} />
         </div>
 
-        <CuratorChat projectId={project.id} />
+        <CuratorChat project={project} onPatch={patch} />
       </div>
       {exportOpen && (
         <ProjectExportModal
