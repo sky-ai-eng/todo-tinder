@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.6.0](https://github.com/sky-ai-eng/triage-factory/compare/v1.5.0...v1.6.0) (2026-05-05)
+
+
+### Features
+
+* **curator:** add built-in Jira formatting skill ([#96](https://github.com/sky-ai-eng/triage-factory/issues/96)) ([31dc26f](https://github.com/sky-ai-eng/triage-factory/commit/31dc26f13579894d12ddfc88d6692258f40c3b38))
+* **delegate:** lazy Jira worktrees + pending-PR approval flow ([#98](https://github.com/sky-ai-eng/triage-factory/issues/98)) ([88d75fc](https://github.com/sky-ai-eng/triage-factory/commit/88d75fcdf8d08082cb1f191065ab87c798f271ba))
+
+
+### Bug Fixes
+
+* **prompts:** add prompt version migration ([#99](https://github.com/sky-ai-eng/triage-factory/issues/99)) ([63f1700](https://github.com/sky-ai-eng/triage-factory/commit/63f1700b5ccfe47d2d7fc860c7603114d866fa04))
+
 ## [1.5.0](https://github.com/sky-ai-eng/triage-factory/compare/v1.4.0...v1.5.0) (2026-05-04)
 
 
