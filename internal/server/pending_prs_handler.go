@@ -1,0 +1,271 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+
+	"github.com/sky-ai-eng/triage-factory/internal/agentmeta"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
+)
+
+// pendingPRJSON is the JSON shape the pending-PR overlay consumes.
+// Mirrors pendingReviewJSON but for PR queue state.
+type pendingPRJSON struct {
+	ID          string `json:"id"`
+	RunID       string `json:"run_id,omitempty"`
+	Owner       string `json:"owner"`
+	Repo        string `json:"repo"`
+	HeadBranch  string `json:"head_branch"`
+	HeadSHA     string `json:"head_sha"`
+	BaseBranch  string `json:"base_branch"`
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	Locked      bool   `json:"locked"`
+	SubmittedAt string `json:"submitted_at,omitempty"`
+}
+
+// handlePendingPRGet returns a single pending PR.
+func (s *Server) handlePendingPRGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	pr, err := db.GetPendingPR(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if pr == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending PR not found"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pendingPRToJSON(pr))
+}
+
+// handleRunPendingPR is the run-keyed lookup the frontend uses to find
+// "the pending PR for this delegated run." Mirrors handleRunReview.
+func (s *Server) handleRunPendingPR(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("runID")
+
+	pr, err := db.PendingPRByRunID(s.db, runID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if pr == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no pending PR for this run"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pendingPRToJSON(pr))
+}
+
+// handlePendingPRUpdate edits the human-visible title and body of a
+// queued pending PR. Originals stay frozen via the COALESCE in
+// UpdatePendingPRTitleBody so the human-feedback diff at submit time
+// has a stable baseline.
+func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var req struct {
+		Title *string `json:"title"`
+		Body  *string `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+
+	pr, err := db.GetPendingPR(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if pr == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending PR not found"})
+		return
+	}
+
+	title := pr.Title
+	body := pr.Body
+	if req.Title != nil {
+		title = *req.Title
+	}
+	if req.Body != nil {
+		body = *req.Body
+	}
+	if title == "" {
+		// Title is NOT NULL on the schema and an empty title is
+		// rejected by GitHub anyway. Fail the PATCH explicitly
+		// rather than letting the user accidentally erase it.
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title cannot be empty"})
+		return
+	}
+
+	if err := db.UpdatePendingPRTitleBody(s.db, id, title, body); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handlePendingPRDiff returns the unified diff between the queued
+// PR's base and head branches, computed against the bare clone we
+// already maintain. The `git fetch origin <head>:<head>` first syncs
+// the bare's local ref to whatever the agent pushed (the bare
+// doesn't auto-update on push). Diff is capped at livePRDiffMaxBytes.
+func (s *Server) handlePendingPRDiff(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	pr, err := db.GetPendingPR(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if pr == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending PR not found"})
+		return
+	}
+
+	diff, err := livePRDiff(r.Context(), pr.Owner, pr.Repo, pr.BaseBranch, pr.HeadBranch)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "diff failed: " + err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(diff))
+}
+
+// handlePendingPRSubmit is the user-clicked-Open-PR endpoint:
+//
+//  1. Concurrent-submit guard (MarkPendingPRSubmitted) — two browser
+//     tabs both clicking can't both call CreatePR.
+//  2. Build final body with agentmeta footer.
+//  3. CreatePR on GitHub. On failure, release the guard so the user
+//     can retry; do NOT delete the row.
+//  4. On success, capture human verdict in run_memory.human_content,
+//     delete the pending row, flip the run to completed, mark the
+//     task done, broadcast the WS event.
+func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	if s.ghClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub credentials not configured"})
+		return
+	}
+
+	var req struct {
+		Draft bool `json:"draft"`
+	}
+	// Empty body → req.Draft = false. JSON decode errors aren't fatal
+	// (we want the endpoint usable from a tab with no body), but if a
+	// caller sent a malformed body we'd rather know.
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+	}
+
+	pr, err := db.GetPendingPR(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if pr == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending PR not found"})
+		return
+	}
+
+	// Concurrent-submit guard. Whichever caller wins this UPDATE goes
+	// on to call GitHub; the loser sees 409 and can retry once the
+	// winner finishes (which will release the guard on failure or
+	// delete the row on success).
+	winner, err := db.MarkPendingPRSubmitted(s.db, id)
+	if err != nil {
+		if errors.Is(err, db.ErrPendingPRSubmitInFlight) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "another submit is in flight or has already completed"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if !winner {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "another submit is in flight or has already completed"})
+		return
+	}
+
+	// Build the final body with footer using actual run cost data.
+	finalBody := pr.Body + agentmeta.Build(s.db, pr.RunID, "PR")
+
+	number, htmlURL, err := s.ghClient.CreatePR(pr.Owner, pr.Repo, pr.HeadBranch, pr.BaseBranch, pr.Title, finalBody, req.Draft)
+	if err != nil {
+		// Release the guard so the user can retry. Pending row stays
+		// in place — they may want to edit title/body or push more
+		// commits and retry without re-queueing.
+		if clearErr := db.ClearPendingPRSubmitted(s.db, id); clearErr != nil {
+			log.Printf("[pending-prs] failed to release submit guard for %s after CreatePR failure: %v", id, clearErr)
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub API error: " + err.Error()})
+		return
+	}
+
+	// Capture the human's verdict (title/body diff vs agent draft)
+	// while the originals are still in scope. SKY-205 parallel: the
+	// next retry of this ticket should see what the human changed.
+	if pr.RunID != "" {
+		humanContent := FormatHumanFeedbackPR(pr, pr.Title, pr.Body)
+		if err := db.UpdateRunMemoryHumanContent(s.db, pr.RunID, humanContent); err != nil {
+			log.Printf("[pending-prs] warning: failed to record human verdict for run %s: %v", pr.RunID, err)
+		}
+	}
+
+	if err := db.DeletePendingPR(s.db, id); err != nil {
+		log.Printf("[pending-prs] warning: failed to clean up pending PR %s after submit: %v", id, err)
+	}
+
+	if pr.RunID != "" {
+		if _, err := s.db.Exec(`UPDATE runs SET status = 'completed' WHERE id = ? AND status = 'pending_approval'`, pr.RunID); err != nil {
+			log.Printf("[pending-prs] warning: failed to update run %s status: %v", pr.RunID, err)
+		}
+		if _, err := s.db.Exec(`UPDATE tasks SET status = 'done' WHERE id = (SELECT task_id FROM runs WHERE id = ?)`, pr.RunID); err != nil {
+			log.Printf("[pending-prs] warning: failed to update task status for run %s: %v", pr.RunID, err)
+		}
+		s.ws.Broadcast(websocket.Event{
+			Type:  "agent_run_update",
+			RunID: pr.RunID,
+			Data:  map[string]string{"status": "completed"},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"number":   number,
+		"html_url": htmlURL,
+	})
+}
+
+// pendingPRToJSON projects the domain row into the wire shape.
+// Pulled out so both the by-id and by-run handlers stay symmetric.
+func pendingPRToJSON(pr *domain.PendingPR) pendingPRJSON {
+	out := pendingPRJSON{
+		ID:         pr.ID,
+		RunID:      pr.RunID,
+		Owner:      pr.Owner,
+		Repo:       pr.Repo,
+		HeadBranch: pr.HeadBranch,
+		HeadSHA:    pr.HeadSHA,
+		BaseBranch: pr.BaseBranch,
+		Title:      pr.Title,
+		Body:       pr.Body,
+		Locked:     pr.Locked,
+	}
+	if pr.SubmittedAt != nil {
+		out.SubmittedAt = pr.SubmittedAt.UTC().Format("2006-01-02T15:04:05Z")
+	}
+	return out
+}

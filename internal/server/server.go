@@ -161,6 +161,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentDelete)
 	s.mux.HandleFunc("GET /api/agent/runs/{runID}/review", s.handleRunReview)
 
+	s.mux.HandleFunc("GET /api/pending-prs/{id}", s.handlePendingPRGet)
+	s.mux.HandleFunc("PATCH /api/pending-prs/{id}", s.handlePendingPRUpdate)
+	s.mux.HandleFunc("GET /api/pending-prs/{id}/diff", s.handlePendingPRDiff)
+	s.mux.HandleFunc("POST /api/pending-prs/{id}/submit", s.handlePendingPRSubmit)
+	s.mux.HandleFunc("GET /api/agent/runs/{runID}/pending-pr", s.handleRunPendingPR)
+
 	s.mux.HandleFunc("GET /api/factory/snapshot", s.handleFactorySnapshot)
 	s.mux.HandleFunc("POST /api/factory/delegate", s.handleFactoryDelegate)
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +26,51 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "run not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, run)
+	writeJSON(w, http.StatusOK, runResponse(s.db, run))
+}
+
+// runResponse projects an AgentRun into the wire shape the frontend
+// consumes, augmented with `pending_kind` so the Board page can pick
+// the right approval card variant ("Review" or "Open PR") when
+// `status == "pending_approval"`. Two side tables can park a run in
+// pending_approval (pending_reviews, pending_prs); the discriminator
+// has to come from the server because the run row itself doesn't
+// know which kind queued it.
+//
+// Cheap: at most two indexed lookups per call, both no-ops on the
+// common case (terminal completed/failed/cancelled with no pending
+// row). Both errors swallow + log — pending_kind is informational
+// for the UI; an erroring lookup shouldn't fail the whole status
+// fetch.
+func runResponse(database *sql.DB, run *domain.AgentRun) map[string]any {
+	out := map[string]any{
+		"ID":            run.ID,
+		"TaskID":        run.TaskID,
+		"PromptID":      run.PromptID,
+		"Status":        run.Status,
+		"Model":         run.Model,
+		"StartedAt":     run.StartedAt,
+		"CompletedAt":   run.CompletedAt,
+		"TotalCostUSD":  run.TotalCostUSD,
+		"DurationMs":    run.DurationMs,
+		"NumTurns":      run.NumTurns,
+		"StopReason":    run.StopReason,
+		"WorktreePath":  run.WorktreePath,
+		"ResultSummary": run.ResultSummary,
+		"SessionID":     run.SessionID,
+		"MemoryMissing": run.MemoryMissing,
+		"TriggerType":   run.TriggerType,
+		"TriggerID":     run.TriggerID,
+	}
+	// pending_kind only relevant when the run is parked.
+	if run.Status == "pending_approval" {
+		if review, err := db.PendingReviewByRunID(database, run.ID); err == nil && review != nil {
+			out["pending_kind"] = "review"
+		} else if pr, err := db.PendingPRByRunID(database, run.ID); err == nil && pr != nil {
+			out["pending_kind"] = "pr"
+		}
+	}
+	return out
 }
 
 func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request) {
@@ -130,7 +175,16 @@ func (s *Server) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	if runs == nil {
 		runs = []domain.AgentRun{}
 	}
-	writeJSON(w, http.StatusOK, runs)
+	// Project each run through runResponse so pending_kind rides
+	// alongside on the list endpoint too. Board's useWebSocket calls
+	// this on every status transition; without the discriminator on
+	// the list response the Open-PR vs Review button choice would
+	// flicker on first paint and only settle after the per-run fetch.
+	out := make([]map[string]any, len(runs))
+	for i := range runs {
+		out[i] = runResponse(s.db, &runs[i])
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleAgentRespond accepts the user's answer to an open yield and
