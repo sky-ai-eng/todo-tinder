@@ -106,12 +106,19 @@ func listWorkspaces(database *db.DB, runID string) (listOutput, error) {
 		})
 	}
 
-	// Available = configured minus already-materialized. Filtering keeps
-	// the agent from re-adding a repo it already has (which would just
-	// be a no-op via the idempotency check, but having `available`
-	// reflect "what's still unmaterialized" is the more useful framing).
+	// Available = configured-and-profilable minus already-materialized.
+	// Skeleton rows in repo_profiles (added to the configured list
+	// but not yet profiled — clone_url is empty) are filtered out:
+	// `workspace add` would reject them later with "no clone URL on
+	// its profile" anyway, so surfacing them here as discoverable
+	// options would just send the agent toward unusable choices.
+	// Materialized filter keeps the list framed as "what's still
+	// unmaterialized," matching the agent's mental model.
 	available := make([]listAvailable, 0, len(configured))
 	for _, p := range configured {
+		if p.CloneURL == "" {
+			continue
+		}
 		if _, alreadyAdded := materializedSet[p.ID]; alreadyAdded {
 			continue
 		}

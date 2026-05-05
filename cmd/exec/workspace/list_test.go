@@ -137,11 +137,14 @@ func TestListWorkspaces_AvailableSurfacesDescription(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert alpha: %v", err)
 	}
-	// Skeleton row (no profile yet → no description). Should still
-	// appear in available with an empty/omitted description.
+	// Skeleton row (configured but profiling hasn't run, no
+	// clone_url). MUST be filtered out — `workspace add` rejects
+	// no-clone-url profiles, so surfacing them here would lead the
+	// agent to options that fail at materialize time.
 	if err := db.UpsertRepoProfile(database.Conn, domain.RepoProfile{
 		ID: "owner/skeleton", Owner: "owner", Repo: "skeleton",
-		CloneURL: "https://x", DefaultBranch: "main",
+		// CloneURL deliberately empty
+		DefaultBranch: "main",
 	}); err != nil {
 		t.Fatalf("upsert skeleton: %v", err)
 	}
@@ -162,11 +165,7 @@ func TestListWorkspaces_AvailableSurfacesDescription(t *testing.T) {
 	if alpha.Description != "Core API service" {
 		t.Errorf("alpha.Description = %q, want %q", alpha.Description, "Core API service")
 	}
-	skel, ok := byRepo["owner/skeleton"]
-	if !ok {
-		t.Fatalf("owner/skeleton missing from available: %+v", out.Available)
-	}
-	if skel.Description != "" {
-		t.Errorf("skeleton.Description = %q, want empty", skel.Description)
+	if _, found := byRepo["owner/skeleton"]; found {
+		t.Errorf("owner/skeleton (no clone_url) should NOT appear in available; got %+v", out.Available)
 	}
 }

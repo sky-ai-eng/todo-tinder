@@ -466,7 +466,23 @@ func prCreate(client *ghclient.Client, database *db.DB, args []string) {
 			Owner: owner, Repo: repo,
 			HeadBranch: head, HeadSHA: headSHA, BaseBranch: base,
 			Title: title, Body: body,
+			Draft: draft,
 		}); err != nil {
+			// The pre-check above is racy: two concurrent `pr create`
+			// invocations on different DB connections can both pass
+			// it before either has inserted, then one wins the
+			// UNIQUE(run_id) insert and the other lands here with a
+			// generic SQL constraint error. Re-check by run_id; if a
+			// row exists, treat this as the same SKY-212 retry case
+			// the pre-check normally catches and surface the clean
+			// "already queued" message instead of a confusing SQL
+			// error the agent doesn't know how to interpret.
+			if existing, lookupErr := db.PendingPRByRunID(database.Conn, runID); lookupErr == nil && existing != nil {
+				exitErr(fmt.Sprintf(
+					"a PR for run %s has already been queued for human approval. Do not call pr create again — your work is complete. Finish the run by writing task_memory/<run_id>.md and returning your completion JSON.",
+					runID,
+				))
+			}
 			exitErr("failed to insert pending PR: " + err.Error())
 		}
 		// LockPendingPR is the second layer — it shouldn't trip in

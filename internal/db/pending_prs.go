@@ -35,16 +35,26 @@ func CreatePendingPR(database *sql.DB, p domain.PendingPR) error {
 	_, err := database.Exec(
 		`INSERT INTO pending_prs
 		   (id, run_id, owner, repo, head_branch, head_sha, base_branch,
-		    title, body, original_title, original_body)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		    title, body, original_title, original_body, draft)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.RunID, p.Owner, p.Repo, p.HeadBranch, p.HeadSHA, p.BaseBranch,
 		p.Title, nullIfEmpty(p.Body),
 		// Snapshot the agent's draft as originals at insert time so
 		// the human-feedback diff has a stable baseline even if the
 		// user edits before the agent has called LockPendingPR.
 		p.Title, nullIfEmpty(p.Body),
+		boolToInt(p.Draft),
 	)
 	return err
+}
+
+// boolToInt is the SQLite-idiomatic 0/1 mapping. Defined locally to
+// avoid leaking a generic helper into a wider scope.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // GetPendingPR fetches a single pending-PR row.
@@ -60,18 +70,18 @@ func GetPendingPR(database *sql.DB, id string) (*domain.PendingPR, error) {
 		SELECT id, run_id, owner, repo, head_branch, head_sha, base_branch,
 		       title, COALESCE(body, ''),
 		       original_title, original_body,
-		       locked, submitted_at, created_at
+		       draft, locked, submitted_at, created_at
 		  FROM pending_prs
 		 WHERE id = ?`, id)
 	var p domain.PendingPR
 	var origTitle, origBody sql.NullString
-	var locked int
+	var draft, locked int
 	var submittedAt sql.NullTime
 	if err := row.Scan(
 		&p.ID, &p.RunID, &p.Owner, &p.Repo, &p.HeadBranch, &p.HeadSHA, &p.BaseBranch,
 		&p.Title, &p.Body,
 		&origTitle, &origBody,
-		&locked, &submittedAt, &p.CreatedAt,
+		&draft, &locked, &submittedAt, &p.CreatedAt,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -86,6 +96,7 @@ func GetPendingPR(database *sql.DB, id string) (*domain.PendingPR, error) {
 		s := origBody.String
 		p.OriginalBody = &s
 	}
+	p.Draft = draft != 0
 	p.Locked = locked != 0
 	if submittedAt.Valid {
 		t := submittedAt.Time
@@ -258,18 +269,18 @@ func PendingPRByRunID(database *sql.DB, runID string) (*domain.PendingPR, error)
 		SELECT id, run_id, owner, repo, head_branch, head_sha, base_branch,
 		       title, COALESCE(body, ''),
 		       original_title, original_body,
-		       locked, submitted_at, created_at
+		       draft, locked, submitted_at, created_at
 		  FROM pending_prs
 		 WHERE run_id = ?`, runID)
 	var p domain.PendingPR
 	var origTitle, origBody sql.NullString
-	var locked int
+	var draft, locked int
 	var submittedAt sql.NullTime
 	if err := row.Scan(
 		&p.ID, &p.RunID, &p.Owner, &p.Repo, &p.HeadBranch, &p.HeadSHA, &p.BaseBranch,
 		&p.Title, &p.Body,
 		&origTitle, &origBody,
-		&locked, &submittedAt, &p.CreatedAt,
+		&draft, &locked, &submittedAt, &p.CreatedAt,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -284,6 +295,7 @@ func PendingPRByRunID(database *sql.DB, runID string) (*domain.PendingPR, error)
 		s := origBody.String
 		p.OriginalBody = &s
 	}
+	p.Draft = draft != 0
 	p.Locked = locked != 0
 	if submittedAt.Valid {
 		t := submittedAt.Time

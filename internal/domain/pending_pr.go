@@ -40,6 +40,7 @@ type PendingPR struct {
 	Body          string
 	OriginalTitle *string // agent's first-draft title, write-once; nil = no snapshot
 	OriginalBody  *string // agent's first-draft body, write-once; nil = no snapshot
+	Draft         bool    // agent's queue-time --draft hint; user can override at approval time
 	Locked        bool
 	SubmittedAt   *time.Time
 	CreatedAt     time.Time

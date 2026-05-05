@@ -10,8 +10,12 @@ interface Props {
   title: string
   body: string
   draft: boolean
-  onUpdateTitle: (title: string) => void
-  onUpdateBody: (body: string) => void
+  // onUpdateTitle/Body return promises so the Save click handler
+  // can await the PATCH before clearing edit-mode state. That
+  // serialization is what prevents a click-Save-then-click-Open-PR
+  // race from submitting the row in its pre-edit state.
+  onUpdateTitle: (title: string) => Promise<void>
+  onUpdateBody: (body: string) => Promise<void>
   onUpdateDraft: (draft: boolean) => void
   onSubmit: () => void
   onClose: () => void
@@ -50,23 +54,42 @@ export default function PendingPRSummary({
   const [rawView, setRawView] = useState(false)
   const [titleDraft, setTitleDraft] = useState(title)
   const [bodyDraft, setBodyDraft] = useState(body)
+  // savingTitle/Body track the await on the PATCH so we can disable
+  // submit while a save is in flight. With the parent's
+  // lastSavePromise serialization the user is guaranteed not to
+  // submit a stale row, but disabling the buttons during the in-
+  // flight window also prevents the user from getting confused
+  // about why the row hasn't appeared to update yet.
+  const [savingTitle, setSavingTitle] = useState(false)
+  const [savingBody, setSavingBody] = useState(false)
 
-  const saveTitle = () => {
-    onUpdateTitle(titleDraft)
-    setEditingTitle(false)
+  const saveTitle = async () => {
+    setSavingTitle(true)
+    try {
+      await onUpdateTitle(titleDraft)
+      setEditingTitle(false)
+    } finally {
+      setSavingTitle(false)
+    }
   }
   const cancelTitle = () => {
     setTitleDraft(title)
     setEditingTitle(false)
   }
-  const saveBody = () => {
-    onUpdateBody(bodyDraft)
-    setEditingBody(false)
+  const saveBody = async () => {
+    setSavingBody(true)
+    try {
+      await onUpdateBody(bodyDraft)
+      setEditingBody(false)
+    } finally {
+      setSavingBody(false)
+    }
   }
   const cancelBody = () => {
     setBodyDraft(body)
     setEditingBody(false)
   }
+  const saving = savingTitle || savingBody
 
   return (
     <div className="backdrop-blur-xl bg-surface-raised/70 border border-border-glass rounded-2xl shadow-sm shadow-black/[0.02] overflow-hidden">
@@ -105,15 +128,17 @@ export default function PendingPRSummary({
             <div className="flex items-center gap-2 justify-end">
               <button
                 onClick={cancelTitle}
-                className="text-[11px] text-text-tertiary hover:text-text-secondary px-3 py-1.5 rounded-lg transition-colors"
+                disabled={savingTitle}
+                className="text-[11px] text-text-tertiary hover:text-text-secondary px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 onClick={saveTitle}
-                className="text-[11px] font-medium text-white bg-accent hover:bg-accent/90 px-3 py-1.5 rounded-lg transition-colors"
+                disabled={savingTitle}
+                className="text-[11px] font-medium text-white bg-accent hover:bg-accent/90 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
               >
-                Save
+                {savingTitle ? 'Saving…' : 'Save'}
               </button>
             </div>
           </div>
@@ -149,15 +174,17 @@ export default function PendingPRSummary({
             <div className="flex items-center gap-2 justify-end">
               <button
                 onClick={cancelBody}
-                className="text-[11px] text-text-tertiary hover:text-text-secondary px-3 py-1.5 rounded-lg transition-colors"
+                disabled={savingBody}
+                className="text-[11px] text-text-tertiary hover:text-text-secondary px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 onClick={saveBody}
-                className="text-[11px] font-medium text-white bg-accent hover:bg-accent/90 px-3 py-1.5 rounded-lg transition-colors"
+                disabled={savingBody}
+                className="text-[11px] font-medium text-white bg-accent hover:bg-accent/90 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
               >
-                Save
+                {savingBody ? 'Saving…' : 'Save'}
               </button>
             </div>
           </div>
@@ -227,9 +254,16 @@ export default function PendingPRSummary({
           </button>
           <button
             onClick={onSubmit}
-            disabled={submitting}
+            disabled={submitting || saving || editingTitle || editingBody}
+            title={
+              editingTitle || editingBody
+                ? 'Save or cancel your edit before opening the PR'
+                : saving
+                  ? 'Waiting for your save to land before opening the PR'
+                  : undefined
+            }
             className={`flex items-center gap-1.5 text-[12px] font-semibold px-4 py-2 rounded-xl transition-all duration-150 ${
-              submitting
+              submitting || saving || editingTitle || editingBody
                 ? 'bg-accent/50 text-white/70 cursor-not-allowed'
                 : 'text-white bg-claim hover:bg-claim/90'
             }`}

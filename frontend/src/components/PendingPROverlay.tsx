@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import { parseDiff } from 'react-diff-view'
 import type { FileData } from 'react-diff-view'
@@ -21,6 +21,7 @@ interface PendingPR {
   base_branch: string
   title: string
   body: string
+  draft: boolean
   locked: boolean
   submitted_at?: string
 }
@@ -50,15 +51,23 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  // draft initializes from the row's persisted value (the agent's
+  // queue-time --draft hint). Reset by the fetch effect on every
+  // overlay open so a previously-toggled state can't leak across
+  // different pending PRs.
   const [draft, setDraft] = useState(false)
   const prId = pr?.id
 
-  // Fetch PR + diff
+  // Fetch PR + diff. Reset stale state from any prior PR before the
+  // new fetch lands so the user doesn't see leftover values
+  // briefly.
   useEffect(() => {
     if (!open || !runID) return
     let cancelled = false
     setLoading(true)
     setError(null)
+    setPR(null)
+    setFiles([])
     ;(async () => {
       try {
         const prRes = await fetch(`/api/agent/runs/${runID}/pending-pr`)
@@ -66,13 +75,16 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
         const prData: PendingPR = await prRes.json()
         if (cancelled) return
         setPR(prData)
+        // Initialize the draft checkbox from the persisted hint.
+        // Resetting here (rather than letting the prior overlay's
+        // value persist) is what fixes the cross-overlay leak.
+        setDraft(prData.draft)
 
         const diffRes = await fetch(`/api/pending-prs/${prData.id}/diff`)
         if (!diffRes.ok) throw new Error('Failed to load diff')
         const diffText = await diffRes.text()
         if (cancelled) return
-        const parsed = parseDiff(diffText)
-        setFiles(parsed)
+        setFiles(parseDiff(diffText))
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err))
       } finally {
@@ -85,17 +97,34 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
     }
   }, [open, runID])
 
+  // savesInFlight tracks how many PATCH requests for title/body are
+  // currently outstanding. The submit handler awaits the most recent
+  // save's promise before POSTing so the user can't click Save and
+  // immediately Open PR before the edit lands — that race would
+  // submit the row's pre-edit state, dropping the user's last edit.
+  // useRef rather than state because submitting reads it
+  // synchronously and we don't want to trigger re-renders on
+  // increment.
+  const lastSavePromise = useRef<Promise<void> | null>(null)
+
   // Title + body updates — explicit-Save model (PendingPRSummary's
-  // Edit / Save / Cancel buttons drive this), not autosave.
+  // Edit / Save / Cancel buttons drive this), not autosave. Returns
+  // the underlying PATCH promise so PendingPRSummary can await it
+  // before clearing edit-mode state, and so handleSubmit can await
+  // any in-flight save before opening the PR.
   const handleUpdateTitle = useCallback(
     async (title: string) => {
       if (!prId) return
       setPR((prev) => (prev ? { ...prev, title } : prev))
-      await fetch(`/api/pending-prs/${prId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
-      })
+      const p = (async () => {
+        await fetch(`/api/pending-prs/${prId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title }),
+        })
+      })()
+      lastSavePromise.current = p
+      await p
     },
     [prId],
   )
@@ -104,18 +133,24 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
     async (body: string) => {
       if (!prId) return
       setPR((prev) => (prev ? { ...prev, body } : prev))
-      await fetch(`/api/pending-prs/${prId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ body }),
-      })
+      const p = (async () => {
+        await fetch(`/api/pending-prs/${prId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body }),
+        })
+      })()
+      lastSavePromise.current = p
+      await p
     },
     [prId],
   )
 
-  // Draft is local state only until submit — it's not persisted on
-  // the row (the schema deliberately doesn't have a draft column;
-  // the value rides through to GitHub at submit time).
+  // draft is the user-facing checkbox state. The submit POST sends
+  // this value; the server falls back to the row's persisted hint
+  // when the field isn't sent, but we always send so the user's
+  // explicit choice (or no-touch matching the agent's hint) is what
+  // GitHub sees.
   const handleUpdateDraft = useCallback((next: boolean) => {
     setDraft(next)
   }, [])
@@ -124,6 +159,20 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
     if (!prId) return
     setSubmitting(true)
     try {
+      // Wait for any in-flight save to land before POSTing. Otherwise
+      // the server would read the row in its pre-edit state and open
+      // the PR with stale title/body, dropping the user's last save.
+      // Errors during the wait are swallowed — we only care that the
+      // PATCH completed (success or failure), not that it succeeded;
+      // the submit's own error handling kicks in if the row state
+      // is wrong.
+      if (lastSavePromise.current) {
+        try {
+          await lastSavePromise.current
+        } catch {
+          /* noop */
+        }
+      }
       const res = await fetch(`/api/pending-prs/${prId}/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

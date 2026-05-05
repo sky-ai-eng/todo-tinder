@@ -24,6 +24,7 @@ type pendingPRJSON struct {
 	BaseBranch  string `json:"base_branch"`
 	Title       string `json:"title"`
 	Body        string `json:"body"`
+	Draft       bool   `json:"draft"`
 	Locked      bool   `json:"locked"`
 	SubmittedAt string `json:"submitted_at,omitempty"`
 }
@@ -159,12 +160,12 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pointer so we can distinguish "client sent draft=false" from
+	// "client didn't send draft." A missing field falls back to the
+	// row's persisted value (the agent's queue-time --draft hint).
 	var req struct {
-		Draft bool `json:"draft"`
+		Draft *bool `json:"draft"`
 	}
-	// Empty body → req.Draft = false. JSON decode errors aren't fatal
-	// (we want the endpoint usable from a tab with no body), but if a
-	// caller sent a malformed body we'd rather know.
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -203,7 +204,16 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 	// Build the final body with footer using actual run cost data.
 	finalBody := pr.Body + agentmeta.Build(s.db, pr.RunID, "PR")
 
-	number, htmlURL, err := s.ghClient.CreatePR(pr.Owner, pr.Repo, pr.HeadBranch, pr.BaseBranch, pr.Title, finalBody, req.Draft)
+	// Default draft to the row's persisted value (agent's hint). The
+	// overlay's checkbox initializes from the same field, so a user
+	// who clicks Open PR without touching the checkbox lands on the
+	// agent's intent. A user who flipped the checkbox sends an
+	// explicit `draft` in the request body.
+	draft := pr.Draft
+	if req.Draft != nil {
+		draft = *req.Draft
+	}
+	number, htmlURL, err := s.ghClient.CreatePR(pr.Owner, pr.Repo, pr.HeadBranch, pr.BaseBranch, pr.Title, finalBody, draft)
 	if err != nil {
 		// Release the guard so the user can retry. Pending row stays
 		// in place — they may want to edit title/body or push more
@@ -262,6 +272,7 @@ func pendingPRToJSON(pr *domain.PendingPR) pendingPRJSON {
 		BaseBranch: pr.BaseBranch,
 		Title:      pr.Title,
 		Body:       pr.Body,
+		Draft:      pr.Draft,
 		Locked:     pr.Locked,
 	}
 	if pr.SubmittedAt != nil {
