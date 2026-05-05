@@ -28,66 +28,96 @@ const livePRDiffMaxBytes = 4 * 1024 * 1024
 // comparison, we have to fetch the head from origin into the bare's
 // own ref so the symbolic comparison resolves.
 //
+// Wrapped in worktree.WithRepoLock because curator refresh,
+// bootstrap, and worktree creation all mutate the same bare and
+// concurrent fetches can fail on ref locks. Without the lock,
+// opening the pending-PR overlay during a curator cycle racing on
+// the same repo intermittently 502s.
+//
 // Errors fall into two buckets:
 //   - the bare doesn't exist (repo not configured) → caller's 502
 //   - the fetch fails (network, auth, branch missing on upstream)
 //   - the diff itself fails (rare; git diff doesn't normally fail
 //     after both refs are present)
 //
-// Output is capped at livePRDiffMaxBytes with a trailing marker so
-// the agent / user can tell when truncation happened.
-func livePRDiff(ctx context.Context, owner, repo, baseBranch, headBranch string) (string, error) {
+// Returns (diff, truncationNote, err). truncationNote is non-empty
+// when the diff was capped at livePRDiffMaxBytes — the handler
+// surfaces it via an X-Diff-Truncated header so the overlay can
+// render a banner above the file list (parseDiff alone would just
+// drop the marker and leave the user thinking the PR is empty).
+func livePRDiff(ctx context.Context, owner, repo, baseBranch, headBranch string) (string, string, error) {
 	bareDir, err := worktree.RepoDir(owner, repo)
 	if err != nil {
-		return "", fmt.Errorf("resolve bare dir: %w", err)
+		return "", "", fmt.Errorf("resolve bare dir: %w", err)
 	}
 
-	// Fetch the head branch from origin into the bare's local ref so
-	// `git diff <base>...<head>` can resolve. Force update via "+" so
-	// a force-pushed head ref still wins. Same pattern
-	// EnsureCuratorWorktree uses.
-	headRefspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", headBranch, headBranch)
-	if err := gitCtx(ctx, bareDir, "fetch", "origin", headRefspec); err != nil {
-		return "", fmt.Errorf("fetch %s from origin: %w", headBranch, err)
-	}
-	// Same for the base, in case it's drifted since the agent's run.
-	baseRefspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", baseBranch, baseBranch)
-	if err := gitCtx(ctx, bareDir, "fetch", "origin", baseRefspec); err != nil {
-		return "", fmt.Errorf("fetch %s from origin: %w", baseBranch, err)
-	}
-
-	// Use the three-dot form (base...head) — show what's on head that
-	// isn't on base, which is what GitHub's PR diff shows. The
-	// two-dot form would also show unrelated changes on base since
-	// the merge base, which isn't what users expect.
-	diffOut, err := gitCtxOutput(ctx, bareDir, "diff",
-		"refs/remotes/origin/"+baseBranch+"..."+"refs/remotes/origin/"+headBranch)
-	if err != nil {
-		return "", fmt.Errorf("git diff: %w", err)
-	}
-
-	if len(diffOut) > livePRDiffMaxBytes {
-		// react-diff-view's parseDiff is unforgiving about half-cut
-		// hunks: a "@@ -1,5 +1,5 @@" header followed by 3 of 5
-		// expected lines fails the parse and the overlay goes
-		// blank — exactly the multi-MB diff case the cap is meant
-		// to protect against. Truncate at the last "\ndiff --git "
-		// boundary inside the cap so the returned text contains
-		// only intact per-file blocks.
-		cut := bytes.LastIndex(diffOut[:livePRDiffMaxBytes], []byte("\ndiff --git "))
-		if cut <= 0 {
-			// First file alone overruns the cap. Return only the
-			// truncation marker — parseDiff sees no diff blocks but
-			// also doesn't choke. The user sees a clear "too
-			// large" message rather than a corrupted render.
-			return "[diff truncated: first file exceeds " + humanBytes(livePRDiffMaxBytes) + "]\n", nil
+	var diffOut []byte
+	lockErr := worktree.WithRepoLock(owner, repo, func() error {
+		// Fetch the head branch from origin into the bare's local ref so
+		// `git diff <base>...<head>` can resolve. Force update via "+" so
+		// a force-pushed head ref still wins. Same pattern
+		// EnsureCuratorWorktree uses.
+		headRefspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", headBranch, headBranch)
+		if err := gitCtx(ctx, bareDir, "fetch", "origin", headRefspec); err != nil {
+			return fmt.Errorf("fetch %s from origin: %w", headBranch, err)
 		}
-		// +1 to keep the leading newline of the boundary as part
-		// of the preserved content so the appended marker starts
-		// on its own line.
-		return string(diffOut[:cut+1]) + "[diff truncated at " + humanBytes(livePRDiffMaxBytes) + "; later files omitted]\n", nil
+		// Same for the base, in case it's drifted since the agent's run.
+		baseRefspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", baseBranch, baseBranch)
+		if err := gitCtx(ctx, bareDir, "fetch", "origin", baseRefspec); err != nil {
+			return fmt.Errorf("fetch %s from origin: %w", baseBranch, err)
+		}
+
+		// Use the three-dot form (base...head) — show what's on head that
+		// isn't on base, which is what GitHub's PR diff shows. The
+		// two-dot form would also show unrelated changes on base since
+		// the merge base, which isn't what users expect.
+		out, err := gitCtxOutput(ctx, bareDir, "diff",
+			"refs/remotes/origin/"+baseBranch+"..."+"refs/remotes/origin/"+headBranch)
+		if err != nil {
+			return fmt.Errorf("git diff: %w", err)
+		}
+		diffOut = out
+		return nil
+	})
+	if lockErr != nil {
+		return "", "", lockErr
 	}
-	return string(diffOut), nil
+
+	out, note := truncateDiffAtFileBoundary(diffOut, livePRDiffMaxBytes)
+	return out, note, nil
+}
+
+// truncateDiffAtFileBoundary caps a unified-diff payload at maxBytes
+// without leaving parseDiff with a half-cut hunk. react-diff-view's
+// parser is unforgiving — a "@@ -1,5 +1,5 @@" header followed by 3
+// of 5 expected lines fails the parse and the overlay goes blank,
+// exactly the multi-MB case the cap is meant to handle.
+//
+// Returns (text, truncationNote). truncationNote is empty when
+// no truncation happened, otherwise human-readable text the handler
+// stamps into an X-Diff-Truncated response header.
+//
+// Three cases:
+//   - len(buf) <= maxBytes: return as-is, no note.
+//   - len(buf) > maxBytes and a "\ndiff --git " boundary exists in
+//     buf[:maxBytes]: cut at that boundary so only intact per-file
+//     blocks survive.
+//   - len(buf) > maxBytes but no boundary in the window (the first
+//     file alone overruns): return empty text. parseDiff will see no
+//     blocks but won't crash, and the handler's X-Diff-Truncated
+//     header tells the overlay to render a "too big to show" banner
+//     instead of "No diff available."
+func truncateDiffAtFileBoundary(buf []byte, maxBytes int) (string, string) {
+	if len(buf) <= maxBytes {
+		return string(buf), ""
+	}
+	cut := bytes.LastIndex(buf[:maxBytes], []byte("\ndiff --git "))
+	if cut <= 0 {
+		return "", "first file alone exceeds " + humanBytes(maxBytes) + " — diff hidden to avoid crashing the overlay"
+	}
+	// +1 to keep the leading newline of the boundary as part of the
+	// preserved content so the diff stays well-formed.
+	return string(buf[:cut+1]), "diff truncated at " + humanBytes(maxBytes) + "; later files omitted"
 }
 
 // gitCtx runs git in `dir` and discards stdout. Used for fetches

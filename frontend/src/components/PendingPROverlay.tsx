@@ -56,6 +56,13 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
   // overlay open so a previously-toggled state can't leak across
   // different pending PRs.
   const [draft, setDraft] = useState(false)
+  // truncationNote is the X-Diff-Truncated header from /diff,
+  // surfaced as a banner so the user knows the diff was capped at
+  // the server's 4MB limit (parseDiff of the truncated text alone
+  // would just yield fewer files — or zero files when the first
+  // file alone overruns — and the "No diff available" fallback
+  // would mislead the user into thinking the PR is empty).
+  const [truncationNote, setTruncationNote] = useState<string | null>(null)
   const prId = pr?.id
 
   // Fetch PR + diff. Reset stale state from any prior PR before the
@@ -68,6 +75,7 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
     setError(null)
     setPR(null)
     setFiles([])
+    setTruncationNote(null)
     ;(async () => {
       try {
         const prRes = await fetch(`/api/agent/runs/${runID}/pending-pr`)
@@ -85,6 +93,7 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
         const diffText = await diffRes.text()
         if (cancelled) return
         setFiles(parseDiff(diffText))
+        setTruncationNote(diffRes.headers.get('X-Diff-Truncated'))
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err))
       } finally {
@@ -292,6 +301,14 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
                     submitting={submitting}
                   />
 
+                  {truncationNote && (
+                    <div className="rounded-xl border border-snooze/30 bg-snooze/[0.06] px-4 py-3 text-[12px] text-text-secondary">
+                      <span className="font-semibold text-text-primary">Diff truncated:</span>{' '}
+                      {truncationNote}. Approving will still open the full PR on GitHub — the cap
+                      only limits what's rendered in this preview.
+                    </div>
+                  )}
+
                   {/* Diff files — same DiffFile component the review
                       overlay uses; commentsByFile is always empty for
                       pending PRs (no inline-comment surface at create
@@ -312,7 +329,7 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
                     })}
                   </div>
 
-                  {files.length === 0 && (
+                  {files.length === 0 && !truncationNote && (
                     <div className="text-center py-12">
                       <p className="text-[13px] text-text-tertiary">No diff available</p>
                     </div>

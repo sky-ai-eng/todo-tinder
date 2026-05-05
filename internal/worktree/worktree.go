@@ -36,6 +36,25 @@ func lockRepo(owner, repo string) *sync.Mutex {
 	return mu
 }
 
+// WithRepoLock serializes a callback against the per-repo bare-clone
+// mutex. Used by callers outside the worktree package — the
+// pending-PR live-diff path in particular runs `git fetch` against
+// the bare to sync the agent's pushed branch, which races with
+// curator refresh / bootstrap / worktree creation if those are
+// happening concurrently for the same repo. Concurrent fetches on a
+// single bare can fail with "fatal: Unable to create
+// '<bare>/refs/remotes/origin/<branch>.lock'" or otherwise corrupt
+// the ref, hence the lock.
+//
+// Callback returns drive the caller's error path; the lock is
+// always released on return.
+func WithRepoLock(owner, repo string, fn func() error) error {
+	mu := lockRepo(owner, repo)
+	mu.Lock()
+	defer mu.Unlock()
+	return fn()
+}
+
 const (
 	reposDir = ".triagefactory/repos" // bare clones: ~/.triagefactory/repos/{owner}/{repo}.git
 	runsDir  = "triagefactory-runs"   // worktrees: /tmp/triagefactory-runs/{run-id}

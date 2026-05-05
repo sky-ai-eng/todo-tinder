@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentmeta"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -98,11 +99,14 @@ func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
 	if req.Body != nil {
 		body = *req.Body
 	}
+	// Trim before the empty check: GitHub rejects whitespace-only
+	// titles ("Title is required") at submit time anyway, and silently
+	// letting "   " through this PATCH means the user only finds out
+	// after clicking Open PR. Fail fast and write the trimmed value
+	// so we don't carry leading/trailing whitespace into the PR.
+	title = strings.TrimSpace(title)
 	if title == "" {
-		// Title is NOT NULL on the schema and an empty title is
-		// rejected by GitHub anyway. Fail the PATCH explicitly
-		// rather than letting the user accidentally erase it.
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title cannot be empty"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title cannot be empty or whitespace-only"})
 		return
 	}
 
@@ -132,12 +136,20 @@ func (s *Server) handlePendingPRDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	diff, err := livePRDiff(r.Context(), pr.Owner, pr.Repo, pr.BaseBranch, pr.HeadBranch)
+	diff, truncationNote, err := livePRDiff(r.Context(), pr.Owner, pr.Repo, pr.BaseBranch, pr.HeadBranch)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "diff failed: " + err.Error()})
 		return
 	}
 
+	// X-Diff-Truncated lets the frontend render a banner above the
+	// file list when the cap kicked in. Without it parseDiff would
+	// silently yield no files for a too-big-to-render diff and the
+	// overlay would say "No diff available" — exactly the
+	// confusing-when-it-matters case the cap is meant to handle.
+	if truncationNote != "" {
+		w.Header().Set("X-Diff-Truncated", truncationNote)
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte(diff))
 }
