@@ -450,6 +450,27 @@ func prCreate(client *ghclient.Client, database *db.DB, args []string) {
 		}
 	}
 
+	// Pre-flight: verify the head branch actually exists on origin.
+	// pr create's contract requires `git push` first, but agents
+	// occasionally skip that step (e.g. a Jira agent that decided
+	// the changes already lived on the remote and went straight to
+	// `pr create`). Without this check, the row queues fine, the
+	// human approval overlay can't fetch the diff, the user sees a
+	// 502, and the run isn't recoverable without manual DB surgery.
+	// `ls-remote --exit-code` returns 2 specifically when nothing
+	// matched, so we hard-fail with a clear "did you forget to
+	// push?" message that teaches the agent how to retry — cheaper
+	// than letting the agent finish the run with a broken row.
+	lsRemote := exec.Command("git", "ls-remote", "--exit-code", "--heads", "origin", head)
+	var lsStderr strings.Builder
+	lsRemote.Stderr = &lsStderr
+	if err := lsRemote.Run(); err != nil {
+		exitErr(fmt.Sprintf(
+			"head branch '%s' is not on origin. Run `git push origin %s` first, then retry `pr create`. `pr create` requires the head branch to exist on the upstream — without it the diff cannot be rendered for human approval. (git ls-remote stderr: %s)",
+			head, head, strings.TrimSpace(lsStderr.String()),
+		))
+	}
+
 	if os.Getenv("TRIAGE_FACTORY_REVIEW_PREVIEW") == "1" {
 		runID := os.Getenv("TRIAGE_FACTORY_RUN_ID")
 		if runID == "" {
