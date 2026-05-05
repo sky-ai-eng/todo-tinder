@@ -12,7 +12,9 @@ import (
 
 // SeedOrUpdateSystemPrompt inserts a shipped prompt if missing, or updates it
 // when the shipped body changes and the local row has not been user-modified.
-// Version state is recorded in system_prompt_versions for idempotent reseeding.
+// Version state is recorded in system_prompt_versions so subsequent seed runs
+// with unchanged shipped content are no-ops (no churn to prompts.updated_at,
+// which the UI orders by).
 func SeedOrUpdateSystemPrompt(db *sql.DB, p domain.Prompt) error {
 	if p.Source == "" {
 		p.Source = "system"
@@ -27,44 +29,80 @@ func SeedOrUpdateSystemPrompt(db *sql.DB, p domain.Prompt) error {
 	}
 	defer tx.Rollback()
 
-	var exists int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM prompts WHERE id = ?`, p.ID).Scan(&exists); err != nil {
-		return fmt.Errorf("check prompt existence: %w", err)
+	var (
+		exists       bool
+		userModified int
+	)
+	switch err := tx.QueryRow(`SELECT user_modified FROM prompts WHERE id = ?`, p.ID).Scan(&userModified); {
+	case err == sql.ErrNoRows:
+		exists = false
+	case err != nil:
+		return fmt.Errorf("read prompt: %w", err)
+	default:
+		exists = true
 	}
-	if exists == 0 {
+
+	if !exists {
 		if _, err := tx.Exec(`
 			INSERT INTO prompts (id, name, body, source, usage_count, user_modified, created_at, updated_at)
 			VALUES (?, ?, ?, ?, 0, 0, ?, ?)
 		`, p.ID, p.Name, p.Body, p.Source, now, now); err != nil {
 			return err
 		}
-	} else {
-		var userModified int
-		if err := tx.QueryRow(`SELECT user_modified FROM prompts WHERE id = ?`, p.ID).Scan(&userModified); err != nil {
-			return fmt.Errorf("read user_modified: %w", err)
+		if err := upsertSystemPromptVersion(tx, p.ID, hash, now); err != nil {
+			return err
 		}
-		if userModified == 0 {
-			if _, err := tx.Exec(`
-				UPDATE prompts
-				SET name = ?, body = ?, source = ?, updated_at = ?
-				WHERE id = ?
-			`, p.Name, p.Body, p.Source, now, p.ID); err != nil {
-				return err
-			}
-		}
+		return tx.Commit()
 	}
 
+	// Row exists. Never touch user-modified prompts — they're intentional
+	// local edits and we shouldn't claim a new shipped hash was applied.
+	if userModified != 0 {
+		return tx.Commit()
+	}
+
+	// Compare against the previously applied shipped hash. If it matches,
+	// the shipped content hasn't changed since the last seed run and we
+	// skip both writes to avoid bumping updated_at / applied_at on every
+	// startup. A missing version row (legacy prompt predating version
+	// tracking) falls through to the update branch and gets overwritten
+	// with the current shipped content.
+	var priorHash sql.NullString
+	if err := tx.QueryRow(
+		`SELECT content_hash FROM system_prompt_versions WHERE prompt_id = ?`,
+		p.ID,
+	).Scan(&priorHash); err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("read prior prompt version: %w", err)
+	}
+	if priorHash.Valid && priorHash.String == hash {
+		return tx.Commit()
+	}
+
+	if _, err := tx.Exec(`
+		UPDATE prompts
+		SET name = ?, body = ?, source = ?, updated_at = ?
+		WHERE id = ?
+	`, p.Name, p.Body, p.Source, now, p.ID); err != nil {
+		return err
+	}
+	if err := upsertSystemPromptVersion(tx, p.ID, hash, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertSystemPromptVersion(tx *sql.Tx, promptID, hash string, now time.Time) error {
 	if _, err := tx.Exec(`
 		INSERT INTO system_prompt_versions (prompt_id, content_hash, applied_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(prompt_id) DO UPDATE SET
 			content_hash = excluded.content_hash,
 			applied_at = excluded.applied_at
-	`, p.ID, hash, now); err != nil {
+		WHERE system_prompt_versions.content_hash != excluded.content_hash
+	`, promptID, hash, now); err != nil {
 		return fmt.Errorf("upsert system prompt version: %w", err)
 	}
-
-	return tx.Commit()
+	return nil
 }
 
 // SeedPrompt inserts a prompt if it doesn't exist.
