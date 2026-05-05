@@ -1441,6 +1441,13 @@ func (s *Spawner) runMemoryGate(
 // the same task have already tried. The agent is taught to read this
 // directory by the envelope.
 //
+// The directory is created unconditionally — even on the very first run
+// when there are no priors. Two reasons: the prompt instructs the agent
+// to `ls task_memory/` early (fails noisily without the dir), and the
+// memory-gate retry message tells the agent to write to
+// `$TRIAGE_FACTORY_RUN_ROOT/task_memory/<run>.md` (which fails on a
+// missing parent dir unless the agent guesses to mkdir first).
+//
 // Pattern: DB is the source of truth, we materialize into the worktree
 // at startup, and ingest back on completion. The worktree is destroyed
 // after every run, so these files never outlive their run on disk —
@@ -1453,18 +1460,18 @@ func (s *Spawner) runMemoryGate(
 // the read side — the write-before-finish gate is enforced separately
 // for NEW memories produced during the run.
 func materializePriorMemories(database *sql.DB, cwd, entityID string) {
+	memDir := filepath.Join(cwd, "task_memory")
+	if err := os.MkdirAll(memDir, 0755); err != nil {
+		log.Printf("[delegate] warning: failed to create task_memory dir at %s: %v", memDir, err)
+		return
+	}
+
 	memories, err := db.GetMemoriesForEntity(database, entityID)
 	if err != nil {
 		log.Printf("[delegate] warning: failed to load prior memories for entity %s: %v", entityID, err)
 		return
 	}
 	if len(memories) == 0 {
-		return
-	}
-
-	memDir := filepath.Join(cwd, "task_memory")
-	if err := os.MkdirAll(memDir, 0755); err != nil {
-		log.Printf("[delegate] warning: failed to create task_memory dir at %s: %v", memDir, err)
 		return
 	}
 

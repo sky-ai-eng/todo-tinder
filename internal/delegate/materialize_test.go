@@ -1,0 +1,103 @@
+package delegate
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+)
+
+// TestMaterializePriorMemories_CreatesDirEvenWithNoPriors guards the
+// invariant the prompt + memory-gate retry both depend on: the agent's
+// initial cwd has a task_memory/ directory it can ls and write into,
+// regardless of whether prior runs ever existed for this entity.
+//
+// Pre-fix, the function early-returned when len(memories)==0, so a
+// first-run agent saw a missing directory and either (a) failed `ls
+// task_memory/` outright or (b) failed the final memory write because
+// the parent dir didn't exist.
+func TestMaterializePriorMemories_CreatesDirEvenWithNoPriors(t *testing.T) {
+	database := newTakeoverTestDB(t)
+	cwd := t.TempDir()
+
+	entity, _, err := db.FindOrCreateEntity(database, "jira", "SKY-100", "issue", "T", "https://x/100")
+	if err != nil {
+		t.Fatalf("entity: %v", err)
+	}
+
+	// Sanity: no memories for this entity yet.
+	mems, err := db.GetMemoriesForEntity(database, entity.ID)
+	if err != nil {
+		t.Fatalf("GetMemoriesForEntity: %v", err)
+	}
+	if len(mems) != 0 {
+		t.Fatalf("expected 0 priors for new entity, got %d", len(mems))
+	}
+
+	materializePriorMemories(database, cwd, entity.ID)
+
+	memDir := filepath.Join(cwd, "task_memory")
+	info, err := os.Stat(memDir)
+	if err != nil {
+		t.Fatalf("task_memory dir not created at %s: %v", memDir, err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("task_memory exists but is not a directory")
+	}
+
+	// And it's empty (no prior memory files materialized).
+	entries, err := os.ReadDir(memDir)
+	if err != nil {
+		t.Fatalf("read task_memory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected empty task_memory dir, found %d entries", len(entries))
+	}
+}
+
+// TestMaterializePriorMemories_WritesPriors verifies the existing
+// happy-path behavior survives the mkdir-first refactor.
+func TestMaterializePriorMemories_WritesPriors(t *testing.T) {
+	database := newTakeoverTestDB(t)
+	cwd := t.TempDir()
+
+	entity, _, err := db.FindOrCreateEntity(database, "jira", "SKY-200", "issue", "T", "https://x/200")
+	if err != nil {
+		t.Fatalf("entity: %v", err)
+	}
+	// Seed task + run + memory chain so GetMemoriesForEntity returns one row.
+	evt, err := db.RecordEvent(database, domain.Event{
+		EventType: domain.EventJiraIssueAssigned, EntityID: &entity.ID, MetadataJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("event: %v", err)
+	}
+	task, _, err := db.FindOrCreateTask(database, entity.ID, domain.EventJiraIssueAssigned, "", evt, 0.5)
+	if err != nil {
+		t.Fatalf("task: %v", err)
+	}
+	if err := db.CreatePrompt(database, domain.Prompt{ID: "p1", Name: "T", Body: "x", Source: "user"}); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	if err := db.CreateAgentRun(database, domain.AgentRun{
+		ID: "prior-run", TaskID: task.ID, PromptID: "p1", Status: "completed", Model: "m",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if err := db.UpsertAgentMemory(database, "prior-run", entity.ID, "what i did last time"); err != nil {
+		t.Fatalf("upsert memory: %v", err)
+	}
+
+	materializePriorMemories(database, cwd, entity.ID)
+
+	priorPath := filepath.Join(cwd, "task_memory", "prior-run.md")
+	body, err := os.ReadFile(priorPath)
+	if err != nil {
+		t.Fatalf("expected materialized prior at %s: %v", priorPath, err)
+	}
+	if string(body) != "what i did last time" {
+		t.Errorf("prior content = %q, want %q", string(body), "what i did last time")
+	}
+}
