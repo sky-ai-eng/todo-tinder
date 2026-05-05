@@ -25,7 +25,7 @@ const jiraFormattingSkillDirName = "jira-formatting"
 //go:embed prompts/jira_formatting_skill.md
 var jiraFormattingSkillTemplate string
 
-// materializeSpecSkill writes <cwd>/.claude/skills/<skillDirName>/SKILL.md
+// materializeSpecSkill writes <cwd>/.claude/skills/<specSkillDirName>/SKILL.md
 // containing the body of the project's effective spec-authorship prompt.
 // Resolution order: project's `spec_authorship_prompt_id`, then the
 // seeded `domain.SystemTicketSpecPromptID`. Either path falling through
