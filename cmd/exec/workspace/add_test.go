@@ -30,7 +30,9 @@ func TestSplitOwnerRepo(t *testing.T) {
 		{"no-slash", "", "", false},
 		{"/missing-owner", "", "", false},
 		{"missing-repo/", "", "", false},
-		{"too/many/slashes", "too", "many/slashes", true}, // SplitN keeps a /-bearing repo half intact; not our concern to reject
+		{"too/many/slashes", "", "", false},
+		{"trailing/", "", "", false},
+		{"a/b/", "", "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {
@@ -503,20 +505,22 @@ func TestMaterializeWorkspace_CreateFailureRetryable(t *testing.T) {
 	}
 }
 
-func TestMaterializeWorkspace_TooManySlashesAccepted(t *testing.T) {
-	// SplitN keeps "too/many/slashes" as ("too", "many/slashes").
-	// Verify the orchestration treats that as a configured-repo lookup
-	// against repoID "too/many/slashes" (which won't exist →
-	// errRepoNotConfigured), not a parse-time reject.
+func TestMaterializeWorkspace_TooManySlashesRejected(t *testing.T) {
+	// Inputs with extra slashes must reject at parse time rather than
+	// synthesizing a repoID like "too/many/slashes" that no configured
+	// repo could match — that would surface as a misleading "repo is
+	// not configured" instead of "invalid owner/repo." The rest of the
+	// codebase validates repo slugs as exactly one slash; this gate
+	// matches that.
 	database := newTestDB(t)
 	seedJiraRun(t, database, "r1", "SKY-1")
 	stub := &stubCalls{}
 
 	_, err := materializeWorkspace(database, "r1", "too/many/slashes", stub.deps())
-	if !errors.Is(err, errRepoNotConfigured) {
-		t.Errorf("err = %v, want errRepoNotConfigured", err)
+	if !errors.Is(err, errInvalidOwnerRepo) {
+		t.Errorf("err = %v, want errInvalidOwnerRepo", err)
 	}
-	if !strings.Contains(err.Error(), "too/many/slashes") {
-		t.Errorf("error %q should mention the full repoID", err.Error())
+	if stub.createCalls != 0 {
+		t.Errorf("createWorktree called for malformed input")
 	}
 }

@@ -219,9 +219,14 @@ func runAdd(database *db.DB, args []string) {
 	fmt.Println(path)
 }
 
-// splitOwnerRepo splits "owner/repo" once. Both halves must be non-empty.
+// splitOwnerRepo splits "owner/repo" — exactly one slash, both halves
+// non-empty. Inputs with extra slashes (`owner/repo/extra`) reject at
+// parse time rather than surfacing as a misleading "repo is not
+// configured" error after the lookup synthesizes a repo ID that no
+// configured repo could ever match. Matches the rest of the
+// codebase's slug convention.
 func splitOwnerRepo(s string) (owner, repo string, ok bool) {
-	parts := strings.SplitN(s, "/", 2)
+	parts := strings.Split(s, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return "", "", false
 	}
