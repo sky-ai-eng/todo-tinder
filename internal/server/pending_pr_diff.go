@@ -121,20 +121,26 @@ func truncateDiffAtFileBoundary(buf []byte, maxBytes int) (string, string) {
 }
 
 // gitCtx runs git in `dir` and discards stdout. Used for fetches
-// where we only care about success/failure.
+// where we only care about success/failure. The error includes the
+// full argv and the working dir so server-side log lines identify
+// exactly which invocation failed — diagnosing "diff failed" 502s
+// without that context means re-running by hand to figure out
+// which step broke.
 func gitCtx(ctx context.Context, dir string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git %s (in %s): %w: %s",
+			strings.Join(args, " "), dir, err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
 }
 
 // gitCtxOutput runs git in `dir` and returns stdout. Used for
-// commands whose output we care about (e.g. diff).
+// commands whose output we care about (e.g. diff). Same argv +
+// dir context as gitCtx so log lines stay actionable.
 func gitCtxOutput(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -142,7 +148,8 @@ func gitCtxOutput(ctx context.Context, dir string, args ...string) ([]byte, erro
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("git %s (in %s): %w: %s",
+			strings.Join(args, " "), dir, err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
 }

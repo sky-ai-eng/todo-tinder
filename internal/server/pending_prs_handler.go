@@ -138,6 +138,14 @@ func (s *Server) handlePendingPRDiff(w http.ResponseWriter, r *http.Request) {
 
 	diff, truncationNote, err := livePRDiff(r.Context(), pr.Owner, pr.Repo, pr.BaseBranch, pr.HeadBranch)
 	if err != nil {
+		// Server-side log with full row context so a 502 shows up
+		// in console logs as something diagnosable instead of a
+		// silent error. The pre-fix version returned the error in
+		// the response body but never logged anything, which made
+		// the "no errors in the backend" complaint accurate even
+		// when the failure was right there in `err`.
+		log.Printf("[pending-prs] diff failed for id=%s run=%s repo=%s/%s base=%s head=%s head_sha=%s: %v",
+			pr.ID, pr.RunID, pr.Owner, pr.Repo, pr.BaseBranch, pr.HeadBranch, pr.HeadSHA, err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "diff failed: " + err.Error()})
 		return
 	}
