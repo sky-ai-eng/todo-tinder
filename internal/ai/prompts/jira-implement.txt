@@ -47,8 +47,9 @@ Reading the tests for the area before reading the implementation is usually the 
 7. Implement the change. Commit incrementally with messages that explain the why, not just the what. Each commit should be self-contained and pass existing tests.
 8. Add or update tests so the requirement — not just the implementation — is covered. A test that would still pass if the requirement changed is a worse test.
 9. Run the relevant test suite for the touched area. Do not push if it is red.
-10. `git push`, then queue the PR for human approval via `{{BINARY_PATH}} exec gh pr create --title <T> --body <B> --base <base-branch>`. The description should link the Jira ticket, summarize the change in two to four sentences, and explicitly name anything you did not do and why. The push must precede the create — the head branch has to exist on the upstream for the PR to open. After you see the `queued_for_human_approval` response, do NOT call `pr create` again; the user opens the PR via the UI.
-11. Comment on the Jira ticket with the PR link and a brief summary that mirrors the PR description.
+10. Push the head branch to origin: `git push -u origin <branch>`. This MUST be a separate Bash call from anything that follows — do not chain commands with `&&`, `;`, or `$(...)` substitution; the permission allowlist matches per-call, and chained forms get rejected even when each piece would pass on its own.
+11. Queue the PR for human approval: `{{BINARY_PATH}} exec gh pr create --title <T> --body-file _scratch/pr-body.md --base <base-branch>`. Write the body to `_scratch/pr-body.md` first (separate Bash call) — the description should link the Jira ticket, summarize the change in two to four sentences, and explicitly name anything you did not do and why. After you see the `queued_for_human_approval` response, do NOT call `pr create` again; the user opens the PR via the UI.
+12. Comment on the Jira ticket with `{{BINARY_PATH}} exec jira ticket comment {{ISSUE_KEY}} --body "Triage Factory auto-PR: <pr_html_url>"`. That is the entire body — no summary, no AC recap. The PR description and the Triage Factory footer carry the detail; duplicating them in the Jira thread just clutters it.
 </process>
 
 <self_check>
