@@ -190,6 +190,17 @@ func main() {
 		log.Fatalf("failed to migrate database: %v", err)
 	}
 
+	// Wire the config package against the DB and run the one-shot
+	// import of any pre-DB ~/.triagefactory/config.yaml. Must happen
+	// after Migrate (settings table is created there) and before any
+	// config.Load / Save call.
+	if err := config.Init(database); err != nil {
+		log.Fatalf("failed to initialize config: %v", err)
+	}
+	if err := config.MigrateLegacyYAML(database); err != nil {
+		log.Printf("[config] legacy YAML import: %v (continuing with defaults)", err)
+	}
+
 	addr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Triage Factory running at http://localhost%s\n", addr)
 

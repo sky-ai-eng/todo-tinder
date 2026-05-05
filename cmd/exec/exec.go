@@ -28,9 +28,9 @@ func Handle(args []string) {
 		os.Exit(1)
 	}
 
-	cfg, _ := config.Load()
-
-	// Open DB for local state (pending reviews, etc.)
+	// Open DB for local state (pending reviews, etc.). Config now lives
+	// in a settings row, so config.Load() requires an initialized DB —
+	// open + migrate before calling Init/Load.
 	conn, err := db.Open()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening database: %v\n", err)
@@ -41,6 +41,14 @@ func Handle(args []string) {
 		fmt.Fprintf(os.Stderr, "error running migrations: %v\n", err)
 		os.Exit(1)
 	}
+	if err := config.Init(conn); err != nil {
+		fmt.Fprintf(os.Stderr, "error initializing config: %v\n", err)
+		os.Exit(1)
+	}
+	if err := config.MigrateLegacyYAML(conn); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: legacy config import: %v\n", err)
+	}
+	cfg, _ := config.Load()
 	database := &db.DB{Conn: conn}
 
 	cmd := args[0]
