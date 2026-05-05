@@ -10,7 +10,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-
 // SeedOrUpdateSystemPrompt inserts a shipped prompt if missing, or updates it
 // when the shipped body changes and the local row has not been user-modified.
 // Version state is recorded in system_prompt_versions for idempotent reseeding.
