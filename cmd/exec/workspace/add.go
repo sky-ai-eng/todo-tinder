@@ -2,7 +2,9 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -10,70 +12,100 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
-// runAdd materializes a worktree for the run identified by
-// $TRIAGE_FACTORY_RUN_ID. Prints the absolute worktree path on stdout
-// (no decoration) so the agent can `cd "$(... workspace add owner/repo)"`.
+// addDeps abstracts the side-effecting collaborators of materializeWorkspace
+// so tests can stub the worktree mutations without invoking real git or
+// touching the filesystem. Production wiring uses defaultAddDeps which
+// delegates to the worktree package.
 //
-// Idempotent: if `add` was already called for this (run, repo), the
-// existing worktree's path is printed and exit is 0 — no second
-// `git worktree add`, no duplicate row.
-func runAdd(database *db.DB, args []string) {
-	if len(args) == 0 {
-		exitErr("workspace add: missing argument; expected owner/repo")
+// Only the worktree-mutating surface is injectable. The DB calls go through
+// the supplied *db.DB directly because tests already have a real in-memory
+// SQLite via newTestDB; mocking the DB layer would test less of the actual
+// SQL than letting it run.
+type addDeps struct {
+	createWorktree func(ctx context.Context, owner, repo, cloneURL, baseBranch, featureBranch, runID, runRoot string) (string, error)
+	removeWorktree func(path, runID string) error
+}
+
+func defaultAddDeps() addDeps {
+	return addDeps{
+		createWorktree: worktree.CreateForBranchInRoot,
+		removeWorktree: worktree.RemoveAt,
 	}
-	ownerRepo := strings.TrimSpace(args[0])
-	owner, repo, ok := splitOwnerRepo(ownerRepo)
+}
+
+// validation errors returned by materializeWorkspace. Callers translate
+// these into stderr messages + non-zero exit; tests assert on identity.
+var (
+	errMissingRunID        = errors.New("workspace add: TRIAGE_FACTORY_RUN_ID not set; this command must be invoked by the delegated agent")
+	errInvalidOwnerRepo    = errors.New("workspace add: invalid owner/repo")
+	errRunNotFound         = errors.New("workspace add: run not found")
+	errTaskNotFound        = errors.New("workspace add: task not found")
+	errNotJiraRun          = errors.New("workspace add: only supported for Jira runs; GitHub PR runs have an eagerly-materialized worktree")
+	errRepoNotConfigured   = errors.New("workspace add: repo is not configured in Triage Factory; add it on the Settings page first")
+	errRepoMissingCloneURL = errors.New("workspace add: repo has no clone URL on its profile; try re-profiling from the Settings page")
+)
+
+// materializeWorkspace is the orchestration body of `workspace add`,
+// extracted from runAdd so it returns errors instead of os.Exit-ing.
+// Returns the absolute worktree path the agent should cd into.
+//
+// Order matters:
+//  1. Run + task validation (and Jira-vs-GitHub gate).
+//  2. Idempotency check via run_worktrees — second add for same (run, repo)
+//     short-circuits before we touch git or repo profiles.
+//  3. Repo-profile lookup (must be configured AND have a clone URL).
+//  4. Worktree create on disk.
+//  5. DB record. On insert failure (write error or race-loss against a
+//     concurrent add) the just-created worktree is rolled back via
+//     removeWorktree so the spawner's cleanup defer (which lists
+//     run_worktrees) doesn't leak an orphan entry.
+func materializeWorkspace(database *db.DB, runID, ownerRepoArg string, deps addDeps) (string, error) {
+	owner, repo, ok := splitOwnerRepo(ownerRepoArg)
 	if !ok {
-		exitErr("workspace add: invalid owner/repo: " + args[0])
+		return "", fmt.Errorf("%w: %q", errInvalidOwnerRepo, ownerRepoArg)
 	}
 	repoID := owner + "/" + repo
 
-	runID := os.Getenv("TRIAGE_FACTORY_RUN_ID")
 	if runID == "" {
-		exitErr("workspace add: TRIAGE_FACTORY_RUN_ID not set; this command must be invoked by the delegated agent")
+		return "", errMissingRunID
 	}
 
-	// Validate the run exists and is a Jira run. GitHub PR runs have a
-	// pre-materialized worktree managed by the spawner; allowing a
-	// `workspace add` against them would create a parallel worktree the
-	// spawner doesn't know to clean up.
 	run, err := db.GetAgentRun(database.Conn, runID)
 	if err != nil {
-		exitErr("workspace add: load run: " + err.Error())
+		return "", fmt.Errorf("workspace add: load run: %w", err)
 	}
 	if run == nil {
-		exitErr("workspace add: run " + runID + " not found")
+		return "", fmt.Errorf("%w: %s", errRunNotFound, runID)
 	}
 	task, err := db.GetTask(database.Conn, run.TaskID)
 	if err != nil {
-		exitErr("workspace add: load task: " + err.Error())
+		return "", fmt.Errorf("workspace add: load task: %w", err)
 	}
 	if task == nil {
-		exitErr("workspace add: task " + run.TaskID + " not found")
+		return "", fmt.Errorf("%w: %s", errTaskNotFound, run.TaskID)
 	}
 	if task.EntitySource != "jira" {
-		exitErr("workspace add: only supported for Jira runs (this run's task source is " + task.EntitySource + "); GitHub PR runs have an eagerly-materialized worktree")
+		return "", fmt.Errorf("%w (run task source is %q)", errNotJiraRun, task.EntitySource)
 	}
 
-	// Idempotency: if already materialized for this (run, repo), reuse.
+	// Idempotent re-add: short-circuit before touching git or profiles.
 	existing, err := db.GetRunWorktreeByRepo(database.Conn, runID, repoID)
 	if err != nil {
-		exitErr("workspace add: lookup existing worktree: " + err.Error())
+		return "", fmt.Errorf("workspace add: lookup existing worktree: %w", err)
 	}
 	if existing != nil {
-		fmt.Println(existing.Path)
-		return
+		return existing.Path, nil
 	}
 
 	profile, err := db.GetRepoProfile(database.Conn, repoID)
 	if err != nil {
-		exitErr("workspace add: load repo profile: " + err.Error())
+		return "", fmt.Errorf("workspace add: load repo profile: %w", err)
 	}
 	if profile == nil {
-		exitErr("workspace add: repo " + repoID + " is not configured in Triage Factory; add it on the Settings page first")
+		return "", fmt.Errorf("%w: %s", errRepoNotConfigured, repoID)
 	}
 	if profile.CloneURL == "" {
-		exitErr("workspace add: repo " + repoID + " has no clone URL on its profile; try re-profiling from the Settings page")
+		return "", fmt.Errorf("%w: %s", errRepoMissingCloneURL, repoID)
 	}
 
 	baseBranch := profile.BaseBranch
@@ -83,7 +115,7 @@ func runAdd(database *db.DB, args []string) {
 	featureBranch := "feature/" + task.EntitySourceID
 	runRoot := worktree.RunRoot(runID)
 
-	wtPath, err := worktree.CreateForBranchInRoot(
+	wtPath, err := deps.createWorktree(
 		context.Background(),
 		profile.Owner, profile.Repo,
 		profile.CloneURL,
@@ -91,7 +123,7 @@ func runAdd(database *db.DB, args []string) {
 		runID, runRoot,
 	)
 	if err != nil {
-		exitErr("workspace add: create worktree: " + err.Error())
+		return "", fmt.Errorf("workspace add: create worktree: %w", err)
 	}
 
 	inserted, winningPath, err := db.InsertRunWorktree(database.Conn, db.RunWorktree{
@@ -101,30 +133,50 @@ func runAdd(database *db.DB, args []string) {
 		FeatureBranch: featureBranch,
 	})
 	if err != nil {
-		// Failed to record the row — the worktree is on disk but the
-		// spawner's cleanup defer (which lists run_worktrees) won't
-		// reap it. Roll back the on-disk worktree so the run terminates
-		// cleanly, surface the error, and let the agent retry.
-		if rmErr := worktree.RemoveAt(wtPath, runID); rmErr != nil {
-			fmt.Fprintf(os.Stderr, "workspace add: rollback after insert failure: %v\n", rmErr)
+		// Insert failed — the worktree is on disk but the spawner's
+		// cleanup defer (which lists run_worktrees) won't see it. Roll
+		// back the on-disk side so we don't leak. Rollback failures are
+		// logged but don't shadow the original error the caller needs.
+		if rmErr := deps.removeWorktree(wtPath, runID); rmErr != nil {
+			log.Printf("workspace add: rollback after insert failure: %v", rmErr)
 		}
-		exitErr("workspace add: record worktree: " + err.Error())
+		return "", fmt.Errorf("workspace add: record worktree: %w", err)
 	}
 	if !inserted {
 		// Race-loss: another concurrent `workspace add` for the same
-		// (run, repo) won. Their on-disk worktree is registered in the
-		// row that won; ours is a duplicate at the same path that we
-		// must remove to avoid an orphan registration. Same target
-		// path, but RemoveAt + pruneAll on the loser still resets the
-		// bare's tracking cleanly.
-		if rmErr := worktree.RemoveAt(wtPath, runID); rmErr != nil {
-			fmt.Fprintf(os.Stderr, "workspace add: cleanup loser worktree after race: %v\n", rmErr)
+		// (run, repo) won the PK conflict. Clean up our duplicate
+		// on-disk worktree (same target path, but RemoveAt + pruneAll
+		// still resets the bare's tracking cleanly) and return the
+		// winning row's path so the agent cd's into the canonical one.
+		if rmErr := deps.removeWorktree(wtPath, runID); rmErr != nil {
+			log.Printf("workspace add: cleanup loser worktree after race: %v", rmErr)
 		}
-		fmt.Println(winningPath)
-		return
+		return winningPath, nil
 	}
 
-	fmt.Println(wtPath)
+	return wtPath, nil
+}
+
+// runAdd is the CLI entrypoint: argv → materializeWorkspace → stdout/stderr.
+// All errors translate into exitErr so the caller process gets a non-zero
+// exit and the agent sees a clear message on stderr. Successful resolution
+// (first add or idempotent re-add) prints the absolute worktree path on
+// stdout for `cd "$(... workspace add owner/repo)"`.
+func runAdd(database *db.DB, args []string) {
+	if len(args) == 0 {
+		exitErr("workspace add: missing argument; expected owner/repo")
+	}
+
+	path, err := materializeWorkspace(
+		database,
+		os.Getenv("TRIAGE_FACTORY_RUN_ID"),
+		strings.TrimSpace(args[0]),
+		defaultAddDeps(),
+	)
+	if err != nil {
+		exitErr(err.Error())
+	}
+	fmt.Println(path)
 }
 
 // splitOwnerRepo splits "owner/repo" once. Both halves must be non-empty.
