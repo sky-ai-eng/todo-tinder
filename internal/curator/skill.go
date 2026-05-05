@@ -2,6 +2,7 @@ package curator
 
 import (
 	"database/sql"
+	_ "embed" // required by //go:embed
 	"fmt"
 	"log"
 	"os"
@@ -12,12 +13,17 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// skillDirName is the per-session subdirectory Claude Code scans for
+// specSkillDirName is the per-session subdirectory Claude Code scans for
 // project-scoped skills. Claude Code globs `<cwd>/.claude/skills/*/SKILL.md`
 // at session start and (best-effort) on resume, so writing into this
 // path before each dispatch is what makes the per-project ticket-spec
 // guidance available to the model as a discoverable skill.
-const skillDirName = "ticket-spec"
+const specSkillDirName = "ticket-spec"
+
+const jiraFormattingSkillDirName = "jira-formatting"
+
+//go:embed prompts/jira_formatting_skill.md
+var jiraFormattingSkillTemplate string
 
 // materializeSpecSkill writes <cwd>/.claude/skills/<skillDirName>/SKILL.md
 // containing the body of the project's effective spec-authorship prompt.
@@ -42,7 +48,7 @@ func materializeSpecSkill(database *sql.DB, project *domain.Project, cwd string)
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(cwd, ".claude", "skills", skillDirName)
+	dir := filepath.Join(cwd, ".claude", "skills", specSkillDirName)
 	path := filepath.Join(dir, "SKILL.md")
 
 	if prompt == nil || strings.TrimSpace(prompt.Body) == "" {
@@ -62,6 +68,23 @@ func materializeSpecSkill(database *sql.DB, project *domain.Project, cwd string)
 	contents := renderSkillFile(prompt.Name, prompt.Body)
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		return fmt.Errorf("write SKILL.md: %w", err)
+	}
+	return nil
+}
+
+// materializeJiraFormattingSkill writes a built-in, always-on skill that teaches
+// the Curator Jira-flavored markup (h2., {{inline code}}, {code} blocks, etc.).
+// Unlike ticket-spec, this guidance is intentionally not user-configurable and
+// should be present regardless of tracker integrations.
+func materializeJiraFormattingSkill(cwd string) error {
+	dir := filepath.Join(cwd, ".claude", "skills", jiraFormattingSkillDirName)
+	path := filepath.Join(dir, "SKILL.md")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create jira formatting skill dir: %w", err)
+	}
+	contents := strings.TrimSpace(jiraFormattingSkillTemplate) + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		return fmt.Errorf("write jira formatting SKILL.md: %w", err)
 	}
 	return nil
 }
@@ -104,7 +127,7 @@ func renderSkillFile(promptName, body string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString("name: ")
-	b.WriteString(skillDirName)
+	b.WriteString(specSkillDirName)
 	b.WriteString("\n")
 	b.WriteString("description: ")
 	b.WriteString(description)

@@ -274,6 +274,9 @@ func (s *projectSession) dispatch(requestID string) {
 	if err := materializeSpecSkill(s.curator.database, project, cwd); err != nil {
 		log.Printf("[curator] warning: materialize spec skill for project %s: %v", s.projectID, err)
 	}
+	if err := materializeJiraFormattingSkill(cwd); err != nil {
+		log.Printf("[curator] warning: materialize jira formatting skill for project %s: %v", s.projectID, err)
+	}
 
 	outcome, runErr := agentproc.Run(msgCtx, agentproc.RunOptions{
 		Cwd:          cwd,

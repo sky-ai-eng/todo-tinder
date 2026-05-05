@@ -193,3 +193,28 @@ func TestMaterializeSpecSkill_NoPromptClearsStaleFile(t *testing.T) {
 		t.Errorf("expected stale SKILL.md to be removed when no prompt resolves, stat err=%v", err)
 	}
 }
+
+func TestMaterializeJiraFormattingSkill_WritesBuiltInSkill(t *testing.T) {
+	cwd := t.TempDir()
+	if err := materializeJiraFormattingSkill(cwd); err != nil {
+		t.Fatalf("materialize jira formatting skill: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cwd, ".claude", "skills", "jira-formatting", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read SKILL.md: %v", err)
+	}
+	contents := string(data)
+	if !strings.Contains(contents, "name: jira-formatting") {
+		t.Error("expected jira-formatting frontmatter name")
+	}
+	if !strings.Contains(contents, "h2. Heading") {
+		t.Error("expected heading guidance")
+	}
+	if !strings.Contains(contents, "{{variable_name}}") {
+		t.Error("expected inline code guidance")
+	}
+	if !strings.Contains(contents, "{code}") {
+		t.Error("expected code block guidance")
+	}
+}
