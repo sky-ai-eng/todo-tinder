@@ -472,14 +472,23 @@ func prCreate(client *ghclient.Client, database *db.DB, args []string) {
 	// matched, so we hard-fail with a clear "did you forget to
 	// push?" message that teaches the agent how to retry — cheaper
 	// than letting the agent finish the run with a broken row.
-	lsRemote := exec.Command("git", "ls-remote", "--exit-code", "--heads", "origin", head)
-	var lsStderr strings.Builder
-	lsRemote.Stderr = &lsStderr
-	if err := lsRemote.Run(); err != nil {
-		exitErr(fmt.Sprintf(
-			"head branch '%s' is not on origin. Run `git push origin %s` first, then retry `pr create`. `pr create` requires the head branch to exist on the upstream — without it the diff cannot be rendered for human approval. (git ls-remote stderr: %s)",
-			head, head, strings.TrimSpace(lsStderr.String()),
-		))
+	//
+	// However, this preflight relies on the current working directory's
+	// git configuration (`origin`). When the caller targets a repository
+	// explicitly (for example via `--repo` and `--head`) from outside a
+	// local checkout, there is no worktree to query and we should let the
+	// request proceed to the GitHub API instead of failing early here.
+	inWorkTree := exec.Command("git", "rev-parse", "--is-inside-work-tree")
+	if err := inWorkTree.Run(); err == nil {
+		lsRemote := exec.Command("git", "ls-remote", "--exit-code", "--heads", "origin", head)
+		var lsStderr strings.Builder
+		lsRemote.Stderr = &lsStderr
+		if err := lsRemote.Run(); err != nil {
+			exitErr(fmt.Sprintf(
+				"head branch '%s' is not on origin. Run `git push origin %s` first, then retry `pr create`. `pr create` requires the head branch to exist on the upstream — without it the diff cannot be rendered for human approval. (git ls-remote stderr: %s)",
+				head, head, strings.TrimSpace(lsStderr.String()),
+			))
+		}
 	}
 
 	if os.Getenv("TRIAGE_FACTORY_REVIEW_PREVIEW") == "1" {
