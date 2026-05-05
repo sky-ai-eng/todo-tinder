@@ -1,0 +1,250 @@
+import { useState } from 'react'
+import Markdown from 'react-markdown'
+
+interface Props {
+  owner: string
+  repo: string
+  headBranch: string
+  baseBranch: string
+  headSHA: string
+  title: string
+  body: string
+  draft: boolean
+  onUpdateTitle: (title: string) => void
+  onUpdateBody: (body: string) => void
+  onUpdateDraft: (draft: boolean) => void
+  onSubmit: () => void
+  onClose: () => void
+  submitting: boolean
+}
+
+// PendingPRSummary is the title/body editor + Open-PR button for the
+// pending-PR overlay. Mirrors ReviewSummary's shape (header, body
+// editor with Markdown preview, footer action cluster) but with PR-
+// specific affordances:
+//   - title editable as a single-line input (reviews don't have a
+//     title field)
+//   - draft checkbox alongside the submit button (reviews don't have
+//     a draft state)
+//   - branch arrow header instead of #PR-number (the PR doesn't
+//     exist yet)
+//   - explicit-Save UX matching ReviewSummary (no autosave)
+export default function PendingPRSummary({
+  owner,
+  repo,
+  headBranch,
+  baseBranch,
+  headSHA,
+  title,
+  body,
+  draft,
+  onUpdateTitle,
+  onUpdateBody,
+  onUpdateDraft,
+  onSubmit,
+  onClose,
+  submitting,
+}: Props) {
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [editingBody, setEditingBody] = useState(false)
+  const [rawView, setRawView] = useState(false)
+  const [titleDraft, setTitleDraft] = useState(title)
+  const [bodyDraft, setBodyDraft] = useState(body)
+
+  const saveTitle = () => {
+    onUpdateTitle(titleDraft)
+    setEditingTitle(false)
+  }
+  const cancelTitle = () => {
+    setTitleDraft(title)
+    setEditingTitle(false)
+  }
+  const saveBody = () => {
+    onUpdateBody(bodyDraft)
+    setEditingBody(false)
+  }
+  const cancelBody = () => {
+    setBodyDraft(body)
+    setEditingBody(false)
+  }
+
+  return (
+    <div className="backdrop-blur-xl bg-surface-raised/70 border border-border-glass rounded-2xl shadow-sm shadow-black/[0.02] overflow-hidden">
+      {/* Header */}
+      <div className="px-5 pt-5 pb-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="text-[15px] font-semibold text-text-primary tracking-tight">
+              Pending PR
+            </h2>
+            <p className="text-[12px] text-text-tertiary mt-0.5 font-mono truncate">
+              {owner}/{repo} &middot; {headBranch} &rarr; {baseBranch}
+            </p>
+            <p className="text-[10.5px] text-text-tertiary/70 mt-0.5 font-mono">
+              queued at {headSHA.slice(0, 7)}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Title (editable) */}
+      <div className="px-5 pb-3">
+        {editingTitle ? (
+          <div className="space-y-2">
+            <input
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              className="w-full text-[14px] font-medium text-text-primary bg-white/40 border border-border-subtle rounded-xl px-4 py-2.5 focus:outline-none focus:border-accent/30 focus:ring-1 focus:ring-accent/10"
+              placeholder="PR title"
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') saveTitle()
+                if (e.key === 'Escape') cancelTitle()
+              }}
+            />
+            <div className="flex items-center gap-2 justify-end">
+              <button
+                onClick={cancelTitle}
+                className="text-[11px] text-text-tertiary hover:text-text-secondary px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveTitle}
+                className="text-[11px] font-medium text-white bg-accent hover:bg-accent/90 px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div
+            onClick={() => {
+              setTitleDraft(title)
+              setEditingTitle(true)
+            }}
+            className="bg-white/30 rounded-xl px-4 py-2.5 border border-transparent hover:border-border-subtle transition-colors cursor-text group"
+          >
+            <span className="text-[14px] font-medium text-text-primary">
+              {title || <span className="text-text-tertiary italic">No title</span>}
+            </span>
+            <span className="text-[10px] text-text-tertiary/70 ml-2 opacity-0 group-hover:opacity-100 transition-opacity">
+              click to edit
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Body */}
+      <div className="px-5 pb-4">
+        {editingBody ? (
+          <div className="space-y-2">
+            <textarea
+              value={bodyDraft}
+              onChange={(e) => setBodyDraft(e.target.value)}
+              className="w-full min-h-[120px] text-[13px] leading-relaxed text-text-primary bg-white/40 border border-border-subtle rounded-xl px-4 py-3 resize-y focus:outline-none focus:border-accent/30 focus:ring-1 focus:ring-accent/10 font-mono"
+              placeholder="PR body (markdown supported)..."
+              autoFocus
+            />
+            <div className="flex items-center gap-2 justify-end">
+              <button
+                onClick={cancelBody}
+                className="text-[11px] text-text-tertiary hover:text-text-secondary px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveBody}
+                className="text-[11px] font-medium text-white bg-accent hover:bg-accent/90 px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="relative group">
+            <div className="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+              <button
+                onClick={() => setRawView(!rawView)}
+                className="text-[10px] text-text-tertiary hover:text-text-secondary px-1.5 py-0.5 rounded bg-white/60 border border-border-subtle transition-colors"
+              >
+                {rawView ? 'Preview' : 'Raw'}
+              </button>
+              <button
+                onClick={() => {
+                  setBodyDraft(body)
+                  setEditingBody(true)
+                }}
+                className="text-[10px] text-text-tertiary hover:text-accent px-1.5 py-0.5 rounded bg-white/60 border border-border-subtle transition-colors"
+              >
+                Edit
+              </button>
+            </div>
+
+            <div className="bg-white/30 rounded-xl px-4 py-3 border border-transparent hover:border-border-subtle transition-colors min-h-[48px]">
+              {!body ? (
+                <span
+                  onClick={() => {
+                    setBodyDraft(body)
+                    setEditingBody(true)
+                  }}
+                  className="text-[13px] text-text-tertiary italic cursor-text"
+                >
+                  No description
+                </span>
+              ) : rawView ? (
+                <pre className="text-[12.5px] leading-relaxed text-text-secondary font-mono whitespace-pre-wrap">
+                  {body}
+                </pre>
+              ) : (
+                <div className="review-markdown text-[13px] leading-relaxed text-text-secondary">
+                  <Markdown>{body}</Markdown>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Footer actions */}
+      <div className="px-5 py-3 border-t border-border-subtle flex items-center justify-between">
+        <label className="flex items-center gap-2 text-[12px] text-text-secondary cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={draft}
+            onChange={(e) => onUpdateDraft(e.target.checked)}
+            className="w-3.5 h-3.5 rounded border-border-subtle text-accent focus:ring-accent/30"
+          />
+          Open as draft
+        </label>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onClose}
+            className="text-[11px] font-medium text-text-tertiary hover:text-text-primary px-3 py-1.5 rounded-lg transition-colors"
+          >
+            Close
+          </button>
+          <button
+            onClick={onSubmit}
+            disabled={submitting}
+            className={`flex items-center gap-1.5 text-[12px] font-semibold px-4 py-2 rounded-xl transition-all duration-150 ${
+              submitting
+                ? 'bg-accent/50 text-white/70 cursor-not-allowed'
+                : 'text-white bg-claim hover:bg-claim/90'
+            }`}
+          >
+            {submitting ? (
+              <>
+                <span className="inline-block w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />
+                Opening...
+              </>
+            ) : (
+              <>Open PR</>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}

@@ -5,6 +5,7 @@ import AgentCard from '../components/AgentCard'
 import TaskCard from '../components/TaskCard'
 import PromptPicker from '../components/PromptPicker'
 import ReviewOverlay from '../components/ReviewOverlay'
+import PendingPROverlay from '../components/PendingPROverlay'
 import EventBadge from '../components/EventBadge'
 import SourceBadge from '../components/SourceBadge'
 import { motion, AnimatePresence } from 'motion/react'
@@ -54,8 +55,13 @@ export default function Board() {
   const [showPromptPicker, setShowPromptPicker] = useState(false)
   const pendingDelegateTask = useRef<Task | null>(null)
 
-  // Review overlay
-  const [reviewRunID, setReviewRunID] = useState<string | null>(null)
+  // Approval overlay — review or PR depending on which side table the
+  // run's pending_approval came from. The run's pending_kind field
+  // (set server-side in runResponse) drives which overlay opens.
+  const [approvalCtx, setApprovalCtx] = useState<{
+    runID: string
+    kind: 'review' | 'pr'
+  } | null>(null)
 
   const fetchTasks = useCallback(async () => {
     try {
@@ -627,7 +633,11 @@ export default function Board() {
                       run={agentRuns[task.id]}
                       messages={agentMessages[agentRuns[task.id].ID] || []}
                       onRequeue={() => handleRequeue(task.id)}
-                      onReview={() => setReviewRunID(agentRuns[task.id].ID)}
+                      onReview={() => {
+                        const run = agentRuns[task.id]
+                        const kind: 'review' | 'pr' = run.pending_kind === 'pr' ? 'pr' : 'review'
+                        setApprovalCtx({ runID: run.ID, kind })
+                      }}
                     />
                   ) : (
                     <SortableTaskCard
@@ -663,7 +673,11 @@ export default function Board() {
                       run={agentRuns[task.id]}
                       messages={agentMessages[agentRuns[task.id].ID] || []}
                       onRequeue={() => handleRequeue(task.id)}
-                      onReview={() => setReviewRunID(agentRuns[task.id].ID)}
+                      onReview={() => {
+                        const run = agentRuns[task.id]
+                        const kind: 'review' | 'pr' = run.pending_kind === 'pr' ? 'pr' : 'review'
+                        setApprovalCtx({ runID: run.ID, kind })
+                      }}
                     />
                   ) : (
                     <SortableTaskCard
@@ -696,7 +710,11 @@ export default function Board() {
                       run={agentRuns[task.id]}
                       messages={agentMessages[agentRuns[task.id].ID] || []}
                       onRequeue={() => handleRequeue(task.id)}
-                      onReview={() => setReviewRunID(agentRuns[task.id].ID)}
+                      onReview={() => {
+                        const run = agentRuns[task.id]
+                        const kind: 'review' | 'pr' = run.pending_kind === 'pr' ? 'pr' : 'review'
+                        setApprovalCtx({ runID: run.ID, kind })
+                      }}
                     />
                   ) : (
                     <SortableTaskCard
@@ -736,12 +754,23 @@ export default function Board() {
         }}
       />
 
-      {/* Review overlay for pending_approval runs */}
+      {/* Approval overlay for pending_approval runs.
+          Branches on the run's pending_kind so a queued review opens
+          ReviewOverlay (with inline-comment editing) and a queued PR
+          opens PendingPROverlay (title/body editor). */}
       <ReviewOverlay
-        runID={reviewRunID ?? ''}
-        open={reviewRunID !== null}
+        runID={approvalCtx?.kind === 'review' ? approvalCtx.runID : ''}
+        open={approvalCtx?.kind === 'review'}
         onClose={() => {
-          setReviewRunID(null)
+          setApprovalCtx(null)
+          fetchTasks()
+        }}
+      />
+      <PendingPROverlay
+        runID={approvalCtx?.kind === 'pr' ? approvalCtx.runID : ''}
+        open={approvalCtx?.kind === 'pr'}
+        onClose={() => {
+          setApprovalCtx(null)
           fetchTasks()
         }}
       />

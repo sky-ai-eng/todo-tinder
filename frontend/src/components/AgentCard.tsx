@@ -292,7 +292,7 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
               onClick={onReview}
               className="text-[12px] font-semibold text-snooze bg-snooze/10 hover:bg-snooze/20 px-3 py-1 rounded-lg transition-colors"
             >
-              Review
+              {run.pending_kind === 'pr' ? 'Open PR' : 'Review'}
             </button>
           )}
           <a
