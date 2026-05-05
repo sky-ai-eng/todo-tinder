@@ -445,6 +445,21 @@ func prCreate(client *ghclient.Client, database *db.DB, args []string) {
 			exitErr("git rev-parse HEAD returned empty; refusing to queue a pending PR with no head sha")
 		}
 
+		// SKY-212-style anti-retry. The schema's UNIQUE(run_id) on
+		// pending_prs would already block a second insert, but it
+		// surfaces as a generic SQL constraint error that doesn't
+		// teach the agent to stop calling. Check up front so the
+		// agent gets a clear "already queued" message on retry,
+		// matching what submit-review does for reviews.
+		if existing, err := db.PendingPRByRunID(database.Conn, runID); err != nil {
+			exitErr("lookup existing pending PR for run: " + err.Error())
+		} else if existing != nil {
+			exitErr(fmt.Sprintf(
+				"a PR for run %s has already been queued for human approval. Do not call pr create again — your work is complete. Finish the run by writing task_memory/<run_id>.md and returning your completion JSON.",
+				runID,
+			))
+		}
+
 		id := uuid.NewString()
 		if err := db.CreatePendingPR(database.Conn, domain.PendingPR{
 			ID: id, RunID: runID,
@@ -454,8 +469,13 @@ func prCreate(client *ghclient.Client, database *db.DB, args []string) {
 		}); err != nil {
 			exitErr("failed to insert pending PR: " + err.Error())
 		}
-		// LockPendingPR seals against the agent calling pr create
-		// twice (SKY-212 anti-retry pattern from prSubmitReview).
+		// LockPendingPR is the second layer — it shouldn't trip in
+		// practice now that we pre-check above, but it's still load-
+		// bearing for the race where two `pr create` invocations
+		// arrive at this point simultaneously (the pre-check happens
+		// in two separate connections and both see "no existing
+		// row"). The lock's WHERE locked = 0 gate serializes them at
+		// the DB layer; the loser sees ErrPendingPRAlreadyQueued.
 		if err := db.LockPendingPR(database.Conn, id, title, body); err != nil {
 			if errors.Is(err, db.ErrPendingPRAlreadyQueued) {
 				exitErr(fmt.Sprintf(
