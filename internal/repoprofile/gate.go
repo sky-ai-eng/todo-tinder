@@ -8,16 +8,17 @@ import (
 
 // ProfileGate coordinates access to repo profiles. The scorer checks
 // Ready() before running; the profiler calls Signal() when done.
-// Invalidate() resets the gate and clears stale repo matches from the DB.
+// Invalidate() flips Ready back to false until the next Signal.
 type ProfileGate struct {
-	mu       sync.Mutex
-	ready    bool
-	database *sql.DB
+	mu    sync.Mutex
+	ready bool
 }
 
-// NewProfileGate creates a gate in the not-ready state.
-func NewProfileGate(database *sql.DB) *ProfileGate {
-	return &ProfileGate{database: database}
+// NewProfileGate creates a gate in the not-ready state. The database
+// argument is preserved for callers that already pass it; the gate
+// itself no longer touches the DB.
+func NewProfileGate(_ *sql.DB) *ProfileGate {
+	return &ProfileGate{}
 }
 
 // Ready returns true if profiling has completed and repo data is current.
@@ -36,17 +37,14 @@ func (g *ProfileGate) Signal() {
 }
 
 // Invalidate marks profiling as stale (e.g., GitHub repos changed).
-// Clears matched_repos and blocked_reason on all tasks so they get
-// re-scored with fresh profiles on the next cycle.
+// The scorer's gate (Ready) flips back to false until Signal fires
+// again post-reprofile. There's no per-task matched-repo column to
+// clear anymore — repo selection is the agent's responsibility at
+// delegation time, materialized lazily via `triagefactory exec
+// workspace add`.
 func (g *ProfileGate) Invalidate() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.ready = false
-	log.Println("[repoprofile] gate: invalidated, clearing stale repo matches")
-
-	if g.database != nil {
-		if _, err := g.database.Exec(`UPDATE tasks SET matched_repos = NULL, blocked_reason = NULL`); err != nil {
-			log.Printf("[repoprofile] gate: failed to clear repo matches: %v", err)
-		}
-	}
+	log.Println("[repoprofile] gate: invalidated; will re-signal after re-profile")
 }

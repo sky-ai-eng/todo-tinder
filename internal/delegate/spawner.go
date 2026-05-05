@@ -293,7 +293,7 @@ func (s *Spawner) Takeover(runID, baseDir string) (*TakeoverResult, error) {
 		return nil, fmt.Errorf("%w: run %s has no session id yet — wait until the agent has started", ErrTakeoverInvalidState, runID)
 	}
 	if run.WorktreePath == "" {
-		return nil, fmt.Errorf("%w: run %s has no worktree to take over (no-repo Jira run)", ErrTakeoverInvalidState, runID)
+		return nil, fmt.Errorf("%w: run %s has no worktree to take over (Jira lazy runs materialize per-repo worktrees on demand and aren't yet supported for takeover)", ErrTakeoverInvalidState, runID)
 	}
 
 	// Atomically: confirm the run is still active, confirm we haven't
@@ -449,13 +449,27 @@ func (s *Spawner) abortTakeover(runID, claudeCwd, destPath string) {
 }
 
 // runConfig holds everything the generic agent runner needs.
+//
+// Two delegation shapes share this struct:
+//
+//   - GitHub PR (eager): hasWT=true, wtPath is the worktree, runRoot=wtPath
+//     (the worktree IS the run-root), owner/repo populated from the PR.
+//     Cleanup uses RemoveAt(wtPath) + CleanupPRConfig.
+//
+//   - Jira (lazy): hasWT=false, wtPath=runRoot is the throwaway run-root
+//     (initial cwd; holds task_memory/ but no codebase), owner/repo empty.
+//     Per-repo worktrees materialize as subdirs under runRoot via the
+//     `triagefactory exec workspace add` CLI; the run_worktrees DB table
+//     is the source of truth for cleanup, which iterates the table at
+//     runAgent terminal.
 type runConfig struct {
 	scope    string // what the agent is scoped to (repo, PR, issue)
 	toolsRef string // tool documentation to inject
-	wtPath   string // worktree path (empty = no working directory)
-	hasWT    bool   // whether a worktree was created (controls cleanup)
-	owner    string // resolved GitHub owner (empty for no-repo Jira runs)
-	repo     string // resolved GitHub repo (empty for no-repo Jira runs)
+	wtPath   string // initial cwd: GitHub PR worktree, or Jira run-root
+	hasWT    bool   // GitHub PR has a real worktree to clean up via RemoveAt; Jira's worktrees are tracked in run_worktrees and cleaned by iterating that table
+	runRoot  string // run-root path: GitHub PR runs == wtPath; Jira lazy runs == the throwaway parent of materialized worktrees. Always set so $TRIAGE_FACTORY_RUN_ROOT resolves uniformly for the memory-gate retry.
+	owner    string // resolved GitHub owner (empty for Jira lazy runs)
+	repo     string // resolved GitHub repo (empty for Jira lazy runs)
 	prNumber int    // PR number (0 for non-PR runs); set so the runAgent defer can call worktree.CleanupPRConfig and reclaim the per-PR remote + branch tracking config the bare repo would otherwise accumulate
 	headRef  string // PR head ref (empty for non-PR runs); passed to CleanupPRConfig so own-repo branch tracking (branch.<headRef>.*) gets reclaimed alongside fork-only artifacts
 }
@@ -620,6 +634,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 		toolsRef: ai.GHToolsTemplate,
 		wtPath:   wtPath,
 		hasWT:    true,
+		runRoot:  wtPath, // GitHub PR runs: worktree IS the run-root, so $TRIAGE_FACTORY_RUN_ROOT resolves to the worktree
 		owner:    owner,
 		repo:     repo,
 		prNumber: prNumber,
@@ -627,71 +642,35 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 	}, nil
 }
 
-// setupJira prepares a worktree (if applicable) for a Jira task.
+// setupJira prepares the run-root for a Jira delegation. No repo is
+// pre-cloned — the agent decides which repo(s) it needs after reading
+// the ticket and materializes them via `triagefactory exec workspace
+// add <owner/repo>`. Each materialization lands a worktree at
+// {runRoot}/{owner}/{repo}/ and inserts a row into run_worktrees.
+//
+// The agent's initial cwd is the run-root: a throwaway dir holding
+// only ./task_memory/ (populated by materializePriorMemories below).
+// Both gh and jira tool surfaces are exposed since the agent will
+// need both to implement and ship a PR.
 func (s *Spawner) setupJira(ctx context.Context, runID string, task domain.Task, ghClient *ghclient.Client) (runConfig, error) {
-	// Look up matched repos from the task's scoring results
-	matchedRepos, err := db.GetTaskMatchedRepos(s.database, task.ID)
+	runRoot, err := worktree.MakeRunRoot(runID)
 	if err != nil {
-		return runConfig{}, fmt.Errorf("failed to look up matched repos: %w", err)
+		return runConfig{}, fmt.Errorf("create run root: %w", err)
 	}
-
-	switch len(matchedRepos) {
-	case 0:
-		// No repo match — pure Jira task, no worktree
-		log.Printf("[delegate] Jira task %s: no matched repo, running without worktree", task.EntitySourceID)
-		return runConfig{
-			scope:    fmt.Sprintf("Jira issue: %s", task.EntitySourceID),
-			toolsRef: ai.JiraToolsTemplate,
-		}, nil
-
-	case 1:
-		// Single repo match — clone and create feature branch
-		repoID := matchedRepos[0]
-		profile, err := db.GetRepoProfile(s.database, repoID)
-		if err != nil || profile == nil {
-			return runConfig{}, fmt.Errorf("failed to load repo profile for %s: %v", repoID, err)
-		}
-		if profile.CloneURL == "" {
-			return runConfig{}, fmt.Errorf("repo %s has no clone URL — try re-profiling", repoID)
-		}
-
-		s.updateStatus(runID, "cloning")
-		baseBranch := profile.BaseBranch
-		if baseBranch == "" {
-			baseBranch = profile.DefaultBranch
-		}
-		featureBranch := "feature/" + task.EntitySourceID
-
-		wtPath, err := worktree.CreateForBranch(ctx, profile.Owner, profile.Repo, profile.CloneURL, baseBranch, featureBranch, runID)
-		if err != nil {
-			return runConfig{}, fmt.Errorf("failed to create worktree: %w", err)
-		}
-
-		if _, err := s.database.Exec(`UPDATE runs SET worktree_path = ? WHERE id = ?`, wtPath, runID); err != nil {
-			log.Printf("[delegate] warning: failed to update worktree path for run %s: %v", runID, err)
-		}
-
-		// Agent gets both GH and Jira tools when it has a repo (may need to create PRs)
-		return runConfig{
-			scope:    fmt.Sprintf("Repository: %s\nJira issue: %s\nBranch: %s", repoID, task.EntitySourceID, featureBranch),
-			toolsRef: ai.GHToolsTemplate + "\n\n" + ai.JiraToolsTemplate,
-			wtPath:   wtPath,
-			hasWT:    true,
-			owner:    profile.Owner,
-			repo:     profile.Repo,
-		}, nil
-
-	default:
-		// Multiple matches — ambiguous, block for now
-		return runConfig{}, fmt.Errorf("jira task %s matched %d repos (%s) — cannot determine which to clone",
-			task.EntitySourceID, len(matchedRepos), strings.Join(matchedRepos, ", "))
-	}
+	return runConfig{
+		scope:    fmt.Sprintf("Jira issue: %s", task.EntitySourceID),
+		toolsRef: ai.GHToolsTemplate + "\n\n" + ai.JiraToolsTemplate,
+		wtPath:   runRoot,
+		hasWT:    false,
+		runRoot:  runRoot,
+		// owner/repo intentionally empty: the agent picks per-ticket via `workspace add`
+	}, nil
 }
 
 // runAgent is the generic agent execution loop. Works for any task type.
 func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, mission string, cfg runConfig, startTime time.Time, model string, triggerType string) {
 	if cfg.hasWT {
-		// Best-effort cleanup on return; the worktree ID is unique per run
+		// GitHub PR cleanup. Best-effort cleanup on return; the worktree ID is unique per run
 		// so a failed remove just leaves a dangling directory under _worktrees.
 		// Skipped when the run was taken over — Takeover() needs the worktree
 		// to still exist for its copy and explicitly cleans up afterward.
@@ -724,29 +703,36 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 				worktree.CleanupPRConfig(cfg.owner, cfg.repo, cfg.headRef, cfg.prNumber)
 			}
 		}()
-	}
-
-	// Determine the cwd for the child claude. For tasks without a repo (Jira no-match)
-	// we spin up a throwaway dir so the child's session history lands in a predictable
-	// disposable ~/.claude/projects entry instead of mixing into the parent binary's
-	// own project dir.
-	claudeCwd := cfg.wtPath
-	if claudeCwd == "" {
-		var err error
-		claudeCwd, err = worktree.MakeRunCwd(runID)
-		if err != nil {
-			s.failRun(runID, task.ID, triggerType, "failed to create run cwd: "+err.Error())
-			return
-		}
-		// Same takeover gate as the worktree.Remove defer above — Takeover
-		// owns destruction of the no-cwd dir until after its copy runs.
+	} else if cfg.runRoot != "" {
+		// Jira lazy cleanup: the agent materialized zero or more worktrees
+		// under cfg.runRoot via `workspace add`. Iterate run_worktrees,
+		// nuke each, then remove the run-root parent. Same takeover gate
+		// as the GitHub branch above — multi-worktree takeover isn't
+		// implemented yet, but the Takeover() rejection on empty
+		// runs.worktree_path catches Jira runs before they get here, so
+		// the gate is defensive rather than load-bearing.
 		defer func() {
 			if s.wasTakenOver(runID) {
 				return
 			}
-			worktree.RemoveRunCwd(runID)
+			rows, err := db.GetRunWorktrees(s.database, runID)
+			if err != nil {
+				log.Printf("[delegate] run %s: list run_worktrees for cleanup: %v", runID, err)
+			} else {
+				for _, w := range rows {
+					if rmErr := worktree.RemoveAt(w.Path, runID); rmErr != nil {
+						log.Printf("[delegate] run %s: remove worktree %s: %v", runID, w.Path, rmErr)
+					}
+				}
+			}
+			worktree.RemoveRunRoot(runID)
 		}()
 	}
+
+	// Initial cwd for the child claude. Always the run-root: the worktree
+	// itself for GitHub PR runs, or the throwaway parent for Jira lazy runs
+	// (the agent cd's into a per-repo subdir after `workspace add`).
+	claudeCwd := cfg.wtPath
 	// Nuke the ghost ~/.claude/projects/<encoded-cwd> that claude auto-creates
 	// for this cwd. Safety-railed to only touch entries under $TMPDIR.
 	// Skipped when the run was taken over by the user — the JSONL inside
@@ -793,13 +779,14 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	extraEnv := []string{
 		"TRIAGE_FACTORY_RUN_ID=" + runID,
 		"TRIAGE_FACTORY_REVIEW_PREVIEW=1",
+		"TRIAGE_FACTORY_RUN_ROOT=" + cfg.runRoot, // Set for both sources so the memory-gate retry message can reference an absolute task_memory path that resolves regardless of which worktree the agent has cd'd into.
 	}
 	// Set TRIAGE_FACTORY_REPO when the run has a resolved GitHub repo context
-	// so gh subcommands can default to the right target without the agent
-	// needing to pass --repo on every invocation. Left unset for Jira runs
-	// with no matched repo; those commands either fall back to .git/config
-	// (unlikely — no worktree) or hard-error, which is correct since they
-	// shouldn't be touching GitHub.
+	// (GitHub PR runs only) so gh subcommands can default to the right target
+	// without the agent needing to pass --repo. Jira lazy runs leave it unset:
+	// after the agent cd's into a worktree materialized by `workspace add`,
+	// cmd/exec/gh/repo.go:resolveRepo falls through to .git/config, which is
+	// the correct per-repo answer.
 	if cfg.owner != "" && cfg.repo != "" {
 		extraEnv = append(extraEnv, "TRIAGE_FACTORY_REPO="+cfg.owner+"/"+cfg.repo)
 	}
@@ -1412,9 +1399,12 @@ func (s *Spawner) runMemoryGate(
 	for attempt := 1; attempt <= maxMemoryRetries; attempt++ {
 		log.Printf("[delegate] run %s: memory file missing after attempt %d, resuming", runID, attempt-1)
 		msg := fmt.Sprintf(
-			"You returned a completion JSON but did not write your memory file to ./task_memory/%s.md. "+
-				"Write it now — one paragraph of what you did, one of why, one of what to try next "+
-				"if this recurs — then return your completion JSON again.",
+			"You returned a completion JSON but did not write your memory file to "+
+				"$TRIAGE_FACTORY_RUN_ROOT/task_memory/%s.md. Write it now using the "+
+				"absolute path (the env var resolves to the run-root regardless of "+
+				"which worktree you have cd'd into) — one paragraph of what you did, "+
+				"one of why, one of what to try next if this recurs — then return "+
+				"your completion JSON again.",
 			runID,
 		)
 		outcome, err := s.ResumeWithMessage(ctx, runID, sessionID, cwd, msg, resumeOpts)
