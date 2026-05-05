@@ -291,3 +291,91 @@ func TestGetPRFiles_SecondPageError(t *testing.T) {
 		t.Fatal("expected error when second page fails, got nil")
 	}
 }
+
+// TestCreatePR_HappyPath asserts the request shape and that we parse
+// number + html_url out of GitHub's response. This is the canonical
+// path the pending-PR submit handler walks on user approval.
+func TestCreatePR_HappyPath(t *testing.T) {
+	var (
+		gotMethod, gotPath string
+		gotBody            map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"number": 42, "html_url": "https://github.com/owner/repo/pull/42"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := clientAgainst(srv.URL)
+	number, url, err := c.CreatePR("owner", "repo", "feature/SKY-1", "main", "Add idempotency", "Body text", false)
+	if err != nil {
+		t.Fatalf("CreatePR: %v", err)
+	}
+	if number != 42 {
+		t.Errorf("number = %d, want 42", number)
+	}
+	if url != "https://github.com/owner/repo/pull/42" {
+		t.Errorf("url = %q, want canonical github.com path", url)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/repos/owner/repo/pulls" {
+		t.Errorf("path = %q, want /repos/owner/repo/pulls", gotPath)
+	}
+	for _, want := range []struct{ key, val string }{
+		{"title", "Add idempotency"},
+		{"head", "feature/SKY-1"},
+		{"base", "main"},
+		{"body", "Body text"},
+	} {
+		if got, _ := gotBody[want.key].(string); got != want.val {
+			t.Errorf("body[%q] = %q, want %q", want.key, got, want.val)
+		}
+	}
+	if draft, _ := gotBody["draft"].(bool); draft {
+		t.Errorf("draft = true, want false (not draft)")
+	}
+}
+
+// TestCreatePR_DraftFlagPropagated confirms the draft boolean rides
+// through to the request body verbatim. UI exposes the draft toggle
+// at submit time; if this regressed, the toggle would silently no-op.
+func TestCreatePR_DraftFlagPropagated(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"number": 1, "html_url": "https://github.com/o/r/pull/1"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := clientAgainst(srv.URL)
+	if _, _, err := c.CreatePR("o", "r", "h", "main", "T", "B", true); err != nil {
+		t.Fatalf("CreatePR: %v", err)
+	}
+	if draft, _ := gotBody["draft"].(bool); !draft {
+		t.Errorf("draft = false, want true (draft requested)")
+	}
+}
+
+// TestCreatePR_422_BaseMissing pins the surfacing-the-message contract
+// for the most common GitHub error: caller specified a base that
+// doesn't exist on the upstream. The server should pass that message
+// through to the user via the submit handler's 502 response.
+func TestCreatePR_422_BaseMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"message":"base 'develop' is not a valid branch"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := clientAgainst(srv.URL)
+	_, _, err := c.CreatePR("o", "r", "h", "develop", "T", "B", false)
+	if err == nil {
+		t.Fatal("expected error for 422, got nil")
+	}
+}

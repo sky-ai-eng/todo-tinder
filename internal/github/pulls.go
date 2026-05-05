@@ -412,6 +412,37 @@ func (c *Client) SubmitReview(owner, repo string, number int, commitSHA, event, 
 	return intVal(raw, "id"), event, nil
 }
 
+// CreatePR opens a new pull request on the upstream repo. head is the
+// branch the agent has already pushed (the upstream must already know
+// about it — git push must precede this call). base is the merge
+// target. draft=true creates a draft PR.
+//
+// Returns (number, htmlURL, err). 422s with a "message" field surface
+// as the error string verbatim so callers can show the actual GitHub
+// reason ("base 'develop' is not a valid branch", "no commits between
+// main and feature/X", etc.).
+func (c *Client) CreatePR(owner, repo, head, base, title, body string, draft bool) (int, string, error) {
+	payload := map[string]any{
+		"title": title,
+		"head":  head,
+		"base":  base,
+		"body":  body,
+		"draft": draft,
+	}
+
+	data, err := c.Post(fmt.Sprintf("/repos/%s/%s/pulls", owner, repo), payload)
+	if err != nil {
+		return 0, "", err
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return 0, "", err
+	}
+
+	return intVal(raw, "number"), strVal(raw, "html_url"), nil
+}
+
 // DismissReview dismisses a submitted review (removes approval/change-request status).
 // Only works on APPROVED or CHANGES_REQUESTED reviews — COMMENTED reviews cannot be dismissed.
 func (c *Client) DismissReview(owner, repo string, number, reviewID int, message string) error {

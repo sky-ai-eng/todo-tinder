@@ -961,7 +961,23 @@ func (s *Spawner) processCompletion(
 	s.updateBreakerCounter(task.ID, triggerType, status)
 
 	if status == "completed" {
+		// Two side-tables can park a completed run in pending_approval:
+		//   - pending_reviews: agent ran `pr submit-review` under
+		//     TRIAGE_FACTORY_REVIEW_PREVIEW=1, queued the review for
+		//     human approval.
+		//   - pending_prs: agent ran `pr create` under the same flag,
+		//     queued the PR for human approval.
+		// Either gate flips the run to pending_approval; the user
+		// approves via the UI and the server flips back to completed.
+		// Frontend distinguishes by which side-table has a row (the
+		// /api/agent/runs/{id} response carries pending_kind).
+		hasPending := false
 		if pendingReview, _ := db.PendingReviewByRunID(s.database, runID); pendingReview != nil {
+			hasPending = true
+		} else if pendingPR, _ := db.PendingPRByRunID(s.database, runID); pendingPR != nil {
+			hasPending = true
+		}
+		if hasPending {
 			status = "pending_approval"
 			if _, err := s.database.Exec(`UPDATE runs SET status = ? WHERE id = ?`, status, runID); err != nil {
 				log.Printf("[delegate] warning: failed to set pending_approval for run %s: %v", runID, err)

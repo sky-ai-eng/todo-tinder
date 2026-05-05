@@ -502,6 +502,16 @@ func (s *Server) cleanupPendingApprovalRun(taskID string, outcome discardOutcome
 		log.Printf("[review-discard] DeletePendingReviewByRunID for run %s failed (run held in pending_approval for retry): %v", runID, err)
 		return
 	}
+	// Same hold-for-retry semantics for the pending-PR side table.
+	// A run can have at most one pending entry across the two tables
+	// (the spawner flips on either), but cleanupPendingApprovalRun
+	// runs against the run id without first determining which kind —
+	// so we attempt both deletes. Both are idempotent no-ops when no
+	// row exists, so calling unconditionally is safe.
+	if err := db.DeletePendingPRByRunID(s.db, runID); err != nil {
+		log.Printf("[review-discard] DeletePendingPRByRunID for run %s failed (run held in pending_approval for retry): %v", runID, err)
+		return
+	}
 
 	// Flip the run row terminal. ok=false here means the row was
 	// already cancelled by a concurrent path (idempotent re-call,

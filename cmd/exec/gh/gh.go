@@ -16,6 +16,19 @@ const HelpText = `GitHub PR Commands:
   gh pr thread-view <number> <comment_id> [--page N]      Comment thread with replies
   gh pr review-view <review_id> --pr <N> [--repo o/r] [-v]  Expand a review + inline comments
 
+PR Creation:
+  gh pr create --title <T> --body <B> --base <branch> [--head <branch>] [--draft] [--repo o/r]
+                                                          Open a pull request. The head branch
+                                                          must already be pushed to the upstream
+                                                          (git push first). --head defaults to
+                                                          the current branch.
+                                                          Inside a delegated Triage Factory run
+                                                          this queues the PR for human approval
+                                                          (the user opens it via the UI); run
+                                                          standalone, it posts to GitHub
+                                                          immediately. Output JSON includes a
+                                                          "status" field that disambiguates.
+
 Review Lifecycle (managed locally, submitted atomically):
   gh pr start-review <number> [--repo o/r]                Start a local pending review
   gh pr add-review-comment <review_id> --file <path> --line <N> --body <text> [--start-line <N>]

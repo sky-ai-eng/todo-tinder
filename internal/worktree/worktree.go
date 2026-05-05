@@ -49,6 +49,15 @@ func repoDir(owner, repo string) (string, error) {
 	return filepath.Join(home, reposDir, owner, repo+".git"), nil
 }
 
+// RepoDir is the exported variant for callers outside the worktree
+// package — specifically internal/server's livePRDiff path, which
+// runs `git -C <bareDir> diff` against the bare clone for the
+// pending-PR live diff. Wrapper rather than renaming repoDir to
+// keep the existing internal call sites untouched.
+func RepoDir(owner, repo string) (string, error) {
+	return repoDir(owner, repo)
+}
+
 func runDir(runID string) string {
 	return filepath.Join(os.TempDir(), runsDir, runID)
 }

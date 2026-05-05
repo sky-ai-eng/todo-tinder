@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
-	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/agentmeta"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -43,6 +43,8 @@ func handlePR(client *ghclient.Client, database *db.DB, args []string) {
 	flags := args[1:]
 
 	switch action {
+	case "create":
+		prCreate(client, database, flags)
 	case "view":
 		prView(client, flags)
 	case "diff":
@@ -355,8 +357,8 @@ func prSubmitReview(client *ghclient.Client, database *db.DB, args []string) {
 		return
 	}
 
-	// Inject header and footer with run metadata
-	body = buildReviewBody(body, database)
+	// Inject footer with run metadata
+	body = body + agentmeta.Build(database.Conn, os.Getenv("TRIAGE_FACTORY_RUN_ID"), "review")
 
 	// Submit atomically to GitHub
 	ghReviewID, actualEvent, err := client.SubmitReview(
@@ -374,6 +376,119 @@ func prSubmitReview(client *ghclient.Client, database *db.DB, args []string) {
 		"github_review_id": ghReviewID,
 		"event":            actualEvent,
 		"comments_posted":  len(ghComments),
+	})
+}
+
+// prCreate queues (preview mode) or directly opens (standalone mode)
+// a pull request. Caller is responsible for having pushed the head
+// branch upstream first; this is the contract documented in the
+// agent prompts and enforced by GitHub's API at submit time anyway.
+//
+// Preview mode (TRIAGE_FACTORY_REVIEW_PREVIEW=1, the delegated-run
+// default): create a pending_prs row + lock it. Output
+// status=queued_for_human_approval. The server's submit handler
+// reads the row at user-approval time, opens the PR for real, and
+// applies the agentmeta footer.
+//
+// Standalone mode (env unset, e.g. a human running this directly
+// from a checkout): pre-apply the footer and POST to GitHub
+// immediately. Same shape as prSubmitReview's standalone branch.
+func prCreate(client *ghclient.Client, database *db.DB, args []string) {
+	title := flagVal(args, "--title")
+	body := flagVal(args, "--body")
+	base := flagVal(args, "--base")
+	head := flagVal(args, "--head")
+	draft := hasFlag(args, "--draft")
+
+	if title == "" {
+		exitErr("usage: gh pr create --title <T> --body <B> --base <branch> [--head <branch>] [--draft] [--repo owner/repo]\n--title is required")
+	}
+	if base == "" {
+		exitErr("--base is required (the branch to merge into, e.g. main)")
+	}
+
+	owner, repo := ownerRepo(args)
+
+	// If --head wasn't supplied, derive from the current branch. The
+	// agent's cwd inside a materialized worktree is `feature/<KEY>`
+	// after `cd "$(triagefactory exec workspace add ...)"` so this
+	// resolves cleanly. exitErr if we can't determine — would otherwise
+	// silently submit the wrong branch to GitHub.
+	if head == "" {
+		out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+		if err != nil {
+			exitErr("could not determine current branch via git rev-parse; pass --head <branch> explicitly. err: " + err.Error())
+		}
+		head = strings.TrimSpace(string(out))
+		if head == "" || head == "HEAD" {
+			exitErr("current branch is detached or empty; pass --head <branch> explicitly")
+		}
+	}
+
+	if os.Getenv("TRIAGE_FACTORY_REVIEW_PREVIEW") == "1" {
+		runID := os.Getenv("TRIAGE_FACTORY_RUN_ID")
+		if runID == "" {
+			exitErr("TRIAGE_FACTORY_REVIEW_PREVIEW=1 but TRIAGE_FACTORY_RUN_ID is empty; this command was meant to be invoked by the delegated agent")
+		}
+
+		// Capture the head sha at queue time so the UI can flag drift if
+		// the agent pushes a fixup mid-approval. Best-effort: if
+		// rev-parse fails (cwd doesn't have HEAD, weird state), we
+		// surface the error rather than queueing a row with no sha
+		// because the head_sha column is NOT NULL.
+		headSHAOut, err := exec.Command("git", "rev-parse", "HEAD").Output()
+		if err != nil {
+			exitErr("could not capture head sha via git rev-parse HEAD; the worktree appears to be in a bad state. err: " + err.Error())
+		}
+		headSHA := strings.TrimSpace(string(headSHAOut))
+		if headSHA == "" {
+			exitErr("git rev-parse HEAD returned empty; refusing to queue a pending PR with no head sha")
+		}
+
+		id := uuid.NewString()
+		if err := db.CreatePendingPR(database.Conn, domain.PendingPR{
+			ID: id, RunID: runID,
+			Owner: owner, Repo: repo,
+			HeadBranch: head, HeadSHA: headSHA, BaseBranch: base,
+			Title: title, Body: body,
+		}); err != nil {
+			exitErr("failed to insert pending PR: " + err.Error())
+		}
+		// LockPendingPR seals against the agent calling pr create
+		// twice (SKY-212 anti-retry pattern from prSubmitReview).
+		if err := db.LockPendingPR(database.Conn, id, title, body); err != nil {
+			if errors.Is(err, db.ErrPendingPRAlreadyQueued) {
+				exitErr(fmt.Sprintf(
+					"a PR for run %s has already been queued for human approval. Do not call pr create again — your work is complete. Finish the run by writing task_memory/<run_id>.md and returning your completion JSON.",
+					runID,
+				))
+			}
+			exitErr("failed to lock pending PR: " + err.Error())
+		}
+
+		printJSON(map[string]any{
+			"status":     "queued_for_human_approval",
+			"id":         id,
+			"owner":      owner,
+			"repo":       repo,
+			"head":       head,
+			"base":       base,
+			"head_sha":   headSHA,
+			"draft_hint": draft, // not stored — passed through at user-approval time
+			"next_step":  "PR is queued for human approval. Do not call pr create again. Finish the run by writing task_memory/<run_id>.md and returning your completion JSON.",
+		})
+		return
+	}
+
+	// Standalone mode: open the PR immediately, with footer pre-applied.
+	body = body + agentmeta.Build(database.Conn, os.Getenv("TRIAGE_FACTORY_RUN_ID"), "PR")
+	number, htmlURL, err := client.CreatePR(owner, repo, head, base, title, body, draft)
+	exitOnErr(err)
+
+	printJSON(map[string]any{
+		"status":   "submitted",
+		"number":   number,
+		"html_url": htmlURL,
 	})
 }
 
@@ -588,64 +703,4 @@ func exitOnErr(err error) {
 func exitErr(msg string) {
 	fmt.Fprintln(os.Stderr, msg)
 	os.Exit(1)
-}
-
-// buildReviewBody wraps the agent's review body with a metadata footer.
-func buildReviewBody(body string, database *db.DB) string {
-	runID := os.Getenv("TRIAGE_FACTORY_RUN_ID")
-	if runID == "" {
-		return body + "\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*"
-	}
-
-	// Look up run for duration info
-	run, err := db.GetAgentRun(database.Conn, runID)
-	if err != nil || run == nil {
-		return body + "\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*"
-	}
-
-	// Sum tokens and calculate cost
-	totals, err := db.RunTokenTotals(database.Conn, runID)
-	if err != nil {
-		return body + "\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*"
-	}
-
-	model := totals.Model
-	if model == "" {
-		model = run.Model
-	}
-
-	cost := ai.CalculateCostUSD(model, totals.InputTokens, totals.OutputTokens, totals.CacheReadTokens, totals.CacheCreationTokens)
-
-	// Pretty-print model name
-	modelDisplay := model
-	switch {
-	case strings.Contains(model, "opus"):
-		modelDisplay = "Claude Opus"
-	case strings.Contains(model, "sonnet"):
-		modelDisplay = "Claude Sonnet"
-	case strings.Contains(model, "haiku"):
-		modelDisplay = "Claude Haiku"
-	}
-
-	// Calculate elapsed time from run start
-	elapsed := prettyElapsed(time.Since(run.StartedAt))
-
-	footer := fmt.Sprintf("\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*\n\nTime: %s | Model: %s | Cost: ~$%.3f", elapsed, modelDisplay, cost)
-
-	return body + footer
-}
-
-func prettyElapsed(d time.Duration) string {
-	s := int(d.Seconds())
-	if s < 60 {
-		return fmt.Sprintf("%ds", s)
-	}
-	m := s / 60
-	s = s % 60
-	if m < 60 {
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	h := m / 60
-	m = m % 60
-	return fmt.Sprintf("%dh %dm", h, m)
 }
