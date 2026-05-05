@@ -6,6 +6,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/gh"
 	jiraexec "github.com/sky-ai-eng/triage-factory/cmd/exec/jira"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/workspace"
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -74,6 +75,12 @@ func Handle(args []string) {
 		jClient := jiraclient.NewClient(creds.JiraURL, creds.JiraPAT)
 		jiraexec.Handle(jClient, cmdArgs)
 
+	case "workspace":
+		// No credentials needed — workspace acts on local DB + filesystem
+		// only. The agent's run identity flows through TRIAGE_FACTORY_RUN_ID,
+		// validated inside the subcommand.
+		workspace.Handle(database, cmdArgs)
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown exec command: %s\nRun 'triagefactory exec --help' for usage.\n", cmd)
 		os.Exit(1)
@@ -90,5 +97,5 @@ func isHelp(args []string) bool {
 }
 
 func printHelp() {
-	fmt.Printf("Usage: triagefactory exec <service> <resource> <action> [flags]\n\n%s\n\n%s\n\nAll commands print JSON to stdout on success, errors to stderr.\n", gh.HelpText, jiraexec.HelpText)
+	fmt.Printf("Usage: triagefactory exec <command> [args]\n\n%s\n\n%s\n\n%s\n\nCommands print their result to stdout on success and errors to stderr. Most commands print JSON; workspace add prints a raw path.\n", gh.HelpText, jiraexec.HelpText, workspace.HelpText)
 }

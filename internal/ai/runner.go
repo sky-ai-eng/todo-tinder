@@ -175,12 +175,6 @@ func (r *Runner) run() {
 		}
 	}
 
-	// Build a source map for repo-match blocked_reason logic.
-	sourceByID := make(map[string]string, len(tasks))
-	for _, t := range tasks {
-		sourceByID[t.ID] = t.EntitySource
-	}
-
 	updates := make([]domain.TaskScoreUpdate, len(scores))
 	for i, s := range scores {
 		updates[i] = domain.TaskScoreUpdate{
@@ -189,18 +183,6 @@ func (r *Runner) run() {
 			AutonomySuitability: s.AutonomySuitability,
 			PriorityReasoning:   s.PriorityReasoning,
 			Summary:             s.Summary,
-		}
-
-		// Determine blocked reason for repo matching.
-		blockedReason := ""
-		if len(s.Repos) > 1 {
-			blockedReason = "multi_repo"
-		} else if len(s.Repos) == 0 && sourceByID[s.ID] == "jira" {
-			blockedReason = "no_repo_match"
-		}
-
-		if err := db.UpdateTaskRepoMatch(r.database, s.ID, s.Repos, blockedReason); err != nil {
-			log.Printf("[ai] error storing repo match for %s: %v", s.ID, err)
 		}
 	}
 

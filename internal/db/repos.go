@@ -2,8 +2,6 @@ package db
 
 import (
 	"database/sql"
-	"encoding/json"
-	"fmt"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
@@ -230,30 +228,4 @@ func GetRepoProfile(database *sql.DB, repoID string) (*domain.RepoProfile, error
 		p.ProfiledAt = &profiledAt.Time
 	}
 	return &p, nil
-}
-
-// GetTaskMatchedRepos returns the matched repo IDs for a task, or an empty slice.
-func GetTaskMatchedRepos(database *sql.DB, taskID string) ([]string, error) {
-	var raw sql.NullString
-	err := database.QueryRow(`SELECT matched_repos FROM tasks WHERE id = ?`, taskID).Scan(&raw)
-	if err != nil || !raw.Valid || raw.String == "" {
-		return nil, err
-	}
-	var repos []string
-	if err := json.Unmarshal([]byte(raw.String), &repos); err != nil {
-		return nil, fmt.Errorf("parse matched_repos: %w", err)
-	}
-	return repos, nil
-}
-
-// UpdateTaskRepoMatch stores the repo match results for a task.
-func UpdateTaskRepoMatch(database *sql.DB, taskID string, repos []string, blockedReason string) error {
-	reposJSON, err := json.Marshal(repos)
-	if err != nil {
-		return fmt.Errorf("marshal repos: %w", err)
-	}
-	_, err = database.Exec(`
-		UPDATE tasks SET matched_repos = ?, blocked_reason = ? WHERE id = ?
-	`, string(reposJSON), nullIfEmpty(blockedReason), taskID)
-	return err
 }

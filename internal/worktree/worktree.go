@@ -36,6 +36,25 @@ func lockRepo(owner, repo string) *sync.Mutex {
 	return mu
 }
 
+// WithRepoLock serializes a callback against the per-repo bare-clone
+// mutex. Used by callers outside the worktree package — the
+// pending-PR live-diff path in particular runs `git fetch` against
+// the bare to sync the agent's pushed branch, which races with
+// curator refresh / bootstrap / worktree creation if those are
+// happening concurrently for the same repo. Concurrent fetches on a
+// single bare can fail with "fatal: Unable to create
+// '<bare>/refs/remotes/origin/<branch>.lock'" or otherwise corrupt
+// the ref, hence the lock.
+//
+// Callback returns drive the caller's error path; the lock is
+// always released on return.
+func WithRepoLock(owner, repo string, fn func() error) error {
+	mu := lockRepo(owner, repo)
+	mu.Lock()
+	defer mu.Unlock()
+	return fn()
+}
+
 const (
 	reposDir = ".triagefactory/repos" // bare clones: ~/.triagefactory/repos/{owner}/{repo}.git
 	runsDir  = "triagefactory-runs"   // worktrees: /tmp/triagefactory-runs/{run-id}
@@ -49,17 +68,60 @@ func repoDir(owner, repo string) (string, error) {
 	return filepath.Join(home, reposDir, owner, repo+".git"), nil
 }
 
+// RepoDir is the exported variant for callers outside the worktree
+// package — specifically internal/server's livePRDiff path, which
+// runs `git -C <bareDir> diff` against the bare clone for the
+// pending-PR live diff. Wrapper rather than renaming repoDir to
+// keep the existing internal call sites untouched.
+func RepoDir(owner, repo string) (string, error) {
+	return repoDir(owner, repo)
+}
+
 func runDir(runID string) string {
 	return filepath.Join(os.TempDir(), runsDir, runID)
 }
 
-// MakeRunCwd creates a throwaway cwd for delegated runs that have no worktree
-// (e.g. Jira tasks with no matched repo). Lives under the same runs base as
-// real worktrees so the existing Cleanup() sweep catches orphans.
+// RunRoot returns the run-root path for a given runID, without
+// creating it. The Jira lazy-worktree CLI calls this from a delegated
+// agent process to derive the parent directory under which `workspace
+// add` materializes per-repo worktrees as `{runRoot}/{owner}/{repo}/`.
+// Callers who need the directory to exist on disk should use MakeRunRoot
+// instead.
+func RunRoot(runID string) string {
+	return runDir(runID)
+}
+
+// MakeRunRoot creates the run-root directory and returns its absolute
+// path. Used by the spawner's setupJira path: the agent's initial cwd
+// is the run-root (a throwaway dir holding only task_memory/ until the
+// agent calls `workspace add` to materialize worktrees as subdirs).
 //
-// Giving every run a unique disposable cwd means the child claude's session
-// history lands in a ~/.claude/projects/<encoded> we can cleanly delete after
-// the run, rather than mixing into the parent binary's own project dir.
+// Single-purpose vs. CreateForBranch: CreateForBranch creates a worktree
+// AT runDir(runID); MakeRunRoot creates only the directory itself, with
+// no git contents. The Jira lazy path uses MakeRunRoot so the agent has
+// somewhere to land before it has chosen which repo(s) to materialize.
+func MakeRunRoot(runID string) (string, error) {
+	dir := runDir(runID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("mkdir run root: %w", err)
+	}
+	return dir, nil
+}
+
+// RemoveRunRoot removes the run-root directory and everything under it
+// (including any per-repo worktrees that were materialized as subdirs).
+// Safe if missing. Cleanup of the bare-side worktree registrations is
+// handled by RemoveAt + pruneAll for each individual worktree before
+// this is called; this is the final sweep of the parent dir itself.
+func RemoveRunRoot(runID string) {
+	os.RemoveAll(runDir(runID))
+}
+
+// MakeRunCwd creates a throwaway cwd for delegated runs that have no worktree.
+// Vestigial — superseded by MakeRunRoot now that Jira runs always populate
+// the run-root and materialize worktrees as subdirs. Kept temporarily so
+// future cleanup callers don't break; remove in a follow-up once no callers
+// remain.
 func MakeRunCwd(runID string) (string, error) {
 	dir := filepath.Join(os.TempDir(), runsDir, runID+"-nocwd")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -69,6 +131,7 @@ func MakeRunCwd(runID string) (string, error) {
 }
 
 // RemoveRunCwd removes the throwaway cwd created by MakeRunCwd. Safe if missing.
+// Vestigial — see MakeRunCwd.
 func RemoveRunCwd(runID string) {
 	os.RemoveAll(filepath.Join(os.TempDir(), runsDir, runID+"-nocwd"))
 }
@@ -814,9 +877,44 @@ func configureOwnRepoPRTracking(ctx context.Context, bareDir, localBranch string
 	return nil
 }
 
-// CreateForBranch sets up a worktree on a new feature branch based off a given base.
-// If baseBranch is empty, the repo's default branch is detected from origin/HEAD.
+// CreateForBranch sets up a worktree on a new feature branch based off
+// a given base, at the run's default location runDir(runID). If
+// baseBranch is empty, the repo's default branch is detected from
+// origin/HEAD. Used by the eager GitHub PR delegation path where the
+// run has exactly one repo.
 func CreateForBranch(ctx context.Context, owner, repo, cloneURL, baseBranch, featureBranch, runID string) (string, error) {
+	wtDir, err := makeWorktreeDir(runID)
+	if err != nil {
+		return "", err
+	}
+	return createBranchWorktreeAt(ctx, owner, repo, cloneURL, baseBranch, featureBranch, runID, wtDir)
+}
+
+// CreateForBranchInRoot is the lazy-Jira-delegation variant: the worktree
+// lands at filepath.Join(runRoot, owner, repo) so a single run can host
+// multiple per-repo worktrees as siblings under a shared run-root. The
+// run-root must already exist (created by MakeRunRoot in the spawner);
+// the owner-level subdir is created here.
+//
+// Other than the path, behavior matches CreateForBranch — same per-repo
+// lock, same bare-clone reuse, same branch-exists reattach, same excludes
+// rollback. The Jira `workspace add` CLI is the sole caller in production.
+func CreateForBranchInRoot(ctx context.Context, owner, repo, cloneURL, baseBranch, featureBranch, runID, runRoot string) (string, error) {
+	if runRoot == "" {
+		return "", fmt.Errorf("CreateForBranchInRoot: runRoot is required")
+	}
+	wtDir := filepath.Join(runRoot, owner, repo)
+	if err := os.MkdirAll(filepath.Dir(wtDir), 0755); err != nil {
+		return "", fmt.Errorf("mkdir owner subdir: %w", err)
+	}
+	return createBranchWorktreeAt(ctx, owner, repo, cloneURL, baseBranch, featureBranch, runID, wtDir)
+}
+
+// createBranchWorktreeAt is the shared body of the two CreateForBranch
+// variants — bare-clone setup, base-branch fetch, `git worktree add`
+// (with branchExists reattach), and exclude-or-rollback. The two
+// public callers differ only in where wtDir lives on disk.
+func createBranchWorktreeAt(ctx context.Context, owner, repo, cloneURL, baseBranch, featureBranch, runID, wtDir string) (string, error) {
 	mu := lockRepo(owner, repo)
 	mu.Lock()
 	defer mu.Unlock()
@@ -826,31 +924,37 @@ func CreateForBranch(ctx context.Context, owner, repo, cloneURL, baseBranch, fea
 		return "", err
 	}
 
-	// Fetch the base branch
+	// Fetch the base branch into the remote-tracking ref rather than
+	// the local branch ref. The Curator's per-project worktrees
+	// (EnsureCuratorWorktree) check out the base branch as a real local
+	// branch in <projectDir>/repos/<owner>/<repo>/; if we fetched with
+	// `+refs/heads/<b>:refs/heads/<b>`, git would refuse with "fatal:
+	// refusing to fetch into branch '<b>' checked out at '<path>'"
+	// because that local branch ref is live in the curator's worktree.
+	// Fetching into refs/remotes/origin/<b> sidesteps the conflict and
+	// matches the pattern EnsureCuratorWorktree already uses (see
+	// internal/worktree/curator.go:93-100). The new feature branch is
+	// then created off the just-fetched remote-tracking ref.
 	if baseBranch == "" {
 		baseBranch = detectDefaultBranch(ctx, bareDir)
 	}
-	baseRef := fmt.Sprintf("+refs/heads/%s:refs/heads/%s", baseBranch, baseBranch)
+	remoteRef := "refs/remotes/origin/" + baseBranch
+	baseRef := fmt.Sprintf("+refs/heads/%s:%s", baseBranch, remoteRef)
 	start := time.Now()
 	if err := gitRunCtx(ctx, bareDir, "fetch", "origin", baseRef); err != nil {
 		return "", fmt.Errorf("fetch base branch %s: %w", baseBranch, err)
 	}
 	log.Printf("[worktree] fetch %s completed in %s", baseBranch, time.Since(start).Round(time.Millisecond))
 
-	wtDir, err := makeWorktreeDir(runID)
-	if err != nil {
-		return "", err
-	}
-
 	// Create worktree — reuse the branch if it already exists (re-delegation),
-	// otherwise create a new one off the base.
+	// otherwise create a new one off the just-fetched remote-tracking ref.
 	if branchExists(bareDir, featureBranch) {
 		// Branch exists from a previous run — check it out
 		if err := gitRunCtx(ctx, bareDir, "worktree", "add", wtDir, featureBranch); err != nil {
 			return "", fmt.Errorf("worktree add existing branch: %w", err)
 		}
 	} else {
-		if err := gitRunCtx(ctx, bareDir, "worktree", "add", "-b", featureBranch, wtDir, "refs/heads/"+baseBranch); err != nil {
+		if err := gitRunCtx(ctx, bareDir, "worktree", "add", "-b", featureBranch, wtDir, remoteRef); err != nil {
 			return "", fmt.Errorf("worktree add new branch: %w", err)
 		}
 	}

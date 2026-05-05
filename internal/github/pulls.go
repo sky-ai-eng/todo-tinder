@@ -412,6 +412,99 @@ func (c *Client) SubmitReview(owner, repo string, number int, commitSHA, event, 
 	return intVal(raw, "id"), event, nil
 }
 
+// CreatePR opens a new pull request on the upstream repo. head is the
+// branch the agent has already pushed (the upstream must already know
+// about it — git push must precede this call). base is the merge
+// target. draft=true creates a draft PR.
+//
+// Returns (number, htmlURL, err). On a 422, the GitHub validation
+// payload is parsed and the per-error "message" / "code"+"field" is
+// folded into the returned error so callers see "Validation Failed:
+// base 'develop' is not a valid branch" rather than the raw JSON
+// blob — the retry flow is much more useful when the actual reason
+// is visible.
+func (c *Client) CreatePR(owner, repo, head, base, title, body string, draft bool) (int, string, error) {
+	payload := map[string]any{
+		"title": title,
+		"head":  head,
+		"base":  base,
+		"body":  body,
+		"draft": draft,
+	}
+
+	data, err := c.Post(fmt.Sprintf("/repos/%s/%s/pulls", owner, repo), payload)
+	if err != nil {
+		return 0, "", liftValidationErr(err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return 0, "", err
+	}
+
+	return intVal(raw, "number"), strVal(raw, "html_url"), nil
+}
+
+// liftValidationErr extracts a useful message from a GitHub error
+// returned by client.do. The original error string has the shape
+// "POST /path returned NNN: {raw JSON body}"; for 422s the body
+// follows GitHub's validation envelope:
+//
+//	{
+//	  "message": "Validation Failed",
+//	  "errors": [
+//	    {"resource": "PullRequest", "code": "invalid", "field": "base"},
+//	    {"resource": "PullRequest", "code": "custom",
+//	     "message": "No commits between main and feature/X"}
+//	  ]
+//	}
+//
+// Falls back to the original error verbatim when the body isn't
+// parseable as JSON or doesn't match the envelope (other 4xx/5xx
+// shapes go straight through unchanged).
+func liftValidationErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	s := err.Error()
+	idx := strings.Index(s, ": ")
+	if idx == -1 {
+		return err
+	}
+	body := s[idx+2:]
+	var parsed struct {
+		Message string `json:"message"`
+		Errors  []struct {
+			Resource string `json:"resource"`
+			Code     string `json:"code"`
+			Field    string `json:"field"`
+			Message  string `json:"message"`
+		} `json:"errors"`
+	}
+	if jsonErr := json.Unmarshal([]byte(body), &parsed); jsonErr != nil {
+		return err
+	}
+	if parsed.Message == "" && len(parsed.Errors) == 0 {
+		return err
+	}
+	var detail strings.Builder
+	if parsed.Message != "" {
+		detail.WriteString(parsed.Message)
+	}
+	for _, e := range parsed.Errors {
+		detail.WriteString(": ")
+		switch {
+		case e.Message != "":
+			detail.WriteString(e.Message)
+		case e.Field != "":
+			fmt.Fprintf(&detail, "%s field '%s'", e.Code, e.Field)
+		default:
+			detail.WriteString(e.Code)
+		}
+	}
+	return fmt.Errorf("%s", detail.String())
+}
+
 // DismissReview dismisses a submitted review (removes approval/change-request status).
 // Only works on APPROVED or CHANGES_REQUESTED reviews — COMMENTED reviews cannot be dismissed.
 func (c *Client) DismissReview(owner, repo string, number, reviewID int, message string) error {

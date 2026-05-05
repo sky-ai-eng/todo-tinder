@@ -38,16 +38,18 @@ Reading the tests for the area before reading the implementation is usually the 
 </patterns>
 
 <process>
-1. `{{BINARY_PATH}} exec jira ticket view {{ISSUE_KEY}}` — read the issue, the acceptance criteria, the comments, and the recent activity.
-2. `{{BINARY_PATH}} exec jira ticket list-children {{ISSUE_KEY}}` — if open sub-issues exist the ticket is not atomic; the right move is usually to report `task_unsolvable` and let decomposition complete. Implement only if the parent's AC is itself directly actionable and the subtasks are tracking unrelated follow-ups.
-3. Explore the codebase. Find the relevant module, read related code and tests, identify the dominant patterns.
-4. If the ticket is ambiguous on any non-trivial point, leave a Jira comment naming the assumption you're making and proceed.
-5. `{{BINARY_PATH}} exec jira ticket transition {{ISSUE_KEY}} --status "In Progress"`.
-6. Implement the change. Commit incrementally with messages that explain the why, not just the what. Each commit should be self-contained and pass existing tests.
-7. Add or update tests so the requirement — not just the implementation — is covered. A test that would still pass if the requirement changed is a worse test.
-8. Run the relevant test suite for the touched area. Do not push if it is red.
-9. Push the branch and open a PR. The description should link the Jira ticket, summarize the change in two to four sentences, and explicitly name anything you did not do and why.
-10. Comment on the Jira ticket with the PR link and a brief summary that mirrors the PR description.
+1. Read the ticket: `{{BINARY_PATH}} exec jira ticket view {{ISSUE_KEY}}` — issue body, AC, comments, recent activity.
+2. Check atomicity: `{{BINARY_PATH}} exec jira ticket list-children {{ISSUE_KEY}}`. If open sub-issues exist the ticket is not atomic; the right move is usually to report `task_unsolvable` and let decomposition complete. Implement only if the parent's AC is itself directly actionable and the subtasks are tracking unrelated follow-ups.
+3. Decide which repo this work belongs in and materialize a worktree for it (see the workspace tool docs in <tools>). If you genuinely cannot tell which repo, report `task_unsolvable` with a one-line note about what was ambiguous — guessing wastes a run and pollutes the branch namespace.
+4. Explore the codebase. Find the relevant module, read related code and tests, identify the dominant patterns.
+5. If the ticket is ambiguous on any non-trivial point, leave a Jira comment naming the assumption you're making and proceed.
+6. `{{BINARY_PATH}} exec jira ticket transition {{ISSUE_KEY}} --status "In Progress"`.
+7. Implement the change. Commit incrementally with messages that explain the why, not just the what. Each commit should be self-contained and pass existing tests.
+8. Add or update tests so the requirement — not just the implementation — is covered. A test that would still pass if the requirement changed is a worse test.
+9. Run the relevant test suite for the touched area. Do not push if it is red.
+10. Push the head branch to origin: `git push -u origin <branch>`. This MUST be a separate Bash call from anything that follows — do not chain commands with `&&`, `;`, or `$(...)` substitution; the permission allowlist matches per-call, and chained forms get rejected even when each piece would pass on its own.
+11. Queue the PR for human approval: `{{BINARY_PATH}} exec gh pr create --title <T> --body-file _scratch/pr-body.md --base <base-branch>`. Write the body to `_scratch/pr-body.md` first (separate Bash call) — the description should link the Jira ticket, summarize the change in two to four sentences, and explicitly name anything you did not do and why. After you see the `queued_for_human_approval` response, do NOT call `pr create` again; the user opens the PR via the UI.
+12. Comment on the Jira ticket with `{{BINARY_PATH}} exec jira ticket comment {{ISSUE_KEY}} --body "Triage Factory auto-PR: <pr_html_url>"`. That is the entire body — no summary, no AC recap. The PR description and the Triage Factory footer carry the detail; duplicating them in the Jira thread just clutters it.
 </process>
 
 <self_check>
@@ -64,5 +66,4 @@ If any answer is no, the work is not done.
 - Push only to the branch you created. No force push, no rebase of shared history.
 - Do not merge the PR yourself.
 - If you discover the ticket is blocked — missing access, missing dependency, ambiguity you cannot resolve from code — comment on Jira with the specific blocker and report `task_unsolvable`. Do not guess past a blocker.
-- If `./task_memory/` shows a prior attempt that landed and was reverted, read why before retrying. Do not repeat the same approach without evidence the failure mode is gone.
 </safety>

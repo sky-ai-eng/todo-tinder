@@ -3,6 +3,7 @@ GitHub interactions use `{{BINARY_PATH}} exec gh`. Run `{{BINARY_PATH}} exec gh 
 Workflows:
 - Inspect a PR: `exec gh pr view`, `exec gh pr diff`, `exec gh pr files`. Use `-v` for full review/comment bodies.
 - Review a PR: `exec gh pr start-review` → `exec gh pr add-review-comment` (repeat) → `exec gh pr submit-review`.
+- Open a PR for your work: ALWAYS `git push` first — even if you think the branch already exists upstream, push the local commits before calling `pr create`. `pr create` verifies the head branch is on origin via `git ls-remote` and hard-rejects when it isn't, because the human-approval overlay can't render a diff for a branch the server can't fetch. After the push, run `exec gh pr create --title <T> --body-file _scratch/pr-body.md --base <branch>`. Write the PR body to a file under `_scratch/` (you have free run of that directory) and pass `--body-file <path>` — for anything beyond a one-liner this is far more reliable than escaping a multi-line `--body "..."` heredoc. Pass `--body-file -` to read from stdin instead. The short `--body <B>` form still works for terse single-line bodies; `--body` and `--body-file` are mutually exclusive. Inside a delegated run this queues the PR for human approval — the user reviews the diff in the UI and clicks Open PR. Do NOT call `pr create` again after seeing the queued response; your work on this PR is complete. Standalone usage submits to GitHub immediately.
 - Investigate a failing CI run: `exec gh actions download-logs <workflow_run_id>` downloads and extracts the full log archive to `./_scratch/ci-logs/<run_id>/`. Returns JSON with `run_id`, `owner`, `repo`, `dest_dir`, `bytes_downloaded`, and an `entries` array listing the top-level contents. Use your standard Read/Grep/Glob tools on the extracted files — each top-level directory under the destination is a single job.
 - Read files in the working directory for context beyond the diff.
 
@@ -17,7 +18,7 @@ Gotchas:
   ```
   `pr thread-view` is also asymmetric: `<pr_number> <comment_id>` (two positionals, no `--pr` flag). When in doubt, run `--help` on the subcommand.
 - The `--body` for `submit-review` should begin with a `##` title (e.g. "## Looks good — minor nits") followed by your summary. A top-level heading and metadata footer are added automatically; use `##` for yours.
-- `submit-review` is the **last** call in a delegated review run. It queues your review for human approval rather than posting it to GitHub directly — the response will be `{"status": "queued_for_human_approval", ...}`. After you see that response, do NOT call `submit-review` again (the second call will hard-error). Write your `task_memory/<run_id>.md` and return your completion JSON.
+- `submit-review` is the **last** call in a delegated review run. It queues your review for human approval rather than posting it to GitHub directly — the response will be `{"status": "queued_for_human_approval", ...}`. After you see that response, do NOT call `submit-review` again (the second call will hard-error). Write your `$TRIAGE_FACTORY_RUN_ROOT/task_memory/<run_id>.md` and return your completion JSON.
 - For multi-line `--body` arguments, use a heredoc:
   ```
   {{BINARY_PATH}} exec gh pr add-review-comment <review_id> --file <path> --line <N> --body "$(cat <<'EOF'

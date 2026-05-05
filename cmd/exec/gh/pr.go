@@ -4,13 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
-	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/agentmeta"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -43,6 +44,8 @@ func handlePR(client *ghclient.Client, database *db.DB, args []string) {
 	flags := args[1:]
 
 	switch action {
+	case "create":
+		prCreate(client, database, flags)
 	case "view":
 		prView(client, flags)
 	case "diff":
@@ -331,7 +334,7 @@ func prSubmitReview(client *ghclient.Client, database *db.DB, args []string) {
 		err = db.LockPendingReviewSubmission(database.Conn, reviewID, body, ghEvent)
 		if errors.Is(err, db.ErrPendingReviewAlreadySubmitted) {
 			exitErr(fmt.Sprintf(
-				"review %s has already been queued for human approval. Do not call submit-review again — your work on this review is complete. Finish the run by writing task_memory/<run_id>.md and returning your completion JSON.",
+				"review %s has already been queued for human approval. Do not call submit-review again — your work on this review is complete. Finish the run by writing $TRIAGE_FACTORY_RUN_ROOT/task_memory/<run_id>.md and returning your completion JSON.",
 				reviewID,
 			))
 		}
@@ -350,13 +353,13 @@ func prSubmitReview(client *ghclient.Client, database *db.DB, args []string) {
 			"review_id":       reviewID,
 			"event":           ghEvent,
 			"comments_queued": len(ghComments),
-			"next_step":       "Review is queued for human approval. Do not call submit-review again. Finish the run by writing task_memory/<run_id>.md and returning your completion JSON.",
+			"next_step":       "Review is queued for human approval. Do not call submit-review again. Finish the run by writing $TRIAGE_FACTORY_RUN_ROOT/task_memory/<run_id>.md and returning your completion JSON.",
 		})
 		return
 	}
 
-	// Inject header and footer with run metadata
-	body = buildReviewBody(body, database)
+	// Inject footer with run metadata
+	body = body + agentmeta.Build(database.Conn, os.Getenv("TRIAGE_FACTORY_RUN_ID"), "review")
 
 	// Submit atomically to GitHub
 	ghReviewID, actualEvent, err := client.SubmitReview(
@@ -374,6 +377,220 @@ func prSubmitReview(client *ghclient.Client, database *db.DB, args []string) {
 		"github_review_id": ghReviewID,
 		"event":            actualEvent,
 		"comments_posted":  len(ghComments),
+	})
+}
+
+// prCreate queues (preview mode) or directly opens (standalone mode)
+// a pull request. Caller is responsible for having pushed the head
+// branch upstream first; this is the contract documented in the
+// agent prompts and enforced by GitHub's API at submit time anyway.
+//
+// Preview mode (TRIAGE_FACTORY_REVIEW_PREVIEW=1, the delegated-run
+// default): create a pending_prs row + lock it. Output
+// status=queued_for_human_approval. The server's submit handler
+// reads the row at user-approval time, opens the PR for real, and
+// applies the agentmeta footer.
+//
+// Standalone mode (env unset, e.g. a human running this directly
+// from a checkout): pre-apply the footer and POST to GitHub
+// immediately. Same shape as prSubmitReview's standalone branch.
+func prCreate(client *ghclient.Client, database *db.DB, args []string) {
+	title := flagVal(args, "--title")
+	body := flagVal(args, "--body")
+	bodyFile := flagVal(args, "--body-file")
+	base := flagVal(args, "--base")
+	head := flagVal(args, "--head")
+	draft := hasFlag(args, "--draft")
+
+	if title == "" {
+		exitErr("usage: gh pr create --title <T> (--body <B> | --body-file <path>) --base <branch> [--head <branch>] [--draft] [--repo owner/repo]\n--title is required")
+	}
+	if base == "" {
+		exitErr("--base is required (the branch to merge into, e.g. main)")
+	}
+
+	// --body and --body-file are mutually exclusive: with both set,
+	// the agent's intent is ambiguous and silently picking one risks
+	// dropping the longer/more-recent draft. Force a clean choice.
+	if body != "" && bodyFile != "" {
+		exitErr("--body and --body-file are mutually exclusive; pass one or the other")
+	}
+	if bodyFile != "" {
+		// "-" means stdin, matching gh's convention. The file path is
+		// read directly (no glob expansion, no relative-path
+		// surprises — just os.ReadFile from cwd).
+		var data []byte
+		var err error
+		if bodyFile == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(bodyFile)
+		}
+		if err != nil {
+			exitErr("read --body-file: " + err.Error())
+		}
+		body = string(data)
+	}
+
+	// Strip Claude Code's auto-appended citation line. Claude Code
+	// (the agent harness) routinely tacks "🤖 Generated with [Claude
+	// Code](https://claude.com/claude-code)" onto every PR body it
+	// produces. Triage Factory's footer (added by the server at
+	// submit time) already attributes the work — letting the
+	// upstream Claude Code citation through would visually crowd
+	// out the TF citation and double-bill the PR. Strip before
+	// queuing so the user never sees it in the preview, even if the
+	// agent forgot to remove it.
+	body = stripClaudeCodeCitation(body)
+
+	owner, repo := ownerRepo(args)
+
+	// If --head wasn't supplied, derive from the current branch. The
+	// agent's cwd inside a materialized worktree is `feature/<KEY>`
+	// after `cd "$(triagefactory exec workspace add ...)"` so this
+	// resolves cleanly. exitErr if we can't determine — would otherwise
+	// silently submit the wrong branch to GitHub.
+	if head == "" {
+		out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+		if err != nil {
+			exitErr("could not determine current branch via git rev-parse; pass --head <branch> explicitly. err: " + err.Error())
+		}
+		head = strings.TrimSpace(string(out))
+		if head == "" || head == "HEAD" {
+			exitErr("current branch is detached or empty; pass --head <branch> explicitly")
+		}
+	}
+
+	// Pre-flight: verify the head branch actually exists on origin.
+	// pr create's contract requires `git push` first, but agents
+	// occasionally skip that step (e.g. a Jira agent that decided
+	// the changes already lived on the remote and went straight to
+	// `pr create`). Without this check, the row queues fine, the
+	// human approval overlay can't fetch the diff, the user sees a
+	// 502, and the run isn't recoverable without manual DB surgery.
+	// `ls-remote --exit-code` returns 2 specifically when nothing
+	// matched, so we hard-fail with a clear "did you forget to
+	// push?" message that teaches the agent how to retry — cheaper
+	// than letting the agent finish the run with a broken row.
+	//
+	// However, this preflight relies on the current working directory's
+	// git configuration (`origin`). When the caller targets a repository
+	// explicitly (for example via `--repo` and `--head`) from outside a
+	// local checkout, there is no worktree to query and we should let the
+	// request proceed to the GitHub API instead of failing early here.
+	inWorkTree := exec.Command("git", "rev-parse", "--is-inside-work-tree")
+	if err := inWorkTree.Run(); err == nil {
+		lsRemote := exec.Command("git", "ls-remote", "--exit-code", "--heads", "origin", head)
+		var lsStderr strings.Builder
+		lsRemote.Stderr = &lsStderr
+		if err := lsRemote.Run(); err != nil {
+			exitErr(fmt.Sprintf(
+				"head branch '%s' is not on origin. Run `git push origin %s` first, then retry `pr create`. `pr create` requires the head branch to exist on the upstream — without it the diff cannot be rendered for human approval. (git ls-remote stderr: %s)",
+				head, head, strings.TrimSpace(lsStderr.String()),
+			))
+		}
+	}
+
+	if os.Getenv("TRIAGE_FACTORY_REVIEW_PREVIEW") == "1" {
+		runID := os.Getenv("TRIAGE_FACTORY_RUN_ID")
+		if runID == "" {
+			exitErr("TRIAGE_FACTORY_REVIEW_PREVIEW=1 but TRIAGE_FACTORY_RUN_ID is empty; this command was meant to be invoked by the delegated agent")
+		}
+
+		// Capture the head sha at queue time so the UI can flag drift if
+		// the agent pushes a fixup mid-approval. Best-effort: if
+		// rev-parse fails (cwd doesn't have HEAD, weird state), we
+		// surface the error rather than queueing a row with no sha
+		// because the head_sha column is NOT NULL.
+		headSHAOut, err := exec.Command("git", "rev-parse", "HEAD").Output()
+		if err != nil {
+			exitErr("could not capture head sha via git rev-parse HEAD; the worktree appears to be in a bad state. err: " + err.Error())
+		}
+		headSHA := strings.TrimSpace(string(headSHAOut))
+		if headSHA == "" {
+			exitErr("git rev-parse HEAD returned empty; refusing to queue a pending PR with no head sha")
+		}
+
+		// SKY-212-style anti-retry. The schema's UNIQUE(run_id) on
+		// pending_prs would already block a second insert, but it
+		// surfaces as a generic SQL constraint error that doesn't
+		// teach the agent to stop calling. Check up front so the
+		// agent gets a clear "already queued" message on retry,
+		// matching what submit-review does for reviews.
+		if existing, err := db.PendingPRByRunID(database.Conn, runID); err != nil {
+			exitErr("lookup existing pending PR for run: " + err.Error())
+		} else if existing != nil {
+			exitErr(fmt.Sprintf(
+				"a PR for run %s has already been queued for human approval. Do not call pr create again — your work is complete. Finish the run by writing $TRIAGE_FACTORY_RUN_ROOT/task_memory/<run_id>.md and returning your completion JSON.",
+				runID,
+			))
+		}
+
+		id := uuid.NewString()
+		if err := db.CreatePendingPR(database.Conn, domain.PendingPR{
+			ID: id, RunID: runID,
+			Owner: owner, Repo: repo,
+			HeadBranch: head, HeadSHA: headSHA, BaseBranch: base,
+			Title: title, Body: body,
+			Draft: draft,
+		}); err != nil {
+			// The pre-check above is racy: two concurrent `pr create`
+			// invocations on different DB connections can both pass
+			// it before either has inserted, then one wins the
+			// UNIQUE(run_id) insert and the other lands here with a
+			// generic SQL constraint error. Re-check by run_id; if a
+			// row exists, treat this as the same SKY-212 retry case
+			// the pre-check normally catches and surface the clean
+			// "already queued" message instead of a confusing SQL
+			// error the agent doesn't know how to interpret.
+			if existing, lookupErr := db.PendingPRByRunID(database.Conn, runID); lookupErr == nil && existing != nil {
+				exitErr(fmt.Sprintf(
+					"a PR for run %s has already been queued for human approval. Do not call pr create again — your work is complete. Finish the run by writing $TRIAGE_FACTORY_RUN_ROOT/task_memory/<run_id>.md and returning your completion JSON.",
+					runID,
+				))
+			}
+			exitErr("failed to insert pending PR: " + err.Error())
+		}
+		// LockPendingPR is the second layer — it shouldn't trip in
+		// practice now that we pre-check above, but it's still load-
+		// bearing for the race where two `pr create` invocations
+		// arrive at this point simultaneously (the pre-check happens
+		// in two separate connections and both see "no existing
+		// row"). The lock's WHERE locked = 0 gate serializes them at
+		// the DB layer; the loser sees ErrPendingPRAlreadyQueued.
+		if err := db.LockPendingPR(database.Conn, id, title, body); err != nil {
+			if errors.Is(err, db.ErrPendingPRAlreadyQueued) {
+				exitErr(fmt.Sprintf(
+					"a PR for run %s has already been queued for human approval. Do not call pr create again — your work is complete. Finish the run by writing $TRIAGE_FACTORY_RUN_ROOT/task_memory/<run_id>.md and returning your completion JSON.",
+					runID,
+				))
+			}
+			exitErr("failed to lock pending PR: " + err.Error())
+		}
+
+		printJSON(map[string]any{
+			"status":     "queued_for_human_approval",
+			"id":         id,
+			"owner":      owner,
+			"repo":       repo,
+			"head":       head,
+			"base":       base,
+			"head_sha":   headSHA,
+			"draft_hint": draft, // not stored — passed through at user-approval time
+			"next_step":  "PR is queued for human approval. Do not call pr create again. Finish the run by writing $TRIAGE_FACTORY_RUN_ROOT/task_memory/<run_id>.md and returning your completion JSON.",
+		})
+		return
+	}
+
+	// Standalone mode: open the PR immediately, with footer pre-applied.
+	body = body + agentmeta.Build(database.Conn, os.Getenv("TRIAGE_FACTORY_RUN_ID"), "PR")
+	number, htmlURL, err := client.CreatePR(owner, repo, head, base, title, body, draft)
+	exitOnErr(err)
+
+	printJSON(map[string]any{
+		"status":   "submitted",
+		"number":   number,
+		"html_url": htmlURL,
 	})
 }
 
@@ -517,7 +734,7 @@ func firstPositional(args []string) string {
 			skipNext = false
 			continue
 		}
-		if a == "--repo" || a == "--file" || a == "--pr" || a == "--body" || a == "--line" || a == "--start-line" || a == "--event" || a == "--status" {
+		if a == "--repo" || a == "--file" || a == "--pr" || a == "--body" || a == "--body-file" || a == "--line" || a == "--start-line" || a == "--event" || a == "--status" {
 			skipNext = true
 			continue
 		}
@@ -590,62 +807,36 @@ func exitErr(msg string) {
 	os.Exit(1)
 }
 
-// buildReviewBody wraps the agent's review body with a metadata footer.
-func buildReviewBody(body string, database *db.DB) string {
-	runID := os.Getenv("TRIAGE_FACTORY_RUN_ID")
-	if runID == "" {
-		return body + "\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*"
+// claudeCodeCitationFragment matches the citation Claude Code
+// auto-appends to every PR body it produces. We match on the
+// markdown-link substring rather than the full "🤖 Generated with
+// ..." prefix so the strip survives the agent reformatting the
+// emoji or surrounding text. The link target is stable.
+const claudeCodeCitationFragment = "Generated with [Claude Code](https://claude.com/claude-code)"
+
+// stripClaudeCodeCitation drops the trailing line containing the
+// Claude Code citation, plus any whitespace separating it from the
+// preceding content. Returns body unchanged when the last
+// non-whitespace line doesn't contain the citation — including the
+// case where the citation appears mid-body, since that's content
+// the user wrote intentionally.
+func stripClaudeCodeCitation(body string) string {
+	trimmed := strings.TrimRight(body, " \t\n\r")
+	if trimmed == "" {
+		return body
 	}
-
-	// Look up run for duration info
-	run, err := db.GetAgentRun(database.Conn, runID)
-	if err != nil || run == nil {
-		return body + "\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*"
+	lastNL := strings.LastIndex(trimmed, "\n")
+	var lastLine string
+	if lastNL == -1 {
+		lastLine = trimmed
+	} else {
+		lastLine = trimmed[lastNL+1:]
 	}
-
-	// Sum tokens and calculate cost
-	totals, err := db.RunTokenTotals(database.Conn, runID)
-	if err != nil {
-		return body + "\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*"
+	if !strings.Contains(lastLine, claudeCodeCitationFragment) {
+		return body
 	}
-
-	model := totals.Model
-	if model == "" {
-		model = run.Model
+	if lastNL == -1 {
+		return ""
 	}
-
-	cost := ai.CalculateCostUSD(model, totals.InputTokens, totals.OutputTokens, totals.CacheReadTokens, totals.CacheCreationTokens)
-
-	// Pretty-print model name
-	modelDisplay := model
-	switch {
-	case strings.Contains(model, "opus"):
-		modelDisplay = "Claude Opus"
-	case strings.Contains(model, "sonnet"):
-		modelDisplay = "Claude Sonnet"
-	case strings.Contains(model, "haiku"):
-		modelDisplay = "Claude Haiku"
-	}
-
-	// Calculate elapsed time from run start
-	elapsed := prettyElapsed(time.Since(run.StartedAt))
-
-	footer := fmt.Sprintf("\n\n---\n*This review was partially generated by AI using [Triage Factory](https://github.com/sky-ai-eng/triage-factory).*\n\nTime: %s | Model: %s | Cost: ~$%.3f", elapsed, modelDisplay, cost)
-
-	return body + footer
-}
-
-func prettyElapsed(d time.Duration) string {
-	s := int(d.Seconds())
-	if s < 60 {
-		return fmt.Sprintf("%ds", s)
-	}
-	m := s / 60
-	s = s % 60
-	if m < 60 {
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	h := m / 60
-	m = m % 60
-	return fmt.Sprintf("%dh %dm", h, m)
+	return strings.TrimRight(trimmed[:lastNL], " \t\n\r")
 }

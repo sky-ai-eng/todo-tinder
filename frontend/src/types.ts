@@ -42,6 +42,13 @@ export interface AgentRun {
   ResultSummary: string
   SessionID?: string
   WorktreePath?: string
+  // pending_kind is set by the server's runResponse projection when
+  // status == 'pending_approval'. The discriminator tells the Board
+  // which approval card variant to render: a queued review opens
+  // ReviewOverlay (with inline-comment editing); a queued PR opens
+  // PendingPROverlay (title/body editor + Open-PR button). Empty /
+  // undefined for non-pending runs.
+  pending_kind?: 'review' | 'pr'
 }
 
 export interface AgentMessage {

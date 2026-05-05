@@ -291,3 +291,120 @@ func TestGetPRFiles_SecondPageError(t *testing.T) {
 		t.Fatal("expected error when second page fails, got nil")
 	}
 }
+
+// TestCreatePR_HappyPath asserts the request shape and that we parse
+// number + html_url out of GitHub's response. This is the canonical
+// path the pending-PR submit handler walks on user approval.
+func TestCreatePR_HappyPath(t *testing.T) {
+	var (
+		gotMethod, gotPath string
+		gotBody            map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"number": 42, "html_url": "https://github.com/owner/repo/pull/42"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := clientAgainst(srv.URL)
+	number, url, err := c.CreatePR("owner", "repo", "feature/SKY-1", "main", "Add idempotency", "Body text", false)
+	if err != nil {
+		t.Fatalf("CreatePR: %v", err)
+	}
+	if number != 42 {
+		t.Errorf("number = %d, want 42", number)
+	}
+	if url != "https://github.com/owner/repo/pull/42" {
+		t.Errorf("url = %q, want canonical github.com path", url)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/repos/owner/repo/pulls" {
+		t.Errorf("path = %q, want /repos/owner/repo/pulls", gotPath)
+	}
+	for _, want := range []struct{ key, val string }{
+		{"title", "Add idempotency"},
+		{"head", "feature/SKY-1"},
+		{"base", "main"},
+		{"body", "Body text"},
+	} {
+		if got, _ := gotBody[want.key].(string); got != want.val {
+			t.Errorf("body[%q] = %q, want %q", want.key, got, want.val)
+		}
+	}
+	if draft, _ := gotBody["draft"].(bool); draft {
+		t.Errorf("draft = true, want false (not draft)")
+	}
+}
+
+// TestCreatePR_DraftFlagPropagated confirms the draft boolean rides
+// through to the request body verbatim. UI exposes the draft toggle
+// at submit time; if this regressed, the toggle would silently no-op.
+func TestCreatePR_DraftFlagPropagated(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"number": 1, "html_url": "https://github.com/o/r/pull/1"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := clientAgainst(srv.URL)
+	if _, _, err := c.CreatePR("o", "r", "h", "main", "T", "B", true); err != nil {
+		t.Fatalf("CreatePR: %v", err)
+	}
+	if draft, _ := gotBody["draft"].(bool); !draft {
+		t.Errorf("draft = false, want true (draft requested)")
+	}
+}
+
+// TestCreatePR_422_BaseMissing pins the surfacing-the-message contract
+// for the most common GitHub error: caller specified a base that
+// doesn't exist on the upstream. The nested errors[].message must
+// land in the returned error (rather than just the raw JSON blob)
+// so the user sees the actionable reason in the submit-handler's 502.
+func TestCreatePR_422_BaseMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"message":"base 'develop' is not a valid branch"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := clientAgainst(srv.URL)
+	_, _, err := c.CreatePR("o", "r", "h", "develop", "T", "B", false)
+	if err == nil {
+		t.Fatal("expected error for 422, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Validation Failed") {
+		t.Errorf("expected error to surface 'Validation Failed', got %q", msg)
+	}
+	if !strings.Contains(msg, "base 'develop' is not a valid branch") {
+		t.Errorf("expected error to surface nested message, got %q", msg)
+	}
+}
+
+// TestCreatePR_422_FieldErr covers the other common 422 shape:
+// errors[].field+code instead of errors[].message (e.g. invalid
+// head ref). Field-level errors should still be readable.
+func TestCreatePR_422_FieldErr(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","field":"head"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := clientAgainst(srv.URL)
+	_, _, err := c.CreatePR("o", "r", "ghost-branch", "main", "T", "B", false)
+	if err == nil {
+		t.Fatal("expected error for 422, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "head") || !strings.Contains(msg, "invalid") {
+		t.Errorf("expected error to mention invalid head field, got %q", msg)
+	}
+}

@@ -10,6 +10,62 @@ import (
 	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
 )
 
+// ticketHelp maps each ticket subcommand to its usage line. Mirrored
+// in jira.HelpText (the master overview); the per-action lookup here
+// powers `jira ticket <action> --help`. Drift between the two is
+// caught manually for now — they live in adjacent files and any
+// rename has to touch both.
+var ticketHelp = map[string]string{
+	"view":             "jira ticket view <key>",
+	"transition":       "jira ticket transition <key> --status <status>",
+	"list-transitions": "jira ticket list-transitions <key>",
+	"comment":          "jira ticket comment <key> --body <text>",
+	"assign":           "jira ticket assign <key>",
+	"unassign":         "jira ticket unassign <key>",
+	"create":           "jira ticket create <project> --type <type> --summary <text> [--description <text>] [--parent <key>] [--priority <priority>]",
+	"set-parent":       "jira ticket set-parent <key> --parent <parent_key>",
+	"set-priority":     "jira ticket set-priority <key> --priority <priority>",
+	"search":           "jira ticket search --jql <jql> [--fields <f1,f2,...>] [--max <N>]",
+	"list-children":    "jira ticket list-children <key>",
+	"list-types":       "jira ticket list-types <project>",
+	"list-priorities":  "jira ticket list-priorities",
+}
+
+// hasHelpFlag returns true if --help or -h appears as a standalone
+// flag (not as the value of a preceding --xxx flag). Per-action help
+// dispatch trips on this BEFORE the action body runs so the agent
+// can run e.g. `jira ticket view --help` without the leading arg
+// being misread as the issue key.
+//
+// The "preceding flag" exclusion is what makes
+// `jira ticket comment KEY --body "--help"` execute the comment
+// instead of printing help — the literal "--help" is the body's
+// value, not a help request. Same for a JQL search whose query
+// happens to contain --help. Assumption: jira ticket has no boolean
+// flags. If one is added, --xxxBool --help would be misread as the
+// boolean's value; the assumption is enforced by ticketHelp listing
+// only value-taking flags. Adding a boolean would require revisiting
+// this helper.
+func hasHelpFlag(args []string) bool {
+	for i, a := range args {
+		if a != "--help" && a != "-h" {
+			continue
+		}
+		if i > 0 {
+			prev := args[i-1]
+			// A `--xxx` arg is treated as a value-taking flag and
+			// the current --help is its value, not a help request.
+			// `--help` itself doesn't claim a value, so an earlier
+			// `--help` doesn't shadow this one.
+			if strings.HasPrefix(prev, "--") && prev != "--help" {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func handleTicket(client *jiraclient.Client, args []string) {
 	if len(args) < 1 {
 		exitErr("usage: triagefactory exec jira ticket <action> [flags]")
@@ -17,6 +73,18 @@ func handleTicket(client *jiraclient.Client, args []string) {
 
 	action := args[0]
 	flags := args[1:]
+
+	// Per-action --help: print just that action's usage and exit cleanly,
+	// without invoking the action body (which would otherwise try to
+	// interpret --help as an issue key / project / etc.).
+	if hasHelpFlag(flags) {
+		if h, ok := ticketHelp[action]; ok {
+			fmt.Printf("usage: triagefactory exec %s\n", h)
+			return
+		}
+		// Unknown action with --help — fall through to the unknown-action
+		// error below so the user sees that the action itself is wrong.
+	}
 
 	switch action {
 	case "view":
