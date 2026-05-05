@@ -28,24 +28,31 @@ type RunWorktree struct {
 	CreatedAt     time.Time
 }
 
-// InsertRunWorktree records a freshly-materialized worktree. Caller must
-// have already created the worktree on disk at w.Path.
+// InsertRunWorktree reserves a row for a worktree the caller is about
+// to create. Used as the cross-process serialization point: two
+// concurrent `workspace add owner/repo` invocations that both passed
+// the GetRunWorktreeByRepo "not found" check race here, and the PK
+// conflict deterministically picks one winner.
 //
-// On PK conflict (concurrent CLI invocations for the same (run_id,
-// repo_id)) the existing row's path is returned with inserted=false so
-// the caller can clean up its just-created loser worktree without
-// confusing future readers about which path actually maps to the row.
+// The path the caller passes is the deterministic target
+// ({runRoot}/{owner}/{repo}) — `CreateForBranchInRoot` always lands
+// there, so we can record the path BEFORE creating the worktree on
+// disk. That ordering matters: if create runs before insert, both
+// racing processes try `git worktree add` against the same target
+// dir and the second fails on "dir already exists" before we ever
+// reach the PK conflict that's supposed to handle them. With insert
+// first, the loser sees inserted=false and returns the winner's path
+// without touching git.
 //
-// Race shape: two `workspace add owner/repo` processes can both pass
-// the GetRunWorktreeByRepo "not found" check, both call
-// CreateForBranchInRoot, and arrive here racing. The per-repo lock
-// inside the worktree library serializes the bare-side git operations,
-// but it can't prevent two distinct on-disk worktree paths if the
-// two processes computed different paths — same here, both computed
-// the same `{runRoot}/{owner}/{repo}` path. The second `git worktree
-// add` will fail because the dir is in use; that's caught at the
-// call site. If by some path the second process did land a worktree,
-// the loser-cleanup path here makes the side-table state authoritative.
+// On PK conflict the winning row's path is returned with
+// inserted=false so the caller skips its create step entirely.
+//
+// Caller responsibilities:
+//   - On winner (inserted=true): create the worktree on disk. If the
+//     create fails, call DeleteRunWorktree to release the reservation
+//     so the next attempt can retry.
+//   - On loser (inserted=false): do NOT create the worktree; return
+//     winningPath so the agent cd's into the canonical location.
 func InsertRunWorktree(database *sql.DB, w RunWorktree) (inserted bool, winningPath string, err error) {
 	res, err := database.Exec(`
 		INSERT OR IGNORE INTO run_worktrees (run_id, repo_id, path, feature_branch)
@@ -73,6 +80,22 @@ func InsertRunWorktree(database *sql.DB, w RunWorktree) (inserted bool, winningP
 		return false, "", fmt.Errorf("run_worktree row vanished after INSERT OR IGNORE conflict (run_id=%s, repo_id=%s)", w.RunID, w.RepoID)
 	}
 	return false, existing.Path, nil
+}
+
+// DeleteRunWorktree removes the row for a (run_id, repo_id) pair.
+// Used to release a reservation after createWorktree fails, or to
+// clear a stale row whose on-disk path was reaped (e.g. by startup
+// orphan sweep) so a subsequent `workspace add` can re-reserve.
+//
+// Idempotent: deleting a row that doesn't exist is a no-op (no error).
+// The caller's "is the dir actually missing" check happens elsewhere;
+// this helper only manipulates the DB row.
+func DeleteRunWorktree(database *sql.DB, runID, repoID string) error {
+	_, err := database.Exec(`
+		DELETE FROM run_worktrees
+		 WHERE run_id = ? AND repo_id = ?
+	`, runID, repoID)
+	return err
 }
 
 // GetRunWorktreeByRepo fetches the worktree row for a (run_id, repo_id)

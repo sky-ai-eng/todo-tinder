@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -24,12 +25,14 @@ import (
 type addDeps struct {
 	createWorktree func(ctx context.Context, owner, repo, cloneURL, baseBranch, featureBranch, runID, runRoot string) (string, error)
 	removeWorktree func(path, runID string) error
+	statPath       func(path string) (os.FileInfo, error)
 }
 
 func defaultAddDeps() addDeps {
 	return addDeps{
 		createWorktree: worktree.CreateForBranchInRoot,
 		removeWorktree: worktree.RemoveAt,
+		statPath:       os.Stat,
 	}
 }
 
@@ -49,16 +52,28 @@ var (
 // extracted from runAdd so it returns errors instead of os.Exit-ing.
 // Returns the absolute worktree path the agent should cd into.
 //
-// Order matters:
-//  1. Run + task validation (and Jira-vs-GitHub gate).
-//  2. Idempotency check via run_worktrees — second add for same (run, repo)
-//     short-circuits before we touch git or repo profiles.
-//  3. Repo-profile lookup (must be configured AND have a clone URL).
-//  4. Worktree create on disk.
-//  5. DB record. On insert failure (write error or race-loss against a
-//     concurrent add) the just-created worktree is rolled back via
-//     removeWorktree so the spawner's cleanup defer (which lists
-//     run_worktrees) doesn't leak an orphan entry.
+// Concurrency: the cross-process serialization point is the
+// run_worktrees PK insert (`InsertRunWorktree`'s INSERT OR IGNORE).
+// Two concurrent invocations both passing the idempotency precheck
+// race at insert time; the loser sees inserted=false and returns the
+// winner's path without touching git. Reserving BEFORE the create is
+// load-bearing — if we created first, both racing processes would
+// hit `git worktree add` against the same deterministic target dir
+// and the second would fail on "directory exists" before ever
+// reaching the PK conflict.
+//
+// Order:
+//  1. Run + task validation, Jira-vs-GitHub gate.
+//  2. Idempotent re-add check: if a row exists AND its path is a
+//     live directory, return it. If the row exists but the path is
+//     missing/not-a-dir (e.g. wiped by startup orphan sweep), drop
+//     the stale row so the reservation step below can re-reserve.
+//  3. Repo profile lookup (clone URL required).
+//  4. Reserve the run_worktrees row with the deterministic path
+//     {runRoot}/{owner}/{repo}. PK conflict picks the winner.
+//  5. Loser path: return winner's path immediately.
+//  6. Winner path: create the worktree on disk. On failure, release
+//     the reservation so the next attempt can retry.
 func materializeWorkspace(database *db.DB, runID, ownerRepoArg string, deps addDeps) (string, error) {
 	owner, repo, ok := splitOwnerRepo(ownerRepoArg)
 	if !ok {
@@ -88,22 +103,29 @@ func materializeWorkspace(database *db.DB, runID, ownerRepoArg string, deps addD
 		return "", fmt.Errorf("%w (run task source is %q)", errNotJiraRun, task.EntitySource)
 	}
 
-	// Idempotent re-add: reuse an existing worktree only if the recorded path
-	// still exists on disk. Startup cleanup can remove worktree directories
-	// without clearing run_worktrees rows, so stale records must be ignored.
+	// Idempotent re-add — but only if the on-disk worktree still exists.
+	// Startup orphan sweep can remove the directory without touching the
+	// row, so a stale row must be dropped (not honored) before we try to
+	// reserve a fresh one.
 	existing, err := db.GetRunWorktreeByRepo(database.Conn, runID, repoID)
 	if err != nil {
 		return "", fmt.Errorf("workspace add: lookup existing worktree: %w", err)
 	}
 	if existing != nil {
-		info, statErr := os.Stat(existing.Path)
+		info, statErr := deps.statPath(existing.Path)
 		switch {
 		case statErr == nil && info.IsDir():
 			return existing.Path, nil
 		case statErr == nil && !info.IsDir():
-			log.Printf("workspace add: ignoring stale worktree record for run %s repo %s: path is not a directory: %s", runID, repoID, existing.Path)
+			log.Printf("workspace add: dropping stale row for run %s repo %s: path is not a directory: %s", runID, repoID, existing.Path)
+			if delErr := db.DeleteRunWorktree(database.Conn, runID, repoID); delErr != nil {
+				return "", fmt.Errorf("workspace add: delete stale worktree row: %w", delErr)
+			}
 		case errors.Is(statErr, os.ErrNotExist):
-			log.Printf("workspace add: ignoring stale worktree record for run %s repo %s: path missing: %s", runID, repoID, existing.Path)
+			log.Printf("workspace add: dropping stale row for run %s repo %s: path missing: %s", runID, repoID, existing.Path)
+			if delErr := db.DeleteRunWorktree(database.Conn, runID, repoID); delErr != nil {
+				return "", fmt.Errorf("workspace add: delete stale worktree row: %w", delErr)
+			}
 		default:
 			return "", fmt.Errorf("workspace add: stat existing worktree path %q: %w", existing.Path, statErr)
 		}
@@ -126,18 +148,13 @@ func materializeWorkspace(database *db.DB, runID, ownerRepoArg string, deps addD
 	}
 	featureBranch := "feature/" + task.EntitySourceID
 	runRoot := worktree.RunRoot(runID)
+	// Path is deterministic from CreateForBranchInRoot's contract:
+	// filepath.Join(runRoot, owner, repo). Compute it here so we can
+	// reserve the row BEFORE the create runs.
+	wtPath := filepath.Join(runRoot, profile.Owner, profile.Repo)
 
-	wtPath, err := deps.createWorktree(
-		context.Background(),
-		profile.Owner, profile.Repo,
-		profile.CloneURL,
-		baseBranch, featureBranch,
-		runID, runRoot,
-	)
-	if err != nil {
-		return "", fmt.Errorf("workspace add: create worktree: %w", err)
-	}
-
+	// Reserve. Two concurrent processes that both reach this point
+	// race at the PK; the loser short-circuits before touching git.
 	inserted, winningPath, err := db.InsertRunWorktree(database.Conn, db.RunWorktree{
 		RunID:         runID,
 		RepoID:        repoID,
@@ -145,25 +162,42 @@ func materializeWorkspace(database *db.DB, runID, ownerRepoArg string, deps addD
 		FeatureBranch: featureBranch,
 	})
 	if err != nil {
-		// Insert failed — the worktree is on disk but the spawner's
-		// cleanup defer (which lists run_worktrees) won't see it. Roll
-		// back the on-disk side so we don't leak. Rollback failures are
-		// logged but don't shadow the original error the caller needs.
-		if rmErr := deps.removeWorktree(wtPath, runID); rmErr != nil {
-			log.Printf("workspace add: rollback after insert failure: %v", rmErr)
-		}
-		return "", fmt.Errorf("workspace add: record worktree: %w", err)
+		return "", fmt.Errorf("workspace add: reserve worktree row: %w", err)
 	}
 	if !inserted {
-		// Race-loss: another concurrent `workspace add` for the same
-		// (run, repo) won the PK conflict. Clean up our duplicate
-		// on-disk worktree (same target path, but RemoveAt + pruneAll
-		// still resets the bare's tracking cleanly) and return the
-		// winning row's path so the agent cd's into the canonical one.
-		if rmErr := deps.removeWorktree(wtPath, runID); rmErr != nil {
-			log.Printf("workspace add: cleanup loser worktree after race: %v", rmErr)
-		}
+		// Lost the reservation race. Return the winner's path. There's
+		// a tiny window where the winner's createWorktree is still in
+		// flight and the path doesn't exist on disk yet; the agent's
+		// subsequent `cd` would fail loudly if the create eventually
+		// errors (winner deletes the row, next agent retry re-reserves).
+		// Polling here would add complexity for negligible gain.
 		return winningPath, nil
+	}
+
+	// We won. Create the worktree.
+	gotPath, err := deps.createWorktree(
+		context.Background(),
+		profile.Owner, profile.Repo,
+		profile.CloneURL,
+		baseBranch, featureBranch,
+		runID, runRoot,
+	)
+	if err != nil {
+		// Release the reservation so the next attempt can retry.
+		// Delete failures are logged but don't shadow the create error
+		// the caller actually needs.
+		if delErr := db.DeleteRunWorktree(database.Conn, runID, repoID); delErr != nil {
+			log.Printf("workspace add: release reservation after create failure: %v", delErr)
+		}
+		return "", fmt.Errorf("workspace add: create worktree: %w", err)
+	}
+	if gotPath != wtPath {
+		// CreateForBranchInRoot's contract is to land at
+		// filepath.Join(runRoot, owner, repo); a divergence means the
+		// worktree library changed and our reservation path no longer
+		// matches reality. Surface loudly rather than silently storing
+		// the wrong path.
+		log.Printf("workspace add: created path %q diverges from reserved %q (run=%s repo=%s); investigate", gotPath, wtPath, runID, repoID)
 	}
 
 	return wtPath, nil
