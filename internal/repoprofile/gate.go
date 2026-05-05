@@ -14,11 +14,12 @@ type ProfileGate struct {
 	ready bool
 }
 
-// NewProfileGate creates a gate in the not-ready state. The database
-// argument is preserved for callers that already pass it; the gate
-// itself no longer touches the DB.
+// NewProfileGate creates a gate in the ready state so scoring is not
+// blocked in installs where repo profiling is disabled or no longer
+// part of bootstrap. The database argument is preserved for callers
+// that already pass it; the gate itself no longer touches the DB.
 func NewProfileGate(_ *sql.DB) *ProfileGate {
-	return &ProfileGate{}
+	return &ProfileGate{ready: true}
 }
 
 // Ready returns true if profiling has completed and repo data is current.
