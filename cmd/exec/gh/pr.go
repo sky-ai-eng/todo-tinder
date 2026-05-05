@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -396,15 +397,39 @@ func prSubmitReview(client *ghclient.Client, database *db.DB, args []string) {
 func prCreate(client *ghclient.Client, database *db.DB, args []string) {
 	title := flagVal(args, "--title")
 	body := flagVal(args, "--body")
+	bodyFile := flagVal(args, "--body-file")
 	base := flagVal(args, "--base")
 	head := flagVal(args, "--head")
 	draft := hasFlag(args, "--draft")
 
 	if title == "" {
-		exitErr("usage: gh pr create --title <T> --body <B> --base <branch> [--head <branch>] [--draft] [--repo owner/repo]\n--title is required")
+		exitErr("usage: gh pr create --title <T> (--body <B> | --body-file <path>) --base <branch> [--head <branch>] [--draft] [--repo owner/repo]\n--title is required")
 	}
 	if base == "" {
 		exitErr("--base is required (the branch to merge into, e.g. main)")
+	}
+
+	// --body and --body-file are mutually exclusive: with both set,
+	// the agent's intent is ambiguous and silently picking one risks
+	// dropping the longer/more-recent draft. Force a clean choice.
+	if body != "" && bodyFile != "" {
+		exitErr("--body and --body-file are mutually exclusive; pass one or the other")
+	}
+	if bodyFile != "" {
+		// "-" means stdin, matching gh's convention. The file path is
+		// read directly (no glob expansion, no relative-path
+		// surprises — just os.ReadFile from cwd).
+		var data []byte
+		var err error
+		if bodyFile == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(bodyFile)
+		}
+		if err != nil {
+			exitErr("read --body-file: " + err.Error())
+		}
+		body = string(data)
 	}
 
 	owner, repo := ownerRepo(args)
@@ -668,7 +693,7 @@ func firstPositional(args []string) string {
 			skipNext = false
 			continue
 		}
-		if a == "--repo" || a == "--file" || a == "--pr" || a == "--body" || a == "--line" || a == "--start-line" || a == "--event" || a == "--status" {
+		if a == "--repo" || a == "--file" || a == "--pr" || a == "--body" || a == "--body-file" || a == "--line" || a == "--start-line" || a == "--event" || a == "--status" {
 			skipNext = true
 			continue
 		}

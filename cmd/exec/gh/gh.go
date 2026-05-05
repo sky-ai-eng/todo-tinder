@@ -17,11 +17,15 @@ const HelpText = `GitHub PR Commands:
   gh pr review-view <review_id> --pr <N> [--repo o/r] [-v]  Expand a review + inline comments
 
 PR Creation:
-  gh pr create --title <T> --body <B> --base <branch> [--head <branch>] [--draft] [--repo o/r]
+  gh pr create --title <T> (--body <B> | --body-file <path>) --base <branch> [--head <branch>] [--draft] [--repo o/r]
                                                           Open a pull request. The head branch
                                                           must already be pushed to the upstream
                                                           (git push first). --head defaults to
                                                           the current branch.
+                                                          For multi-line markdown bodies use
+                                                          --body-file <path> (or "-" for stdin)
+                                                          to skip shell escaping. --body and
+                                                          --body-file are mutually exclusive.
                                                           Inside a delegated Triage Factory run
                                                           this queues the PR for human approval
                                                           (the user opens it via the UI); run
