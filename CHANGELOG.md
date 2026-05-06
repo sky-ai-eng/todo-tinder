@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.1](https://github.com/sky-ai-eng/triage-factory/compare/v1.6.0...v1.6.1) (2026-05-06)
+
+
+### Bug Fixes
+
+* **agentproc:** bufio.Scanner tool_result lines don't kill runs ([#103](https://github.com/sky-ai-eng/triage-factory/issues/103)) ([d6fda3b](https://github.com/sky-ai-eng/triage-factory/commit/d6fda3b3146a62fcfd30227b86a4ba60fb8bd620))
+* **config:** settings in SQLite not yaml, default poll to 5m ([#100](https://github.com/sky-ai-eng/triage-factory/issues/100)) ([c65a5b5](https://github.com/sky-ai-eng/triage-factory/commit/c65a5b55489b96728d66a25f8c32250dd9978ce3))
+* **factory:** flush turn-pole belt seams via analytic endpoint tangents ([#104](https://github.com/sky-ai-eng/triage-factory/issues/104)) ([9a49369](https://github.com/sky-ai-eng/triage-factory/commit/9a49369ea4e46b07e249737902b167c1832835a8))
+* **review:** multi-line comments must be within one diff hunk ([#101](https://github.com/sky-ai-eng/triage-factory/issues/101)) ([96b989d](https://github.com/sky-ai-eng/triage-factory/commit/96b989d38c78ec00b985c6d4e1260a1d4db0a5e3))
+
 ## [1.6.0](https://github.com/sky-ai-eng/triage-factory/compare/v1.5.0...v1.6.0) (2026-05-05)
 
 
