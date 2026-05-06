@@ -11,6 +11,13 @@ type Handler = (event: WSEvent) => void
 let globalWs: WebSocket | null = null
 const listeners = new Set<Handler>()
 
+// Track per-repo clone_status across WS events so we only fire the
+// "clone failed" toast on the *transition* into 'failed', not on every
+// repo_profile_updated event with the same failed status. Module-level
+// (not React state) so the dedupe survives page navigations and the
+// short-lived useWebSocket subscriptions on individual pages.
+const cloneStatusByRepo = new Map<string, 'ok' | 'failed' | 'pending'>()
+
 function ensureConnected() {
   if (
     globalWs &&
@@ -35,6 +42,31 @@ function ensureConnected() {
           body: event.data.body,
         })
         return
+      }
+      // Cross-page clone failure surfacing: when a repo's clone_status
+      // transitions to 'failed' on the backend (bootstrap, lazy clone,
+      // or import path), fire a sticky error toast with a CTA to the
+      // Repos page. Doing it here (rather than in Repos.tsx) means the
+      // user sees it even when they're on Board / Settings / Tasks.
+      if (event.type === 'repo_profile_updated' && event.data && typeof event.data === 'object') {
+        const data = event.data as {
+          id?: string
+          clone_status?: 'ok' | 'failed' | 'pending'
+          clone_error_kind?: 'ssh' | 'other'
+        }
+        if (data.id && data.clone_status) {
+          const prev = cloneStatusByRepo.get(data.id)
+          cloneStatusByRepo.set(data.id, data.clone_status)
+          if (data.clone_status === 'failed' && prev !== 'failed') {
+            const kind = data.clone_error_kind === 'ssh' ? ' (SSH)' : ''
+            toastStore.push({
+              level: 'error',
+              title: 'Clone failed',
+              body: `Could not clone ${data.id}${kind}. Open the Repos page for details.`,
+              action: { label: 'Go to Repos', to: '/repos' },
+            })
+          }
+        }
       }
       for (const fn of listeners) {
         fn(event)

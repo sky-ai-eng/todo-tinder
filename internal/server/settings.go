@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
 // validateStatusRule enforces the shape invariants for a JiraStatusRule.
@@ -54,6 +56,18 @@ func ruleEqual(a, b config.JiraStatusRule) bool {
 		slices.Equal(normalizeMembers(a.Members), normalizeMembers(b.Members))
 }
 
+// defaultedCloneProtocol normalizes a stored CloneProtocol value for the
+// API surface using the same effective semantics as backend clone URL
+// selection: only the literal value "ssh" selects SSH; empty, "https",
+// and any other invalid/stale value are treated as HTTPS. Clients should
+// always see one of the two known forms.
+func defaultedCloneProtocol(stored string) string {
+	if stored == "ssh" {
+		return "ssh"
+	}
+	return "https"
+}
+
 // settingsResponse combines config values with auth status so the frontend
 // can render everything on one page.
 type settingsResponse struct {
@@ -64,10 +78,11 @@ type settingsResponse struct {
 }
 
 type githubSettings struct {
-	Enabled      bool   `json:"enabled"`
-	BaseURL      string `json:"base_url"`
-	HasToken     bool   `json:"has_token"`
-	PollInterval string `json:"poll_interval"`
+	Enabled       bool   `json:"enabled"`
+	BaseURL       string `json:"base_url"`
+	HasToken      bool   `json:"has_token"`
+	PollInterval  string `json:"poll_interval"`
+	CloneProtocol string `json:"clone_protocol"` // "ssh" | "https"
 }
 
 type jiraSettings struct {
@@ -102,10 +117,11 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 
 	resp := settingsResponse{
 		GitHub: githubSettings{
-			Enabled:      creds.GitHubPAT != "",
-			BaseURL:      cfg.GitHub.BaseURL,
-			HasToken:     creds.GitHubPAT != "",
-			PollInterval: cfg.GitHub.PollInterval.String(),
+			Enabled:       creds.GitHubPAT != "",
+			BaseURL:       cfg.GitHub.BaseURL,
+			HasToken:      creds.GitHubPAT != "",
+			PollInterval:  cfg.GitHub.PollInterval.String(),
+			CloneProtocol: defaultedCloneProtocol(cfg.GitHub.CloneProtocol),
 		},
 		Jira: jiraSettings{
 			Enabled:      creds.JiraPAT != "",
@@ -154,9 +170,10 @@ type settingsUpdateRequest struct {
 	JiraPAT       string `json:"jira_pat"` // empty means "keep existing"
 
 	// Config
-	GitHubPollInterval string   `json:"github_poll_interval"`
-	JiraPollInterval   string   `json:"jira_poll_interval"`
-	JiraProjects       []string `json:"jira_projects"`
+	GitHubPollInterval  string   `json:"github_poll_interval"`
+	GitHubCloneProtocol string   `json:"github_clone_protocol"` // "ssh" | "https" | "" (don't touch)
+	JiraPollInterval    string   `json:"jira_poll_interval"`
+	JiraProjects        []string `json:"jira_projects"`
 	// JiraPickup/InProgress/Done are pointers so the request can distinguish
 	// "don't touch" (nil) from "clear" ({Members:[], Canonical:""}). Empty
 	// members + non-empty canonical is a validation error.
@@ -187,6 +204,13 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	prevGHURL := creds.GitHubURL
 	prevGHPAT := creds.GitHubPAT
 	prevGHPollInterval := cfg.GitHub.PollInterval
+	// Compare the raw stored value (not defaulted), so a legacy install
+	// that the migration left at "https" detects an explicit flip to
+	// "ssh" as a real change. Defaulting both sides via
+	// defaultedCloneProtocol would treat empty (legacy/pre-feature)
+	// and "ssh" (post-feature default) as equal, silently skipping
+	// the re-profile + re-bootstrap that the toggle relies on.
+	prevGHCloneProtocol := cfg.GitHub.CloneProtocol
 	prevJiraURL := creds.JiraURL
 	prevJiraPAT := creds.JiraPAT
 	prevJiraProjects := cfg.Jira.Projects
@@ -292,6 +316,18 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			cfg.GitHub.PollInterval = d
 		}
 	}
+	// Empty string means "don't touch" so the toggle UX (which always
+	// sends one of "ssh" / "https") flips the value while older clients
+	// that omit the field leave it alone. Unrecognized values are
+	// rejected rather than silently coerced — the frontend should never
+	// send anything other than the two known values.
+	if req.GitHubCloneProtocol != "" {
+		if req.GitHubCloneProtocol != "ssh" && req.GitHubCloneProtocol != "https" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "github_clone_protocol must be 'ssh' or 'https'"})
+			return
+		}
+		cfg.GitHub.CloneProtocol = req.GitHubCloneProtocol
+	}
 	if req.JiraPollInterval != "" {
 		if d, err := time.ParseDuration(req.JiraPollInterval); err == nil && d >= 10*time.Second {
 			cfg.Jira.PollInterval = d
@@ -333,6 +369,32 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		cfg.Server.Port = req.ServerPort
 	}
 
+	// Hard-block a transition into SSH mode if our preflight against
+	// the configured GitHub host can't authenticate. Otherwise the
+	// toggle would "succeed" silently — repairOriginURL is a local
+	// config write that doesn't test connectivity, so the failure
+	// wouldn't surface until the next poll/delegation tries to fetch.
+	// Only gate the transition (prev != "ssh") so a user with broken
+	// SSH today can still save unrelated fields without being held
+	// hostage to fix SSH first; switching AWAY from SSH is also
+	// unblocked. Probe target is derived from creds.GitHubURL so GHE
+	// users see hints with their hostname, not "github.com".
+	if cfg.GitHub.CloneProtocol == "ssh" && prevGHCloneProtocol != "ssh" {
+		sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		err := worktree.PreflightSSH(ctx, sshHost)
+		cancel()
+		if err != nil {
+			log.Printf("[settings] blocked SSH switch against %s for %q: preflight failed: %v", sshHost, creds.GitHubURL, err)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error":  fmt.Sprintf("SSH preflight against %s failed — fix your SSH setup or keep HTTPS. %s", sshHost, err.Error()),
+				"field":  "github_clone_protocol",
+				"stderr": err.Error(),
+			})
+			return
+		}
+	}
+
 	// Persist
 	if err := auth.Store(creds); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
@@ -343,10 +405,15 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Detect what changed and fire the appropriate callback
+	// Detect what changed and fire the appropriate callback. Treat a
+	// CloneProtocol flip the same as URL/PAT/PollInterval changes:
+	// onGitHubChanged re-runs profiling AND bootstrapBareClones, which
+	// is exactly what we need to repair every bare's origin URL to the
+	// new form.
 	ghChanged := creds.GitHubURL != prevGHURL ||
 		creds.GitHubPAT != prevGHPAT ||
-		cfg.GitHub.PollInterval != prevGHPollInterval
+		cfg.GitHub.PollInterval != prevGHPollInterval ||
+		cfg.GitHub.CloneProtocol != prevGHCloneProtocol
 
 	jiraChanged := creds.JiraURL != prevJiraURL ||
 		creds.JiraPAT != prevJiraPAT ||
@@ -492,4 +559,39 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusOK, statuses)
+}
+
+// handleGitHubPreflightSSH probes whether the user's machine can
+// authenticate to GitHub over SSH (key + agent + known_hosts all
+// usable). Powers the Setup wizard's gating UX and the Settings
+// page's "Test SSH connection" button. Always returns HTTP 200 — the
+// body's "ok" flag is the verdict — so the client can distinguish
+// "preflight reported failure" from "the server itself errored".
+//
+// Logs both the success path and the failure stderr to the daemon's
+// log so users investigating issues see the exact ssh output even
+// when the UI only renders the friendly summary.
+func (s *Server) handleGitHubPreflightSSH(w http.ResponseWriter, r *http.Request) {
+	// Probe target tracks the configured GitHub base URL so the Test
+	// SSH button on the Settings page works for GHE deployments. We
+	// load creds (not config) because creds.GitHubURL is the URL the
+	// user actually authenticates against; cfg.GitHub.BaseURL mirrors
+	// it but the keychain copy is the source of truth.
+	creds, _ := auth.Load()
+	sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := worktree.PreflightSSH(ctx, sshHost); err != nil {
+		log.Printf("[settings] SSH preflight against %s failed: %v", sshHost, err)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     false,
+			"stderr": err.Error(),
+			"host":   sshHost,
+		})
+		return
+	}
+	log.Printf("[settings] SSH preflight ok (%s authenticated)", sshHost)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "host": sshHost})
 }

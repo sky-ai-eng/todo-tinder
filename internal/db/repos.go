@@ -37,7 +37,7 @@ func UpsertRepoProfile(database *sql.DB, p domain.RepoProfile) error {
 // GetAllRepoProfiles returns all repo profiles, including those without profile text.
 func GetAllRepoProfiles(database *sql.DB) ([]domain.RepoProfile, error) {
 	rows, err := database.Query(`
-		SELECT id, owner, repo, description, has_readme, has_claude_md, has_agents_md, profile_text, clone_url, default_branch, base_branch, profiled_at
+		SELECT id, owner, repo, description, has_readme, has_claude_md, has_agents_md, profile_text, clone_url, default_branch, base_branch, profiled_at, clone_status, clone_error, clone_error_kind
 		FROM repo_profiles
 		ORDER BY id
 	`)
@@ -49,9 +49,9 @@ func GetAllRepoProfiles(database *sql.DB) ([]domain.RepoProfile, error) {
 	var profiles []domain.RepoProfile
 	for rows.Next() {
 		var p domain.RepoProfile
-		var description, profileText, cloneURL, defaultBranch, baseBranch sql.NullString
+		var description, profileText, cloneURL, defaultBranch, baseBranch, cloneError, cloneErrorKind sql.NullString
 		var profiledAt sql.NullTime
-		if err := rows.Scan(&p.ID, &p.Owner, &p.Repo, &description, &p.HasReadme, &p.HasClaudeMd, &p.HasAgentsMd, &profileText, &cloneURL, &defaultBranch, &baseBranch, &profiledAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Owner, &p.Repo, &description, &p.HasReadme, &p.HasClaudeMd, &p.HasAgentsMd, &profileText, &cloneURL, &defaultBranch, &baseBranch, &profiledAt, &p.CloneStatus, &cloneError, &cloneErrorKind); err != nil {
 			return nil, err
 		}
 		p.Description = description.String
@@ -59,6 +59,8 @@ func GetAllRepoProfiles(database *sql.DB) ([]domain.RepoProfile, error) {
 		p.CloneURL = cloneURL.String
 		p.DefaultBranch = defaultBranch.String
 		p.BaseBranch = baseBranch.String
+		p.CloneError = cloneError.String
+		p.CloneErrorKind = cloneErrorKind.String
 		if profiledAt.Valid {
 			p.ProfiledAt = &profiledAt.Time
 		}
@@ -207,12 +209,12 @@ func UpdateRepoBaseBranch(database *sql.DB, repoID, baseBranch string) error {
 // GetRepoProfile returns a single repo profile by ID (owner/repo), or nil if not found.
 func GetRepoProfile(database *sql.DB, repoID string) (*domain.RepoProfile, error) {
 	var p domain.RepoProfile
-	var description, profileText, cloneURL, defaultBranch, baseBranch sql.NullString
+	var description, profileText, cloneURL, defaultBranch, baseBranch, cloneError, cloneErrorKind sql.NullString
 	var profiledAt sql.NullTime
 	err := database.QueryRow(`
-		SELECT id, owner, repo, description, has_readme, has_claude_md, has_agents_md, profile_text, clone_url, default_branch, base_branch, profiled_at
+		SELECT id, owner, repo, description, has_readme, has_claude_md, has_agents_md, profile_text, clone_url, default_branch, base_branch, profiled_at, clone_status, clone_error, clone_error_kind
 		FROM repo_profiles WHERE id = ?
-	`, repoID).Scan(&p.ID, &p.Owner, &p.Repo, &description, &p.HasReadme, &p.HasClaudeMd, &p.HasAgentsMd, &profileText, &cloneURL, &defaultBranch, &baseBranch, &profiledAt)
+	`, repoID).Scan(&p.ID, &p.Owner, &p.Repo, &description, &p.HasReadme, &p.HasClaudeMd, &p.HasAgentsMd, &profileText, &cloneURL, &defaultBranch, &baseBranch, &profiledAt, &p.CloneStatus, &cloneError, &cloneErrorKind)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -224,8 +226,28 @@ func GetRepoProfile(database *sql.DB, repoID string) (*domain.RepoProfile, error
 	p.CloneURL = cloneURL.String
 	p.DefaultBranch = defaultBranch.String
 	p.BaseBranch = baseBranch.String
+	p.CloneError = cloneError.String
+	p.CloneErrorKind = cloneErrorKind.String
 	if profiledAt.Valid {
 		p.ProfiledAt = &profiledAt.Time
 	}
 	return &p, nil
+}
+
+// UpdateRepoCloneStatus records the outcome of an EnsureBareClone attempt
+// for the given repo. status is "ok" | "failed" | "pending"; errMsg and
+// errKind are stored as TEXT (empty string serializes to NULL) — kind is
+// "ssh" when our SSH preflight has confirmed the SSH side is the cause,
+// "other" when the failure is on the git/transport side, and empty for
+// status="ok".
+//
+// No-ops silently when the repo isn't in repo_profiles (configured-repos
+// only invariant — clone hooks fire after repo selection).
+func UpdateRepoCloneStatus(database *sql.DB, owner, repo, status, errMsg, errKind string) error {
+	_, err := database.Exec(`
+		UPDATE repo_profiles
+		SET clone_status = ?, clone_error = ?, clone_error_kind = ?, updated_at = datetime('now')
+		WHERE owner = ? AND repo = ?
+	`, status, nullIfEmpty(errMsg), nullIfEmpty(errKind), owner, repo)
+	return err
 }

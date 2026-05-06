@@ -47,6 +47,7 @@ func (c *Client) ListUserRepos() ([]UserRepo, error) {
 type RepoMeta struct {
 	DefaultBranch string `json:"default_branch"`
 	CloneURL      string `json:"clone_url"`
+	SSHURL        string `json:"ssh_url"`
 }
 
 // GetRepoMeta fetches the default branch and clone URL for a repository.

@@ -200,6 +200,12 @@ func main() {
 	if err := config.MigrateLegacyYAML(database); err != nil {
 		log.Printf("[config] legacy YAML import: %v (continuing with defaults)", err)
 	}
+	// Preserve HTTPS for installs that predate the SSH/HTTPS toggle.
+	// New installs (no settings row) skip this; the new Default() of
+	// "ssh" applies. See MigrateLegacyCloneProtocol's docstring.
+	if err := config.MigrateLegacyCloneProtocol(database); err != nil {
+		log.Printf("[config] legacy clone_protocol migration: %v (continuing — backend treats empty as HTTPS so this is non-fatal)", err)
+	}
 
 	addr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Triage Factory running at http://localhost%s\n", addr)
@@ -261,6 +267,64 @@ func main() {
 	bus := eventbus.New()
 
 	wsHub := srv.WSHub()
+
+	// Wire the worktree clone-result callback before any bootstrap or
+	// lazy-clone path can fire. EnsureBareClone (and its private
+	// equivalent used by CreateForPR / createBranchWorktreeAt) invokes
+	// this on every attempt; we use it to stamp repo_profiles with the
+	// outcome and broadcast a websocket event so the Repos page updates
+	// live. Failures get an SSH preflight to classify whether the SSH
+	// side is the cause — that drives the per-row CTA on the frontend
+	// ("Fix in Settings" for SSH issues, raw stderr otherwise).
+	worktree.SetOnCloneResult(func(owner, repo string, cloneErr error) {
+		if cloneErr == nil {
+			if err := db.UpdateRepoCloneStatus(database, owner, repo, "ok", "", ""); err != nil {
+				log.Printf("[clone-status] update %s/%s ok: %v", owner, repo, err)
+			}
+			wsHub.Broadcast(websocket.Event{
+				Type: "repo_profile_updated",
+				Data: map[string]any{
+					"id":           owner + "/" + repo,
+					"clone_status": "ok",
+				},
+			})
+			return
+		}
+
+		log.Printf("[clone-status] %s/%s clone failed: %v", owner, repo, cloneErr)
+
+		kind := "other"
+		if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+			// Use the configured GitHub host so GHE installs probe
+			// the right SSH endpoint, not github.com. Falls back to
+			// git@github.com when the URL is empty/unparseable.
+			creds, _ := auth.Load()
+			sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			if perr := worktree.CachedPreflightSSH(ctx, sshHost); perr != nil {
+				kind = "ssh"
+				log.Printf("[clone-status] %s/%s SSH preflight against %s also failed → kind=ssh: %v", owner, repo, sshHost, perr)
+			} else {
+				log.Printf("[clone-status] %s/%s SSH preflight against %s passed → kind=other (clone error is on the git side)", owner, repo, sshHost)
+			}
+			cancel()
+		} else if cErr != nil {
+			log.Printf("[clone-status] %s/%s load config to classify: %v (defaulting to kind=other)", owner, repo, cErr)
+		}
+
+		if err := db.UpdateRepoCloneStatus(database, owner, repo, "failed", cloneErr.Error(), kind); err != nil {
+			log.Printf("[clone-status] update %s/%s failed: %v", owner, repo, err)
+		}
+		wsHub.Broadcast(websocket.Event{
+			Type: "repo_profile_updated",
+			Data: map[string]any{
+				"id":               owner + "/" + repo,
+				"clone_status":     "failed",
+				"clone_error":      cloneErr.Error(),
+				"clone_error_kind": kind,
+			},
+		})
+	})
 
 	// Lifetime distinct-entity counter for the factory snapshot. Hydrate
 	// once from the events table so we don't pay a full-table scan per

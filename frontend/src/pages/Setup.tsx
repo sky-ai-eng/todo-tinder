@@ -21,8 +21,16 @@ export default function Setup() {
   const [step, setStep] = useState<Step>('github')
   const [initDone, setInitDone] = useState(false)
 
-  // GitHub (mandatory)
-  const [githubForm, setGithubForm] = useState({ url: '', pat: '' })
+  // GitHub (mandatory). clone_protocol defaults to 'ssh' — the user
+  // can flip it to 'https' on this same step if their machine doesn't
+  // have SSH access set up. The server runs a preflight when "ssh" is
+  // selected and rejects setup if it fails; the rejection surfaces as
+  // an inline error via the existing ErrorBanner.
+  const [githubForm, setGithubForm] = useState<{
+    url: string
+    pat: string
+    clone_protocol: 'ssh' | 'https'
+  }>({ url: '', pat: '', clone_protocol: 'ssh' })
 
   // Repo selection — cached so navigating back doesn't re-fetch or lose selection
   const [cachedRepos, setCachedRepos] = useState<GitHubRepo[] | undefined>(undefined)
@@ -78,12 +86,18 @@ export default function Setup() {
     setError('')
     setLoading(true)
     try {
+      // The server is authoritative on SSH preflight: it runs the
+      // check itself when clone_protocol == "ssh" and rejects the
+      // setup with a clear error if it fails. Don't double-check
+      // here — duplicating the gate forces us to keep two error
+      // surfaces in sync.
       const res = await fetch('/api/auth/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           github_url: githubForm.url,
           github_pat: githubForm.pat,
+          clone_protocol: githubForm.clone_protocol,
         }),
       })
       if (!res.ok) {
@@ -324,6 +338,36 @@ export default function Setup() {
               memberships so review requests sent to your teams (e.g. CODEOWNERS) surface as tasks —
               without it, only PRs that request you individually will show up.
             </p>
+
+            {/* Clone protocol — controls how we materialize bare clones in
+                ~/.triagefactory/repos/. The token is still required for
+                the GitHub API regardless of which form we pick here. */}
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium uppercase tracking-wide text-text-tertiary">
+                Clone protocol
+              </label>
+              <div className="inline-flex rounded-lg border border-border-glass bg-black/[0.02] p-0.5">
+                {(['ssh', 'https'] as const).map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setGithubForm((f) => ({ ...f, clone_protocol: p }))}
+                    className={`px-3 py-1 text-[12px] font-medium rounded-md transition-colors ${
+                      githubForm.clone_protocol === p
+                        ? 'bg-white text-text-primary shadow-sm'
+                        : 'text-text-tertiary hover:text-text-secondary'
+                    }`}
+                  >
+                    {p.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-text-tertiary leading-relaxed">
+                Your token is still required for the GitHub API. The protocol only affects how
+                Triage Factory clones repos to your machine — SSH uses your existing key + agent,
+                HTTPS uses your git credential helper.
+              </p>
+            </div>
           </div>
 
           <ErrorBanner error={error} />
@@ -603,7 +647,7 @@ const secondaryBtnClass =
 function ErrorBanner({ error }: { error: string }) {
   if (!error) return null
   return (
-    <div className="rounded-xl bg-dismiss/[0.08] border border-dismiss/20 px-4 py-2.5 text-[13px] text-dismiss">
+    <div className="rounded-xl bg-dismiss/[0.08] border border-dismiss/20 px-4 py-2.5 text-[13px] text-dismiss whitespace-pre-line">
       {error}
     </div>
   )

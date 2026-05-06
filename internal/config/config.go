@@ -30,6 +30,11 @@ type Config struct {
 type GitHubConfig struct {
 	BaseURL      string        `yaml:"base_url"`
 	PollInterval time.Duration `yaml:"poll_interval"`
+	// CloneProtocol controls how bare clones in ~/.triagefactory/repos/
+	// are created. "ssh" uses git@github.com:owner/repo.git, "https"
+	// uses GitHub's clone_url (depends on a credential helper holding
+	// a PAT). Empty string is treated as "https" by callers.
+	CloneProtocol string `yaml:"clone_protocol,omitempty"`
 }
 
 type JiraConfig struct {
@@ -129,7 +134,8 @@ func (c JiraConfig) Ready(pat, url string) bool {
 func Default() Config {
 	return Config{
 		GitHub: GitHubConfig{
-			PollInterval: 5 * time.Minute,
+			PollInterval:  5 * time.Minute,
+			CloneProtocol: "ssh",
 		},
 		Jira: JiraConfig{
 			PollInterval: 5 * time.Minute,
@@ -258,6 +264,80 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("unmarshal settings: %w", err)
 	}
 	return cfg, nil
+}
+
+// MigrateLegacyCloneProtocol runs once at startup to preserve HTTPS for
+// installs that predate the SSH/HTTPS toggle. Without this step, the
+// new-install default ("ssh", from Default()) would silently migrate
+// existing HTTPS workflows to SSH the first time anything triggers a
+// re-profile (a settings change, the 3-day profile TTL, etc.) — and
+// users without SSH configured would see clones start failing for
+// no apparent reason.
+//
+// Detection: parse the raw settings blob and check whether the
+// `github.clone_protocol` key was ever written. If absent, this row
+// was produced by a pre-feature version of TF; we set CloneProtocol to
+// "https" so the existing working state is preserved. If present
+// (including the empty value, which the toggle never produces but the
+// user might write manually), this is a current-version row and we
+// leave it alone.
+//
+// We deliberately parse the YAML rather than substring-matching the
+// blob: a substring search could false-positive on a user-controlled
+// value containing "clone_protocol" (Jira project names, base URLs,
+// etc.) and skip the migration, silently flipping legacy installs to
+// SSH — exactly the footgun this function exists to prevent.
+//
+// Idempotent: subsequent runs see the key in the blob and return nil.
+// Fresh installs (no row at all) also return nil — Default() handles
+// them.
+func MigrateLegacyCloneProtocol(db *sql.DB) error {
+	if db == nil {
+		return errors.New("config.MigrateLegacyCloneProtocol: nil db")
+	}
+	var blob string
+	err := db.QueryRow(`SELECT data FROM settings WHERE id = 1`).Scan(&blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("probe settings row: %w", err)
+	}
+	if cloneProtocolKeyPresent(blob) {
+		return nil
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		return fmt.Errorf("load settings for legacy migration: %w", err)
+	}
+	cfg.GitHub.CloneProtocol = "https"
+	if err := Save(cfg); err != nil {
+		return fmt.Errorf("save legacy clone-protocol default: %w", err)
+	}
+	log.Printf("[config] migrated legacy install to clone_protocol=https (toggle is now opt-in via Settings)")
+	return nil
+}
+
+// cloneProtocolKeyPresent reports whether the YAML blob has the
+// `github.clone_protocol` key set (any value, including the empty
+// string). On unmarshal failure we conservatively report `true` —
+// migrating a corrupt blob would Save() over it with whatever Load()
+// degraded to, potentially destroying recoverable user state. The
+// post-migration "you're stuck on the new-install default" path
+// reproduces deterministically on next save once the user fixes the
+// blob; the destroy-corrupt-blob path doesn't.
+func cloneProtocolKeyPresent(blob string) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(blob), &raw); err != nil {
+		return true
+	}
+	gh, ok := raw["github"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = gh["clone_protocol"]
+	return ok
 }
 
 // Save upserts the settings row.

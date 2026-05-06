@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/github"
@@ -54,6 +55,19 @@ func (p *Profiler) Run(ctx context.Context, repos []string, force bool) error {
 	}
 
 	log.Printf("[repoprofile] profiling %d configured repos", len(repos))
+
+	// Resolve the clone protocol once for the whole run rather than
+	// re-loading config inside the per-repo loop. The setting can't
+	// change mid-run — handleSettingsPost serializes config writes
+	// behind the same `onGitHubChanged` callback that owns this
+	// goroutine — so capturing it here matches actual semantics and
+	// avoids N redundant DB reads + YAML unmarshals.
+	preferSSH := false
+	if cfg, cErr := config.Load(); cErr != nil {
+		log.Printf("[repoprofile] load config to pick clone protocol: %v (defaulting to HTTPS)", cErr)
+	} else {
+		preferSSH = cfg.GitHub.CloneProtocol == "ssh"
+	}
 
 	var withDocs []repoWithDocs
 	var withoutDocs []domain.RepoProfile
@@ -101,13 +115,21 @@ func (p *Profiler) Run(ctx context.Context, repos []string, force bool) error {
 			log.Printf("[repoprofile] %s: get AGENTS.md: %v", name, err)
 		}
 
-		// Fetch repo metadata (default branch, clone URL)
+		// Fetch repo metadata (default branch, clone URL). Both HTTPS
+		// and SSH forms come back from the same /repos/:owner/:repo
+		// response, so picking is a one-line branch on the result.
+		// Empty SSHURL (legacy GHE deployments without ssh_url
+		// surfaced) falls back to HTTPS so we always have *some* URL
+		// on the row.
 		var defaultBranch, cloneURL string
 		if meta, err := p.gh.GetRepoMeta(owner, repo); err != nil {
 			log.Printf("[repoprofile] %s: get repo meta: %v", name, err)
 		} else {
 			defaultBranch = meta.DefaultBranch
 			cloneURL = meta.CloneURL
+			if preferSSH && meta.SSHURL != "" {
+				cloneURL = meta.SSHURL
+			}
 		}
 
 		prof := domain.RepoProfile{
