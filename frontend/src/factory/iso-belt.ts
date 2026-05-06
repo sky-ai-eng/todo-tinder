@@ -237,6 +237,8 @@ export function buildCurvedBelt(
   pathPoints: Vector3[],
   pathOffset: number,
   material: PBRMaterial,
+  startTangent?: Vector3,
+  endTangent?: Vector3,
 ): BeltBuild {
   if (pathPoints.length < 2) {
     throw new Error('buildCurvedBelt requires at least 2 waypoints')
@@ -263,14 +265,28 @@ export function buildCurvedBelt(
     const p = pathPoints[i]
 
     // Tangent in xy. Average forward + backward chords at interior
-    // points; one-sided at the endpoints.
+    // points. At endpoints, prefer a caller-supplied tangent if given —
+    // a one-sided chord is off from the analytic tangent of a
+    // tessellated arc by half the per-segment sweep angle, which
+    // rotates the endpoint cross-section and leaves a wedge gap at
+    // the seam with a connecting straight belt.
     let tx: number, ty: number
     if (i === 0) {
-      tx = pathPoints[1].x - pathPoints[0].x
-      ty = pathPoints[1].y - pathPoints[0].y
+      if (startTangent) {
+        tx = startTangent.x
+        ty = startTangent.y
+      } else {
+        tx = pathPoints[1].x - pathPoints[0].x
+        ty = pathPoints[1].y - pathPoints[0].y
+      }
     } else if (i === pathPoints.length - 1) {
-      tx = pathPoints[i].x - pathPoints[i - 1].x
-      ty = pathPoints[i].y - pathPoints[i - 1].y
+      if (endTangent) {
+        tx = endTangent.x
+        ty = endTangent.y
+      } else {
+        tx = pathPoints[i].x - pathPoints[i - 1].x
+        ty = pathPoints[i].y - pathPoints[i - 1].y
+      }
     } else {
       tx = pathPoints[i + 1].x - pathPoints[i - 1].x
       ty = pathPoints[i + 1].y - pathPoints[i - 1].y
