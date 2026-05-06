@@ -194,39 +194,60 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 // at stream close — any mid-run consumer (the future curator UI, a
 // memory-gate retry, a takeover) can read it without waiting for the
 // stream to complete.
+//
+// Reader choice: bufio.Reader.ReadBytes('\n') instead of bufio.Scanner
+// because each NDJSON line is one whole stream event, and a single
+// tool_result event (a Read of a big file, large Bash output, a fat
+// structured artifact) can easily exceed Scanner's per-token limit.
+// When that limit was hit the run aborted with no terminal `result`
+// captured, even though the subprocess was emitting valid JSON we just
+// couldn't fit. ReadBytes grows its buffer as needed; the only ceiling
+// is process memory.
 func consumeStream(stdout io.Reader, sink Sink, stream *StreamState, traceID string) (*Result, error) {
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	reader := bufio.NewReader(stdout)
 
 	sessionDelivered := false
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		// ReadBytes returns the partial line *with* the error on EOF
+		// (or the full line + nil err on a clean newline). Process
+		// whatever bytes came back before reacting to the error so a
+		// final unterminated event isn't dropped.
+		if len(line) > 0 {
+			if line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+			}
+			if len(line) > 0 {
+				messages, result := stream.ParseLine(line, traceID)
 
-		messages, result := stream.ParseLine(line, traceID)
-
-		if !sessionDelivered {
-			if sid := stream.SessionID(); sid != "" {
-				if err := sink.OnSession(sid); err != nil {
-					log.Printf("[agentproc] sink.OnSession failed: %v", err)
+				if !sessionDelivered {
+					if sid := stream.SessionID(); sid != "" {
+						if err := sink.OnSession(sid); err != nil {
+							log.Printf("[agentproc] sink.OnSession failed: %v", err)
+						}
+						sessionDelivered = true
+					}
 				}
-				sessionDelivered = true
+
+				for _, msg := range messages {
+					if err := sink.OnMessage(msg); err != nil {
+						log.Printf("[agentproc] sink.OnMessage failed: %v", err)
+						continue
+					}
+				}
+
+				if result != nil {
+					return result, nil
+				}
 			}
 		}
 
-		for _, msg := range messages {
-			if err := sink.OnMessage(msg); err != nil {
-				log.Printf("[agentproc] sink.OnMessage failed: %v", err)
-				continue
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil, nil
 			}
-		}
-
-		if result != nil {
-			return result, nil
+			return nil, readErr
 		}
 	}
-	return nil, scanner.Err()
 }
