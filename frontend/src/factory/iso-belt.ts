@@ -231,7 +231,18 @@ export function buildBelt(scene: Scene, spec: BeltSpec, material: PBRMaterial): 
  *  The path is given in world coords with z = floor level (the belt's
  *  top sits at z + CONVEYOR_HEIGHT). For tight curves the belt's inner
  *  edge will be more compressed than the outer; this is normal — pick
- *  a tessellation high enough that the chord error is negligible. */
+ *  a tessellation high enough that the chord error is negligible.
+ *
+ *  Optional `startTangent` / `endTangent` override the per-vertex
+ *  tangent at the first / last waypoint. By default each endpoint
+ *  uses a one-sided chord to its single neighbor, which on a
+ *  tessellated arc differs from the analytic tangent by half the
+ *  per-segment sweep angle and rotates the endpoint cross-section.
+ *  Pass these when the caller knows the true tangent (e.g. an arc's
+ *  radial-perpendicular at its endpoints) and the belt must butt up
+ *  flush with another belt at that seam. World-space xy direction
+ *  vectors; z is ignored. Magnitude doesn't matter — they're
+ *  normalized internally — but they must be non-zero. */
 export function buildCurvedBelt(
   scene: Scene,
   pathPoints: Vector3[],
