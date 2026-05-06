@@ -423,10 +423,10 @@ func (c *Client) SubmitReview(owner, repo string, number int, commitSHA, event, 
 					"start a new review so the captured hunks match the current diff",
 			)
 		}
-		// Unclassified review-submit failure. Log the request shape once
-		// so the next mystery 422 (e.g., "thread end commit oid is not
-		// part of the pull request") can be diagnosed against the PR's
-		// /commits list and live diff without re-running the agent.
+		// Unclassified review-submit failure. Log the request shape so
+		// mystery 422s (e.g., "thread end commit oid is not part of the
+		// pull request") can be diagnosed against the PR's /commits list
+		// and live diff without re-running the agent.
 		positions := make([]string, len(comments))
 		for i, cm := range comments {
 			if cm.StartLine != nil {
