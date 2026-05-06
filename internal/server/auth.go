@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -42,19 +43,22 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hard-block setup with SSH selected if our preflight against
-	// git@github.com can't authenticate. Run BEFORE the PAT check so
-	// the user gets the SSH error first rather than entering a valid
-	// PAT just to find out their SSH is broken on the next step. The
-	// HTTPS path skips this entirely.
+	// Hard-block setup with SSH selected if our preflight against the
+	// configured GitHub host can't authenticate. Run BEFORE the PAT
+	// check so the user gets the SSH error first rather than entering
+	// a valid PAT just to find out their SSH is broken on the next
+	// step. The HTTPS path skips this entirely. The probe target is
+	// derived from the URL the user just submitted so GHE deployments
+	// see hints with their hostname, not "github.com".
 	if req.CloneProtocol == "ssh" {
+		sshHost := worktree.SSHHostFromBaseURL(req.GitHubURL)
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		err := worktree.PreflightSSH(ctx, "git@github.com")
+		err := worktree.PreflightSSH(ctx, sshHost)
 		cancel()
 		if err != nil {
-			log.Printf("[auth] blocked SSH setup: preflight failed: %v", err)
+			log.Printf("[auth] blocked SSH setup against %s: preflight failed: %v", sshHost, err)
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error":  "SSH preflight against git@github.com failed — set up your SSH key or pick HTTPS. " + err.Error(),
+				"error":  fmt.Sprintf("SSH preflight against %s failed — set up your SSH key or pick HTTPS. %s", sshHost, err.Error()),
 				"field":  "clone_protocol",
 				"stderr": err.Error(),
 			})

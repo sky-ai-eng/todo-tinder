@@ -383,7 +383,7 @@ export default function Settings() {
                   ✓ SSH preflight succeeded — git@
                   {(() => {
                     try {
-                      return new URL(form.github_base_url).hostname || 'github.com'
+                      return new URL(form.github_url).hostname || 'github.com'
                     } catch {
                       return 'github.com'
                     }

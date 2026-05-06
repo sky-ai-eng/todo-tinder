@@ -162,6 +162,33 @@ func TestCachedPreflightSSH_DefaultHostFallback(t *testing.T) {
 	}
 }
 
+func TestSSHHostFromBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"github.com", "https://github.com", "git@github.com"},
+		{"github.com with trailing slash", "https://github.com/", "git@github.com"},
+		{"GHE host", "https://github.example.com", "git@github.example.com"},
+		{"GHE with subdir path", "https://corp.example.com/github", "git@corp.example.com"},
+		{"empty falls back", "", "git@github.com"},
+		{"unparseable falls back", "://bad", "git@github.com"},
+		{"no scheme falls back", "github.com", "git@github.com"},
+		{"http (not https)", "http://github.example.com", "git@github.example.com"},
+		{"with port", "https://github.example.com:8443", "git@github.example.com"},
+		{"with userinfo", "https://user:pass@github.example.com", "git@github.example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SSHHostFromBaseURL(tc.in)
+			if got != tc.want {
+				t.Errorf("SSHHostFromBaseURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPreflightEntry_Validity(t *testing.T) {
 	resetPreflightCacheForTest(t)
 	sshPreflightFailureTTL = 100 * time.Millisecond

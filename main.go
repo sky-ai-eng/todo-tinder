@@ -295,12 +295,17 @@ func main() {
 
 		kind := "other"
 		if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+			// Use the configured GitHub host so GHE installs probe
+			// the right SSH endpoint, not github.com. Falls back to
+			// git@github.com when the URL is empty/unparseable.
+			creds, _ := auth.Load()
+			sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			if perr := worktree.CachedPreflightSSH(ctx, "git@github.com"); perr != nil {
+			if perr := worktree.CachedPreflightSSH(ctx, sshHost); perr != nil {
 				kind = "ssh"
-				log.Printf("[clone-status] %s/%s SSH preflight also failed → kind=ssh: %v", owner, repo, perr)
+				log.Printf("[clone-status] %s/%s SSH preflight against %s also failed → kind=ssh: %v", owner, repo, sshHost, perr)
 			} else {
-				log.Printf("[clone-status] %s/%s SSH preflight passed → kind=other (clone error is on the git side)", owner, repo)
+				log.Printf("[clone-status] %s/%s SSH preflight against %s passed → kind=other (clone error is on the git side)", owner, repo, sshHost)
 			}
 			cancel()
 		} else if cErr != nil {

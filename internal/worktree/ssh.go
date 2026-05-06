@@ -3,11 +3,43 @@ package worktree
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 )
+
+// SSHHostFromBaseURL turns a GitHub HTTPS base URL (the value stored in
+// auth.Credentials.GitHubURL / config.GitHubConfig.BaseURL) into the
+// SSH probe target — e.g. "https://github.example.com" → "git@github.example.com".
+//
+// Defaults to "git@github.com" when the input is empty or unparseable
+// rather than refusing to operate: the toggle flow has already gated
+// the user past credential validation by the time we reach a probe,
+// and a conservative default is more useful than a hard failure here.
+// Callers that want to fail loudly on a missing host should check for
+// emptiness themselves before calling.
+//
+// Strips userinfo, port, path, query, and fragment from the URL — only
+// the hostname becomes part of the SSH target. GHE deployments served
+// on non-default ports still use the standard SSH port 22 by default,
+// and SSH config aliases handle anything more exotic.
+func SSHHostFromBaseURL(baseURL string) string {
+	const fallback = "git@github.com"
+	if baseURL == "" {
+		return fallback
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fallback
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fallback
+	}
+	return "git@" + host
+}
 
 // sshPreflightCache holds a per-host cached result so a burst of simultaneous
 // clone failures (e.g. during bootstrap with many repos) triggers at most one
@@ -46,7 +78,9 @@ func (e sshPreflightEntry) valid() bool {
 }
 
 // PreflightSSH runs a non-interactive `ssh -T <host>` against the given
-// host (typically "git@github.com") to verify that the user has a
+// host (typically "git@github.com" for github.com or "git@<ghe-host>"
+// for GitHub Enterprise — derive the right value via SSHHostFromBaseURL)
+// to verify that the user has a
 // usable SSH key + agent + known_hosts entry — the prerequisites for
 // `git clone` over SSH to succeed without prompting. The check is the
 // canonical way to test GitHub SSH access; GitHub returns a greeting
@@ -93,8 +127,10 @@ func PreflightSSH(ctx context.Context, host string) error {
 	// actionable message rather than just "Permission denied
 	// (publickey)". The probe is a best-effort `ssh-add -l` against
 	// whatever SSH_AUTH_SOCK the binary inherited; its exit code maps
-	// cleanly to "no agent" / "empty agent" / "agent loaded".
-	hint := diagnoseSSHFailure(ctx, combined)
+	// cleanly to "no agent" / "empty agent" / "agent loaded". host is
+	// threaded through so GHE users see hints with their hostname
+	// rather than a misleading "github.com".
+	hint := diagnoseSSHFailure(ctx, combined, host)
 
 	// When ssh produced no output we can't show the user *anything*
 	// useful unless we surface the underlying run error: this catches
@@ -130,9 +166,15 @@ func PreflightSSH(ctx context.Context, host string) error {
 //	   with passphrase-protected keys: the keychain agent is empty
 //	   and BatchMode blocks the unlock prompt.
 //	2: agent socket unreachable (SSH_AUTH_SOCK unset or stale).
-func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
-	const githubKeysURL = "https://github.com/settings/keys"
+func diagnoseSSHFailure(ctx context.Context, sshOut, host string) string {
+	if host == "" {
+		host = "git@github.com"
+	}
+	hostname := strings.TrimPrefix(host, "git@")
 	const macOSNote = "On macOS, `ssh-add --apple-use-keychain ~/.ssh/id_ed25519` persists the key in the login keychain so you don't have to re-add it after every reboot."
+	// settingsURL is on the user's GitHub host, not always github.com —
+	// GHE deployments mirror the same /settings/keys path.
+	settingsURL := fmt.Sprintf("https://%s/settings/keys", hostname)
 
 	lower := strings.ToLower(sshOut)
 
@@ -147,12 +189,12 @@ func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
 		strings.Contains(lower, "network is unreachable"),
 		strings.Contains(lower, "operation timed out"):
 		return strings.Join([]string{
-			"ssh couldn't reach git@github.com over the network — this isn't an auth issue.",
+			fmt.Sprintf("ssh couldn't reach %s over the network — this isn't an auth issue.", host),
 			"",
 			"Common causes:",
 			"  - Corporate firewall blocking outbound port 22",
 			"  - VPN required and not connected",
-			"  - DNS lookup failing for github.com",
+			fmt.Sprintf("  - DNS lookup failing for %s", hostname),
 			"",
 			"If port 22 is blocked, switch the clone protocol to HTTPS in Settings.",
 		}, "\n")
@@ -163,11 +205,11 @@ func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
 	// the key manually in the past and GitHub rotated theirs).
 	if strings.Contains(lower, "host key verification failed") {
 		return strings.Join([]string{
-			"github.com's host key in your ~/.ssh/known_hosts doesn't match what the server presented.",
+			fmt.Sprintf("%s's host key in your ~/.ssh/known_hosts doesn't match what the server presented.", hostname),
 			"",
 			"If you trust the host (it's almost certainly a key rotation), refresh the entry:",
-			"  ssh-keygen -R github.com",
-			"  ssh-keyscan github.com >> ~/.ssh/known_hosts",
+			fmt.Sprintf("  ssh-keygen -R %s", hostname),
+			fmt.Sprintf("  ssh-keyscan %s >> ~/.ssh/known_hosts", hostname),
 		}, "\n")
 	}
 
@@ -193,7 +235,7 @@ func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
 			"Don't have a key yet?",
 			"  ssh-keygen -t ed25519 -C \"you@example.com\"",
 			"  ssh-add ~/.ssh/id_ed25519",
-			"  cat ~/.ssh/id_ed25519.pub      # paste at " + githubKeysURL,
+			"  cat ~/.ssh/id_ed25519.pub      # paste at " + settingsURL,
 			"",
 			macOSNote,
 		}, "\n")
@@ -221,14 +263,14 @@ func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
 			count = 1
 		}
 		return strings.Join([]string{
-			fmt.Sprintf("Your ssh-agent has %d key(s) loaded, but GitHub rejected them.", count),
+			fmt.Sprintf("Your ssh-agent has %d key(s) loaded, but %s rejected them.", count, hostname),
 			"",
 			"The most likely fix:",
-			"  - Make sure the public key is added at " + githubKeysURL,
+			"  - Make sure the public key is added at " + settingsURL,
 			"  - Confirm you're connecting as the right GitHub user",
 			"",
 			"To see which key was offered, run:",
-			"  ssh -vT git@github.com 2>&1 | grep 'Offering public key'",
+			fmt.Sprintf("  ssh -vT %s 2>&1 | grep 'Offering public key'", host),
 		}, "\n")
 	default:
 		// ssh-add wasn't found, was killed, or returned an unexpected
@@ -239,8 +281,8 @@ func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
 			"",
 			"Common fixes:",
 			"  - `ssh-add ~/.ssh/id_ed25519` to load your key",
-			"  - Add the public key at " + githubKeysURL,
-			"  - Run `ssh -vT git@github.com` for verbose output",
+			"  - Add the public key at " + settingsURL,
+			fmt.Sprintf("  - Run `ssh -vT %s` for verbose output", host),
 		}, "\n")
 	}
 }
@@ -255,11 +297,12 @@ func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
 // double-checked-lock pattern actually dedupes. N concurrent callers
 // see one ssh + one ssh-add subprocess pair; the rest hit the
 // populated cache when they acquire the lock. We accept global
-// (rather than per-host) serialization here because the only host in
-// production use is "git@github.com" and the probe is bounded by
-// PreflightSSH's 15-second context — switching to per-host locks
-// would only matter if a future caller probes multiple hosts in
-// parallel, which doesn't exist today.
+// (rather than per-host) serialization here because production
+// callers probe a single host (the configured GitHub base, derived
+// via SSHHostFromBaseURL) and the probe is bounded by PreflightSSH's
+// 15-second context — switching to per-host locks would only matter
+// if a future caller probes multiple hosts in parallel, which
+// doesn't exist today.
 func CachedPreflightSSH(ctx context.Context, host string) error {
 	if host == "" {
 		host = "git@github.com"

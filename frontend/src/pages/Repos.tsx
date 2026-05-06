@@ -329,9 +329,9 @@ function CloneFailedBadge({ profile }: { profile: RepoProfile }) {
           </p>
           {isSSH ? (
             <p className="text-text-secondary leading-snug mb-2">
-              The bare-clone for this repo couldn&apos;t be created over SSH. Our preflight against{' '}
-              <code>git@github.com</code> also failed — check that your SSH key is added to GitHub
-              and loaded into your agent, or switch the clone protocol to HTTPS.
+              The bare-clone for this repo couldn&apos;t be created over SSH. Our preflight against
+              your GitHub host also failed — check that your SSH key is added to GitHub and loaded
+              into your agent, or switch the clone protocol to HTTPS.
             </p>
           ) : (
             <p className="text-text-secondary leading-snug mb-2">

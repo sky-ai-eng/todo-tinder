@@ -370,21 +370,24 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Hard-block a transition into SSH mode if our preflight against
-	// git@github.com can't authenticate. Otherwise the toggle would
-	// "succeed" silently — repairOriginURL is a local config write
-	// that doesn't test connectivity, so the failure wouldn't surface
-	// until the next poll/delegation tries to fetch. Only gate the
-	// transition (prev != "ssh") so a user with broken SSH today can
-	// still save unrelated fields without being held hostage to fix
-	// SSH first; switching AWAY from SSH is also unblocked.
+	// the configured GitHub host can't authenticate. Otherwise the
+	// toggle would "succeed" silently — repairOriginURL is a local
+	// config write that doesn't test connectivity, so the failure
+	// wouldn't surface until the next poll/delegation tries to fetch.
+	// Only gate the transition (prev != "ssh") so a user with broken
+	// SSH today can still save unrelated fields without being held
+	// hostage to fix SSH first; switching AWAY from SSH is also
+	// unblocked. Probe target is derived from creds.GitHubURL so GHE
+	// users see hints with their hostname, not "github.com".
 	if cfg.GitHub.CloneProtocol == "ssh" && prevGHCloneProtocol != "ssh" {
+		sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		err := worktree.PreflightSSH(ctx, "git@github.com")
+		err := worktree.PreflightSSH(ctx, sshHost)
 		cancel()
 		if err != nil {
-			log.Printf("[settings] blocked SSH switch for %q: preflight failed: %v", creds.GitHubURL, err)
+			log.Printf("[settings] blocked SSH switch against %s for %q: preflight failed: %v", sshHost, creds.GitHubURL, err)
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error":  "SSH preflight against git@github.com failed — fix your SSH setup or keep HTTPS. " + err.Error(),
+				"error":  fmt.Sprintf("SSH preflight against %s failed — fix your SSH setup or keep HTTPS. %s", sshHost, err.Error()),
 				"field":  "github_clone_protocol",
 				"stderr": err.Error(),
 			})
@@ -569,17 +572,26 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 // log so users investigating issues see the exact ssh output even
 // when the UI only renders the friendly summary.
 func (s *Server) handleGitHubPreflightSSH(w http.ResponseWriter, r *http.Request) {
+	// Probe target tracks the configured GitHub base URL so the Test
+	// SSH button on the Settings page works for GHE deployments. We
+	// load creds (not config) because creds.GitHubURL is the URL the
+	// user actually authenticates against; cfg.GitHub.BaseURL mirrors
+	// it but the keychain copy is the source of truth.
+	creds, _ := auth.Load()
+	sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
+
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	if err := worktree.PreflightSSH(ctx, "git@github.com"); err != nil {
-		log.Printf("[settings] SSH preflight failed: %v", err)
+	if err := worktree.PreflightSSH(ctx, sshHost); err != nil {
+		log.Printf("[settings] SSH preflight against %s failed: %v", sshHost, err)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":     false,
 			"stderr": err.Error(),
+			"host":   sshHost,
 		})
 		return
 	}
-	log.Printf("[settings] SSH preflight ok (git@github.com authenticated)")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	log.Printf("[settings] SSH preflight ok (%s authenticated)", sshHost)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "host": sshHost})
 }
