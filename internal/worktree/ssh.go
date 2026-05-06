@@ -22,7 +22,16 @@ var sshPreflightCache = struct {
 	entries map[string]sshPreflightEntry
 }{entries: make(map[string]sshPreflightEntry)}
 
-const sshPreflightFailureTTL = 60 * time.Second
+// sshPreflightFailureTTL is a var (not const) so tests can shorten it
+// without having to wait 60 s for failure-cache expiry. Production code
+// should treat it as immutable; only ssh_test.go writes to it.
+var sshPreflightFailureTTL = 60 * time.Second
+
+// preflightImpl is the function CachedPreflightSSH delegates to. The
+// default points at the real PreflightSSH; tests swap it for a mock
+// that controls the result and counts invocations. Same testing-only
+// caveat as sshPreflightFailureTTL — never mutated outside of tests.
+var preflightImpl = PreflightSSH
 
 type sshPreflightEntry struct {
 	err      error // nil = success
@@ -68,7 +77,7 @@ func PreflightSSH(ctx context.Context, host string) error {
 		"-o", "StrictHostKeyChecking=accept-new",
 		host,
 	)
-	out, _ := cmd.CombinedOutput()
+	out, runErr := cmd.CombinedOutput()
 	combined := strings.TrimSpace(string(out))
 
 	// GitHub's greeting on a successful auth handshake (no shell granted):
@@ -86,14 +95,33 @@ func PreflightSSH(ctx context.Context, host string) error {
 	// whatever SSH_AUTH_SOCK the binary inherited; its exit code maps
 	// cleanly to "no agent" / "empty agent" / "agent loaded".
 	hint := diagnoseSSHFailure(ctx, combined)
+
+	// When ssh produced no output we can't show the user *anything*
+	// useful unless we surface the underlying run error: this catches
+	// "ssh binary not on PATH" (exec.Error), "context cancelled before
+	// ssh started", and similarly opaque states where the auth-failure
+	// hints below would mislead. Auth failures yield exit-status-255
+	// with a populated stderr, so combined != "" — runErr in that case
+	// is just the *exec.ExitError wrapping the same exit code and we
+	// don't need to repeat it.
+	if combined == "" {
+		if runErr != nil {
+			return fmt.Errorf("ssh preflight could not run: %v\n\n%s", runErr, hint)
+		}
+		return fmt.Errorf("ssh preflight produced no output\n\n%s", hint)
+	}
 	return fmt.Errorf("%s\n\n%s", combined, hint)
 }
 
-// diagnoseSSHFailure inspects the ssh stderr and the local ssh-agent
-// state to produce a one-paragraph hint pointing at the most likely
-// fix. Returned text is plain and intended for direct UI display.
+// diagnoseSSHFailure inspects the ssh stderr and (when relevant) the
+// local ssh-agent state to produce a one-paragraph hint pointing at
+// the most likely fix. Returned text is plain and intended for direct
+// UI display.
 //
-// The three branches correspond to ssh-add -l's documented exit codes:
+// We classify the failure by stderr first so we don't send a network-
+// failure user on a wild goose chase configuring keys, then fall back
+// to the auth-path probe (`ssh-add -l`) for the remaining cases.
+// ssh-add's documented exit codes:
 //
 //	0: agent reachable, has identities → key probably not on GitHub,
 //	   or BatchMode is rejecting a passphrase-protected key whose
@@ -103,15 +131,54 @@ func PreflightSSH(ctx context.Context, host string) error {
 //	   and BatchMode blocks the unlock prompt.
 //	2: agent socket unreachable (SSH_AUTH_SOCK unset or stale).
 func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
+	const githubKeysURL = "https://github.com/settings/keys"
+	const macOSNote = "On macOS, `ssh-add --apple-use-keychain ~/.ssh/id_ed25519` persists the key in the login keychain so you don't have to re-add it after every reboot."
+
+	lower := strings.ToLower(sshOut)
+
+	// Network-layer failures: ssh never got to the auth handshake, so
+	// agent/key state is irrelevant. Telling the user to `ssh-add` here
+	// would waste their time.
+	switch {
+	case strings.Contains(lower, "connection refused"),
+		strings.Contains(lower, "connection timed out"),
+		strings.Contains(lower, "could not resolve hostname"),
+		strings.Contains(lower, "no route to host"),
+		strings.Contains(lower, "network is unreachable"),
+		strings.Contains(lower, "operation timed out"):
+		return strings.Join([]string{
+			"ssh couldn't reach git@github.com over the network — this isn't an auth issue.",
+			"",
+			"Common causes:",
+			"  - Corporate firewall blocking outbound port 22",
+			"  - VPN required and not connected",
+			"  - DNS lookup failing for github.com",
+			"",
+			"If port 22 is blocked, switch the clone protocol to HTTPS in Settings.",
+		}, "\n")
+	}
+
+	// Host key mismatch: known_hosts has a stale fingerprint. Rare with
+	// our `accept-new` setting (would only happen if the user pinned
+	// the key manually in the past and GitHub rotated theirs).
+	if strings.Contains(lower, "host key verification failed") {
+		return strings.Join([]string{
+			"github.com's host key in your ~/.ssh/known_hosts doesn't match what the server presented.",
+			"",
+			"If you trust the host (it's almost certainly a key rotation), refresh the entry:",
+			"  ssh-keygen -R github.com",
+			"  ssh-keyscan github.com >> ~/.ssh/known_hosts",
+		}, "\n")
+	}
+
+	// Default: auth-layer failure ("Permission denied (publickey)" and
+	// friends). Probe the agent to pick a more specific hint.
 	addCmd := exec.CommandContext(ctx, "ssh-add", "-l")
 	addOut, _ := addCmd.CombinedOutput()
 	exit := -1
 	if addCmd.ProcessState != nil {
 		exit = addCmd.ProcessState.ExitCode()
 	}
-
-	const githubKeysURL = "https://github.com/settings/keys"
-	const macOSNote = "On macOS, `ssh-add --apple-use-keychain ~/.ssh/id_ed25519` persists the key in the login keychain so you don't have to re-add it after every reboot."
 
 	switch exit {
 	case 1:
@@ -205,7 +272,7 @@ func CachedPreflightSSH(ctx context.Context, host string) error {
 		return e.err
 	}
 
-	err := PreflightSSH(ctx, host)
+	err := preflightImpl(ctx, host)
 	sshPreflightCache.entries[host] = sshPreflightEntry{err: err, cachedAt: time.Now()}
 	return err
 }
