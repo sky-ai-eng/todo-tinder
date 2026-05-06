@@ -636,15 +636,29 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 	// just always pass HTTPS — repairOriginURL inside CreateForPR
 	// rewrites the bare's origin to whatever URL we pass, so passing
 	// HTTPS would clobber the SSH origin that bootstrap put there.
+	//
+	// Failure modes when SSH is selected:
+	//   - pr.BaseSSHURL empty: the API didn't return base.repo.ssh_url
+	//     (theoretically possible on weird GHE configs). Fail loudly
+	//     rather than fall back to HTTPS — falling back would silently
+	//     repoint the bare to HTTPS via repairOriginURL.
+	//   - pr.SSHURL empty while pr.CloneURL non-empty: same condition
+	//     for the head repo (the fork). Fork tracking would silently
+	//     mix origins (SSH bare, HTTPS push remote) and break `git push`
+	//     for SSH-only users. Same fail-loud treatment.
+	// pr.CloneURL == "" (head.repo == null) is the deleted-fork case;
+	// pr.SSHURL is also empty there, and we leave headCloneURL = ""
+	// so CreateForPR's hasHeadRepo=false branch fires correctly.
 	upstreamCloneURL, headCloneURL := pr.BaseCloneURL, pr.CloneURL
 	if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
-		if pr.BaseSSHURL != "" {
-			upstreamCloneURL = pr.BaseSSHURL
+		if pr.BaseSSHURL == "" {
+			return runConfig{}, fmt.Errorf("PR #%d on %s/%s: SSH clone protocol selected but GitHub did not return base.repo.ssh_url; switch to HTTPS in Settings or check your GHE config", prNumber, owner, repo)
 		}
-		// pr.SSHURL is empty for deleted-fork PRs (head.repo == null);
-		// keep headCloneURL empty too in that case so CreateForPR's
-		// hasHeadRepo check still treats it as deleted-fork.
+		upstreamCloneURL = pr.BaseSSHURL
 		if pr.CloneURL != "" {
+			if pr.SSHURL == "" {
+				return runConfig{}, fmt.Errorf("PR #%d on %s/%s: SSH clone protocol selected but GitHub did not return head.repo.ssh_url for the head fork; switch to HTTPS in Settings or check your GHE config", prNumber, owner, repo)
+			}
 			headCloneURL = pr.SSHURL
 		}
 	} else if cErr != nil {
