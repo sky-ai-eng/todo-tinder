@@ -32,7 +32,8 @@ func (c *captureSink) OnMessage(m *domain.AgentMessage) error {
 // just couldn't read. Asserts the bigger line flows through and the
 // terminal `result` event is still observed.
 func TestConsumeStream_HandlesOversizedToolResult(t *testing.T) {
-	huge := strings.Repeat("x", 4*1024*1024) // 4 MB — comfortably past the old 1 MB cap.
+	const oldScannerCap = 1 * 1024 * 1024
+	huge := strings.Repeat("x", oldScannerCap+1) // Just over the old 1 MB cap.
 
 	stream := strings.Join([]string{
 		`{"type":"system","subtype":"init","session_id":"sess-big"}`,
