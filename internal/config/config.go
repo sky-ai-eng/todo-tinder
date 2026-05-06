@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,12 @@ type Config struct {
 type GitHubConfig struct {
 	BaseURL      string        `yaml:"base_url"`
 	PollInterval time.Duration `yaml:"poll_interval"`
+	// CloneProtocol controls how bare clones in ~/.triagefactory/repos/
+	// are created. "ssh" uses git@github.com:owner/repo.git (default;
+	// inherits the user's SSH key + agent), "https" uses GitHub's
+	// clone_url (depends on a credential helper holding a PAT).
+	// Empty string is treated as "ssh" by callers.
+	CloneProtocol string `yaml:"clone_protocol,omitempty"`
 }
 
 type JiraConfig struct {
@@ -129,7 +136,8 @@ func (c JiraConfig) Ready(pat, url string) bool {
 func Default() Config {
 	return Config{
 		GitHub: GitHubConfig{
-			PollInterval: 5 * time.Minute,
+			PollInterval:  5 * time.Minute,
+			CloneProtocol: "ssh",
 		},
 		Jira: JiraConfig{
 			PollInterval: 5 * time.Minute,
@@ -258,6 +266,53 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("unmarshal settings: %w", err)
 	}
 	return cfg, nil
+}
+
+// MigrateLegacyCloneProtocol runs once at startup to preserve HTTPS for
+// installs that predate the SSH/HTTPS toggle. Without this step, the
+// new-install default ("ssh", from Default()) would silently migrate
+// existing HTTPS workflows to SSH the first time anything triggers a
+// re-profile (a settings change, the 3-day profile TTL, etc.) — and
+// users without SSH configured would see clones start failing for
+// no apparent reason.
+//
+// Detection: we look at the raw settings blob and check whether the
+// "clone_protocol" key was ever written. If absent, this row was
+// produced by a pre-feature version of TF; we set CloneProtocol to
+// "https" so the existing working state is preserved. If present
+// (including the empty value, which the toggle never produces but the
+// user might write manually), this is a current-version row and we
+// leave it alone.
+//
+// Idempotent: subsequent runs see the key in the blob and return nil.
+// Fresh installs (no row at all) also return nil — Default() handles
+// them.
+func MigrateLegacyCloneProtocol(db *sql.DB) error {
+	if db == nil {
+		return errors.New("config.MigrateLegacyCloneProtocol: nil db")
+	}
+	var blob string
+	err := db.QueryRow(`SELECT data FROM settings WHERE id = 1`).Scan(&blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("probe settings row: %w", err)
+	}
+	if strings.Contains(blob, "clone_protocol") {
+		return nil
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		return fmt.Errorf("load settings for legacy migration: %w", err)
+	}
+	cfg.GitHub.CloneProtocol = "https"
+	if err := Save(cfg); err != nil {
+		return fmt.Errorf("save legacy clone-protocol default: %w", err)
+	}
+	log.Printf("[config] migrated legacy install to clone_protocol=https (toggle is now opt-in via Settings)")
+	return nil
 }
 
 // Save upserts the settings row.

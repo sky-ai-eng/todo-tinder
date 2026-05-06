@@ -34,10 +34,12 @@ func servePRFixture(t *testing.T, prJSON string) http.Handler {
 }
 
 // TestGetPR_ForkPR_ParsesHeadAndBaseCloneURLs locks down the parsing
-// of base.repo.clone_url and head.repo.clone_url. setupGitHub depends
+// of base.repo.clone_url, head.repo.clone_url, and the SSH variants
+// (base.repo.ssh_url, head.repo.ssh_url). setupGitHub depends
 // on the upstream URL coming from base.repo.clone_url (anything else
 // would point the bare's origin at a fork) and on head.repo.clone_url
-// for fork-tracking configuration. If the GitHub API ever moves
+// for fork-tracking configuration. The SSH equivalents are picked when
+// GitHubConfig.CloneProtocol == "ssh". If the GitHub API ever moves
 // these fields or the parser regresses, this test catches it before
 // every PR delegation starts pushing to the wrong place.
 func TestGetPR_ForkPR_ParsesHeadAndBaseCloneURLs(t *testing.T) {
@@ -48,11 +50,17 @@ func TestGetPR_ForkPR_ParsesHeadAndBaseCloneURLs(t *testing.T) {
 		"head": {
 			"ref": "feature-branch",
 			"sha": "abc123",
-			"repo": {"clone_url": "https://github.com/contributor/forked-repo.git"}
+			"repo": {
+				"clone_url": "https://github.com/contributor/forked-repo.git",
+				"ssh_url":   "git@github.com:contributor/forked-repo.git"
+			}
 		},
 		"base": {
 			"ref": "main",
-			"repo": {"clone_url": "https://github.com/upstream-owner/upstream-repo.git"}
+			"repo": {
+				"clone_url": "https://github.com/upstream-owner/upstream-repo.git",
+				"ssh_url":   "git@github.com:upstream-owner/upstream-repo.git"
+			}
 		}
 	}`
 	srv := httptest.NewServer(servePRFixture(t, prJSON))
@@ -67,6 +75,12 @@ func TestGetPR_ForkPR_ParsesHeadAndBaseCloneURLs(t *testing.T) {
 	}
 	if pr.BaseCloneURL != "https://github.com/upstream-owner/upstream-repo.git" {
 		t.Errorf("BaseCloneURL (upstream URL) = %q, want %q", pr.BaseCloneURL, "https://github.com/upstream-owner/upstream-repo.git")
+	}
+	if pr.SSHURL != "git@github.com:contributor/forked-repo.git" {
+		t.Errorf("SSHURL (head fork SSH URL) = %q, want %q", pr.SSHURL, "git@github.com:contributor/forked-repo.git")
+	}
+	if pr.BaseSSHURL != "git@github.com:upstream-owner/upstream-repo.git" {
+		t.Errorf("BaseSSHURL (upstream SSH URL) = %q, want %q", pr.BaseSSHURL, "git@github.com:upstream-owner/upstream-repo.git")
 	}
 	if pr.HeadRef != "feature-branch" {
 		t.Errorf("HeadRef = %q, want %q", pr.HeadRef, "feature-branch")
@@ -90,11 +104,17 @@ func TestGetPR_OwnRepoPR_HeadAndBaseEqual(t *testing.T) {
 		"head": {
 			"ref": "my-feature",
 			"sha": "def456",
-			"repo": {"clone_url": "https://github.com/me/myrepo.git"}
+			"repo": {
+				"clone_url": "https://github.com/me/myrepo.git",
+				"ssh_url":   "git@github.com:me/myrepo.git"
+			}
 		},
 		"base": {
 			"ref": "main",
-			"repo": {"clone_url": "https://github.com/me/myrepo.git"}
+			"repo": {
+				"clone_url": "https://github.com/me/myrepo.git",
+				"ssh_url":   "git@github.com:me/myrepo.git"
+			}
 		}
 	}`
 	srv := httptest.NewServer(servePRFixture(t, prJSON))
@@ -109,6 +129,12 @@ func TestGetPR_OwnRepoPR_HeadAndBaseEqual(t *testing.T) {
 	}
 	if pr.CloneURL != pr.BaseCloneURL {
 		t.Errorf("own-repo PR: head and base clone URLs should be equal; got CloneURL=%q BaseCloneURL=%q", pr.CloneURL, pr.BaseCloneURL)
+	}
+	if pr.SSHURL == "" || pr.BaseSSHURL == "" {
+		t.Fatalf("expected both SSH URLs populated; got SSHURL=%q BaseSSHURL=%q", pr.SSHURL, pr.BaseSSHURL)
+	}
+	if pr.SSHURL != pr.BaseSSHURL {
+		t.Errorf("own-repo PR: head and base SSH URLs should be equal; got SSHURL=%q BaseSSHURL=%q", pr.SSHURL, pr.BaseSSHURL)
 	}
 }
 
@@ -130,7 +156,10 @@ func TestGetPR_DeletedFork_BaseStillPopulated(t *testing.T) {
 		},
 		"base": {
 			"ref": "main",
-			"repo": {"clone_url": "https://github.com/me/myrepo.git"}
+			"repo": {
+				"clone_url": "https://github.com/me/myrepo.git",
+				"ssh_url":   "git@github.com:me/myrepo.git"
+			}
 		}
 	}`
 	srv := httptest.NewServer(servePRFixture(t, prJSON))
@@ -143,8 +172,14 @@ func TestGetPR_DeletedFork_BaseStillPopulated(t *testing.T) {
 	if pr.CloneURL != "" {
 		t.Errorf("CloneURL should be empty when head.repo is null; got %q", pr.CloneURL)
 	}
+	if pr.SSHURL != "" {
+		t.Errorf("SSHURL should be empty when head.repo is null; got %q", pr.SSHURL)
+	}
 	if pr.BaseCloneURL != "https://github.com/me/myrepo.git" {
 		t.Errorf("BaseCloneURL = %q, want %q (must survive deleted-fork)", pr.BaseCloneURL, "https://github.com/me/myrepo.git")
+	}
+	if pr.BaseSSHURL != "git@github.com:me/myrepo.git" {
+		t.Errorf("BaseSSHURL = %q, want %q (must survive deleted-fork)", pr.BaseSSHURL, "git@github.com:me/myrepo.git")
 	}
 	if pr.HeadRef != "deleted-branch" {
 		t.Errorf("HeadRef = %q, want %q (head.ref still parseable when repo is null)", pr.HeadRef, "deleted-branch")

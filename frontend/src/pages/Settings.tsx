@@ -14,6 +14,7 @@ interface SettingsData {
     base_url: string
     has_token: boolean
     poll_interval: string
+    clone_protocol: 'ssh' | 'https'
   }
   jira: {
     enabled: boolean
@@ -44,6 +45,7 @@ export default function Settings() {
     jira_url: string
     jira_pat: string
     github_poll_interval: string
+    github_clone_protocol: 'ssh' | 'https'
     jira_poll_interval: string
     jira_projects: string
     jira_pickup: JiraStatusRuleValue
@@ -60,6 +62,7 @@ export default function Settings() {
     jira_url: '',
     jira_pat: '',
     github_poll_interval: '5m0s',
+    github_clone_protocol: 'ssh',
     jira_poll_interval: '5m0s',
     jira_projects: '',
     jira_pickup: { members: [] },
@@ -75,6 +78,32 @@ export default function Settings() {
   const [jiraConnected, setJiraConnected] = useState(false)
   const [jiraConnecting, setJiraConnecting] = useState(false)
   const [jiraConnectError, setJiraConnectError] = useState<string | null>(null)
+  const [sshTestState, setSshTestState] = useState<
+    { kind: 'idle' } | { kind: 'running' } | { kind: 'ok' } | { kind: 'fail'; stderr: string }
+  >({ kind: 'idle' })
+
+  // Test SSH preflight on demand. Doesn't save settings — purely
+  // diagnostic. Useful for users on the Settings page after they've
+  // toggled SSH (or fixed their key) and want a clean confirmation
+  // before saving and watching the bootstrap re-run.
+  const testSSH = async () => {
+    setSshTestState({ kind: 'running' })
+    try {
+      const res = await fetch('/api/github/preflight-ssh', { method: 'POST' })
+      if (!res.ok) {
+        setSshTestState({ kind: 'fail', stderr: `Server returned ${res.status}` })
+        return
+      }
+      const data = (await res.json()) as { ok: boolean; stderr?: string }
+      if (data.ok) {
+        setSshTestState({ kind: 'ok' })
+      } else {
+        setSshTestState({ kind: 'fail', stderr: data.stderr || 'Preflight failed.' })
+      }
+    } catch (err) {
+      setSshTestState({ kind: 'fail', stderr: (err as Error).message })
+    }
+  }
 
   useEffect(() => {
     fetch('/api/settings')
@@ -89,6 +118,7 @@ export default function Settings() {
           jira_url: d.jira.base_url || '',
           jira_pat: '',
           github_poll_interval: d.github.poll_interval,
+          github_clone_protocol: d.github.clone_protocol === 'https' ? 'https' : 'ssh',
           jira_poll_interval: d.jira.poll_interval,
           jira_projects: (d.jira.projects || []).join(', '),
           jira_pickup: d.jira.pickup || { members: [] },
@@ -227,6 +257,7 @@ export default function Settings() {
           jira_url: form.jira_url,
           jira_pat: form.jira_pat || undefined,
           github_poll_interval: form.github_poll_interval,
+          github_clone_protocol: form.github_clone_protocol,
           jira_poll_interval: form.jira_poll_interval,
           jira_projects: projects,
           jira_pickup: form.jira_pickup,
@@ -311,6 +342,58 @@ export default function Settings() {
                 <option value="2m0s">2 minutes</option>
                 <option value="5m0s">5 minutes</option>
               </select>
+            </Field>
+            <Field label="Clone protocol">
+              <div className="flex items-center gap-3">
+                <div className="inline-flex rounded-lg border border-border-glass bg-black/[0.02] p-0.5">
+                  {(['ssh', 'https'] as const).map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => {
+                        setForm((f) => ({ ...f, github_clone_protocol: p }))
+                        setSshTestState({ kind: 'idle' })
+                      }}
+                      className={`px-3 py-1 text-[12px] font-medium rounded-md transition-colors ${
+                        form.github_clone_protocol === p
+                          ? 'bg-white text-text-primary shadow-sm'
+                          : 'text-text-tertiary hover:text-text-secondary'
+                      }`}
+                    >
+                      {p.toUpperCase()}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={testSSH}
+                  disabled={sshTestState.kind === 'running'}
+                  className="text-[11px] text-accent hover:underline disabled:opacity-50"
+                >
+                  {sshTestState.kind === 'running' ? 'Testing...' : 'Test SSH connection'}
+                </button>
+              </div>
+              <p className="text-[11px] text-text-tertiary mt-1.5 leading-relaxed">
+                Your token is still required for the GitHub API. The protocol only affects how
+                Triage Factory clones repos to your machine. Saving the toggle re-clones bare repos
+                with the new origin URL.
+              </p>
+              {sshTestState.kind === 'ok' && (
+                <p className="text-[11px] text-[var(--color-claim)] mt-1.5">
+                  ✓ SSH preflight succeeded — git@github.com is reachable with your key.
+                </p>
+              )}
+              {sshTestState.kind === 'fail' && (
+                <pre
+                  className="
+                  mt-1.5 max-h-[120px] overflow-auto rounded
+                  bg-[var(--color-dismiss)]/10 p-2 text-[11px]
+                  text-[var(--color-dismiss)] whitespace-pre-wrap break-words
+                "
+                >
+                  {sshTestState.stderr}
+                </pre>
+              )}
             </Field>
           </div>
         </Section>

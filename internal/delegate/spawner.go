@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -621,20 +622,40 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 		return runConfig{}, fmt.Errorf("failed to fetch PR: %w", err)
 	}
 
-	// pr.BaseCloneURL is the upstream (the repo where /pulls/<n>
-	// lives, which is always the canonical repo by construction),
-	// populated from base.repo.clone_url. pr.CloneURL is the head's
-	// clone_url — the fork's URL when the PR is from a fork, equal
-	// to pr.BaseCloneURL for own-repo PRs. CreateForPR uses the
-	// upstream to fetch refs/pull/<n>/head and (if they differ) the
-	// head URL to configure push tracking so commits land in the
-	// fork's branch instead of creating a stray branch on upstream.
-	if pr.BaseCloneURL == "" {
-		return runConfig{}, fmt.Errorf("PR #%d on %s/%s: GitHub did not return base.repo.clone_url; cannot create worktree", prNumber, owner, repo)
+	// pr.BaseCloneURL / pr.SSHURL pair: the upstream (the repo where
+	// /pulls/<n> lives, which is always the canonical repo by
+	// construction), populated from base.repo.{clone_url,ssh_url}.
+	// pr.CloneURL / pr.SSHURL is the head's URL — the fork's URL when
+	// the PR is from a fork, equal to the base URL for own-repo PRs.
+	// CreateForPR uses the upstream URL to fetch refs/pull/<n>/head
+	// and (if they differ) the head URL to configure push tracking so
+	// commits land in the fork's branch instead of creating a stray
+	// branch on upstream.
+	//
+	// Pick HTTPS or SSH form based on the user's config. We can't
+	// just always pass HTTPS — repairOriginURL inside CreateForPR
+	// rewrites the bare's origin to whatever URL we pass, so passing
+	// HTTPS would clobber the SSH origin that bootstrap put there.
+	upstreamCloneURL, headCloneURL := pr.BaseCloneURL, pr.CloneURL
+	if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+		if pr.BaseSSHURL != "" {
+			upstreamCloneURL = pr.BaseSSHURL
+		}
+		// pr.SSHURL is empty for deleted-fork PRs (head.repo == null);
+		// keep headCloneURL empty too in that case so CreateForPR's
+		// hasHeadRepo check still treats it as deleted-fork.
+		if pr.CloneURL != "" {
+			headCloneURL = pr.SSHURL
+		}
+	} else if cErr != nil {
+		log.Printf("[delegate] load config to pick clone protocol for run %s: %v (defaulting to HTTPS)", runID, cErr)
+	}
+	if upstreamCloneURL == "" {
+		return runConfig{}, fmt.Errorf("PR #%d on %s/%s: GitHub did not return a usable upstream URL; cannot create worktree", prNumber, owner, repo)
 	}
 
 	s.updateStatus(runID, "cloning")
-	wtPath, err := worktree.CreateForPR(ctx, owner, repo, pr.BaseCloneURL, pr.CloneURL, pr.HeadRef, prNumber, runID)
+	wtPath, err := worktree.CreateForPR(ctx, owner, repo, upstreamCloneURL, headCloneURL, pr.HeadRef, prNumber, runID)
 	if err != nil {
 		return runConfig{}, fmt.Errorf("failed to create worktree: %w", err)
 	}

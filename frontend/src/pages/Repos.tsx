@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import * as Popover from '@radix-ui/react-popover'
-import { ChevronDown, GitBranch, Plus, RotateCw } from 'lucide-react'
+import { ChevronDown, GitBranch, Plus, RotateCw, AlertTriangle } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import RepoPickerModal from '../components/RepoPickerModal'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { toast } from '../components/Toast/toastStore'
@@ -18,6 +19,17 @@ interface RepoProfile {
   default_branch?: string
   base_branch?: string
   profiled_at?: string
+  // Bare-clone status reported by the worktree package via main.go's
+  // SetOnCloneResult hook. 'pending' for repos that haven't been
+  // attempted yet (legacy rows or repos selected since the last
+  // bootstrap pass); 'ok' / 'failed' for attempted repos.
+  clone_status?: 'ok' | 'failed' | 'pending'
+  clone_error?: string
+  // 'ssh' when our SSH preflight confirmed the SSH side is the cause
+  // of the failure (so the UI can offer "Fix in Settings"); 'other'
+  // when the failure is on the git/transport side (show raw stderr,
+  // no settings shortcut).
+  clone_error_kind?: 'ssh' | 'other'
 }
 
 // --- BranchPicker ----------------------------------------------------------
@@ -269,6 +281,93 @@ function StatusDot({ state }: { state: DotState }) {
   )
 }
 
+// --- CloneFailedBadge ------------------------------------------------------
+// A small red pill anchored next to the repo title, with a Radix Popover
+// that exposes the actual error and a CTA. The CTA branches on
+// clone_error_kind: SSH-classified failures get a "Fix in Settings"
+// link (the user almost certainly needs to set up keys / agent / known
+// hosts); other failures just show the raw stderr so the user can
+// diagnose. We deliberately do NOT try to summarize git stderr — the
+// text is short enough to display verbatim and the user is the right
+// audience to interpret git/curl/connection errors.
+
+function CloneFailedBadge({ profile }: { profile: RepoProfile }) {
+  const [open, setOpen] = useState(false)
+  const isSSH = profile.clone_error_kind === 'ssh'
+  return (
+    <Popover.Root open={open} onOpenChange={setOpen}>
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`Clone failed for ${profile.id}`}
+          className="
+            inline-flex items-center gap-1 rounded-full
+            border border-[var(--color-dismiss)]/30
+            bg-[var(--color-dismiss)]/10 px-2 py-0.5
+            text-[10px] font-medium uppercase tracking-wide
+            text-[var(--color-dismiss)]
+            hover:bg-[var(--color-dismiss)]/15 transition-colors
+          "
+        >
+          <AlertTriangle size={10} />
+          Clone failed
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          side="bottom"
+          align="start"
+          sideOffset={6}
+          className="
+            z-50 w-[320px] rounded-xl border border-border-glass
+            bg-surface-raised/95 backdrop-blur-xl shadow-lg shadow-black/[0.08]
+            p-3 text-[12px] text-text-primary
+          "
+        >
+          <p className="font-semibold mb-1.5">
+            {isSSH ? 'SSH not configured for GitHub' : 'Clone failed'}
+          </p>
+          {isSSH ? (
+            <p className="text-text-secondary leading-snug mb-2">
+              The bare-clone for this repo couldn&apos;t be created over SSH. Our preflight against{' '}
+              <code>git@github.com</code> also failed — check that your SSH key is added to GitHub
+              and loaded into your agent, or switch the clone protocol to HTTPS.
+            </p>
+          ) : (
+            <p className="text-text-secondary leading-snug mb-2">
+              The bare-clone for this repo failed. Raw output from git:
+            </p>
+          )}
+          {profile.clone_error && (
+            <pre
+              className="
+              mb-2 max-h-[140px] overflow-auto rounded
+              bg-black/[0.04] p-2 text-[11px] text-text-secondary
+              whitespace-pre-wrap break-words
+            "
+            >
+              {profile.clone_error}
+            </pre>
+          )}
+          {isSSH && (
+            <Link
+              to="/settings"
+              onClick={() => setOpen(false)}
+              className="
+                inline-flex items-center gap-1 rounded-md
+                bg-accent/10 px-2 py-1 text-[12px] font-medium
+                text-accent hover:bg-accent/15 transition-colors
+              "
+            >
+              Fix in Settings
+            </Link>
+          )}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  )
+}
+
 // --- RepoCard --------------------------------------------------------------
 
 function RepoCard({
@@ -320,6 +419,7 @@ function RepoCard({
         <h3 className="text-[13px] font-semibold tracking-tight text-text-primary truncate">
           {profile.id}
         </h3>
+        {profile.clone_status === 'failed' && <CloneFailedBadge profile={profile} />}
         <div className="ml-auto flex items-center gap-3">
           <BranchPicker profile={profile} onSave={onBranchChange} />
           {profile.profiled_at && (
@@ -552,9 +652,28 @@ export default function Repos() {
       )
     }
     if (event.type === 'repo_profile_updated') {
-      const d = event.data as { id: string; profile_text: string }
+      // Two producers share this event type: the AI profiler (sends
+      // profile_text) and main.go's clone-result hook (sends
+      // clone_status / clone_error / clone_error_kind). Merge whichever
+      // fields are present rather than overwriting — a clone-status
+      // event must not blank the AI profile_text and vice versa.
+      const d = event.data as {
+        id: string
+        profile_text?: string
+        clone_status?: 'ok' | 'failed' | 'pending'
+        clone_error?: string
+        clone_error_kind?: 'ssh' | 'other'
+      }
       setProfiles((prev) =>
-        prev.map((p) => (p.id === d.id ? { ...p, profile_text: d.profile_text } : p)),
+        prev.map((p) => {
+          if (p.id !== d.id) return p
+          const next: RepoProfile = { ...p }
+          if (d.profile_text !== undefined) next.profile_text = d.profile_text
+          if (d.clone_status !== undefined) next.clone_status = d.clone_status
+          if (d.clone_error !== undefined) next.clone_error = d.clone_error
+          if (d.clone_error_kind !== undefined) next.clone_error_kind = d.clone_error_kind
+          return next
+        }),
       )
     }
   })

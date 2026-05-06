@@ -1,5 +1,6 @@
 import * as Toast from '@radix-ui/react-toast'
 import { X } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { toastStore, type ToastLevel } from './toastStore'
 import { useToast } from './useToast'
 import { useWebSocket } from '../../hooks/useWebSocket'
@@ -28,6 +29,7 @@ const LEVEL_STYLE: Record<ToastLevel, { border: string; label: string }> = {
 
 export default function ToastProvider() {
   const items = useToast()
+  const navigate = useNavigate()
   // Keep the WS singleton connected whenever the provider is mounted, even
   // on pages (like Setup) whose components don't otherwise subscribe. The
   // handler itself is a no-op — toast events are intercepted in the WS
@@ -68,6 +70,20 @@ export default function ToastProvider() {
               <Toast.Description className="text-[13px] text-text-primary leading-snug">
                 {item.body}
               </Toast.Description>
+              {item.action && (
+                <Toast.Action altText={item.action.label} asChild className="mt-2 inline-flex">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigate(item.action!.to)
+                      toastStore.dismiss(item.id)
+                    }}
+                    className={`text-[12px] font-semibold underline-offset-2 hover:underline ${style.label}`}
+                  >
+                    {item.action.label}
+                  </button>
+                </Toast.Action>
+              )}
             </div>
             <Toast.Close
               aria-label="Dismiss"

@@ -15,6 +15,11 @@ type setupRequest struct {
 	GitHubPAT string `json:"github_pat"`
 	JiraURL   string `json:"jira_url"`
 	JiraPAT   string `json:"jira_pat"`
+	// CloneProtocol is the user's choice on the Setup wizard: "ssh"
+	// (default) or "https". Empty means "use the existing config
+	// value" — important because the wizard runs preflight separately
+	// and may post setup multiple times during reconfiguration.
+	CloneProtocol string `json:"clone_protocol"`
 }
 
 type setupResponse struct {
@@ -85,6 +90,9 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.JiraURL != "" {
 		cfg.Jira.BaseURL = req.JiraURL
+	}
+	if req.CloneProtocol == "ssh" || req.CloneProtocol == "https" {
+		cfg.GitHub.CloneProtocol = req.CloneProtocol
 	}
 	if err := config.Save(cfg); err != nil {
 		log.Printf("[auth] warning: failed to save config: %v", err)

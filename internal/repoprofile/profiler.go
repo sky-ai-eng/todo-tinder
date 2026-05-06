@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/github"
@@ -101,13 +102,23 @@ func (p *Profiler) Run(ctx context.Context, repos []string, force bool) error {
 			log.Printf("[repoprofile] %s: get AGENTS.md: %v", name, err)
 		}
 
-		// Fetch repo metadata (default branch, clone URL)
+		// Fetch repo metadata (default branch, clone URL). Pick HTTPS or
+		// SSH form based on the user's config — both URLs come back from
+		// the same /repos/:owner/:repo response, so this is a one-line
+		// branch on the result, not a second API call. Empty SSHURL
+		// (legacy GHE deployments without ssh_url surfaced) falls back
+		// to HTTPS so we always have *some* URL on the row.
 		var defaultBranch, cloneURL string
 		if meta, err := p.gh.GetRepoMeta(owner, repo); err != nil {
 			log.Printf("[repoprofile] %s: get repo meta: %v", name, err)
 		} else {
 			defaultBranch = meta.DefaultBranch
 			cloneURL = meta.CloneURL
+			if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" && meta.SSHURL != "" {
+				cloneURL = meta.SSHURL
+			} else if cErr != nil {
+				log.Printf("[repoprofile] %s: load config to pick clone protocol: %v (defaulting to HTTPS)", name, cErr)
+			}
 		}
 
 		prof := domain.RepoProfile{

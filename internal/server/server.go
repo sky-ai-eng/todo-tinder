@@ -144,6 +144,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/settings", s.handleSettingsPost)
 	s.mux.HandleFunc("POST /api/skills/import", s.handleSkillsImport)
 	s.mux.HandleFunc("GET /api/github/repos", s.handleGitHubRepos)
+	s.mux.HandleFunc("POST /api/github/preflight-ssh", s.handleGitHubPreflightSSH)
 	s.mux.HandleFunc("GET /api/repos", s.handleRepoProfiles)
 	s.mux.HandleFunc("POST /api/repos", s.handleReposSave)
 	s.mux.HandleFunc("PATCH /api/repos/{owner}/{repo}", s.handleRepoUpdate)

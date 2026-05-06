@@ -24,6 +24,48 @@ var (
 	repoLocks = map[string]*sync.Mutex{}
 )
 
+// onCloneResult is invoked by EnsureBareClone after every clone attempt
+// (success or failure) for the per-repo callback wired in main.go. The
+// callback writes to repo_profiles.clone_status / clone_error /
+// clone_error_kind and broadcasts a websocket event so the Repos page
+// updates live, and logs the failure to stderr so it's visible in
+// `journalctl` / launch-agent logs even if the user isn't on the page.
+//
+// Package-level (rather than struct-level) because the worktree package
+// has no struct — main.go calls EnsureBareClone / CreateForPR directly.
+// One callback per process is enough; tests that don't set it get the
+// nil-guard early-return.
+var (
+	onCloneResultMu sync.RWMutex
+	onCloneResult   func(owner, repo string, err error)
+)
+
+// SetOnCloneResult installs the post-clone callback. Safe to call
+// multiple times (last writer wins). Pass nil to detach (used by tests).
+func SetOnCloneResult(cb func(owner, repo string, err error)) {
+	onCloneResultMu.Lock()
+	defer onCloneResultMu.Unlock()
+	onCloneResult = cb
+}
+
+// fireCloneResult invokes the registered callback if any. Recovers from
+// panics in the callback so a misbehaving consumer can't bring down a
+// poller goroutine — the callback's job is purely observational.
+func fireCloneResult(owner, repo string, err error) {
+	onCloneResultMu.RLock()
+	cb := onCloneResult
+	onCloneResultMu.RUnlock()
+	if cb == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[worktree] onCloneResult callback panicked for %s/%s: %v", owner, repo, r)
+		}
+	}()
+	cb(owner, repo, err)
+}
+
 func lockRepo(owner, repo string) *sync.Mutex {
 	key := owner + "/" + repo
 	repoMu.Lock()
@@ -320,13 +362,26 @@ func EnsureBareClone(ctx context.Context, owner, repo, cloneURL string) (string,
 // `git fetch` / `git pull`, where it would mirror every PR's head
 // on every refresh — thousands of extra refs on busy repos for no
 // internal benefit.
-func ensureBareCloneLocked(ctx context.Context, owner, repo, cloneURL string) (string, error) {
-	bareDir, err := cloneBareIfMissing(ctx, owner, repo, cloneURL)
+func ensureBareCloneLocked(ctx context.Context, owner, repo, cloneURL string) (bareDir string, err error) {
+	// Fire the post-clone callback exactly once per call so consumers
+	// (main.go's hook → repo_profiles + websocket) see one event per
+	// attempt regardless of whether we hit the fresh-clone branch or
+	// the existing-bare repair branch. Logging the failure here as
+	// well guarantees stderr coverage even if no callback is wired
+	// (tests, future CLI tools, etc.).
+	defer func() {
+		if err != nil {
+			log.Printf("[worktree] ensureBareClone %s/%s: %v", owner, repo, err)
+		}
+		fireCloneResult(owner, repo, err)
+	}()
+
+	bareDir, err = cloneBareIfMissing(ctx, owner, repo, cloneURL)
 	if err != nil {
 		return "", err
 	}
 	if cloneURL != "" {
-		if err := repairOriginURL(ctx, bareDir, cloneURL); err != nil {
+		if err = repairOriginURL(ctx, bareDir, cloneURL); err != nil {
 			return "", fmt.Errorf("repair origin url: %w", err)
 		}
 	}
