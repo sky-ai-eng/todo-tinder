@@ -1,13 +1,16 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
 type setupRequest struct {
@@ -37,6 +40,26 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	if req.GitHubURL == "" || req.GitHubPAT == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GitHub URL and token are required"})
 		return
+	}
+
+	// Hard-block setup with SSH selected if our preflight against
+	// git@github.com can't authenticate. Run BEFORE the PAT check so
+	// the user gets the SSH error first rather than entering a valid
+	// PAT just to find out their SSH is broken on the next step. The
+	// HTTPS path skips this entirely.
+	if req.CloneProtocol == "ssh" {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		err := worktree.PreflightSSH(ctx, "git@github.com")
+		cancel()
+		if err != nil {
+			log.Printf("[auth] blocked SSH setup: preflight failed: %v", err)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error":  "SSH preflight against git@github.com failed — set up your SSH key or pick HTTPS. " + err.Error(),
+				"field":  "clone_protocol",
+				"stderr": err.Error(),
+			})
+			return
+		}
 	}
 
 	resp := setupResponse{}

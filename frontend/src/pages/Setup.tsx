@@ -21,17 +21,16 @@ export default function Setup() {
   const [step, setStep] = useState<Step>('github')
   const [initDone, setInitDone] = useState(false)
 
-  // GitHub (mandatory). clone_protocol defaults to 'ssh' — the user can
-  // flip it to 'https' on this same step if their machine doesn't have
-  // SSH access set up. We run a server-side preflight on submit for
-  // "ssh" so the user gets a heads-up rather than a silent first-clone
-  // hang on the Repos page.
+  // GitHub (mandatory). clone_protocol defaults to 'ssh' — the user
+  // can flip it to 'https' on this same step if their machine doesn't
+  // have SSH access set up. The server runs a preflight when "ssh" is
+  // selected and rejects setup if it fails; the rejection surfaces as
+  // an inline error via the existing ErrorBanner.
   const [githubForm, setGithubForm] = useState<{
     url: string
     pat: string
     clone_protocol: 'ssh' | 'https'
   }>({ url: '', pat: '', clone_protocol: 'ssh' })
-  const [sshPreflightWarning, setSshPreflightWarning] = useState('')
 
   // Repo selection — cached so navigating back doesn't re-fetch or lose selection
   const [cachedRepos, setCachedRepos] = useState<GitHubRepo[] | undefined>(undefined)
@@ -85,33 +84,13 @@ export default function Setup() {
   const submitGitHub = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
-    setSshPreflightWarning('')
     setLoading(true)
     try {
-      // Preflight SSH only when the user picked SSH. We never block on
-      // the result — if it fails the user can still proceed (some setups
-      // legitimately have SSH configured in ways our preflight doesn't
-      // detect, e.g. exotic ProxyCommand chains). We surface the failure
-      // as a warning banner and let the user decide whether to fix
-      // before continuing or to fall back to HTTPS.
-      if (githubForm.clone_protocol === 'ssh') {
-        try {
-          const pre = await fetch('/api/github/preflight-ssh', { method: 'POST' })
-          if (pre.ok) {
-            const data = (await pre.json()) as { ok: boolean; stderr?: string }
-            if (!data.ok) {
-              setSshPreflightWarning(
-                data.stderr ||
-                  'SSH preflight against git@github.com did not succeed. Add your key to GitHub, load it into ssh-agent, and run `ssh -T git@github.com` once — or switch to HTTPS below.',
-              )
-            }
-          }
-        } catch {
-          // Network/server hiccup on the preflight — don't block the
-          // setup flow; the user can retry from Settings.
-        }
-      }
-
+      // The server is authoritative on SSH preflight: it runs the
+      // check itself when clone_protocol == "ssh" and rejects the
+      // setup with a clear error if it fails. Don't double-check
+      // here — duplicating the gate forces us to keep two error
+      // surfaces in sync.
       const res = await fetch('/api/auth/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -392,26 +371,6 @@ export default function Setup() {
           </div>
 
           <ErrorBanner error={error} />
-          {sshPreflightWarning && (
-            <div className="rounded-lg border border-[var(--color-snooze)]/30 bg-[var(--color-snooze)]/10 p-3">
-              <p className="text-[12px] font-semibold text-text-primary mb-1">
-                SSH preflight failed
-              </p>
-              <p className="text-[11px] text-text-secondary leading-snug mb-1.5">
-                We&apos;ll continue with setup, but the first clone will likely fail. Verify your
-                key is added to GitHub and loaded in your ssh-agent, or flip the toggle above to
-                HTTPS.
-              </p>
-              <pre
-                className="
-                max-h-[120px] overflow-auto rounded bg-black/[0.04] p-2
-                text-[11px] text-text-secondary whitespace-pre-wrap break-words
-              "
-              >
-                {sshPreflightWarning}
-              </pre>
-            </div>
-          )}
 
           <button type="submit" disabled={loading || !canSubmitGitHub} className={primaryBtnClass}>
             {loading ? 'Validating...' : 'Connect'}

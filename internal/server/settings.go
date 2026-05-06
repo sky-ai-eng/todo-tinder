@@ -369,6 +369,29 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		cfg.Server.Port = req.ServerPort
 	}
 
+	// Hard-block a transition into SSH mode if our preflight against
+	// git@github.com can't authenticate. Otherwise the toggle would
+	// "succeed" silently — repairOriginURL is a local config write
+	// that doesn't test connectivity, so the failure wouldn't surface
+	// until the next poll/delegation tries to fetch. Only gate the
+	// transition (prev != "ssh") so a user with broken SSH today can
+	// still save unrelated fields without being held hostage to fix
+	// SSH first; switching AWAY from SSH is also unblocked.
+	if cfg.GitHub.CloneProtocol == "ssh" && prevGHCloneProtocol != "ssh" {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		err := worktree.PreflightSSH(ctx, "git@github.com")
+		cancel()
+		if err != nil {
+			log.Printf("[settings] blocked SSH switch for %q: preflight failed: %v", creds.GitHubURL, err)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error":  "SSH preflight against git@github.com failed — fix your SSH setup or keep HTTPS. " + err.Error(),
+				"field":  "github_clone_protocol",
+				"stderr": err.Error(),
+			})
+			return
+		}
+	}
+
 	// Persist
 	if err := auth.Store(creds); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
