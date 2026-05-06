@@ -5,12 +5,12 @@
 -- readable dump, and the legacy-YAML import is a literal copy of the
 -- file's bytes (after forcing the new poll-interval default).
 --
--- The actual import of an existing config.yaml runs in Go inside
--- config.Init (it needs to read the file, mutate the struct, and
--- delete the YAML on success — none of which is expressible in pure
--- SQL). This file just creates the table; the row is populated either
--- by that import or, on fresh installs, by the first Save() from the
--- Settings UI.
+-- The actual import of an existing config.yaml runs in Go via
+-- config.MigrateLegacyYAML, which entrypoints call after config.Init
+-- (it needs to read the file, mutate the struct, and delete the YAML
+-- on success — none of which is expressible in pure SQL). This file
+-- just creates the table; the row is populated either by that import
+-- or, on fresh installs, by the first Save() from the Settings UI.
 CREATE TABLE IF NOT EXISTS settings (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     data       TEXT NOT NULL,
