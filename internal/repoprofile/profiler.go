@@ -56,6 +56,19 @@ func (p *Profiler) Run(ctx context.Context, repos []string, force bool) error {
 
 	log.Printf("[repoprofile] profiling %d configured repos", len(repos))
 
+	// Resolve the clone protocol once for the whole run rather than
+	// re-loading config inside the per-repo loop. The setting can't
+	// change mid-run — handleSettingsPost serializes config writes
+	// behind the same `onGitHubChanged` callback that owns this
+	// goroutine — so capturing it here matches actual semantics and
+	// avoids N redundant DB reads + YAML unmarshals.
+	preferSSH := false
+	if cfg, cErr := config.Load(); cErr != nil {
+		log.Printf("[repoprofile] load config to pick clone protocol: %v (defaulting to HTTPS)", cErr)
+	} else {
+		preferSSH = cfg.GitHub.CloneProtocol == "ssh"
+	}
+
 	var withDocs []repoWithDocs
 	var withoutDocs []domain.RepoProfile
 
@@ -102,22 +115,20 @@ func (p *Profiler) Run(ctx context.Context, repos []string, force bool) error {
 			log.Printf("[repoprofile] %s: get AGENTS.md: %v", name, err)
 		}
 
-		// Fetch repo metadata (default branch, clone URL). Pick HTTPS or
-		// SSH form based on the user's config — both URLs come back from
-		// the same /repos/:owner/:repo response, so this is a one-line
-		// branch on the result, not a second API call. Empty SSHURL
-		// (legacy GHE deployments without ssh_url surfaced) falls back
-		// to HTTPS so we always have *some* URL on the row.
+		// Fetch repo metadata (default branch, clone URL). Both HTTPS
+		// and SSH forms come back from the same /repos/:owner/:repo
+		// response, so picking is a one-line branch on the result.
+		// Empty SSHURL (legacy GHE deployments without ssh_url
+		// surfaced) falls back to HTTPS so we always have *some* URL
+		// on the row.
 		var defaultBranch, cloneURL string
 		if meta, err := p.gh.GetRepoMeta(owner, repo); err != nil {
 			log.Printf("[repoprofile] %s: get repo meta: %v", name, err)
 		} else {
 			defaultBranch = meta.DefaultBranch
 			cloneURL = meta.CloneURL
-			if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" && meta.SSHURL != "" {
+			if preferSSH && meta.SSHURL != "" {
 				cloneURL = meta.SSHURL
-			} else if cErr != nil {
-				log.Printf("[repoprofile] %s: load config to pick clone protocol: %v (defaulting to HTTPS)", name, cErr)
 			}
 		}
 
