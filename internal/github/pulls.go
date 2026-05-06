@@ -3,6 +3,7 @@ package github
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 )
@@ -422,6 +423,20 @@ func (c *Client) SubmitReview(owner, repo string, number int, commitSHA, event, 
 					"start a new review so the captured hunks match the current diff",
 			)
 		}
+		// Unclassified review-submit failure. Log the request shape once
+		// so the next mystery 422 (e.g., "thread end commit oid is not
+		// part of the pull request") can be diagnosed against the PR's
+		// /commits list and live diff without re-running the agent.
+		positions := make([]string, len(comments))
+		for i, cm := range comments {
+			if cm.StartLine != nil {
+				positions[i] = fmt.Sprintf("%s:%d-%d", cm.Path, *cm.StartLine, cm.Line)
+			} else {
+				positions[i] = fmt.Sprintf("%s:%d", cm.Path, cm.Line)
+			}
+		}
+		log.Printf("[github] SubmitReview failed %s/%s#%d commit=%s event=%s comments=%d [%s]: %v",
+			owner, repo, number, commitSHA, event, len(comments), strings.Join(positions, ", "), err)
 		return 0, event, err
 	}
 
