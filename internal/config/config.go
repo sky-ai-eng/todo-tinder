@@ -32,10 +32,9 @@ type GitHubConfig struct {
 	BaseURL      string        `yaml:"base_url"`
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// CloneProtocol controls how bare clones in ~/.triagefactory/repos/
-	// are created. "ssh" uses git@github.com:owner/repo.git (default;
-	// inherits the user's SSH key + agent), "https" uses GitHub's
-	// clone_url (depends on a credential helper holding a PAT).
-	// Empty string is treated as "ssh" by callers.
+	// are created. "ssh" uses git@github.com:owner/repo.git, "https"
+	// uses GitHub's clone_url (depends on a credential helper holding
+	// a PAT). Empty string is treated as "https" by callers.
 	CloneProtocol string `yaml:"clone_protocol,omitempty"`
 }
 
