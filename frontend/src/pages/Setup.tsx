@@ -647,7 +647,7 @@ const secondaryBtnClass =
 function ErrorBanner({ error }: { error: string }) {
   if (!error) return null
   return (
-    <div className="rounded-xl bg-dismiss/[0.08] border border-dismiss/20 px-4 py-2.5 text-[13px] text-dismiss">
+    <div className="rounded-xl bg-dismiss/[0.08] border border-dismiss/20 px-4 py-2.5 text-[13px] text-dismiss whitespace-pre-line">
       {error}
     </div>
   )

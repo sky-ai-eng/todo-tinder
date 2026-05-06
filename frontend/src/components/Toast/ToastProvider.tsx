@@ -67,7 +67,7 @@ export default function ToastProvider() {
                   {item.title}
                 </Toast.Title>
               )}
-              <Toast.Description className="text-[13px] text-text-primary leading-snug">
+              <Toast.Description className="text-[13px] text-text-primary leading-snug whitespace-pre-line">
                 {item.body}
               </Toast.Description>
               {item.action && (

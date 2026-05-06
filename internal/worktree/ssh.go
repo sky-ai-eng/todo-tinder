@@ -68,7 +68,7 @@ func PreflightSSH(ctx context.Context, host string) error {
 		"-o", "StrictHostKeyChecking=accept-new",
 		host,
 	)
-	out, err := cmd.CombinedOutput()
+	out, _ := cmd.CombinedOutput()
 	combined := strings.TrimSpace(string(out))
 
 	// GitHub's greeting on a successful auth handshake (no shell granted):
@@ -80,11 +80,102 @@ func PreflightSSH(ctx context.Context, host string) error {
 		return nil
 	}
 
-	if err != nil {
-		return fmt.Errorf("ssh preflight against %s failed: %w; output: %s", host, err, combined)
+	// Diagnose the most common failure modes so the user gets an
+	// actionable message rather than just "Permission denied
+	// (publickey)". The probe is a best-effort `ssh-add -l` against
+	// whatever SSH_AUTH_SOCK the binary inherited; its exit code maps
+	// cleanly to "no agent" / "empty agent" / "agent loaded".
+	hint := diagnoseSSHFailure(ctx, combined)
+	return fmt.Errorf("%s\n\n%s", combined, hint)
+}
+
+// diagnoseSSHFailure inspects the ssh stderr and the local ssh-agent
+// state to produce a one-paragraph hint pointing at the most likely
+// fix. Returned text is plain and intended for direct UI display.
+//
+// The three branches correspond to ssh-add -l's documented exit codes:
+//
+//	0: agent reachable, has identities → key probably not on GitHub,
+//	   or BatchMode is rejecting a passphrase-protected key whose
+//	   keychain unlock dialog is being suppressed.
+//	1: agent reachable, no identities → most common case on macOS
+//	   with passphrase-protected keys: the keychain agent is empty
+//	   and BatchMode blocks the unlock prompt.
+//	2: agent socket unreachable (SSH_AUTH_SOCK unset or stale).
+func diagnoseSSHFailure(ctx context.Context, sshOut string) string {
+	addCmd := exec.CommandContext(ctx, "ssh-add", "-l")
+	addOut, _ := addCmd.CombinedOutput()
+	exit := -1
+	if addCmd.ProcessState != nil {
+		exit = addCmd.ProcessState.ExitCode()
 	}
-	// No error and no greeting — unusual; treat as failure with the raw output.
-	return fmt.Errorf("ssh preflight against %s did not return GitHub auth greeting; output: %s", host, combined)
+
+	const githubKeysURL = "https://github.com/settings/keys"
+	const macOSNote = "On macOS, `ssh-add --apple-use-keychain ~/.ssh/id_ed25519` persists the key in the login keychain so you don't have to re-add it after every reboot."
+
+	switch exit {
+	case 1:
+		// Agent reachable but empty — by far the most common cause
+		// of "Permission denied (publickey)" with BatchMode on macOS.
+		return strings.Join([]string{
+			"Your ssh-agent has no keys loaded, so the connection had nothing to offer.",
+			"",
+			"Fix:",
+			"  ssh-add ~/.ssh/id_ed25519     # or your key path",
+			"",
+			"Don't have a key yet?",
+			"  ssh-keygen -t ed25519 -C \"you@example.com\"",
+			"  ssh-add ~/.ssh/id_ed25519",
+			"  cat ~/.ssh/id_ed25519.pub      # paste at " + githubKeysURL,
+			"",
+			macOSNote,
+		}, "\n")
+	case 2:
+		// Socket missing — SSH_AUTH_SOCK isn't set in this process's
+		// environment. Common when the binary was launched outside
+		// a normal login shell (Finder, launchd plist, etc.).
+		return strings.Join([]string{
+			"ssh-agent isn't reachable from this process (SSH_AUTH_SOCK is unset or stale).",
+			"",
+			"Fix: start Triage Factory from a terminal that has the agent running.",
+			"On macOS this is automatic in any login shell; double-clicking the binary",
+			"in Finder runs it in launchd's reduced environment without the agent.",
+			"",
+			"Check from the terminal you launched TF in:",
+			"  echo $SSH_AUTH_SOCK            # should be non-empty",
+			"  ssh-add -l                     # should list your key(s)",
+		}, "\n")
+	case 0:
+		// Agent has keys but GitHub still rejected — key probably
+		// isn't on GitHub, or it's a different identity than the
+		// one authorized.
+		count := strings.Count(string(addOut), "\n")
+		if count == 0 {
+			count = 1
+		}
+		return strings.Join([]string{
+			fmt.Sprintf("Your ssh-agent has %d key(s) loaded, but GitHub rejected them.", count),
+			"",
+			"The most likely fix:",
+			"  - Make sure the public key is added at " + githubKeysURL,
+			"  - Confirm you're connecting as the right GitHub user",
+			"",
+			"To see which key was offered, run:",
+			"  ssh -vT git@github.com 2>&1 | grep 'Offering public key'",
+		}, "\n")
+	default:
+		// ssh-add wasn't found, was killed, or returned an unexpected
+		// status. Fall back to a generic hint that covers the broad
+		// strokes without being misleading.
+		return strings.Join([]string{
+			"Couldn't determine the ssh-agent state — falling back to general guidance.",
+			"",
+			"Common fixes:",
+			"  - `ssh-add ~/.ssh/id_ed25519` to load your key",
+			"  - Add the public key at " + githubKeysURL,
+			"  - Run `ssh -vT git@github.com` for verbose output",
+		}, "\n")
+	}
 }
 
 // CachedPreflightSSH is identical to PreflightSSH but de-duplicates probes
