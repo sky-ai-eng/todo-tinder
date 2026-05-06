@@ -278,10 +278,8 @@ func readLine(r *bufio.Reader, maxBytes int) ([]byte, error) {
 			if n > 0 && chunk[n-1] == '\n' {
 				chunk = chunk[:n-1]
 			}
-			out := make([]byte, len(buf)+len(chunk))
-			copy(out, buf)
-			copy(out[len(buf):], chunk)
-			return out, nil
+			buf = append(buf, chunk...)
+			return buf, nil
 		}
 		if err == bufio.ErrBufferFull {
 			buf = append(buf, chunk...)
