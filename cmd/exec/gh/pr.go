@@ -260,12 +260,14 @@ func prAddReviewComment(database *db.DB, args []string) {
 	// Validate the comment's range against the captured diff. Prefer the
 	// hunk-aware check (start_line and line must be in the same hunk —
 	// GitHub rejects cross-hunk ranges with 422 at submit time); fall back
-	// to the legacy line-only check for pre-migration rows whose
-	// diff_hunks column is empty (start_line goes unvalidated there, same
-	// as before this change — no regression for in-flight reviews).
+	// to the legacy line-only check when diff_hunks is empty (pre-migration
+	// rows) or its JSON fails to parse (internal corruption — better to
+	// run the weaker check than silently accept the comment, since
+	// diff_hunks is something *we* wrote).
+	validated := false
 	if review.DiffHunks != "" {
 		var hunksJSON map[string][][2]int
-		if json.Unmarshal([]byte(review.DiffHunks), &hunksJSON) == nil {
+		if err := json.Unmarshal([]byte(review.DiffHunks), &hunksJSON); err == nil {
 			hunks := make(map[string][]ghclient.Hunk, len(hunksJSON))
 			for f, pairs := range hunksJSON {
 				hs := make([]ghclient.Hunk, len(pairs))
@@ -277,8 +279,10 @@ func prAddReviewComment(database *db.DB, args []string) {
 			if msg := ghclient.ValidateCommentRange(hunks, file, line, startLine); msg != "" {
 				exitErr(msg)
 			}
+			validated = true
 		}
-	} else if review.DiffLines != "" {
+	}
+	if !validated && review.DiffLines != "" {
 		var validLines map[string][]int
 		if json.Unmarshal([]byte(review.DiffLines), &validLines) == nil {
 			fileLines, fileExists := validLines[file]

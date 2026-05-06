@@ -359,10 +359,16 @@ func TestValidateCommentRange_CrossHunkRejected(t *testing.T) {
 }
 
 func TestValidateCommentRange_LineNotInDiff(t *testing.T) {
-	hunks := map[string][]Hunk{"a.go": {{NewStart: 1, NewEnd: 5}}}
+	hunks := map[string][]Hunk{"a.go": {{NewStart: 1, NewEnd: 5}, {NewStart: 30, NewEnd: 40}}}
 	msg := ValidateCommentRange(hunks, "a.go", 100, nil)
 	if !strings.Contains(msg, "line 100") || !strings.Contains(msg, "not part of the diff") {
 		t.Errorf("expected line-not-in-diff error, got: %q", msg)
+	}
+	// The error must include the file's hunks so the agent can pick a
+	// valid line on retry without another round-trip — same pattern as
+	// the cross-hunk and start_line-not-in-diff errors.
+	if !strings.Contains(msg, "[1–5]") || !strings.Contains(msg, "[30–40]") {
+		t.Errorf("error should include hunk list, got: %q", msg)
 	}
 }
 
