@@ -43,11 +43,15 @@ type Credentials struct {
 }
 
 // Store saves all credentials to the OS keychain.
-// If the keychain backend is unavailable (e.g. Linux without a secret service),
-// the error is logged and suppressed.
+// If the keychain backend is unavailable and env vars supply at least one PAT,
+// the error is logged and suppressed; otherwise it is returned so the caller
+// knows credentials were not persisted.
 func Store(creds Credentials) error {
 	if !probeKeychain() {
-		return nil
+		if len(EnvProvided()) > 0 {
+			return nil
+		}
+		return fmt.Errorf("keychain backend unavailable and no TRIAGE_FACTORY_*_PAT env vars set")
 	}
 	pairs := []struct{ key, val string }{
 		{keyGitHubURL, creds.GitHubURL},
