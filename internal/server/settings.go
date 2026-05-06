@@ -57,15 +57,15 @@ func ruleEqual(a, b config.JiraStatusRule) bool {
 }
 
 // defaultedCloneProtocol normalizes a stored CloneProtocol value for the
-// API surface. Empty stored value means "unset / pre-feature install"
-// and resolves to "ssh" (the post-feature default). Anything other
-// than "ssh"/"https" is also treated as the default — clients should
+// API surface using the same effective semantics as backend clone URL
+// selection: only the literal value "ssh" selects SSH; empty, "https",
+// and any other invalid/stale value are treated as HTTPS. Clients should
 // always see one of the two known forms.
 func defaultedCloneProtocol(stored string) string {
-	if stored == "ssh" || stored == "https" {
-		return stored
+	if stored == "ssh" {
+		return "ssh"
 	}
-	return "ssh"
+	return "https"
 }
 
 // settingsResponse combines config values with auth status so the frontend
