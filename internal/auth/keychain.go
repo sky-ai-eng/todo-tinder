@@ -14,8 +14,8 @@ const service = "triagefactory"
 
 // Keychain keys
 const (
-	keyGitHubURL       = "github_url"
-	keyGitHubPAT       = "github_pat"
+	keyGitHubURL        = "github_url"
+	keyGitHubPAT        = "github_pat"
 	keyGitHubUsername   = "github_username"
 	keyJiraURL         = "jira_url"
 	keyJiraPAT         = "jira_pat"
