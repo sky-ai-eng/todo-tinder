@@ -17,22 +17,26 @@ import (
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 )
 
-// getDiffLines fetches commentable line numbers for a PR. It tries the full
-// diff first; if GitHub rejects it as too large (HTTP 406) it falls back to
-// per-file patches from the PR files endpoint.
-func getDiffLines(client *ghclient.Client, owner, repo string, number int) (map[string]map[int]bool, error) {
+// getDiffShapes fetches the PR diff and returns both representations we
+// persist on a pending review: a flat per-file set of commentable lines
+// (used for legacy line-only validation) and a per-file list of hunk
+// ranges (used to validate that multi-line comments don't straddle two
+// hunks — GitHub rejects those with 422 at submit time). Tries the full
+// diff first; falls back to per-file patches if GitHub rejects it as
+// too large (HTTP 406).
+func getDiffShapes(client *ghclient.Client, owner, repo string, number int) (map[string]map[int]bool, map[string][]ghclient.Hunk, error) {
 	diff, err := client.GetPRDiff(owner, repo, number, "")
 	if err != nil {
 		if ghclient.IsHTTP406(err) {
 			files, filesErr := client.GetPRFiles(owner, repo, number)
 			if filesErr != nil {
-				return nil, filesErr
+				return nil, nil, filesErr
 			}
-			return ghclient.DiffLinesFromPatches(files), nil
+			return ghclient.DiffLinesFromPatches(files), ghclient.DiffHunksFromPatches(files), nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return ghclient.DiffLines(diff), nil
+	return ghclient.DiffLines(diff), ghclient.DiffHunks(diff), nil
 }
 
 func handlePR(client *ghclient.Client, database *db.DB, args []string) {
@@ -181,11 +185,11 @@ func prStartReview(client *ghclient.Client, database *db.DB, args []string) {
 	pr, err := client.GetPR(owner, repo, number, false)
 	exitOnErr(err)
 
-	// Fetch commentable lines; falls back to per-file patches on HTTP 406.
-	diffLinesMap, err := getDiffLines(client, owner, repo, number)
+	// Fetch commentable lines + hunk ranges; falls back to per-file patches on HTTP 406.
+	diffLinesMap, diffHunksMap, err := getDiffShapes(client, owner, repo, number)
 	exitOnErr(err)
 
-	// Convert to JSON: {"file": [1,2,3,...], ...}
+	// Lines as JSON: {"file": [1,2,3,...], ...}
 	compactMap := make(map[string][]int)
 	for file, lines := range diffLinesMap {
 		for line := range lines {
@@ -193,6 +197,17 @@ func prStartReview(client *ghclient.Client, database *db.DB, args []string) {
 		}
 	}
 	diffLinesJSON, _ := json.Marshal(compactMap)
+
+	// Hunks as JSON: {"file": [[start,end], ...], ...}
+	hunksMap := make(map[string][][2]int, len(diffHunksMap))
+	for file, hunks := range diffHunksMap {
+		pairs := make([][2]int, len(hunks))
+		for i, h := range hunks {
+			pairs[i] = [2]int{h.NewStart, h.NewEnd}
+		}
+		hunksMap[file] = pairs
+	}
+	diffHunksJSON, _ := json.Marshal(hunksMap)
 
 	reviewID := uuid.New().String()
 	err = db.CreatePendingReview(database.Conn, domain.PendingReview{
@@ -202,6 +217,7 @@ func prStartReview(client *ghclient.Client, database *db.DB, args []string) {
 		Repo:      repo,
 		CommitSHA: pr.HeadSHA,
 		DiffLines: string(diffLinesJSON),
+		DiffHunks: string(diffHunksJSON),
 		RunID:     os.Getenv("TRIAGE_FACTORY_RUN_ID"),
 	})
 	exitOnErr(err)
@@ -228,6 +244,12 @@ func prAddReviewComment(database *db.DB, args []string) {
 		exitErr("--file and --body are required")
 	}
 
+	var startLine *int
+	if sl := flagVal(args, "--start-line"); sl != "" {
+		v := mustInt(sl, "start-line")
+		startLine = &v
+	}
+
 	// Verify review exists
 	review, err := db.GetPendingReview(database.Conn, reviewID)
 	exitOnErr(err)
@@ -235,8 +257,28 @@ func prAddReviewComment(database *db.DB, args []string) {
 		exitErr(fmt.Sprintf("pending review %s not found", reviewID))
 	}
 
-	// Validate line against diff
-	if review.DiffLines != "" {
+	// Validate the comment's range against the captured diff. Prefer the
+	// hunk-aware check (start_line and line must be in the same hunk —
+	// GitHub rejects cross-hunk ranges with 422 at submit time); fall back
+	// to the legacy line-only check for pre-migration rows whose
+	// diff_hunks column is empty (start_line goes unvalidated there, same
+	// as before this change — no regression for in-flight reviews).
+	if review.DiffHunks != "" {
+		var hunksJSON map[string][][2]int
+		if json.Unmarshal([]byte(review.DiffHunks), &hunksJSON) == nil {
+			hunks := make(map[string][]ghclient.Hunk, len(hunksJSON))
+			for f, pairs := range hunksJSON {
+				hs := make([]ghclient.Hunk, len(pairs))
+				for i, p := range pairs {
+					hs[i] = ghclient.Hunk{NewStart: p[0], NewEnd: p[1]}
+				}
+				hunks[f] = hs
+			}
+			if msg := ghclient.ValidateCommentRange(hunks, file, line, startLine); msg != "" {
+				exitErr(msg)
+			}
+		}
+	} else if review.DiffLines != "" {
 		var validLines map[string][]int
 		if json.Unmarshal([]byte(review.DiffLines), &validLines) == nil {
 			fileLines, fileExists := validLines[file]
@@ -255,16 +297,12 @@ func prAddReviewComment(database *db.DB, args []string) {
 
 	commentID := uuid.New().String()
 	comment := domain.PendingReviewComment{
-		ID:       commentID,
-		ReviewID: reviewID,
-		Path:     file,
-		Line:     line,
-		Body:     body,
-	}
-
-	if sl := flagVal(args, "--start-line"); sl != "" {
-		v := mustInt(sl, "start-line")
-		comment.StartLine = &v
+		ID:        commentID,
+		ReviewID:  reviewID,
+		Path:      file,
+		Line:      line,
+		StartLine: startLine,
+		Body:      body,
 	}
 
 	err = db.AddPendingReviewComment(database.Conn, comment)
