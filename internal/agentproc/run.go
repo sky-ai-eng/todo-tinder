@@ -122,17 +122,26 @@ type Outcome struct {
 //     mid-stream, subprocess crashed, or ctx cancelled. Outcome.Stderr
 //     is populated when the subprocess produced any.
 func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
+	// Derived ctx so the stream-error path can SIGKILL the process
+	// group via cmd.Cancel without affecting the caller's ctx. Without
+	// this, a stream read failure (cap exceeded, malformed mid-stream)
+	// would leave the subprocess alive with bytes still to write; the
+	// kernel stdout pipe fills, the subprocess blocks on write, and
+	// cmd.Wait below deadlocks indefinitely.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// exec.CommandContext owns the cancel watcher: it spawns a goroutine
-	// at Start time that selects on ctx.Done() vs. an internal "wait
+	// at Start time that selects on runCtx.Done() vs. an internal "wait
 	// finished" channel, and exits whichever fires first. That's
 	// important here because the subprocess may exit naturally well
-	// before ctx ever cancels — without this binding, a stray goroutine
-	// would block on <-ctx.Done() and, when ctx finally cancelled,
+	// before runCtx ever cancels — without this binding, a stray goroutine
+	// would block on <-runCtx.Done() and, when runCtx finally cancelled,
 	// SIGKILL whatever process happened to be reusing the original
 	// pgid. The Cancel hook below customizes the kill to target the
 	// process group (Setpgid is set), so child processes the agent
 	// spawned go down with it.
-	cmd := exec.CommandContext(ctx, "claude", BuildArgs(opts)...)
+	cmd := exec.CommandContext(runCtx, "claude", BuildArgs(opts)...)
 	cmd.Dir = opts.Cwd
 	cmd.Env = append(os.Environ(), opts.ExtraEnv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -140,7 +149,7 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		// Process is non-nil here because the watcher only fires after
 		// Start has succeeded. ESRCH is fine — it just means the
 		// process group already exited on its own between Wait
-		// returning and the cancel watcher reading ctx.Done(),
+		// returning and the cancel watcher reading runCtx.Done(),
 		// which is a race exec handles internally.
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
@@ -159,6 +168,14 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 
 	stream := NewStreamState()
 	result, streamErr := consumeStream(stdout, sink, stream, opts.TraceID)
+
+	// If the stream reader bailed before a terminal result, the
+	// subprocess is likely still running and may have more data to
+	// write. Kill the process group now so cmd.Wait below doesn't
+	// block forever on a stuck pipe write.
+	if streamErr != nil && result == nil {
+		cancel()
+	}
 
 	waitErr := cmd.Wait()
 
