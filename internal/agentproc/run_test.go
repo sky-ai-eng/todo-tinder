@@ -1,6 +1,7 @@
 package agentproc
 
 import (
+	"bufio"
 	"strings"
 	"testing"
 
@@ -68,6 +69,25 @@ func TestConsumeStream_HandlesOversizedToolResult(t *testing.T) {
 	}
 	if len(toolMsg.Content) != len(huge) {
 		t.Errorf("tool message content length = %d, want %d", len(toolMsg.Content), len(huge))
+	}
+}
+
+// TestReadLine_RejectsRunawayLine guards the upper bound: if the
+// subprocess wedges and streams without ever emitting a newline (or a
+// single legitimate line somehow exceeds maxStreamLineBytes), we want
+// a clear stream error and a failed run, not an OOM. Exercises the
+// helper directly with a tight cap so the test stays cheap; the
+// production cap is 64 MB.
+func TestReadLine_RejectsRunawayLine(t *testing.T) {
+	payload := strings.Repeat("y", 2*1024*1024) // No terminating newline.
+
+	r := bufio.NewReader(strings.NewReader(payload))
+	_, err := readLine(r, 1*1024*1024)
+	if err == nil {
+		t.Fatal("expected error when line exceeds cap; got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error message %q should mention the cap was exceeded", err.Error())
 	}
 }
 

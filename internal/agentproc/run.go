@@ -186,6 +186,13 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	return outcome, nil
 }
 
+// maxStreamLineBytes caps a single NDJSON line. Well above any
+// legitimate tool_result (Claude truncates Read/Bash output internally
+// long before this) but low enough that a wedged or misbehaving
+// subprocess that streams without ever emitting a newline gets
+// surfaced as a clear stream error instead of growing the heap.
+const maxStreamLineBytes = 64 * 1024 * 1024
+
 // consumeStream scans NDJSON output, drives the Sink, and returns the
 // first `result` event it sees. Sink errors are logged and skipped so
 // a transient DB hiccup on one row doesn't abandon the whole run.
@@ -195,51 +202,47 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 // memory-gate retry, a takeover) can read it without waiting for the
 // stream to complete.
 //
-// Reader choice: bufio.Reader.ReadBytes('\n') instead of bufio.Scanner
+// Reader choice: a bounded readLine loop instead of bufio.Scanner
 // because each NDJSON line is one whole stream event, and a single
 // tool_result event (a Read of a big file, large Bash output, a fat
-// structured artifact) can easily exceed Scanner's per-token limit.
-// When that limit was hit the run aborted with no terminal `result`
-// captured, even though the subprocess was emitting valid JSON we just
-// couldn't fit. ReadBytes grows its buffer as needed; the only ceiling
-// is process memory.
+// structured artifact) can easily exceed Scanner's old 1 MB per-token
+// ceiling. When that ceiling was hit the run aborted with no terminal
+// `result` captured, even though the subprocess kept emitting valid
+// JSON we just couldn't fit. The new bound (maxStreamLineBytes) is
+// generous enough that legitimate events pass through but a runaway /
+// newline-less stream still fails fast rather than OOMing the process.
 func consumeStream(stdout io.Reader, sink Sink, stream *StreamState, traceID string) (*Result, error) {
 	reader := bufio.NewReader(stdout)
 
 	sessionDelivered := false
 
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		// ReadBytes returns the partial line *with* the error on EOF
-		// (or the full line + nil err on a clean newline). Process
-		// whatever bytes came back before reacting to the error so a
-		// final unterminated event isn't dropped.
+		line, readErr := readLine(reader, maxStreamLineBytes)
+		// readLine returns whatever bytes it has alongside the error on
+		// EOF (or the full line + nil err on a clean newline). Process
+		// the bytes before reacting to the error so a final unterminated
+		// event isn't dropped.
 		if len(line) > 0 {
-			if line[len(line)-1] == '\n' {
-				line = line[:len(line)-1]
+			messages, result := stream.ParseLine(line, traceID)
+
+			if !sessionDelivered {
+				if sid := stream.SessionID(); sid != "" {
+					if err := sink.OnSession(sid); err != nil {
+						log.Printf("[agentproc] sink.OnSession failed: %v", err)
+					}
+					sessionDelivered = true
+				}
 			}
-			if len(line) > 0 {
-				messages, result := stream.ParseLine(line, traceID)
 
-				if !sessionDelivered {
-					if sid := stream.SessionID(); sid != "" {
-						if err := sink.OnSession(sid); err != nil {
-							log.Printf("[agentproc] sink.OnSession failed: %v", err)
-						}
-						sessionDelivered = true
-					}
+			for _, msg := range messages {
+				if err := sink.OnMessage(msg); err != nil {
+					log.Printf("[agentproc] sink.OnMessage failed: %v", err)
+					continue
 				}
+			}
 
-				for _, msg := range messages {
-					if err := sink.OnMessage(msg); err != nil {
-						log.Printf("[agentproc] sink.OnMessage failed: %v", err)
-						continue
-					}
-				}
-
-				if result != nil {
-					return result, nil
-				}
+			if result != nil {
+				return result, nil
 			}
 		}
 
@@ -249,5 +252,46 @@ func consumeStream(stdout io.Reader, sink Sink, stream *StreamState, traceID str
 			}
 			return nil, readErr
 		}
+	}
+}
+
+// readLine reads up to and including the next '\n', returning the line
+// without the trailing newline. If a single line exceeds maxBytes,
+// readLine stops reading and returns an error so the caller surfaces
+// the stuck-stream case without OOMing on a runaway subprocess.
+//
+// Implemented over ReadSlice so we can check the accumulated size each
+// time bufio's internal buffer fills — bufio.Reader.ReadBytes itself
+// has no per-line cap and would grow its buffer until it ran out of
+// memory.
+func readLine(r *bufio.Reader, maxBytes int) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(buf)+len(chunk) > maxBytes {
+			return nil, fmt.Errorf("stream line exceeded %d bytes; subprocess may be emitting unbounded output", maxBytes)
+		}
+		// ReadSlice's chunk shares bufio's internal buffer and is
+		// invalidated by the next read, so always copy out.
+		if err == nil {
+			n := len(chunk)
+			if n > 0 && chunk[n-1] == '\n' {
+				chunk = chunk[:n-1]
+			}
+			out := make([]byte, len(buf)+len(chunk))
+			copy(out, buf)
+			copy(out[len(buf):], chunk)
+			return out, nil
+		}
+		if err == bufio.ErrBufferFull {
+			buf = append(buf, chunk...)
+			continue
+		}
+		// Real error (EOF or otherwise). Return whatever partial line
+		// we have so an EOF-terminated final event still gets parsed.
+		if len(chunk) > 0 {
+			buf = append(buf, chunk...)
+		}
+		return buf, err
 	}
 }
