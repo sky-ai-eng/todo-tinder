@@ -2,8 +2,8 @@
 -- ~/.triagefactory/config.yaml. The CHECK (id = 1) keeps it strictly
 -- one row — Save() upserts against id=1, Load() reads it. The blob is
 -- still YAML so anyone reaching for `sqlite3` to inspect gets a
--- readable dump, and the legacy-YAML import is a literal copy of the
--- file's bytes (after forcing the new poll-interval default).
+-- readable dump, and the legacy-YAML import stores a re-marshaled YAML
+-- rendering of the config after forcing the new poll-interval default.
 --
 -- The actual import of an existing config.yaml runs in Go via
 -- config.MigrateLegacyYAML, which entrypoints call after config.Init
