@@ -104,6 +104,16 @@ func TestNormalizeToolList(t *testing.T) {
 		{"Read, Read, Glob", "Read,Glob"},
 		{" ", ""},
 		{",,Read,,", "Read"},
+		// YAML-quoted value
+		{`"Read, Grep, Glob, Bash(git:*)"`, "Read,Grep,Glob,Bash(git:*)"},
+		// Space-delimited (no commas), spaces inside parens preserved
+		{"Bash(git:*) Bash(gh:*) Read Grep Glob", "Bash(git:*),Bash(gh:*),Read,Grep,Glob"},
+		// Mixed: commas + spaces-inside-parens
+		{"Bash(git diff:*), Read, Agent", "Bash(git diff:*),Read,Agent"},
+		// Space-delimited with spaces inside parens
+		{"Bash(git diff:*) Read Agent", "Bash(git diff:*),Read,Agent"},
+		// Single-quoted YAML value
+		{"'Read, Write'", "Read,Write"},
 	}
 	for _, tt := range tests {
 		got := NormalizeToolList(tt.input)

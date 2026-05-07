@@ -252,9 +252,18 @@ func parseToolsFrontmatter(frontmatter, key string) string {
 	return ""
 }
 
-// NormalizeToolList cleans a comma-separated tool string: trims
-// whitespace around each entry, drops empties, deduplicates.
+// NormalizeToolList cleans a tool list string: strips YAML quotes,
+// splits on commas or spaces-outside-parentheses, trims whitespace
+// around each entry, drops empties, and deduplicates.
 func NormalizeToolList(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, `"'`)
+
+	// Convert spaces outside parentheses to commas so both
+	// "Bash(git diff:*),Read" and "Bash(git:*) Read Glob" normalize
+	// the same way. Spaces inside Bash(...) patterns are preserved.
+	raw = spaceToCommaOutsideParens(raw)
+
 	parts := strings.Split(raw, ",")
 	seen := make(map[string]struct{}, len(parts))
 	var out []string
@@ -270,6 +279,36 @@ func NormalizeToolList(raw string) string {
 		out = append(out, p)
 	}
 	return strings.Join(out, ",")
+}
+
+// spaceToCommaOutsideParens replaces spaces that are not inside
+// parentheses with commas. This lets "Bash(git diff:*) Read" become
+// "Bash(git diff:*),Read" while preserving "git diff" inside the parens.
+func spaceToCommaOutsideParens(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+			b.WriteByte(s[i])
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			b.WriteByte(s[i])
+		case ' ', '\t':
+			if depth > 0 {
+				b.WriteByte(s[i])
+			} else {
+				b.WriteByte(',')
+			}
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 // splitFrontmatter splits YAML frontmatter from markdown content.
