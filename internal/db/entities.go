@@ -144,7 +144,14 @@ func AssignEntityProject(database *sql.DB, entityID string, projectID *string, r
 		return err
 	}
 	if n == 0 {
-		return sql.ErrNoRows
+		var exists int
+		err := database.QueryRow(`SELECT 1 FROM entities WHERE id = ?`, entityID).Scan(&exists)
+		if err == sql.ErrNoRows {
+			return sql.ErrNoRows
+		}
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
