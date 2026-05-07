@@ -48,31 +48,33 @@ func WaitFor(ctx context.Context, database *sql.DB, runner *Runner, entityID str
 	}
 	runner.Trigger()
 
-	deadline := time.Now().Add(timeout)
+	// NewTimer + NewTicker rather than time.After in a loop so the
+	// timers stop cleanly on ctx-cancel (no garbage timers firing
+	// later) and we don't allocate a fresh timer per iteration. Hot
+	// path — called once per delegated run setup.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
 	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		sleep := pollInterval
-		if remaining < sleep {
-			sleep = remaining
-		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(sleep):
-		}
-		done, exists := classificationStatus(database, entityID)
-		if !exists {
-			log.Printf("[classify] WaitFor: entity %s vanished mid-wait — returning early", entityID)
+		case <-timer.C:
+			log.Printf("[classify] WaitFor timed out for entity %s after %s — proceeding without project context", entityID, timeout)
 			return
-		}
-		if done {
-			return
+		case <-ticker.C:
+			done, exists := classificationStatus(database, entityID)
+			if !exists {
+				log.Printf("[classify] WaitFor: entity %s vanished mid-wait — returning early", entityID)
+				return
+			}
+			if done {
+				return
+			}
 		}
 	}
-	log.Printf("[classify] WaitFor timed out for entity %s after %s — proceeding without project context", entityID, timeout)
 }
 
 // classificationStatus returns (classified, exists). A missing row

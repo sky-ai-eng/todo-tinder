@@ -144,12 +144,13 @@ func TestWaitFor_WakesOnceClassificationLands(t *testing.T) {
 // TestWaitFor_ReturnsEarlyOnMissingEntity guards against the bug where
 // classified() treated sql.ErrNoRows as "still unclassified" and the
 // caller stalled the full timeout for a deleted/non-existent row.
+//
+// Intentionally no drainer goroutine on runner.trigger — WaitFor
+// short-circuits BEFORE calling Trigger() for a missing entity, so a
+// drainer would block forever waiting for a signal that never comes.
 func TestWaitFor_ReturnsEarlyOnMissingEntity(t *testing.T) {
 	database := newTestDB(t)
 	runner := NewRunner(database)
-	go func() {
-		<-runner.trigger
-	}()
 
 	start := time.Now()
 	WaitFor(context.Background(), database, runner, "nonexistent-entity-id", 5*time.Second)
