@@ -292,11 +292,21 @@ func truncateDescription(desc string) string {
 }
 
 // readProjectKB returns the concatenated content of every .md file
-// under the project's knowledge-base/ directory, capped at
-// kbInlineMaxBytes total. Files are read in lexical order so the same
-// inputs produce the same prompt across runs. Returns (content,
-// truncated, err) — truncated is true when the cap was hit, signaling
-// the orchestrator that Stage 2 might help.
+// under the project's knowledge-base/ directory that fits under the
+// kbInlineMaxBytes budget. Files are read in lexical order so the
+// same inputs produce the same prompt across runs.
+//
+// Files larger than the remaining budget are SKIPPED ENTIRELY rather
+// than truncated mid-content — a half-paragraph fragment misleads the
+// model more than a missing file does, and Stage 2 (which fires on
+// truncated=true) will read the skipped files via filesystem tools.
+// Smaller subsequent files in lex order are still inlined if they
+// fit, so a project with one giant file + several small ones still
+// gets the small ones in Stage 1.
+//
+// We Stat each file before reading so we never load oversized content
+// into memory. truncated=true signals at least one file was skipped,
+// which is the orchestrator's escalation trigger.
 func readProjectKB(projectID string) (string, bool, error) {
 	root, err := curator.KnowledgeDir(projectID)
 	if err != nil {
@@ -323,17 +333,27 @@ func readProjectKB(projectID string) (string, bool, error) {
 	var buf bytes.Buffer
 	truncated := false
 	for _, name := range names {
-		data, err := os.ReadFile(filepath.Join(kbDir, name))
+		full := filepath.Join(kbDir, name)
+		info, err := os.Stat(full)
 		if err != nil {
-			log.Printf("[classify] project %s: skip KB file %s (%v)", projectID, name, err)
+			log.Printf("[classify] project %s: stat KB file %s: %v", projectID, name, err)
+			continue
+		}
+		headerOverhead := len("## ") + len(name) + len("\n\n") + len("\n\n")
+		needed := buf.Len() + headerOverhead + int(info.Size())
+		if needed > kbInlineMaxBytes {
+			truncated = true
+			continue
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			log.Printf("[classify] project %s: read KB file %s: %v", projectID, name, err)
 			continue
 		}
 		fmt.Fprintf(&buf, "## %s\n\n%s\n\n", name, data)
-		if buf.Len() >= kbInlineMaxBytes {
-			truncated = true
-			buf.WriteString("\n…[knowledge base truncated for prompt size — Stage 2 will read selectively]")
-			break
-		}
+	}
+	if truncated {
+		buf.WriteString("\n…[some knowledge-base files exceeded the inline cap and were skipped — Stage 2 will read selectively]")
 	}
 	return buf.String(), truncated, nil
 }

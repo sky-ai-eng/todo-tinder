@@ -43,8 +43,16 @@ func WaitFor(database *sql.DB, runner *Runner, entityID string, timeout time.Dur
 	runner.Trigger()
 
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		time.Sleep(pollInterval)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		sleep := pollInterval
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
 		if classified(database, entityID) {
 			return
 		}

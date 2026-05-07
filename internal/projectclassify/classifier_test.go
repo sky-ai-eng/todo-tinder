@@ -11,6 +11,17 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
+// isolateHome redirects ~ to a fresh tempdir for the test. Required
+// for any test that runs Classify, because readProjectKB resolves
+// project IDs under ~/.triagefactory/projects/<id>/ — without
+// isolation, a developer machine with real project dirs could leak
+// real KB files into the test run, producing flaky truncation flags
+// and unintended Stage 2 escalations.
+func isolateHome(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+}
+
 func mkdirAll(t *testing.T, path string) error {
 	t.Helper()
 	return os.MkdirAll(path, 0o755)
@@ -88,6 +99,7 @@ func (c *callRecorder) callCount() int {
 }
 
 func TestClassify_WinnerAboveThreshold(t *testing.T) {
+	isolateHome(t)
 	stubStage1(t, map[string]int{
 		"Auth Migration": 85,
 		"Misc Work":      20,
@@ -117,6 +129,7 @@ func TestClassify_WinnerAboveThreshold(t *testing.T) {
 }
 
 func TestClassify_AllBelowThreshold_ReturnsNil(t *testing.T) {
+	isolateHome(t)
 	stubStage1(t, map[string]int{
 		"Misc Work":     20,
 		"Other Project": 45,
@@ -143,6 +156,7 @@ func TestClassify_AllBelowThreshold_ReturnsNil(t *testing.T) {
 }
 
 func TestClassify_HighestAboveThresholdWins(t *testing.T) {
+	isolateHome(t)
 	stubStage1(t, map[string]int{
 		"P1": 65,
 		"P2": 90,
@@ -166,6 +180,7 @@ func TestClassify_HighestAboveThresholdWins(t *testing.T) {
 }
 
 func TestClassify_TiesGoToFirstReturned(t *testing.T) {
+	isolateHome(t)
 	stubStage1(t, map[string]int{
 		"Alpha": 75,
 		"Beta":  75,
@@ -196,6 +211,7 @@ func TestClassify_NoProjects_ReturnsNilNoVotes(t *testing.T) {
 }
 
 func TestClassify_HaikuErrorTreatedAsNoVote(t *testing.T) {
+	isolateHome(t)
 	origS1 := runStage1Haiku
 	t.Cleanup(func() { runStage1Haiku = origS1 })
 	runStage1Haiku = func(prompt string) (int, string, error) {
@@ -232,10 +248,9 @@ func TestClassify_HaikuErrorTreatedAsNoVote(t *testing.T) {
 // kbInlineMaxBytes so the truncation flag is exercised through the
 // production code path.
 func TestClassify_Stage2EscalatesOnBorderlineTruncated(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateHome(t)
 	projectID := "p-border"
-	kbDir := fmt.Sprintf("%s/.triagefactory/projects/%s/knowledge-base", home, projectID)
+	kbDir := fmt.Sprintf("%s/.triagefactory/projects/%s/knowledge-base", os.Getenv("HOME"), projectID)
 	if err := mkdirAll(t, kbDir); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -282,6 +297,7 @@ func TestClassify_Stage2EscalatesOnBorderlineTruncated(t *testing.T) {
 // higher with more context"; if it already had the full KB, Stage 2
 // can't help.
 func TestClassify_Stage2DoesNotFireWithoutTruncation(t *testing.T) {
+	isolateHome(t)
 	stubStage1(t, map[string]int{
 		"NotTruncated": 50, // Borderline score…
 	})
