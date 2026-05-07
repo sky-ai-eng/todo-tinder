@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -1614,6 +1615,27 @@ func lookupEntityProjectID(database *sql.DB, entityID string) *string {
 // than a noisy log line.
 const projectKnowledgeWarnBytes = 500 * 1024
 
+// streamCopyFile copies src to dst via io.Copy so large knowledge-base
+// files don't get buffered fully in the spawner's heap. Returns bytes
+// written. Uses 0644 to mirror the previous os.WriteFile behavior.
+func streamCopyFile(src, dst string) (int64, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return 0, err
+	}
+	n, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return n, copyErr
+	}
+	return n, closeErr
+}
+
 // materializeProjectKnowledge stages the entity's project knowledge-base
 // into <cwd>/_scratch/project-knowledge/ so the agent can read it as
 // ambient context. Mirrors materializePriorMemories' "create the dir
@@ -1671,18 +1693,14 @@ func materializeProjectKnowledge(cwd string, projectID *string) {
 			continue
 		}
 		src := filepath.Join(srcDir, e.Name())
-		data, err := os.ReadFile(src)
-		if err != nil {
-			log.Printf("[delegate] warning: read project knowledge file %s: %v", src, err)
-			continue
-		}
 		dst := filepath.Join(dir, e.Name())
-		if err := os.WriteFile(dst, data, 0644); err != nil {
-			log.Printf("[delegate] warning: write project knowledge file %s: %v", dst, err)
+		n, err := streamCopyFile(src, dst)
+		if err != nil {
+			log.Printf("[delegate] warning: copy project knowledge file %s -> %s: %v", src, dst, err)
 			continue
 		}
 		written++
-		totalBytes += int64(len(data))
+		totalBytes += n
 	}
 
 	if totalBytes > projectKnowledgeWarnBytes {
