@@ -135,9 +135,9 @@ func RunRoot(runID string) string {
 
 // MakeRunRoot creates the run-root directory and returns its absolute
 // path. Used by the spawner's setupJira path: the agent's initial cwd
-// is the run-root (a throwaway dir holding only _scratch/entity-memory/
-// until the agent calls `workspace add` to materialize worktrees as
-// subdirs).
+// is the run-root (a throwaway dir holding only _scratch/ scratch
+// subdirs until the agent calls `workspace add` to materialize
+// worktrees as subdirs).
 //
 // Single-purpose vs. CreateForBranch: CreateForBranch creates a worktree
 // AT runDir(runID); MakeRunRoot creates only the directory itself, with
