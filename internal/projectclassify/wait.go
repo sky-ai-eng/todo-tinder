@@ -1,7 +1,9 @@
 package projectclassify
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"time"
 )
@@ -21,23 +23,27 @@ const DefaultWaitTimeout = 90 * time.Second
 const pollInterval = 1 * time.Second
 
 // WaitFor blocks until the entity has been classified (classified_at
-// IS NOT NULL) or the timeout elapses. Triggers the runner once on
-// entry to ensure the classifier wakes up even if no post-poll
+// IS NOT NULL), the entity row vanishes, ctx is cancelled, or the
+// timeout elapses — whichever fires first. Triggers the runner once
+// on entry to ensure the classifier wakes up even if no post-poll
 // trigger has fired for this entity yet.
 //
-// Always returns — never propagates error to the caller. A failed DB
-// read is treated as "still unclassified" and the caller proceeds
-// with whatever project_id is on the row (typically NULL). The
-// alternative (returning the error) would force every caller to
-// duplicate the "fall back to no project context" branch.
+// Always returns — never propagates error to the caller. The caller
+// (typically the spawner's setup path) proceeds with whatever
+// project_id is currently on the row.
 //
 // Intended call site: spawner setup, just before reading
 // entity.project_id to inject project knowledge into the worktree.
-func WaitFor(database *sql.DB, runner *Runner, entityID string, timeout time.Duration) {
+func WaitFor(ctx context.Context, database *sql.DB, runner *Runner, entityID string, timeout time.Duration) {
 	if entityID == "" || database == nil || runner == nil {
 		return
 	}
-	if classified(database, entityID) {
+	done, exists := classificationStatus(database, entityID)
+	if !exists {
+		log.Printf("[classify] WaitFor: entity %s not found — returning early", entityID)
+		return
+	}
+	if done {
 		return
 	}
 	runner.Trigger()
@@ -52,19 +58,37 @@ func WaitFor(database *sql.DB, runner *Runner, entityID string, timeout time.Dur
 		if remaining < sleep {
 			sleep = remaining
 		}
-		time.Sleep(sleep)
-		if classified(database, entityID) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleep):
+		}
+		done, exists := classificationStatus(database, entityID)
+		if !exists {
+			log.Printf("[classify] WaitFor: entity %s vanished mid-wait — returning early", entityID)
+			return
+		}
+		if done {
 			return
 		}
 	}
 	log.Printf("[classify] WaitFor timed out for entity %s after %s — proceeding without project context", entityID, timeout)
 }
 
-func classified(database *sql.DB, entityID string) bool {
+// classificationStatus returns (classified, exists). A missing row
+// (sql.ErrNoRows) returns (false, false) so WaitFor can stop polling
+// early — an entity that was deleted will never be classified. Other
+// errors return (false, true), treating the row as still-pending so
+// transient DB blips don't short-circuit the wait.
+func classificationStatus(database *sql.DB, entityID string) (classified, exists bool) {
 	var ts sql.NullTime
 	err := database.QueryRow(`SELECT classified_at FROM entities WHERE id = ?`, entityID).Scan(&ts)
-	if err != nil {
-		return false
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false
 	}
-	return ts.Valid
+	if err != nil {
+		log.Printf("[classify] WaitFor: transient read error for entity %s: %v", entityID, err)
+		return false, true
+	}
+	return ts.Valid, true
 }

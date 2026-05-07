@@ -462,8 +462,8 @@ func main() {
 	// blocks until classified_at is set (or DefaultWaitTimeout elapses).
 	// projectclassify.WaitFor triggers the runner on entry to wake it up
 	// even if no post-poll cycle has fired for this entity yet.
-	spawner.SetWaitForClassification(func(entityID string) {
-		projectclassify.WaitFor(database, classifier, entityID, projectclassify.DefaultWaitTimeout)
+	spawner.SetWaitForClassification(func(ctx context.Context, entityID string) {
+		projectclassify.WaitFor(ctx, database, classifier, entityID, projectclassify.DefaultWaitTimeout)
 	})
 
 	// Curator runtime (SKY-216) — per-project chat sessions. Any

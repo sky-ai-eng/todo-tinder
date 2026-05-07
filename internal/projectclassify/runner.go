@@ -102,13 +102,23 @@ func (r *Runner) run() {
 	log.Printf("[classify] classifying %d entities against %d projects", len(entities), len(projects))
 
 	assigned := 0
+	skipped := 0
 	for _, e := range entities {
 		winner, votes := Classify(projects, e)
+		// All votes errored — leave classified_at NULL so the entity
+		// resurfaces next cycle. Stamping it here would permanently
+		// freeze the entity at unassigned even if the underlying
+		// failure (claude CLI unavailable, transient network) clears.
+		if allErrored(votes) {
+			skipped++
+			log.Printf("[classify] %s: all %d votes errored — leaving unclassified for retry", e.ID, len(votes))
+			continue
+		}
 		rationale := bestRationale(votes)
 		if winner != nil {
 			log.Printf("[classify] %s -> project %s (winning vote)", e.ID, *winner)
 			assigned++
-		} else if len(votes) > 0 {
+		} else {
 			best := -1
 			for _, v := range votes {
 				if v.Err == nil && v.Score > best {
@@ -121,7 +131,24 @@ func (r *Runner) run() {
 			log.Printf("[classify] assign %s: %v", e.ID, err)
 		}
 	}
-	log.Printf("[classify] cycle complete: %d/%d entities assigned", assigned, len(entities))
+	log.Printf("[classify] cycle complete: %d/%d assigned, %d retried-next-cycle", assigned, len(entities), skipped)
+}
+
+// allErrored returns true iff there's at least one vote and every vote
+// carries an Err. Used to decide whether the runner should stamp
+// classified_at: a fully-failed cycle (likely a systemic CLI/network
+// outage) should retry on the next trigger rather than permanently
+// freezing the entity.
+func allErrored(votes []Vote) bool {
+	if len(votes) == 0 {
+		return false
+	}
+	for _, v := range votes {
+		if v.Err == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // bestRationale picks the rationale of the highest-scoring vote (winner

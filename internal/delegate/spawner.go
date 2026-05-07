@@ -54,10 +54,10 @@ type Spawner struct {
 	mu                    sync.Mutex
 	ghClient              *ghclient.Client
 	model                 string
-	cancels               map[string]context.CancelFunc // runID → cancel the entire run
-	drainer               QueueDrainer                  // nil-safe; set post-construction via SetQueueDrainer
-	takenOver             map[string]bool               // runIDs claimed by Takeover. Sticky-on for the rest of the goroutine's lifetime even after rollback — clearing the entry would let late-firing goroutine gates race the takeover/abort lifecycle. Suppresses every cleanup path in runAgent so Takeover/abortTakeover own the row's terminal state.
-	waitForClassification func(entityID string)         // SKY-220 hook: blocks until the project classifier has decided this entity, or a timeout elapses. Nil-safe (test setups skip it). Wired in main.go via SetWaitForClassification — keeps internal/delegate from importing internal/projectclassify.
+	cancels               map[string]context.CancelFunc              // runID → cancel the entire run
+	drainer               QueueDrainer                               // nil-safe; set post-construction via SetQueueDrainer
+	takenOver             map[string]bool                            // runIDs claimed by Takeover. Sticky-on for the rest of the goroutine's lifetime even after rollback — clearing the entry would let late-firing goroutine gates race the takeover/abort lifecycle. Suppresses every cleanup path in runAgent so Takeover/abortTakeover own the row's terminal state.
+	waitForClassification func(ctx context.Context, entityID string) // SKY-220 hook: blocks until the project classifier has decided this entity, or a timeout/ctx-cancel elapses. Nil-safe (test setups skip it). Wired in main.go via SetWaitForClassification — keeps internal/delegate from importing internal/projectclassify.
 }
 
 func NewSpawner(database *sql.DB, ghClient *ghclient.Client, wsHub *websocket.Hub, model string) *Spawner {
@@ -108,26 +108,26 @@ func (s *Spawner) SetQueueDrainer(d QueueDrainer) {
 }
 
 // SetWaitForClassification wires the SKY-220 hook that blocks the
-// spawner until the project classifier has decided the entity (or a
-// timeout elapses). main.go provides the implementation so this
-// package doesn't import projectclassify. Nil-safe — tests and any
-// configuration without a classifier skip the wait entirely.
-func (s *Spawner) SetWaitForClassification(fn func(entityID string)) {
+// spawner until the project classifier has decided the entity (or
+// the timeout / ctx fires). main.go provides the implementation so
+// this package doesn't import projectclassify. Nil-safe — tests and
+// any configuration without a classifier skip the wait entirely.
+func (s *Spawner) SetWaitForClassification(fn func(ctx context.Context, entityID string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.waitForClassification = fn
 }
 
-// awaitClassification calls the wait hook if one is configured. Used
-// in setupGitHub / setupJira before lookupEntityProjectID so the
-// spawner reads a freshly-classified project_id when the classifier
-// is available.
-func (s *Spawner) awaitClassification(entityID string) {
+// awaitClassification calls the wait hook if one is configured. ctx
+// is forwarded so the spawner's run cancellation / shutdown path
+// breaks out of the wait early instead of blocking the full
+// classifier timeout.
+func (s *Spawner) awaitClassification(ctx context.Context, entityID string) {
 	s.mu.Lock()
 	fn := s.waitForClassification
 	s.mu.Unlock()
 	if fn != nil {
-		fn(entityID)
+		fn(ctx, entityID)
 	}
 }
 
@@ -710,7 +710,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 	// runner) can decide this entity before we read project_id for KB
 	// injection. Nil-safe — tests and pre-classifier configurations
 	// skip the wait.
-	s.awaitClassification(task.EntityID)
+	s.awaitClassification(ctx, task.EntityID)
 
 	return runConfig{
 		scope:     fmt.Sprintf("Repository: %s/%s\nPR: #%d\nBranch: %s", owner, repo, prNumber, pr.HeadRef),
@@ -756,7 +756,7 @@ func (s *Spawner) setupJira(ctx context.Context, runID string, task domain.Task,
 
 	// SKY-220: block briefly so the project classifier can decide this
 	// entity before we read project_id for KB injection. Nil-safe.
-	s.awaitClassification(task.EntityID)
+	s.awaitClassification(ctx, task.EntityID)
 
 	return runConfig{
 		scope:     fmt.Sprintf("Jira issue: %s", task.EntitySourceID),

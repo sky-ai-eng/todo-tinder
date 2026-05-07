@@ -1,11 +1,14 @@
 package projectclassify
 
 import (
+	"context"
 	"database/sql"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 
 	_ "modernc.org/sqlite"
 )
@@ -40,7 +43,7 @@ func TestWaitFor_ReturnsImmediatelyWhenAlreadyClassified(t *testing.T) {
 
 	runner := NewRunner(database)
 	start := time.Now()
-	WaitFor(database, runner, entity.ID, 5*time.Second)
+	WaitFor(context.Background(), database, runner, entity.ID, 5*time.Second)
 	elapsed := time.Since(start)
 
 	if elapsed > 100*time.Millisecond {
@@ -63,7 +66,12 @@ func TestWaitFor_TriggersRunnerOnEntry(t *testing.T) {
 	// Don't Start the runner — we just want to observe that Trigger()
 	// got invoked. Inspect the trigger channel directly: a buffered
 	// chan with capacity 1 should have one signal queued after WaitFor.
-	go WaitFor(database, runner, entity.ID, 200*time.Millisecond)
+	// Cancellable ctx so the goroutine doesn't outlive the test —
+	// avoids a leaked WaitFor sleeping out its timeout in the
+	// background and logging into adjacent tests.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go WaitFor(ctx, database, runner, entity.ID, 200*time.Millisecond)
 	// Give the goroutine a moment to enter WaitFor and call Trigger.
 	time.Sleep(50 * time.Millisecond)
 
@@ -91,7 +99,7 @@ func TestWaitFor_HonorsTimeout(t *testing.T) {
 	}()
 
 	start := time.Now()
-	WaitFor(database, runner, entity.ID, 250*time.Millisecond)
+	WaitFor(context.Background(), database, runner, entity.ID, 250*time.Millisecond)
 	elapsed := time.Since(start)
 
 	if elapsed < 200*time.Millisecond {
@@ -125,11 +133,60 @@ func TestWaitFor_WakesOnceClassificationLands(t *testing.T) {
 	}()
 
 	start := time.Now()
-	WaitFor(database, runner, entity.ID, 5*time.Second)
+	WaitFor(context.Background(), database, runner, entity.ID, 5*time.Second)
 	elapsed := time.Since(start)
 
 	if elapsed > 2*time.Second {
 		t.Errorf("WaitFor returned in %s — should have woken within the polling cadence after classification", elapsed)
+	}
+}
+
+// TestWaitFor_ReturnsEarlyOnMissingEntity guards against the bug where
+// classified() treated sql.ErrNoRows as "still unclassified" and the
+// caller stalled the full timeout for a deleted/non-existent row.
+func TestWaitFor_ReturnsEarlyOnMissingEntity(t *testing.T) {
+	database := newTestDB(t)
+	runner := NewRunner(database)
+	go func() {
+		<-runner.trigger
+	}()
+
+	start := time.Now()
+	WaitFor(context.Background(), database, runner, "nonexistent-entity-id", 5*time.Second)
+	elapsed := time.Since(start)
+
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("WaitFor took %s for a missing entity — should have returned immediately", elapsed)
+	}
+}
+
+// TestWaitFor_ReturnsOnContextCancel guards the spawner-shutdown path:
+// when the caller's ctx is cancelled (run aborted, server shutting
+// down), WaitFor must break out instead of blocking the full timeout.
+func TestWaitFor_ReturnsOnContextCancel(t *testing.T) {
+	database := newTestDB(t)
+	entity, _, err := db.FindOrCreateEntity(database, "github", "owner/repo#5", "pr", "T", "https://x/5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(database)
+	go func() {
+		<-runner.trigger
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	WaitFor(ctx, database, runner, entity.ID, 5*time.Second)
+	elapsed := time.Since(start)
+
+	if elapsed > 1*time.Second {
+		t.Errorf("WaitFor took %s after ctx cancel — should have returned within the next poll tick", elapsed)
 	}
 }
 
