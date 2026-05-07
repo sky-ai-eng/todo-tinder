@@ -8,7 +8,10 @@
 //   - ~/.triagefactory/ in full (db, config, bare repo clones, and
 //     default-location takeovers)
 //   - the corresponding ~/.claude/projects/<encoded> session JSONL dirs
-//     for any takeovers (enumerated BEFORE the takeovers dir is deleted)
+//     for any takeovers AND for any per-project Curator working
+//     directories (enumerated BEFORE ~/.triagefactory/ is deleted, so
+//     we can still resolve their absolute paths to compute the encoded
+//     name Claude Code uses)
 //   - all keychain entries under the "triagefactory" service
 //   - the symlink left by `triagefactory install` at its default
 //     destination, when present
@@ -100,13 +103,13 @@ func Handle(args []string) {
 		failed = true
 	}
 
-	// Order: enumerate takeover dirs and clear their Claude project
-	// entries BEFORE removing takeover trees, otherwise we lose the
+	// Order: enumerate takeover/curator dirs and clear their Claude
+	// project entries BEFORE removing the trees, otherwise we lose the
 	// inputs needed to compute the encoded names.
 	if plan.hasTakeovers {
 		n, err := removeClaudeProjectsForTakeovers(plan.takeoversDir, home)
 		if n > 0 {
-			fmt.Printf("  removed %d Claude Code session entr%s\n", n, plural(n, "y", "ies"))
+			fmt.Printf("  removed %d Claude Code session entr%s for takeovers\n", n, plural(n, "y", "ies"))
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  warn: remove Claude Code session entries for takeovers: %v\n", err)
@@ -119,6 +122,21 @@ func Handle(args []string) {
 			} else {
 				fmt.Printf("  removed %s\n", plan.takeoversDir)
 			}
+		}
+	}
+
+	// Curator's per-project working dirs at ~/.triagefactory/projects/<id>/
+	// each get a corresponding ~/.claude/projects/<encoded> entry where
+	// Claude Code stores the curator session JSONL. Walk and clear those
+	// before RemoveAll(dataDir) takes the projects dir with it.
+	if plan.hasProjects {
+		n, err := removeClaudeProjectsForCurator(plan.projectsDir, home)
+		if n > 0 {
+			fmt.Printf("  removed %d Claude Code session entr%s for curator projects\n", n, plural(n, "y", "ies"))
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warn: remove Claude Code session entries for curator projects: %v\n", err)
+			failed = true
 		}
 	}
 
@@ -198,9 +216,11 @@ func Handle(args []string) {
 type uninstallPlan struct {
 	dataDir        string
 	takeoversDir   string
+	projectsDir    string
 	linkPath       string
 	hasDataDir     bool
 	hasTakeovers   bool
+	hasProjects    bool
 	hasInstallLink bool
 }
 
@@ -210,7 +230,7 @@ func (p uninstallPlan) empty() bool {
 	// read each item. Probing here would prompt 6 times before the
 	// user even said yes. The Clear() call later is no-op for missing
 	// keys, so it's safe to always run.
-	return !p.hasDataDir && !p.hasTakeovers && !p.hasInstallLink
+	return !p.hasDataDir && !p.hasTakeovers && !p.hasProjects && !p.hasInstallLink
 }
 
 func (p uninstallPlan) summary() []string {
@@ -222,6 +242,9 @@ func (p uninstallPlan) summary() []string {
 		lines = append(lines, fmt.Sprintf("takeovers under %s", p.takeoversDir))
 		lines = append(lines, "Claude Code session entries under ~/.claude/projects/ for any takeovers")
 	}
+	if p.hasProjects {
+		lines = append(lines, "Claude Code session entries under ~/.claude/projects/ for any curator projects")
+	}
 	lines = append(lines, "credentials in the OS keychain (GitHub + Jira tokens)")
 	if p.hasInstallLink {
 		lines = append(lines, fmt.Sprintf("install symlink at %s", p.linkPath))
@@ -230,7 +253,8 @@ func (p uninstallPlan) summary() []string {
 }
 
 func buildPlan(dataDir, takeoversDir, linkPath string) uninstallPlan {
-	p := uninstallPlan{dataDir: dataDir, takeoversDir: takeoversDir, linkPath: linkPath}
+	projectsDir := filepath.Join(dataDir, "projects")
+	p := uninstallPlan{dataDir: dataDir, takeoversDir: takeoversDir, projectsDir: projectsDir, linkPath: linkPath}
 
 	if info, err := os.Stat(dataDir); err == nil && info.IsDir() {
 		p.hasDataDir = true
@@ -239,6 +263,9 @@ func buildPlan(dataDir, takeoversDir, linkPath string) uninstallPlan {
 		if info, err := os.Stat(p.takeoversDir); err == nil && info.IsDir() {
 			p.hasTakeovers = true
 		}
+	}
+	if info, err := os.Stat(projectsDir); err == nil && info.IsDir() {
+		p.hasProjects = true
 	}
 	// Lstat — we want the symlink itself, not its target. A broken
 	// symlink (target removed) still counts as something to clean up.
@@ -271,6 +298,49 @@ func removeClaudeProjectsForTakeovers(takeoversDir, home string) (int, error) {
 			continue
 		}
 		full := filepath.Join(takeoversDir, entry.Name())
+		resolved, err := filepath.EvalSymlinks(full)
+		if err != nil {
+			resolved = full
+		}
+		encoded := strings.NewReplacer("/", "-", ".", "-").Replace(resolved)
+		projectDir := filepath.Join(home, ".claude", "projects", encoded)
+		if _, err := os.Stat(projectDir); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			joinedErr = errors.Join(joinedErr, fmt.Errorf("inspect %s: %w", projectDir, err))
+			continue
+		}
+		if err := os.RemoveAll(projectDir); err != nil {
+			joinedErr = errors.Join(joinedErr, fmt.Errorf("remove %s: %w", projectDir, err))
+			continue
+		}
+		count++
+	}
+	return count, joinedErr
+}
+
+// removeClaudeProjectsForCurator walks ~/.triagefactory/projects/<id>/
+// dirs (the Curator's per-project working directories) and deletes the
+// matching ~/.claude/projects/<encoded> dir for each. Symmetric to
+// removeClaudeProjectsForTakeovers — same encoding rule, different
+// source of cwds. Without this, curator session JSONLs orphan in
+// ~/.claude/projects/ after uninstall.
+func removeClaudeProjectsForCurator(projectsDir, home string) (int, error) {
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	var joinedErr error
+	for _, entry := range entries {
+		// Every immediate subdir of projects/ is a project ID — there's
+		// no naming filter the way takeovers/ has run-* dirs alongside
+		// other state. Skip non-dirs defensively.
+		if !entry.IsDir() {
+			continue
+		}
+		full := filepath.Join(projectsDir, entry.Name())
 		resolved, err := filepath.EvalSymlinks(full)
 		if err != nil {
 			resolved = full
