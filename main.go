@@ -22,6 +22,7 @@ import (
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
 	"github.com/sky-ai-eng/triage-factory/internal/poller"
+	"github.com/sky-ai-eng/triage-factory/internal/projectclassify"
 	"github.com/sky-ai-eng/triage-factory/internal/repoprofile"
 	"github.com/sky-ai-eng/triage-factory/internal/routing"
 	"github.com/sky-ai-eng/triage-factory/internal/server"
@@ -408,6 +409,21 @@ func main() {
 		},
 	})
 
+	// Project classifier (SKY-220): per-poll, classify any newly-
+	// discovered entities against existing projects via per-project
+	// Haiku quorum vote. Sticky — only fires on entities with
+	// classified_at IS NULL, so re-polls don't re-classify.
+	classifier := projectclassify.NewRunner(database)
+	classifier.Start()
+	log.Println("[classify] project classifier started (model: haiku)")
+	bus.Subscribe(eventbus.Subscriber{
+		Name:   "classifier",
+		Filter: []string{"system:poll:"},
+		Handle: func(evt domain.Event) {
+			classifier.Trigger()
+		},
+	})
+
 	// Poller manager — uses event bus instead of direct callbacks.
 	// Poll errors are toasted with per-source time-based throttling: the
 	// poller fires OnError on every failure (raw signal), but we only
@@ -440,6 +456,15 @@ func main() {
 	// Create spawner once — credentials are hot-swapped in place
 	spawner := delegate.NewSpawner(database, nil, wsHub, "")
 	srv.SetSpawner(spawner)
+
+	// SKY-220: wire the classifier wait into the spawner's setup path.
+	// Before reading entity.project_id for KB injection, the spawner
+	// blocks until classified_at is set (or DefaultWaitTimeout elapses).
+	// projectclassify.WaitFor triggers the runner on entry to wake it up
+	// even if no post-poll cycle has fired for this entity yet.
+	spawner.SetWaitForClassification(func(ctx context.Context, entityID string) {
+		projectclassify.WaitFor(ctx, database, classifier, entityID, projectclassify.DefaultWaitTimeout)
+	})
 
 	// Curator runtime (SKY-216) — per-project chat sessions. Any
 	// rows left non-terminal from a previous process are stranded:
