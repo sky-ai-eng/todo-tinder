@@ -113,7 +113,7 @@ func CloseEntity(db *sql.DB, entityID string) error {
 func GetEntity(db *sql.DB, id string) (*domain.Entity, error) {
 	row := db.QueryRow(`
 		SELECT id, source, source_id, kind, COALESCE(title, ''), COALESCE(url, ''),
-		       COALESCE(snapshot_json, ''), COALESCE(description, ''), state, created_at, last_polled_at, closed_at
+		       COALESCE(snapshot_json, ''), COALESCE(description, ''), state, project_id, created_at, last_polled_at, closed_at
 		FROM entities WHERE id = ?
 	`, id)
 	return scanEntity(row)
@@ -123,7 +123,7 @@ func GetEntity(db *sql.DB, id string) (*domain.Entity, error) {
 func GetEntityBySource(db *sql.DB, source, sourceID string) (*domain.Entity, error) {
 	row := db.QueryRow(`
 		SELECT id, source, source_id, kind, COALESCE(title, ''), COALESCE(url, ''),
-		       COALESCE(snapshot_json, ''), COALESCE(description, ''), state, created_at, last_polled_at, closed_at
+		       COALESCE(snapshot_json, ''), COALESCE(description, ''), state, project_id, created_at, last_polled_at, closed_at
 		FROM entities WHERE source = ? AND source_id = ?
 	`, source, sourceID)
 	return scanEntity(row)
@@ -204,7 +204,7 @@ func GetEntityDescriptions(database *sql.DB, ids []string) (map[string]string, e
 func ListActiveEntities(db *sql.DB, source string) ([]domain.Entity, error) {
 	rows, err := db.Query(`
 		SELECT id, source, source_id, kind, COALESCE(title, ''), COALESCE(url, ''),
-		       COALESCE(snapshot_json, ''), COALESCE(description, ''), state, created_at, last_polled_at, closed_at
+		       COALESCE(snapshot_json, ''), COALESCE(description, ''), state, project_id, created_at, last_polled_at, closed_at
 		FROM entities WHERE source = ? AND state = 'active'
 		ORDER BY last_polled_at ASC
 	`, source)
@@ -216,9 +216,13 @@ func ListActiveEntities(db *sql.DB, source string) ([]domain.Entity, error) {
 	var entities []domain.Entity
 	for rows.Next() {
 		var e domain.Entity
+		var projectID sql.NullString
 		if err := rows.Scan(&e.ID, &e.Source, &e.SourceID, &e.Kind, &e.Title, &e.URL,
-			&e.SnapshotJSON, &e.Description, &e.State, &e.CreatedAt, &e.LastPolledAt, &e.ClosedAt); err != nil {
+			&e.SnapshotJSON, &e.Description, &e.State, &projectID, &e.CreatedAt, &e.LastPolledAt, &e.ClosedAt); err != nil {
 			return nil, err
+		}
+		if projectID.Valid {
+			e.ProjectID = &projectID.String
 		}
 		entities = append(entities, e)
 	}
@@ -227,13 +231,17 @@ func ListActiveEntities(db *sql.DB, source string) ([]domain.Entity, error) {
 
 func scanEntity(row *sql.Row) (*domain.Entity, error) {
 	var e domain.Entity
+	var projectID sql.NullString
 	err := row.Scan(&e.ID, &e.Source, &e.SourceID, &e.Kind, &e.Title, &e.URL,
-		&e.SnapshotJSON, &e.Description, &e.State, &e.CreatedAt, &e.LastPolledAt, &e.ClosedAt)
+		&e.SnapshotJSON, &e.Description, &e.State, &projectID, &e.CreatedAt, &e.LastPolledAt, &e.ClosedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if projectID.Valid {
+		e.ProjectID = &projectID.String
 	}
 	return &e, nil
 }

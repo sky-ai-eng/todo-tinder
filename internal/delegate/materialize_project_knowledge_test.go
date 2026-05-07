@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // TestMaterializeProjectKnowledge_NilProjectID_CreatesEmptyDir guards
@@ -127,5 +130,37 @@ func TestMaterializeProjectKnowledge_MissingKnowledgeDir_NoOp(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("expected empty project-knowledge dir, found %d entries", len(entries))
+	}
+}
+
+// TestLookupEntityProjectID_RoundTrips guards against the silent
+// regression where db.GetEntity's SELECT omits project_id and
+// e.ProjectID always reads as nil — making materializeProjectKnowledge
+// a no-op for every assigned entity.
+func TestLookupEntityProjectID_RoundTrips(t *testing.T) {
+	database := newTakeoverTestDB(t)
+
+	entity, _, err := db.FindOrCreateEntity(database, "github", "owner/repo#1", "pr", "T", "https://x/1")
+	if err != nil {
+		t.Fatalf("entity: %v", err)
+	}
+
+	if got := lookupEntityProjectID(database, entity.ID); got != nil {
+		t.Errorf("expected nil for unassigned entity, got %q", *got)
+	}
+
+	if _, err := db.CreateProject(database, domain.Project{ID: "proj-rt", Name: "Roundtrip"}); err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE entities SET project_id = ? WHERE id = ?`, "proj-rt", entity.ID); err != nil {
+		t.Fatalf("assign project: %v", err)
+	}
+
+	got := lookupEntityProjectID(database, entity.ID)
+	if got == nil {
+		t.Fatal("expected project id after assignment, got nil")
+	}
+	if *got != "proj-rt" {
+		t.Errorf("project id = %q, want %q", *got, "proj-rt")
 	}
 }
