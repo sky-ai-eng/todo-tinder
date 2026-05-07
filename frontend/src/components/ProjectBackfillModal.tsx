@@ -251,16 +251,7 @@ function CandidateRow({ candidate, checked, failure, onToggle }: RowProps) {
         flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors cursor-pointer
         ${errored ? 'bg-dismiss/[0.04]' : 'hover:bg-black/[0.02]'}
       `}
-      role="checkbox"
-      tabIndex={0}
-      aria-checked={checked}
       onClick={onToggle}
-      onKeyDown={(e) => {
-        if (e.key === ' ' || e.key === 'Enter') {
-          e.preventDefault()
-          onToggle()
-        }
-      }}
     >
       <input
         type="checkbox"
