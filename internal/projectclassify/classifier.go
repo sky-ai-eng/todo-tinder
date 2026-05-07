@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sky-ai-eng/triage-factory/internal/ai"
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
@@ -386,7 +387,7 @@ func runHaiku(cmd *exec.Cmd) (int, string, error) {
 	if err := json.Unmarshal(raw, &envelope); err == nil && envelope.Result != "" {
 		raw = []byte(envelope.Result)
 	}
-	raw = stripCodeFences(raw)
+	raw = ai.StripCodeFences(raw)
 
 	var resp struct {
 		Score     int    `json:"score"`
@@ -402,17 +403,4 @@ func runHaiku(cmd *exec.Cmd) (int, string, error) {
 		resp.Score = 100
 	}
 	return resp.Score, resp.Rationale, nil
-}
-
-func stripCodeFences(b []byte) []byte {
-	s := bytes.TrimSpace(b)
-	if bytes.HasPrefix(s, []byte("```")) {
-		if idx := bytes.Index(s[3:], []byte("\n")); idx >= 0 {
-			s = s[3+idx+1:]
-		}
-		if idx := bytes.LastIndex(s, []byte("```")); idx >= 0 {
-			s = s[:idx]
-		}
-	}
-	return bytes.TrimSpace(s)
 }
