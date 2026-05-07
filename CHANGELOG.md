@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.8.0](https://github.com/sky-ai-eng/triage-factory/compare/v1.7.1...v1.8.0) (2026-05-07)
+
+
+### Features
+
+* **classify:** per-project quorum classifier on entity discovery ([#117](https://github.com/sky-ai-eng/triage-factory/issues/117)) ([342db5c](https://github.com/sky-ai-eng/triage-factory/commit/342db5cd4fb94acceb42c8a4932a5b9358f1df20))
+* **delegate:** consolidate scratch dirs + propagate project knowledge ([#116](https://github.com/sky-ai-eng/triage-factory/issues/116)) ([2c1572f](https://github.com/sky-ai-eng/triage-factory/commit/2c1572fbedc68110a809b8f7ab463ee2d188a0a8))
+* **projects:** backfill popup on project create + import ([#118](https://github.com/sky-ai-eng/triage-factory/issues/118)) ([c1d30ed](https://github.com/sky-ai-eng/triage-factory/commit/c1d30ede3bdffe7f5a361156dd29976312c42c06))
+* **projects:** entities panel under knowledge base on project detail ([#119](https://github.com/sky-ai-eng/triage-factory/issues/119)) ([4b7f615](https://github.com/sky-ai-eng/triage-factory/commit/4b7f6157591d166b62231a94c7ed87c753433bda))
+
+
+### Bug Fixes
+
+* **uninstall:** drop curator Claude sessions + sync clean-slate.sh ([#114](https://github.com/sky-ai-eng/triage-factory/issues/114)) ([07826bb](https://github.com/sky-ai-eng/triage-factory/commit/07826bb2519083d0f6297bb7c9eca83f76c6f20b))
+
 ## [1.7.1](https://github.com/sky-ai-eng/triage-factory/compare/v1.7.0...v1.7.1) (2026-05-06)
 
 
