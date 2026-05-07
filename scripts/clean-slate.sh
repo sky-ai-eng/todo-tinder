@@ -23,9 +23,13 @@ if command -v sqlite3 >/dev/null 2>&1 && [ -f ~/.triagefactory/triagefactory.db 
     custom=$(printf '%s\n' "$yaml_blob" | sed -n 's/^[[:space:]]*takeover_dir:[[:space:]]*//p' | head -n 1 | tr -d '"' | tr -d "'")
     if [ -n "$custom" ]; then
       case "$custom" in
-        "~/"*) custom="$HOME/${custom#~/}" ;;
+        "~/"*)
+          takeover_dir="$HOME/${custom#~/}"
+          ;;
+        /*)
+          takeover_dir="$custom"
+          ;;
       esac
-      takeover_dir="$custom"
     fi
   fi
 fi
