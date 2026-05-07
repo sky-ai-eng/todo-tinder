@@ -134,6 +134,13 @@ func (r *Router) HandleEvent(evt domain.Event) {
 		return
 	}
 
+	// Inline close checks run unconditionally — they are lifecycle signals
+	// that close stale tasks. They must fire even when no task_rules or
+	// triggers match the event, because close-signal events (ci_check_passed,
+	// review_submitted, review_request_removed) are not task-creating events.
+	r.runInlineCloseChecks(evt, entityID)
+	r.ws.Broadcast(websocket.Event{Type: "tasks_updated", Data: map[string]any{}})
+
 	// became_atomic is the belated-discovery path for parents whose
 	// subtasks just closed. Only create a task when none exists on the
 	// entity — otherwise an atomic ticket that gained and then lost
@@ -256,8 +263,6 @@ func (r *Router) HandleEvent(evt domain.Event) {
 		}
 	}
 
-	// Step 10: Inline close checks.
-	r.runInlineCloseChecks(evt, entityID)
 }
 
 // tryAutoDelegate decides whether a matched (task, trigger) fires now or
@@ -740,6 +745,8 @@ func (r *Router) runInlineCloseChecks(evt domain.Event, entityID string) {
 		r.closeCheckReviewResolved(evt, entityID)
 	case domain.EventGitHubPRReviewSubmitted:
 		r.closeCheckReviewSubmitted(evt, entityID)
+	case domain.EventGitHubPRReviewRequestRemoved:
+		r.closeCheckReviewRequestRemoved(evt, entityID)
 	case domain.EventJiraIssueAssigned:
 		r.closeCheckJiraReassigned(evt, entityID)
 	}
@@ -873,6 +880,23 @@ func (r *Router) closeCheckReviewSubmitted(evt domain.Event, entityID string) {
 			log.Printf("[router] failed to close review_requested task %s: %v", t.ID, err)
 		} else {
 			log.Printf("[router] inline-closed task %s (review submitted by self)", t.ID)
+		}
+	}
+}
+
+// closeCheckReviewRequestRemoved: user was removed from the PR's requested-
+// reviewers list (reviewed or request rescinded). Close any active
+// review_requested task on this entity.
+func (r *Router) closeCheckReviewRequestRemoved(evt domain.Event, entityID string) {
+	tasks, err := dbpkg.FindActiveTasksByEntityAndType(r.db, entityID, domain.EventGitHubPRReviewRequested)
+	if err != nil {
+		return
+	}
+	for _, t := range tasks {
+		if err := r.closeTaskWithAudit(t.ID, evt.ID, "auto_closed_by_event", domain.EventGitHubPRReviewRequestRemoved); err != nil {
+			log.Printf("[router] failed to close review_requested task %s: %v", t.ID, err)
+		} else {
+			log.Printf("[router] inline-closed task %s (review request removed)", t.ID)
 		}
 	}
 }

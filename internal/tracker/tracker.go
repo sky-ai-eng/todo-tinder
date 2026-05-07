@@ -160,6 +160,26 @@ func (t *Tracker) RefreshGitHub(client *ghclient.Client, username string, userTe
 		if snap.NodeID == "" {
 			continue // can't refresh without a node ID
 		}
+
+		// Close stale review_requested tasks where the stored snapshot shows
+		// the user is no longer in ReviewRequests. Runs before the gate so
+		// quiet (skipped) entities are still reconciled. Guarded by NodeID
+		// above: empty/legacy snapshots have nil ReviewRequests which would
+		// falsely close legitimate tasks. This reconciliation also depends on
+		// team membership data for team-based review requests, so skip it when
+		// userTeams is unavailable rather than treating "unknown teams" as
+		// "user is not a reviewer" and incorrectly closing active tasks.
+		if userTeams != nil && !isReviewerMatch(snap.ReviewRequests, username, userTeams) {
+			if stale, err := db.FindActiveTasksByEntityAndType(t.database, e.ID, domain.EventGitHubPRReviewRequested); err == nil {
+				for _, task := range stale {
+					if err := db.CloseTask(t.database, task.ID, "reconciled_stale", domain.EventGitHubPRReviewRequestRemoved); err != nil {
+						log.Printf("[tracker] reconcile: failed to close task %s: %v", task.ID, err)
+					} else {
+						log.Printf("[tracker] reconciled stale review_requested task %s", task.ID)
+					}
+				}
+			}
+		}
 		item := entityWithSnap{entity: e, snap: snap, nodeID: snap.NodeID}
 		if snap.Merged || snap.State == "CLOSED" || snap.State == "MERGED" {
 			terminalItems = append(terminalItems, item)
