@@ -59,11 +59,6 @@ func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	pinnedSet := make(map[string]struct{}, len(project.PinnedRepos))
-	for _, repo := range project.PinnedRepos {
-		pinnedSet[repo] = struct{}{}
-	}
-
 	var collected []domain.Entity
 
 	github, err := db.ListActiveEntities(s.db, "github")
@@ -73,10 +68,8 @@ func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request
 		return
 	}
 	for _, e := range github {
-		if len(pinnedSet) > 0 {
-			if _, ok := pinnedSet[githubRepoFromSourceID(e.SourceID)]; !ok {
-				continue
-			}
+		if !entityInProjectScope(&e, project) {
+			continue
 		}
 		collected = append(collected, e)
 	}
@@ -88,10 +81,8 @@ func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request
 		return
 	}
 	for _, e := range jira {
-		if project.JiraProjectKey != "" {
-			if jiraKeyFromSourceID(e.SourceID) != project.JiraProjectKey {
-				continue
-			}
+		if !entityInProjectScope(&e, project) {
+			continue
 		}
 		collected = append(collected, e)
 	}
@@ -178,6 +169,31 @@ func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
 		if eid == "" {
 			continue
 		}
+		// Re-validate every id server-side. The client built this list
+		// from /backfill-candidates, which already filtered, but a
+		// stale tab, a tampered request, or a race against entity
+		// closure could submit ids that are now ineligible — closed
+		// entities, entities outside the project's tracker scope, etc.
+		// Without this gate, a malicious client could reassign any
+		// entity row by id, and a stale UI could quietly stamp
+		// classified_at on closed work.
+		entity, lookupErr := db.GetEntity(s.db, eid)
+		if lookupErr != nil {
+			failures = append(failures, backfillFailure{EntityID: eid, Error: "lookup failed: " + lookupErr.Error()})
+			continue
+		}
+		if entity == nil {
+			failures = append(failures, backfillFailure{EntityID: eid, Error: "entity not found"})
+			continue
+		}
+		if entity.State != "active" {
+			failures = append(failures, backfillFailure{EntityID: eid, Error: "entity is not active"})
+			continue
+		}
+		if !entityInProjectScope(entity, project) {
+			failures = append(failures, backfillFailure{EntityID: eid, Error: "entity is outside this project's scope"})
+			continue
+		}
 		// Empty rationale: this is a human-driven assignment, not a
 		// model-driven one. The classifier's rationale (if any) was set
 		// by the post-poll runner; we don't overwrite with an empty
@@ -206,6 +222,41 @@ func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
 		failures = []backfillFailure{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"applied": applied, "failed": failures})
+}
+
+// entityInProjectScope reports whether the entity falls under the
+// project's tracker scope. Per-source rules:
+//   - github: source_id's "owner/repo" prefix must be in pinned_repos
+//     (an empty pinned_repos = no filter on github).
+//   - jira: source_id's project-key prefix must equal jira_project_key
+//     (an empty jira_project_key = no filter on jira).
+//   - other sources are rejected — we only know how to scope these
+//     two, and nothing outside them should be claimable.
+//
+// Used by both /backfill-candidates (to filter the list shown to the
+// user) and /backfill (to revalidate every submitted id, so a stale
+// tab can't reassign out-of-scope entities).
+func entityInProjectScope(entity *domain.Entity, project *domain.Project) bool {
+	switch entity.Source {
+	case "github":
+		if len(project.PinnedRepos) == 0 {
+			return true
+		}
+		repo := githubRepoFromSourceID(entity.SourceID)
+		for _, pin := range project.PinnedRepos {
+			if pin == repo {
+				return true
+			}
+		}
+		return false
+	case "jira":
+		if project.JiraProjectKey == "" {
+			return true
+		}
+		return jiraKeyFromSourceID(entity.SourceID) == project.JiraProjectKey
+	default:
+		return false
+	}
 }
 
 // githubRepoFromSourceID extracts "owner/repo" from a GitHub entity's

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -191,6 +192,78 @@ func TestBackfill_BulkAssignPartialSuccess(t *testing.T) {
 		got, _ := db.GetEntity(s.db, e.ID)
 		if got == nil || got.ProjectID == nil || *got.ProjectID != pid {
 			t.Errorf("entity %s not assigned to %s", e.ID, pid)
+		}
+	}
+}
+
+// TestBackfill_RejectsOutOfScopeAndClosed verifies the server-side
+// eligibility gate: a stale or tampered request with ids for closed
+// entities or entities outside the project's tracker scope must be
+// rejected with per-row failures, not silently applied. Without this
+// gate, a malicious client could reassign any entity by id and a
+// stale UI could re-stamp classified_at on closed work.
+func TestBackfill_RejectsOutOfScopeAndClosed(t *testing.T) {
+	s := newTestServer(t)
+	seedConfiguredRepo(t, s, "owner", "in-scope")
+	seedConfiguredRepo(t, s, "owner", "out-of-scope")
+	pid, err := db.CreateProject(s.db, domain.Project{
+		Name:           "P",
+		PinnedRepos:    []string{"owner/in-scope"},
+		JiraProjectKey: "SKY",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	inScope := mustEntity(t, s.db, "github", "owner/in-scope#1", "pr", "ok")
+	outScope := mustEntity(t, s.db, "github", "owner/out-of-scope#2", "pr", "wrong repo")
+	wrongJira := mustEntity(t, s.db, "jira", "FOO-9", "issue", "wrong project")
+	closedEnt := mustEntity(t, s.db, "github", "owner/in-scope#3", "pr", "closed")
+	if err := db.MarkEntityClosed(s.db, closedEnt.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	body := map[string]any{
+		"entity_ids": []string{inScope.ID, outScope.ID, wrongJira.ID, closedEnt.ID},
+	}
+	rec := doJSON(t, s, http.MethodPost, "/api/projects/"+pid+"/backfill", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Applied int               `json:"applied"`
+		Failed  []backfillFailure `json:"failed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if resp.Applied != 1 {
+		t.Errorf("applied = %d, want 1 (only in-scope active entity)", resp.Applied)
+	}
+	failedByID := map[string]string{}
+	for _, f := range resp.Failed {
+		failedByID[f.EntityID] = f.Error
+	}
+	if msg := failedByID[outScope.ID]; msg == "" || !strings.Contains(msg, "outside") {
+		t.Errorf("out-of-scope github entity: failure = %q, want 'outside ... scope'", msg)
+	}
+	if msg := failedByID[wrongJira.ID]; msg == "" || !strings.Contains(msg, "outside") {
+		t.Errorf("wrong-jira-project entity: failure = %q, want 'outside ... scope'", msg)
+	}
+	if msg := failedByID[closedEnt.ID]; msg == "" || !strings.Contains(msg, "active") {
+		t.Errorf("closed entity: failure = %q, want 'not active'", msg)
+	}
+
+	// Confirm only the in-scope active entity actually landed.
+	got, _ := db.GetEntity(s.db, inScope.ID)
+	if got == nil || got.ProjectID == nil || *got.ProjectID != pid {
+		t.Errorf("in-scope entity not assigned")
+	}
+	for _, e := range []*domain.Entity{outScope, wrongJira} {
+		got, _ := db.GetEntity(s.db, e.ID)
+		if got != nil && got.ProjectID != nil {
+			t.Errorf("entity %s should not have been reassigned, got project_id=%q", e.SourceID, *got.ProjectID)
 		}
 	}
 }
