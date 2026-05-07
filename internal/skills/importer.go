@@ -112,7 +112,7 @@ func importSkillFile(database *sql.DB, path string, canonicalPath string) error 
 	}
 
 	content := string(data)
-	name, description, body := parseSkillFile(content, path)
+	meta := ParseSkillMeta(content, path)
 
 	// Deterministic ID from the canonical file path so re-imports are idempotent
 	// even when the same file is discovered as relative/absolute or via symlink.
@@ -124,76 +124,152 @@ func importSkillFile(database *sql.DB, path string, canonicalPath string) error 
 		return err
 	}
 	if existing != nil {
-		// Update body/name if the file changed
-		if existing.Body == body && existing.Name == name {
+		// Update body/name/tools if the file changed
+		if existing.Body == meta.Body && existing.Name == meta.Name && existing.AllowedTools == meta.AllowedTools {
 			return errSkillUnchanged
 		}
-		if err := db.UpdatePrompt(database, id, name, body); err != nil {
+		if err := db.UpdateImportedPrompt(database, id, meta.Name, meta.Body, meta.AllowedTools); err != nil {
 			return err
 		}
-		log.Printf("[skills] updated %q from %s", name, path)
+		log.Printf("[skills] updated %q from %s", meta.Name, path)
 		return nil
 	}
 
 	// Skip creating a duplicate imported prompt if the same skill body/name is
 	// already present from another path.
-	duplicateID, err := findVisibleImportedPromptByContent(database, name, body)
+	duplicateID, err := findVisibleImportedPromptByContent(database, meta.Name, meta.Body)
 	if err != nil {
 		return err
 	}
 	if duplicateID != "" {
-		log.Printf("[skills] skipped duplicate %q from %s (already imported as %s)", name, path, duplicateID)
+		log.Printf("[skills] skipped duplicate %q from %s (already imported as %s)", meta.Name, path, duplicateID)
 		return errSkillDuplicate
 	}
 
 	prompt := domain.Prompt{
-		ID:     id,
-		Name:   name,
-		Body:   body,
-		Source: "imported",
+		ID:           id,
+		Name:         meta.Name,
+		Body:         meta.Body,
+		Source:       "imported",
+		AllowedTools: meta.AllowedTools,
 	}
 
 	if err := db.CreatePrompt(database, prompt); err != nil {
 		return err
 	}
 
-	log.Printf("[skills] imported %q from %s (description: %s)", name, path, description)
+	log.Printf("[skills] imported %q from %s (description: %s)", meta.Name, path, meta.Description)
 	return nil
 }
 
-// parseSkillFile extracts the name, description, and body from a SKILL.md file.
-// Handles YAML frontmatter between --- markers.
-func parseSkillFile(content, path string) (name, description, body string) {
+// SkillMeta holds everything extracted from a SKILL.md file's frontmatter.
+type SkillMeta struct {
+	Name         string
+	Description  string
+	Body         string
+	AllowedTools string // comma-separated tool names from allowed-tools:
+}
+
+// ParseSkillMeta extracts name, description, body, and allowed-tools
+// from a SKILL.md file. Handles YAML frontmatter between --- markers.
+//
+// allowed-tools: accepts three shapes:
+//   - Inline comma-separated: `allowed-tools: Read, Write, Glob`
+//   - YAML list: `allowed-tools:\n  - Bash(git diff:*)\n  - Read`
+//   - Inline with colon-containing patterns: `tools: Bash(git diff:*), Glob`
+//
+// All forms are normalized to a deduplicated comma-separated string.
+func ParseSkillMeta(content, path string) SkillMeta {
 	// Default name from directory
 	dir := filepath.Base(filepath.Dir(path))
-	name = dir
+	meta := SkillMeta{Name: dir}
 
 	// Split frontmatter
 	frontmatter, markdown := splitFrontmatter(content)
 
 	// Parse frontmatter fields
 	if frontmatter != "" {
+		meta.AllowedTools = parseToolsFrontmatter(frontmatter, "allowed-tools")
+		if meta.AllowedTools == "" {
+			meta.AllowedTools = parseToolsFrontmatter(frontmatter, "tools")
+		}
+
 		for _, line := range strings.Split(frontmatter, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "name:") {
-				val := strings.TrimSpace(strings.TrimPrefix(line, "name:"))
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "name:") {
+				val := strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
 				if val != "" {
-					name = val
+					meta.Name = val
 				}
 			}
-			if strings.HasPrefix(line, "description:") {
-				description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
+			if strings.HasPrefix(trimmed, "description:") {
+				meta.Description = strings.TrimSpace(strings.TrimPrefix(trimmed, "description:"))
 			}
 		}
 	}
 
 	// The body is the markdown content (the actual prompt/instructions)
-	body = strings.TrimSpace(markdown)
-	if body == "" {
-		body = content // fallback: use entire file
+	meta.Body = strings.TrimSpace(markdown)
+	if meta.Body == "" {
+		meta.Body = content // fallback: use entire file
 	}
 
-	return name, description, body
+	return meta
+}
+
+// parseToolsFrontmatter extracts tool entries from a frontmatter key
+// that can be either inline (comma-separated) or a YAML list (dash-
+// prefixed lines). Returns a comma-separated string or "".
+func parseToolsFrontmatter(frontmatter, key string) string {
+	lines := strings.Split(frontmatter, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, key+":") {
+			continue
+		}
+		// Inline value after the colon.
+		val := strings.TrimSpace(strings.TrimPrefix(trimmed, key+":"))
+		if val != "" {
+			return NormalizeToolList(val)
+		}
+		// YAML list: subsequent lines starting with "  -" or "- ".
+		var items []string
+		for j := i + 1; j < len(lines); j++ {
+			entry := strings.TrimSpace(lines[j])
+			if !strings.HasPrefix(entry, "- ") && !strings.HasPrefix(entry, "-\t") {
+				break
+			}
+			item := strings.TrimSpace(strings.TrimPrefix(entry, "-"))
+			if item != "" {
+				items = append(items, item)
+			}
+		}
+		if len(items) > 0 {
+			return NormalizeToolList(strings.Join(items, ","))
+		}
+		return ""
+	}
+	return ""
+}
+
+// NormalizeToolList cleans a comma-separated tool string: trims
+// whitespace around each entry, drops empties, deduplicates.
+func NormalizeToolList(raw string) string {
+	parts := strings.Split(raw, ",")
+	seen := make(map[string]struct{}, len(parts))
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return strings.Join(out, ",")
 }
 
 // splitFrontmatter splits YAML frontmatter from markdown content.
