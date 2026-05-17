@@ -1,10 +1,5 @@
 import { useState, useEffect } from 'react'
-import type {
-  CurrentUserIdentity,
-  DeploymentConfig,
-  TeamMember,
-  TeamMembersResponse,
-} from '../types'
+import type { DeploymentConfig, MeResponse, TeamMember, TeamMembersResponse } from '../types'
 
 /** In-flight Promise dedup for /api/config. The endpoint is read once at
  *  FE boot by AuthGate, but multiple components may still race to mount
@@ -65,15 +60,15 @@ export function useDeploymentConfig(): {
  *  cache — identity fields can change mid-session (user opens editor,
  *  configures Jira via Settings, returns), and caching would shadow
  *  real changes until reload. */
-let meInFlight: Promise<CurrentUserIdentity | null> | null = null
+let meInFlight: Promise<MeResponse | null> | null = null
 
-function loadMe(): Promise<CurrentUserIdentity | null> {
+function loadMe(): Promise<MeResponse | null> {
   if (meInFlight) return meInFlight
   meInFlight = fetch('/api/me')
     .then((r) => {
       if (r.status === 401) return null
       if (!r.ok) throw new Error(`/api/me: ${r.status}`)
-      return r.json() as Promise<CurrentUserIdentity>
+      return r.json() as Promise<MeResponse>
     })
     .finally(() => {
       meInFlight = null
@@ -81,18 +76,22 @@ function loadMe(): Promise<CurrentUserIdentity | null> {
   return meInFlight
 }
 
-/** useCurrentUserIdentity fetches /api/me on each mount with in-flight
- *  dedup, narrowed to the fields the predicate editor needs. Works in
+/** useMe fetches /api/me on each mount with in-flight dedup. Works in
  *  both modes (local mode synthesizes from the users row, multi mode
- *  reads via JWT-context query). Returns `me: null` on 401 so the editor
+ *  reads via JWT-context query). Returns `me: null` on 401 so callers
  *  can render a "not signed in" state rather than crashing on missing
- *  identity. */
-export function useCurrentUserIdentity(): {
-  me: CurrentUserIdentity | null
+ *  identity.
+ *
+ *  Distinct from AuthContext.useAuth: this hook works in both modes
+ *  without depending on the AuthProvider (which only mounts in multi
+ *  mode). Components that render in both modes — e.g. IdentityListField
+ *  inside the predicate editor — use this hook. */
+export function useMe(): {
+  me: MeResponse | null
   loading: boolean
   error: string | null
 } {
-  const [me, setMe] = useState<CurrentUserIdentity | null>(null)
+  const [me, setMe] = useState<MeResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 

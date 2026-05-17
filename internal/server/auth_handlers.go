@@ -501,10 +501,9 @@ func (s *Server) handleActiveOrgUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMe returns the authenticated user's identity + org list.
-// Wrapped in SessionMiddleware at mount time.
-//
-// GET /api/me  →  { id, email, display_name, avatar_url, github_username,
-//                   jira_account_id, jira_display_name, orgs: [...], active_org_id }
+// Wrapped in SessionMiddleware at mount time. Response wire shape is
+// mirrored in the frontend as the canonical `MeResponse` type — the
+// sole identity endpoint in both modes.
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	claims := ClaimsFrom(r.Context())
 	if claims == nil {

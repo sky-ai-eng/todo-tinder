@@ -282,14 +282,28 @@ export interface DeploymentConfig {
   deployment_mode: 'local' | 'multi'
 }
 
-/** Subset of GET /api/me used by the predicate editor's
- *  IdentityListField. The full MeResponse lives in contexts/AuthContext
- *  for the multi-mode auth state machine; this narrower view covers the
- *  "what's my identity in connected integrations" use case that needs
- *  to work in both modes (and so can't depend on AuthContext, which
- *  only mounts in multi mode). */
-export interface CurrentUserIdentity {
+/** AuthOrg is one membership row in MeResponse.orgs. Standalone export
+ *  so multi-mode consumers (OrgPicker, OrgContext) can name the type
+ *  without round-tripping through MeResponse['orgs'][number]. */
+export interface AuthOrg {
   id: string
+  name: string
+  role: string
+}
+
+/** GET /api/me response — the canonical "current user" shape, served in
+ *  both modes (local mode synthesizes from the users row, multi mode
+ *  reads via JWT-context query). All fields except `id` and `orgs` are
+ *  optional because the server uses `omitempty` for unset values; FE
+ *  consumers should treat empty/undefined identically.
+ *
+ *  Single source of truth — every endpoint that surfaces the current
+ *  user's identity goes through here. */
+export interface MeResponse {
+  id: string
+  email?: string
+  display_name?: string
+  avatar_url?: string
   github_username?: string
   /** Atlassian account ID. Absent when Jira is not yet connected — the
    *  predicate editor renders the Variant-A toggle disabled with a
@@ -299,6 +313,12 @@ export interface CurrentUserIdentity {
    *  /rest/api/2/myself; used in UI hints ("Match my issues as
    *  Aidan Allchin"). Absent when Jira not connected. */
   jira_display_name?: string
+  orgs: AuthOrg[]
+  /** Session-scoped active org. Per-session, not per-user — two tabs
+   *  of the same user can hold different values. Omitted by the server
+   *  when the session has no active org (zero memberships, or the
+   *  previously-selected org membership was revoked). */
+  active_org_id?: string
 }
 
 /** GET /api/team/members row. Backs Variant B's searchable multi-select.

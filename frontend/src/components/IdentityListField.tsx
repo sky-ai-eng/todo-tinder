@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { X } from 'lucide-react'
-import { useCurrentUserIdentity, useTeamMembers } from '../hooks/useDeploymentConfig'
-import type { CurrentUserIdentity, TeamMember } from '../types'
+import { useMe, useTeamMembers } from '../hooks/useDeploymentConfig'
+import type { MeResponse, TeamMember } from '../types'
 
 /** IdentityListField is the editor for `author_in` / `reviewer_in` /
  *  `commenter_in` (GitHub, SKY-264) and `assignee_in` / `reporter_in` /
@@ -40,7 +40,7 @@ export default function IdentityListField({
   value: string[] | undefined
   onChange: (val: string[] | undefined) => void
 }) {
-  const { me, loading: meLoading, error: meError } = useCurrentUserIdentity()
+  const { me, loading: meLoading, error: meError } = useMe()
   const { members, loading: membersLoading, error: membersError } = useTeamMembers()
   const labels = labelsForField(fieldName, identityKind)
 
@@ -94,7 +94,7 @@ export default function IdentityListField({
 // payload for the given identity source. Centralizes the
 // github_username vs jira_account_id branch so call sites don't have
 // to know.
-function identityFromMe(me: CurrentUserIdentity, kind: IdentityKind): string | null {
+function identityFromMe(me: MeResponse, kind: IdentityKind): string | null {
   const v = kind === 'jira' ? me.jira_account_id : me.github_username
   return v || null
 }
@@ -213,7 +213,7 @@ function VariantA({
 }: {
   value: string[] | undefined
   onChange: (val: string[] | undefined) => void
-  me: CurrentUserIdentity
+  me: MeResponse
   labels: ActorLabels
   identityKind: IdentityKind
 }) {
