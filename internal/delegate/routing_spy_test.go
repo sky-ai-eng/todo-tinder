@@ -179,6 +179,62 @@ func TestTakeover_PreflightUsesSyntheticClaims(t *testing.T) {
 	}
 }
 
+// TestCancel_UserInitiated_PreflightUsesSyntheticClaims pins the
+// active-goroutine gate for user-initiated cancels. The cancels map
+// inside Spawner is keyed only by runID, so without an org-scoped
+// preflight a cross-org caller who learns an active runID could fire
+// the goroutine's cancel() and tear down a live run — the goroutine
+// would then write the terminal row under its own captured cfg.orgID
+// and the attacker would be invisible to the audit trail. This test
+// proves the user-initiated path goes through SyntheticClaimsWithTx
+// before any cancels-map access, with the caller's userID for RLS.
+func TestCancel_UserInitiated_PreflightUsesSyntheticClaims(t *testing.T) {
+	const runID = "run-cancel-spy"
+	const callerID = "00000000-0000-0000-0000-000000000ddd"
+
+	database := newTakeoverTestDB(t)
+	seedRun(t, database, runID, "session-x", "/tmp/some-wt")
+
+	stores := sqlitestore.New(database)
+	tx := &recordingTxRunner{TxRunner: stores.Tx}
+	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, tx, nil, nil, "")
+
+	// No goroutine registered in s.cancels — Cancel will fall through
+	// to the DB path. The preflight runs first; the assertion is the
+	// synth call.
+	_ = s.Cancel(runmode.LocalDefaultOrg, runID, callerID)
+
+	if len(tx.synthCalls) < 1 {
+		t.Fatalf("SyntheticClaimsWithTx called %d times; want at least 1 (preflight must route through synth claims)", len(tx.synthCalls))
+	}
+	if tx.synthCalls[0].userID != callerID {
+		t.Errorf("preflight synth call userID = %q; want the calling user %q (preflight must check the caller's RLS scope, not a sentinel)", tx.synthCalls[0].userID, callerID)
+	}
+}
+
+// TestCancel_SystemInitiated_PreflightSkipsSynthClaims pins the other
+// side of the gate: router-driven cancels (DrainEntity rollback,
+// task-close cleanup) pass userID="" because they're system actors
+// with no user identity to project. Those must still scope by orgID
+// but go through the admin pool, not synth claims — otherwise the
+// router's no-user-context path would FK-fail in multi-mode.
+func TestCancel_SystemInitiated_PreflightSkipsSynthClaims(t *testing.T) {
+	const runID = "run-cancel-system-spy"
+
+	database := newTakeoverTestDB(t)
+	seedRun(t, database, runID, "session-x", "/tmp/some-wt")
+
+	stores := sqlitestore.New(database)
+	tx := &recordingTxRunner{TxRunner: stores.Tx}
+	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, tx, nil, nil, "")
+
+	_ = s.Cancel(runmode.LocalDefaultOrg, runID, "")
+
+	if len(tx.synthCalls) != 0 {
+		t.Errorf("SyntheticClaimsWithTx called %d times; want 0 for system-initiated cancel (must use admin pool, not synth claims)", len(tx.synthCalls))
+	}
+}
+
 // TestRelease_PreflightUsesSyntheticClaims pins fix #5 for Release.
 // Same shape as Takeover's preflight test: the run lookup that
 // gates the teardown machinery must run under the caller's claims

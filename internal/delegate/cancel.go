@@ -27,6 +27,38 @@ import (
 // runmode.LocalDefaultUserID; multi-mode handlers extract from JWT
 // claims.
 func (s *Spawner) Cancel(orgID, runID, userID string) error {
+	// Preflight: load the run under the caller's identity so a
+	// cross-org runID surfaces as "not found" BEFORE we tear anything
+	// down. The cancels map below is keyed only by runID, so without
+	// this gate any caller who learns an active runID could fire its
+	// goroutine cancel() regardless of which org owns the run — the
+	// goroutine then writes the terminal row under its own captured
+	// cfg.orgID and the cross-org actor is invisible to the audit
+	// trail. User-initiated cancels gate via the app pool under the
+	// caller's claims (RLS does the visibility check); system-
+	// initiated cancels (router cleanup, drain sweeps) still scope
+	// the read by orgID but go through the admin pool because there
+	// is no user identity to project.
+	var (
+		run          *domain.AgentRun
+		preflightErr error
+	)
+	if userID != "" {
+		preflightErr = s.tx.SyntheticClaimsWithTx(context.Background(), orgID, userID, func(ts db.TxStores) error {
+			r, e := ts.AgentRuns.Get(context.Background(), orgID, runID)
+			run = r
+			return e
+		})
+	} else {
+		run, preflightErr = s.agentRuns.GetSystem(context.Background(), orgID, runID)
+	}
+	if preflightErr != nil {
+		return fmt.Errorf("load run: %w", preflightErr)
+	}
+	if run == nil {
+		return fmt.Errorf("no active run %s", runID)
+	}
+
 	s.mu.Lock()
 	cancel, ok := s.cancels[runID]
 	s.mu.Unlock()
@@ -49,25 +81,16 @@ func (s *Spawner) Cancel(orgID, runID, userID string) error {
 	// defer); a Cancel() that hits this DB-only path has no defer to
 	// piggy-back on, so an auto-fired run cancelled while parked in
 	// awaiting_input would leave the entity's firing queue stuck
-	// until some other run on that entity terminated. Look up
-	// triggerType + entityID before the flip so a concurrent task
-	// delete can't strand us; drain only on a successful flip so we
-	// don't double-drain a row another path already terminated.
-	//
-	// Two reads instead of the previous joined query — agentRuns.Get
-	// returns trigger_type on the AgentRun struct, and tasks.Get gives
-	// us entity_id. Both miss the JWT-claims context (Cancel is a
-	// detached-context path so its writes survive request
-	// cancellation), so route through the System variants. Errors are
-	// swallowed: the flip below decides whether to surface that as
-	// "no active run" or proceed; drain just won't fire if entityID
-	// stays empty.
-	var triggerType, entityID string
-	if run, _ := s.agentRuns.GetSystem(context.Background(), orgID, runID); run != nil {
-		triggerType = run.TriggerType
-		if task, _ := s.tasks.GetSystem(context.Background(), orgID, run.TaskID); task != nil {
-			entityID = task.EntityID
-		}
+	// until some other run on that entity terminated. The preflight
+	// above already loaded the run, so trigger_type is in hand; we
+	// only need a separate task read to resolve entity_id for the
+	// drain notify. Errors on that task read are swallowed: the flip
+	// below decides whether to surface as "no active run" or proceed;
+	// drain just won't fire if entityID stays empty.
+	triggerType := run.TriggerType
+	var entityID string
+	if task, _ := s.tasks.GetSystem(context.Background(), orgID, run.TaskID); task != nil {
+		entityID = task.EntityID
 	}
 
 	// User-initiated cancel: write under the cancelling user's
