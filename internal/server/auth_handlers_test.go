@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -350,6 +351,7 @@ func TestAuthFlow_LoginToMe(t *testing.T) {
 			Name string `json:"name"`
 			Role string `json:"role"`
 		} `json:"orgs"`
+		ActiveOrgID string `json:"active_org_id"`
 	}
 	if err := json.NewDecoder(meResp.Body).Decode(&me); err != nil {
 		t.Fatalf("decode /api/me: %v", err)
@@ -368,6 +370,45 @@ func TestAuthFlow_LoginToMe(t *testing.T) {
 	}
 	if me.Orgs[0].Role != "owner" {
 		t.Errorf("me.orgs[0].role = %q, want owner", me.Orgs[0].Role)
+	}
+	if me.ActiveOrgID != orgID.String() {
+		t.Errorf("me.active_org_id = %q, want %q (OAuth callback defaults to earliest membership)",
+			me.ActiveOrgID, orgID)
+	}
+}
+
+// TestAuthFlow_Me_NoMemberships_OmitsActiveOrgID covers the multi-mode
+// edge case: a freshly-logged-in user with zero org_memberships rows
+// gets a session whose active_org_id is NULL. /api/me must omit the
+// field (omitempty) rather than render it as an empty string.
+func TestAuthFlow_Me_NoMemberships_OmitsActiveOrgID(t *testing.T) {
+	r := newAuthRig(t)
+	userID := r.seedUser()
+	// Deliberately no seedOrg — session lands with active_org_id NULL.
+
+	resp, _ := r.driveCallback(userID)
+	sid := r.sidFromResp(resp)
+
+	meResp := r.requestWithSid("GET", "/api/me", sid)
+	if meResp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/me status=%d, want 200", meResp.StatusCode)
+	}
+	raw, err := io.ReadAll(meResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	// Decode into a map so we can distinguish "field absent" from
+	// "field present and empty" — that's exactly the omitempty contract
+	// the ticket pins.
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode /api/me: %v", err)
+	}
+	if _, present := m["active_org_id"]; present {
+		t.Errorf("active_org_id present in /api/me with zero memberships: %s", raw)
+	}
+	if m["id"] != userID.String() {
+		t.Errorf("id = %v, want %s", m["id"], userID)
 	}
 }
 
