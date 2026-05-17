@@ -115,7 +115,7 @@ func (s *Spawner) delegateChain(orgID string, task domain.Task, chainPrompt *dom
 			WorktreePath:  cfg.wtPath,
 		}); err != nil {
 			log.Printf("[chain] failed to persist chain_run %s: %v", chainRunID, err)
-			s.runChainWorktreeCleanup(orgID, chainRunID, cfg)
+			s.runChainWorktreeCleanup(chainRunID, cfg)
 			if cfgEntity := taskEntityID(s.tasks, orgID, task.ID); cfgEntity != "" {
 				s.notifyDrainer(triggerType, cfgEntity)
 			}
@@ -437,7 +437,7 @@ func (s *Spawner) terminateChain(
 	// _scratch/handoff.md and decide what to do next.
 
 	if !skipCleanup {
-		s.runChainWorktreeCleanup(orgID, chainRunID, cfg)
+		s.runChainWorktreeCleanup(chainRunID, cfg)
 	}
 
 	// Drain the per-entity queue exactly once for the chain (independent
@@ -453,7 +453,7 @@ func (s *Spawner) terminateChain(
 
 // runChainWorktreeCleanup performs the cleanup runAgent would have done
 // per-step, except now once for the whole chain.
-func (s *Spawner) runChainWorktreeCleanup(orgID, chainRunID string, cfg runConfig) {
+func (s *Spawner) runChainWorktreeCleanup(chainRunID string, cfg runConfig) {
 	if cfg.hasWT {
 		if err := worktree.RemoveAt(cfg.wtPath, chainRunID); err != nil {
 			log.Printf("[chain] worktree remove failed for chain %s: %v", chainRunID, err)
@@ -468,14 +468,14 @@ func (s *Spawner) runChainWorktreeCleanup(orgID, chainRunID string, cfg runConfi
 		// agent's TRIAGE_FACTORY_RUN_ID), not by the chain_run_id.
 		// Iterate every step run in the chain so we actually find and
 		// remove their reservations.
-		stepRuns, err := s.chains.RunsForChainSystem(context.Background(), orgID, chainRunID)
+		stepRuns, err := s.chains.RunsForChainSystem(context.Background(), cfg.orgID, chainRunID)
 		if err != nil {
 			log.Printf("[chain] run %s: list step runs for cleanup: %v", chainRunID, err)
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		for _, sr := range stepRuns {
-			rows, err := s.runWorktrees.ListSystem(context.Background(), orgID, sr.ID)
+			rows, err := s.runWorktrees.ListSystem(context.Background(), cfg.orgID, sr.ID)
 			if err != nil {
 				log.Printf("[chain] run %s: list run_worktrees for step %s: %v", chainRunID, sr.ID, err)
 				// Log but continue to attempt DB row deletion below.
@@ -486,7 +486,7 @@ func (s *Spawner) runChainWorktreeCleanup(orgID, chainRunID string, cfg runConfi
 					log.Printf("[chain] run %s: remove worktree %s: %v", chainRunID, w.Path, err)
 					// Still attempt the DB row deletion even if the worktree remove failed.
 				}
-				if err := s.runWorktrees.DeleteByPathSystem(cleanupCtx, orgID, sr.ID, w.Path); err != nil {
+				if err := s.runWorktrees.DeleteByPathSystem(cleanupCtx, cfg.orgID, sr.ID, w.Path); err != nil {
 					log.Printf("[chain] run %s: delete run_worktrees row for %s: %v", chainRunID, w.Path, err)
 				}
 			}
