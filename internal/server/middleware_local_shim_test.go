@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -43,15 +44,14 @@ func TestWithSession_LocalShim_InjectsSentinels(t *testing.T) {
 	}
 }
 
-// TestHandleMe_LocalMode_Returns401 pins the regression: the shim
-// injects sentinel claims into every withSession-wrapped request,
-// which would otherwise let /api/me proceed into handleMe's
-// Postgres-only body (public.users + tf.current_user_id()) and 500
-// against local SQLite. handleMe must gate on runmode and 401 in
-// local mode to preserve the pre-shim behavior. The forthcoming
-// handler-sweep PR will replace the 401 with a SQLite-compatible
-// local identity path returning the sentinel user + sentinel org.
-func TestHandleMe_LocalMode_Returns401(t *testing.T) {
+// TestHandleMe_LocalMode_SynthesizesSentinelResponse pins the
+// local-equals-multi-at-N=1 contract: the withSession shim injects a
+// synthetic claim with Subject = LocalDefaultUserID, and handleMe
+// detects that and returns a synthesized response built from sentinel
+// constants instead of hitting Postgres-only queries (public.users,
+// tf.current_user_id()) that would 500 against local SQLite. The FE
+// gets one signed-in shape across both modes.
+func TestHandleMe_LocalMode_SynthesizesSentinelResponse(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeLocal)
 
 	s := &Server{} // authDeps nil → shim injects sentinel claims
@@ -59,8 +59,49 @@ func TestHandleMe_LocalMode_Returns401(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.withSession(http.HandlerFunc(s.handleMe)).ServeHTTP(rec, httptest.NewRequest("GET", "/api/me", nil))
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (handleMe must short-circuit in local mode to avoid Postgres-only query path)", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (local-mode /api/me must synthesize a signed-in response)", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var body struct {
+		ID          string `json:"id"`
+		Email       string `json:"email"`
+		DisplayName string `json:"display_name"`
+		ActiveOrgID string `json:"active_org_id"`
+		Orgs        []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			Role string `json:"role"`
+		} `json:"orgs"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.ID != runmode.LocalDefaultUserID {
+		t.Errorf("id = %q, want %q", body.ID, runmode.LocalDefaultUserID)
+	}
+	if body.Email != "" {
+		t.Errorf("email = %q, want empty (local mode has no email)", body.Email)
+	}
+	if body.DisplayName != "Local" {
+		t.Errorf("display_name = %q, want %q", body.DisplayName, "Local")
+	}
+	if body.ActiveOrgID != runmode.LocalDefaultOrgID {
+		t.Errorf("active_org_id = %q, want %q", body.ActiveOrgID, runmode.LocalDefaultOrgID)
+	}
+	if len(body.Orgs) != 1 {
+		t.Fatalf("orgs len = %d, want 1", len(body.Orgs))
+	}
+	if body.Orgs[0].ID != runmode.LocalDefaultOrgID {
+		t.Errorf("orgs[0].id = %q, want %q", body.Orgs[0].ID, runmode.LocalDefaultOrgID)
+	}
+	if body.Orgs[0].Name != "Local" {
+		t.Errorf("orgs[0].name = %q, want %q", body.Orgs[0].Name, "Local")
+	}
+	if body.Orgs[0].Role != "owner" {
+		t.Errorf("orgs[0].role = %q, want owner", body.Orgs[0].Role)
 	}
 }
 

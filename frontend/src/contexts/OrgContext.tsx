@@ -12,17 +12,18 @@ import { useOptionalAuth } from './AuthContext'
  *
  * Source of truth precedence:
  *   1. URL path — if at /orgs/:org_id/*, that org_id wins.
- *   2. localStorage[ACTIVE_ORG_KEY] — sticky pick from last session.
- *   3. First org in the user's org list.
+ *   2. /api/me's active_org_id — the session's server-side choice.
+ *   3. localStorage[ACTIVE_ORG_KEY] — sticky pick from last session.
+ *   4. First org in the user's org list.
  *
  * The URL is authoritative when present so deep links survive across
- * sessions. localStorage exists for the boot case (user lands on /
- * after login, before we've routed them into an org).
+ * sessions. The server value beats localStorage so a switch made in
+ * another tab (POST /api/me/active-org persists on the session row)
+ * wins over this tab's cached pick on the next /api/me load.
  *
  * Stale localStorage is silently ignored: if the stored org_id isn't
- * in the current user's org list, we fall through to (3). Avoids
- * surfacing a "you don't have access" error for an org the user used
- * to belong to.
+ * in the current user's org list, we fall through. Avoids surfacing a
+ * "you don't have access" error for an org the user used to belong to.
  */
 
 const ACTIVE_ORG_KEY = 'triagefactory.activeOrgId'
@@ -75,11 +76,14 @@ export function OrgProvider({ children }: { children: React.ReactNode }) {
 
   const urlOrgId = orgIdFromPath(location.pathname)
 
-  // Resolve the active org: URL wins, then localStorage, then first org.
+  // Resolve the active org: URL wins, then the session's server-side
+  // active_org_id, then localStorage, then first org.
   const activeOrgId = useMemo(() => {
     if (!auth) return null
     const validIds = new Set(auth.orgs.map((o) => o.id))
     if (urlOrgId && validIds.has(urlOrgId)) return urlOrgId
+    if (auth.serverActiveOrgId && validIds.has(auth.serverActiveOrgId))
+      return auth.serverActiveOrgId
     if (storedId && validIds.has(storedId)) return storedId
     if (auth.orgs.length > 0) return auth.orgs[0].id
     return null
