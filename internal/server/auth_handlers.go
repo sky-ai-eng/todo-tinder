@@ -503,7 +503,8 @@ func (s *Server) handleActiveOrgUpdate(w http.ResponseWriter, r *http.Request) {
 // handleMe returns the authenticated user's identity + org list.
 // Wrapped in SessionMiddleware at mount time.
 //
-// GET /api/me  →  { id, email, display_name, avatar_url, github_username, orgs: [...], active_org_id }
+// GET /api/me  →  { id, email, display_name, avatar_url, github_username,
+//                   jira_account_id, jira_display_name, orgs: [...], active_org_id }
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	claims := ClaimsFrom(r.Context())
 	if claims == nil {
@@ -516,21 +517,27 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		Role string `json:"role"`
 	}
 	type response struct {
-		ID             string   `json:"id"`
-		Email          string   `json:"email"`
-		DisplayName    string   `json:"display_name,omitempty"`
-		AvatarURL      string   `json:"avatar_url,omitempty"`
-		GitHubUsername string   `json:"github_username,omitempty"`
-		Orgs           []orgRow `json:"orgs"`
-		ActiveOrgID    string   `json:"active_org_id,omitempty"`
+		ID              string   `json:"id"`
+		Email           string   `json:"email"`
+		DisplayName     string   `json:"display_name,omitempty"`
+		AvatarURL       string   `json:"avatar_url,omitempty"`
+		GitHubUsername  string   `json:"github_username,omitempty"`
+		JiraAccountID   string   `json:"jira_account_id,omitempty"`
+		JiraDisplayName string   `json:"jira_display_name,omitempty"`
+		Orgs            []orgRow `json:"orgs"`
+		ActiveOrgID     string   `json:"active_org_id,omitempty"`
 	}
 
 	// Local-mode shim path: withSession injects a synthetic claim
 	// carrying LocalDefaultUserID when authDeps is nil. The multi-mode
 	// body below reads public.users via tf.current_user_id() — both
 	// Postgres-only and would 500 against local SQLite. Synthesize the
-	// same response shape from sentinel constants so the FE renders one
-	// signed-in path across both modes (local equals multi at N=1).
+	// same response shape from sentinel constants + the local user
+	// row's stored identity so the FE renders one signed-in path across
+	// both modes (local equals multi at N=1). github_username + jira_*
+	// are sourced from the same users-store calls /api/config used to
+	// make pre-slim, so the predicate editor finds them on /api/me in
+	// both modes.
 	//
 	// Gated on authDeps==nil (not just the Subject) so a multi-mode
 	// caller whose real GoTrue user UUID happens to collide with the
@@ -547,6 +554,15 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 				Role: "owner",
 			}},
 			ActiveOrgID: runmode.LocalDefaultOrgID,
+		}
+		// s.users is wired by New(). The middleware-shim unit test
+		// constructs a bare &Server{} to exercise the sentinel path
+		// without an auth stack — guard the lookups so that minimal
+		// rig still works while production calls (always wired)
+		// populate identity from the users row.
+		if s.users != nil {
+			resp.GitHubUsername, _ = s.users.GetGitHubUsername(r.Context(), runmode.LocalDefaultUserID)
+			resp.JiraAccountID, resp.JiraDisplayName, _ = s.users.GetJiraIdentity(r.Context(), runmode.LocalDefaultUserID)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -575,10 +591,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 				SELECT id::text,
 				       COALESCE(display_name, ''),
 				       COALESCE(avatar_url, ''),
-				       COALESCE(github_username, '')
+				       COALESCE(github_username, ''),
+				       COALESCE(jira_account_id, ''),
+				       COALESCE(jira_display_name, '')
 				  FROM public.users
 				 WHERE id = tf.current_user_id()
-			`).Scan(&resp.ID, &resp.DisplayName, &resp.AvatarURL, &resp.GitHubUsername); err != nil {
+			`).Scan(&resp.ID, &resp.DisplayName, &resp.AvatarURL, &resp.GitHubUsername, &resp.JiraAccountID, &resp.JiraDisplayName); err != nil {
 				return fmt.Errorf("user lookup: %w", err)
 			}
 

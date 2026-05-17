@@ -274,25 +274,31 @@ export interface EventSchema {
   fields: FieldSchema[]
 }
 
-/** GET /api/config response (SKY-264). One-shot read at FE boot. Tells
- *  the predicate editor which variant of the identity-allowlist field
- *  to render — toggle (team_size===1) vs multi-select (team_size>1) vs
- *  disabled (current_user.github_username===null). */
+/** GET /api/config response. One-shot read at FE boot — AuthGate uses
+ *  deployment_mode to choose between the local keychain-capture flow
+ *  and the multi-mode OAuth flow. Per-user identity that used to live
+ *  here (github_username, jira_*) moved to /api/me. */
 export interface DeploymentConfig {
   deployment_mode: 'local' | 'multi'
-  team_size: number
-  current_user: {
-    id: string
-    github_username: string | null
-    /** Atlassian account ID (SKY-270). Null when Jira is not yet
-     *  connected — the editor renders a disabled Variant A in that
-     *  case, with a "configure Jira on Settings" hint. */
-    jira_account_id: string | null
-    /** Jira-side display name. Captured alongside account ID from
-     *  /rest/api/2/myself; used in UI hints ("Match my issues as
-     *  Aidan Allchin"). Null when Jira not connected. */
-    jira_display_name: string | null
-  }
+}
+
+/** Subset of GET /api/me used by the predicate editor's
+ *  IdentityListField. The full MeResponse lives in contexts/AuthContext
+ *  for the multi-mode auth state machine; this narrower view covers the
+ *  "what's my identity in connected integrations" use case that needs
+ *  to work in both modes (and so can't depend on AuthContext, which
+ *  only mounts in multi mode). */
+export interface CurrentUserIdentity {
+  id: string
+  github_username?: string
+  /** Atlassian account ID. Absent when Jira is not yet connected — the
+   *  predicate editor renders the Variant-A toggle disabled with a
+   *  "configure Jira on Settings" hint. */
+  jira_account_id?: string
+  /** Jira-side display name. Captured alongside account ID from
+   *  /rest/api/2/myself; used in UI hints ("Match my issues as
+   *  Aidan Allchin"). Absent when Jira not connected. */
+  jira_display_name?: string
 }
 
 /** GET /api/team/members row. Backs Variant B's searchable multi-select.

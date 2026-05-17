@@ -1,17 +1,14 @@
 import { useState, useEffect } from 'react'
-import type { DeploymentConfig, TeamMember, TeamMembersResponse } from '../types'
+import type {
+  CurrentUserIdentity,
+  DeploymentConfig,
+  TeamMember,
+  TeamMembersResponse,
+} from '../types'
 
-/** In-flight Promise dedup for /api/config. When multiple
- *  IdentityListField components mount in the same render (e.g. a review
- *  event predicate with both author_in and reviewer_in fields), they
- *  share one round-trip rather than fanning out to identical fetches.
- *  Cleared once the request settles so the next mount re-fetches —
- *  there's deliberately no persistent result cache, because
- *  current_user.github_username can change mid-session (user opens
- *  editor → connects GitHub via Settings → returns), and a cached
- *  value would keep the editor stuck in the "identity not captured"
- *  state until a page reload. The endpoint is one cheap SELECT, so
- *  re-fetching per editor mount is correct and cheap. */
+/** In-flight Promise dedup for /api/config. The endpoint is read once at
+ *  FE boot by AuthGate, but multiple components may still race to mount
+ *  before the result lands; sharing one round-trip is courteous. */
 let configInFlight: Promise<DeploymentConfig> | null = null
 
 function loadConfig(): Promise<DeploymentConfig> {
@@ -28,9 +25,8 @@ function loadConfig(): Promise<DeploymentConfig> {
 }
 
 /** useDeploymentConfig fetches /api/config on every mount with in-flight
- *  dedup. No persistent cache — the response carries
- *  current_user.github_username which is mutable during a session, and
- *  caching it would shadow real changes until a page reload. */
+ *  dedup. The response carries only deployment_mode — AuthGate's
+ *  pre-login signal for which login flow to render. */
 export function useDeploymentConfig(): {
   config: DeploymentConfig | null
   loading: boolean
@@ -61,6 +57,66 @@ export function useDeploymentConfig(): {
   }, [])
 
   return { config, loading, error }
+}
+
+/** In-flight Promise dedup for /api/me. Multiple IdentityListField
+ *  mounts in one render (e.g. a review-event predicate editing both
+ *  author_in and reviewer_in) share one round-trip. No persistent
+ *  cache — identity fields can change mid-session (user opens editor,
+ *  configures Jira via Settings, returns), and caching would shadow
+ *  real changes until reload. */
+let meInFlight: Promise<CurrentUserIdentity | null> | null = null
+
+function loadMe(): Promise<CurrentUserIdentity | null> {
+  if (meInFlight) return meInFlight
+  meInFlight = fetch('/api/me')
+    .then((r) => {
+      if (r.status === 401) return null
+      if (!r.ok) throw new Error(`/api/me: ${r.status}`)
+      return r.json() as Promise<CurrentUserIdentity>
+    })
+    .finally(() => {
+      meInFlight = null
+    })
+  return meInFlight
+}
+
+/** useCurrentUserIdentity fetches /api/me on each mount with in-flight
+ *  dedup, narrowed to the fields the predicate editor needs. Works in
+ *  both modes (local mode synthesizes from the users row, multi mode
+ *  reads via JWT-context query). Returns `me: null` on 401 so the editor
+ *  can render a "not signed in" state rather than crashing on missing
+ *  identity. */
+export function useCurrentUserIdentity(): {
+  me: CurrentUserIdentity | null
+  loading: boolean
+  error: string | null
+} {
+  const [me, setMe] = useState<CurrentUserIdentity | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    loadMe()
+      .then((data) => {
+        if (!cancelled) {
+          setMe(data)
+          setLoading(false)
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err))
+          setLoading(false)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  return { me, loading, error }
 }
 
 /** useTeamMembers fetches the roster for the active user's team. Used

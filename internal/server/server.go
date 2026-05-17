@@ -245,6 +245,10 @@ func (s *Server) routes() {
 	//        the session; can't gate on the session it's about to mint.
 	//   POST /api/auth/logout           — reads sid cookie directly so
 	//        logout still works on a stale/invalid session. CSRF only.
+	//   GET  /api/config                — AuthGate reads deployment_mode
+	//        at boot to pick the login flow; must answer before any
+	//        session exists. The handler returns only deployment_mode;
+	//        per-user identity lives on /api/me.
 	//   /auth/v1/                        — GoTrue reverse proxy; auth
 	//        happens upstream, not in our middleware.
 	//   /                                — SPA fallback; static-file
@@ -252,6 +256,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/auth/oauth/{provider}", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/auth/callback", s.handleOAuthCallback)
 	s.mux.Handle("POST /api/auth/logout", s.withCSRFOriginCheck(http.HandlerFunc(s.handleLogout)))
+	s.mux.HandleFunc("GET /api/config", s.handleConfig)
 	// /auth/v1/* reverse-proxy to gotrue, wired lazily inside
 	// SetAuthDeps. The closure here re-reads s.authProxy each
 	// request so local-mode (where it stays nil) returns 404
@@ -352,13 +357,12 @@ func (s *Server) routes() {
 	s.api("GET /api/settings", s.handleSettingsGet)
 	s.apiMutating("POST /api/settings", s.handleSettingsPost)
 
-	// SKY-264: deployment shape + team roster for the predicate editor.
-	// Both endpoints are fetched fresh on every consumer mount (the FE
-	// hooks dedup concurrent in-flight calls within a render but don't
-	// hold a persistent cache — current_user.github_username and the
-	// roster are both mutable mid-session). Endpoint costs are a single
-	// SELECT each, so re-fetching per editor mount is cheap and correct.
-	s.api("GET /api/config", s.handleConfig)
+	// SKY-264: team roster for the predicate editor. Fetched fresh on
+	// every consumer mount (the FE dedups concurrent in-flight calls
+	// within a render but doesn't hold a persistent cache — the roster
+	// is mutable mid-session). One SELECT per call. /api/config — the
+	// AuthGate boot endpoint — is mounted pre-auth above; per-user
+	// identity that used to live on /api/config moved to /api/me.
 	s.api("GET /api/team/members", s.handleTeamMembers)
 	s.apiMutating("POST /api/skills/import", s.handleSkillsImport)
 	s.api("GET /api/github/repos", s.handleGitHubRepos)
