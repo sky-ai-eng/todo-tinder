@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/skills"
@@ -34,14 +35,48 @@ var (
 )
 
 // resolvePrompt finds the prompt for a task from an explicit prompt ID.
-// Manual delegation always requires the caller to pick a prompt; auto-delegation
-// supplies the prompt_id from the trigger row.
-func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID string) (*domain.Prompt, error) {
+// Manual delegation always requires the caller to pick a prompt; auto-
+// delegation supplies the prompt_id from the trigger row.
+//
+// Routing splits on triggerType to honor the prompts_select RLS policy:
+//
+//   - triggerType == "event": router-fired runs have no user identity to
+//     check against. Stay on the admin pool (GetSystem) — the event
+//     subscriber is a system actor.
+//   - triggerType == "manual": load via the app pool under the
+//     requesting user's synthetic claims so prompts_select filters out
+//     prompts the user can't see. Without this, a caller could supply a
+//     guessed prompt_id belonging to another user's private prompt and
+//     the agent would run under it.
+//
+// In SQLite (local mode), SyntheticClaimsWithTx is essentially a pass-
+// through (asserts orgID == LocalDefaultOrg, ignores userID), so the
+// "manual" branch resolves identically to the "event" branch. The
+// routing only changes behavior under Postgres + RLS.
+//
+// creatorUserID is required when triggerType == "manual"; ignored for
+// "event" since the admin pool doesn't read JWT claims.
+func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID, triggerType, creatorUserID string) (*domain.Prompt, error) {
 	if explicitPromptID == "" {
 		return nil, fmt.Errorf("%w — select one from the prompt picker", ErrPromptUnspecified)
 	}
 
-	p, err := s.prompts.GetSystem(context.Background(), runmode.LocalDefaultOrg, explicitPromptID)
+	var (
+		p   *domain.Prompt
+		err error
+	)
+	if triggerType == "manual" {
+		err = s.tx.SyntheticClaimsWithTx(context.Background(), runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
+			got, gErr := ts.Prompts.Get(context.Background(), runmode.LocalDefaultOrg, explicitPromptID)
+			if gErr != nil {
+				return gErr
+			}
+			p = got
+			return nil
+		})
+	} else {
+		p, err = s.prompts.GetSystem(context.Background(), runmode.LocalDefaultOrg, explicitPromptID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to load prompt %s: %w", explicitPromptID, err)
 	}

@@ -78,7 +78,18 @@ type DelegateOpts struct {
 	// TriggerType is "manual" (user clicked Delegate) or "event"
 	// (router auto-fired from a matched event_handler). Drives the
 	// routing decision inside the goroutine: synthetic-claims for
-	// manual, admin pool for event. Defaults to "manual" if empty.
+	// manual (so prompts_select RLS filters by user, runs_insert RLS
+	// sees creator_user_id), admin pool for event (router has no
+	// user identity to project). Defaults to "manual" if empty.
+	//
+	// **Server-side provenance, never caller-derived.** API handlers
+	// hardcode "manual" (factory_delegate.go, tasks.go); the event
+	// router hardcodes "event" (routing/router.go). There is no path
+	// where this field is unmarshaled from a request body. The
+	// invariant is load-bearing: if a caller could set
+	// TriggerType="event", resolvePrompt's app-pool branch would be
+	// bypassed and the caller could read prompts they can't see.
+	// internal/server/delegate_trigger_invariant_test.go pins this.
 	TriggerType string
 
 	// TriggerID is the event_handler ID for event-triggered runs,
@@ -102,21 +113,9 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 	defaultModel := s.model
 	s.mu.Unlock()
 
-	// Resolve prompt
-	resolved, err := s.resolvePrompt(task, opts.ExplicitPromptID)
-	if err != nil {
-		return "", err
-	}
-	promptID := resolved.ID
-	mission := resolved.Body
-
-	model := defaultModel
-	if resolved.Model != "" {
-		model = resolved.Model
-	}
-
-	extraTools := s.collectExtraTools(resolved.AllowedTools)
-
+	// Compute trigger type + creator user up front so resolvePrompt
+	// can route by them (manual delegations must honor prompts_select
+	// RLS; event-triggered ones stay on the admin pool).
 	triggerType := opts.TriggerType
 	if triggerType == "" {
 		triggerType = "manual"
@@ -138,6 +137,22 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 			creatorUserID = runmode.LocalDefaultUserID
 		}
 	}
+
+	// Resolve prompt under the right pool for the trigger type. See
+	// resolvePrompt's docstring for the routing rationale.
+	resolved, err := s.resolvePrompt(task, opts.ExplicitPromptID, triggerType, creatorUserID)
+	if err != nil {
+		return "", err
+	}
+	promptID := resolved.ID
+	mission := resolved.Body
+
+	model := defaultModel
+	if resolved.Model != "" {
+		model = resolved.Model
+	}
+
+	extraTools := s.collectExtraTools(resolved.AllowedTools)
 
 	// IncrementUsage routes per trigger type. Manual delegations
 	// write under the user's synthetic claims; event-triggered ones
@@ -173,7 +188,7 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 	}
 
 	runID := uuid.New().String()
-	if err := s.agentRuns.Create(context.Background(), runmode.LocalDefaultOrg, domain.AgentRun{
+	runRow := domain.AgentRun{
 		ID:            runID,
 		TaskID:        task.ID,
 		PromptID:      promptID,
@@ -183,8 +198,22 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 		TriggerID:     triggerID,
 		ActorAgentID:  actorAgentID,
 		CreatorUserID: creatorUserID,
-	}); err != nil {
-		return "", fmt.Errorf("create agent run: %w", err)
+	}
+	// Route by trigger type, mirroring the IncrementUsage split above.
+	// Manual inserts wrap in SyntheticClaimsWithTx so runs_insert's RLS
+	// check (creator_user_id = tf.current_user_id()) sees the correct
+	// identity; event-triggered inserts stay on the admin pool because
+	// the router has no user identity to project.
+	var createErr error
+	if triggerType == "manual" {
+		createErr = s.tx.SyntheticClaimsWithTx(context.Background(), runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
+			return ts.AgentRuns.Create(context.Background(), runmode.LocalDefaultOrg, runRow)
+		})
+	} else {
+		createErr = s.agentRuns.Create(context.Background(), runmode.LocalDefaultOrg, runRow)
+	}
+	if createErr != nil {
+		return "", fmt.Errorf("create agent run: %w", createErr)
 	}
 	s.broadcastRunUpdate(runID, "initializing")
 
