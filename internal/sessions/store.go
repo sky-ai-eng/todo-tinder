@@ -50,16 +50,28 @@ type Session struct {
 	RevokedAt    sql.NullTime
 	UserAgent    string
 	IPAddr       string
+	// ActiveOrgID is the org context the session currently routes
+	// requests under. NULL when the user has no memberships yet
+	// (first-time login pre-invite) — handlers that require an org
+	// then return 409 and the SPA prompts the user to pick or join one.
+	// Switched server-side via POST /api/me/active-org.
+	ActiveOrgID uuid.NullUUID
 }
 
 // Create encrypts the tokens and inserts a fresh row. Returns the
 // session ID (the opaque value we'll set on the sid cookie).
+//
+// activeOrgID may be invalid (Valid=false) for a user with zero
+// memberships at login time; the row stores NULL and handlers that
+// require an org-scoped identity will 409 until the user calls
+// POST /api/me/active-org.
 func (s *Store) CreateSystem(
 	ctx context.Context,
 	userID uuid.UUID,
 	jwt, refresh string,
 	jwtExp, sessExp time.Time,
 	userAgent, ipAddr string,
+	activeOrgID uuid.NullUUID,
 ) (*Session, error) {
 	jwtEnc, jwtNonce, err := s.key.Encrypt([]byte(jwt))
 	if err != nil {
@@ -78,10 +90,10 @@ func (s *Store) CreateSystem(
 	row := s.db.QueryRowContext(ctx, `
 		INSERT INTO public.sessions
 		    (user_id, jwt_enc, jwt_nonce, refresh_token_enc, refresh_nonce,
-		     jwt_expires_at, expires_at, user_agent, ip_addr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), NULLIF($9, '')::inet)
+		     jwt_expires_at, expires_at, user_agent, ip_addr, active_org_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), NULLIF($9, '')::inet, $10)
 		RETURNING id, created_at, last_seen_at
-	`, userID, jwtEnc, jwtNonce, refEnc, refNonce, jwtExp, sessExp, userAgent, ipAddr)
+	`, userID, jwtEnc, jwtNonce, refEnc, refNonce, jwtExp, sessExp, userAgent, ipAddr, activeOrgID)
 
 	out := &Session{
 		UserID:       userID,
@@ -91,6 +103,7 @@ func (s *Store) CreateSystem(
 		ExpiresAt:    sessExp,
 		UserAgent:    userAgent,
 		IPAddr:       ipAddr,
+		ActiveOrgID:  activeOrgID,
 	}
 	if err := row.Scan(&out.ID, &out.CreatedAt, &out.LastSeenAt); err != nil {
 		return nil, fmt.Errorf("insert session: %w", err)
@@ -113,7 +126,7 @@ func (s *Store) LookupSystem(ctx context.Context, sid uuid.UUID) (*Session, erro
 		SELECT id, user_id,
 		       jwt_enc, jwt_nonce, refresh_token_enc, refresh_nonce,
 		       jwt_expires_at, expires_at, created_at, last_seen_at, revoked_at,
-		       COALESCE(user_agent, ''), COALESCE(host(ip_addr), '')
+		       COALESCE(user_agent, ''), COALESCE(host(ip_addr), ''), active_org_id
 		  FROM public.sessions
 		 WHERE id = $1
 		   AND revoked_at IS NULL
@@ -128,7 +141,7 @@ func (s *Store) LookupSystem(ctx context.Context, sid uuid.UUID) (*Session, erro
 		&out.ID, &out.UserID,
 		&jwtEnc, &jwtNonce, &refEnc, &refNonce,
 		&out.JWTExpiresAt, &out.ExpiresAt, &out.CreatedAt, &out.LastSeenAt, &out.RevokedAt,
-		&out.UserAgent, &out.IPAddr,
+		&out.UserAgent, &out.IPAddr, &out.ActiveOrgID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -191,6 +204,27 @@ func (s *Store) UpdateJWTSystem(
 // or revoked between read and write. Middleware turns this into a 401.
 var ErrSessionGone = errors.New("session no longer exists or was revoked")
 
+// UpdateActiveOrgSystem swaps the active org for a session. Caller is
+// responsible for verifying membership BEFORE calling — this method
+// trusts the (sid, orgID) pair. Returns sql.ErrNoRows if the session
+// is revoked or doesn't exist.
+func (s *Store) UpdateActiveOrgSystem(ctx context.Context, sid uuid.UUID, activeOrgID uuid.UUID) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE public.sessions
+		   SET active_org_id = $1
+		 WHERE id = $2
+		   AND revoked_at IS NULL
+	`, activeOrgID, sid)
+	if err != nil {
+		return fmt.Errorf("update active org: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // Revoke flips revoked_at to now() on a session. Soft-delete: row stays
 // for audit. Idempotent — calling on an already-revoked row is a no-op.
 func (s *Store) RevokeSystem(ctx context.Context, sid uuid.UUID) error {
@@ -218,7 +252,7 @@ func (s *Store) ListActiveForUserSystem(ctx context.Context, userID uuid.UUID) (
 		SELECT id, user_id,
 		       jwt_enc, jwt_nonce, refresh_token_enc, refresh_nonce,
 		       jwt_expires_at, expires_at, created_at, last_seen_at, revoked_at,
-		       COALESCE(user_agent, ''), COALESCE(host(ip_addr), '')
+		       COALESCE(user_agent, ''), COALESCE(host(ip_addr), ''), active_org_id
 		  FROM public.sessions
 		 WHERE user_id = $1
 		   AND revoked_at IS NULL
@@ -240,7 +274,7 @@ func (s *Store) ListActiveForUserSystem(ctx context.Context, userID uuid.UUID) (
 			&sess.ID, &sess.UserID,
 			&jwtEnc, &jwtNonce, &refEnc, &refNonce,
 			&sess.JWTExpiresAt, &sess.ExpiresAt, &sess.CreatedAt, &sess.LastSeenAt, &sess.RevokedAt,
-			&sess.UserAgent, &sess.IPAddr,
+			&sess.UserAgent, &sess.IPAddr, &sess.ActiveOrgID,
 		); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
