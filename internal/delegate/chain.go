@@ -100,7 +100,7 @@ func (s *Spawner) delegateChain(orgID string, task domain.Task, chainPrompt *dom
 				WorktreePath:  "",
 			})
 			if cfgEntity := taskEntityID(s.tasks, orgID, task.ID); cfgEntity != "" {
-				s.notifyDrainer(triggerType, cfgEntity)
+				s.notifyDrainer(orgID, triggerType, cfgEntity)
 			}
 			return
 		}
@@ -117,7 +117,7 @@ func (s *Spawner) delegateChain(orgID string, task domain.Task, chainPrompt *dom
 			log.Printf("[chain] failed to persist chain_run %s: %v", chainRunID, err)
 			s.runChainWorktreeCleanup(chainRunID, cfg)
 			if cfgEntity := taskEntityID(s.tasks, orgID, task.ID); cfgEntity != "" {
-				s.notifyDrainer(triggerType, cfgEntity)
+				s.notifyDrainer(orgID, triggerType, cfgEntity)
 			}
 			return
 		}
@@ -443,7 +443,7 @@ func (s *Spawner) terminateChain(
 	// Drain the per-entity queue exactly once for the chain (independent
 	// of how many steps ran).
 	if cfgEntity := taskEntityID(s.tasks, orgID, taskID); cfgEntity != "" {
-		s.notifyDrainer(triggerType, cfgEntity)
+		s.notifyDrainer(orgID, triggerType, cfgEntity)
 	}
 
 	dur := time.Since(startTime)

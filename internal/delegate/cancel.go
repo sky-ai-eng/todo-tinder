@@ -121,7 +121,7 @@ func (s *Spawner) Cancel(orgID, runID, userID string) error {
 	}
 	s.broadcastRunUpdate(runID, "cancelled")
 	if entityID != "" {
-		s.notifyDrainer(triggerType, entityID)
+		s.notifyDrainer(orgID, triggerType, entityID)
 	}
 	return nil
 }

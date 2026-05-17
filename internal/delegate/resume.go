@@ -181,7 +181,7 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 			// matches the initial-run defer in Delegate so a yield
 			// resume that lands the run terminal still flushes any
 			// queued auto-firings for the same entity.
-			s.notifyDrainer(triggerType, taskCopy.EntityID)
+			s.notifyDrainer(orgID, triggerType, taskCopy.EntityID)
 		}()
 
 		// markCancelled writes the terminal cancelled status iff the

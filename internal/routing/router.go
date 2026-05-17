@@ -58,6 +58,7 @@ type Router struct {
 	entities   dbpkg.EntityStore         // SKY-284: closed-entity guard + entity-terminating close cascade
 	firings    dbpkg.PendingFiringsStore // SKY-289: per-entity firing queue + active-run gate
 	events     dbpkg.EventStore          // SKY-305: admin-pool RecordSystem + GetMetadataSystem for the background subscriber
+	orgs       dbpkg.OrgsStore           // per-org iteration for the drain sweeper; nil-safe, falls back to N=1 sentinel when unset
 	spawner    Delegator
 	scorer     Scorer
 	ws         *websocket.Hub
@@ -84,7 +85,9 @@ type Router struct {
 // behavior). users is nil-safe too — the SKY-270 inline-close gate
 // degrades to "treat every reassignment as away-from-me" when missing,
 // which over-closes (acceptable: user can reopen via the next poll).
-func NewRouter(prompts dbpkg.PromptStore, handlers dbpkg.EventHandlerStore, agents dbpkg.AgentStore, teamAgents dbpkg.TeamAgentStore, users dbpkg.UsersStore, tasks dbpkg.TaskStore, agentRuns dbpkg.AgentRunStore, entities dbpkg.EntityStore, firings dbpkg.PendingFiringsStore, events dbpkg.EventStore, spawner Delegator, scorer Scorer, ws *websocket.Hub) *Router {
+// orgs is nil-safe — the drain sweeper collapses to a single-org pass
+// over the local sentinel when missing, matching pre-D9 behavior.
+func NewRouter(prompts dbpkg.PromptStore, handlers dbpkg.EventHandlerStore, agents dbpkg.AgentStore, teamAgents dbpkg.TeamAgentStore, users dbpkg.UsersStore, tasks dbpkg.TaskStore, agentRuns dbpkg.AgentRunStore, entities dbpkg.EntityStore, firings dbpkg.PendingFiringsStore, events dbpkg.EventStore, orgs dbpkg.OrgsStore, spawner Delegator, scorer Scorer, ws *websocket.Hub) *Router {
 	return &Router{
 		prompts:    prompts,
 		handlers:   handlers,
@@ -96,6 +99,7 @@ func NewRouter(prompts dbpkg.PromptStore, handlers dbpkg.EventHandlerStore, agen
 		entities:   entities,
 		firings:    firings,
 		events:     events,
+		orgs:       orgs,
 		spawner:    spawner,
 		scorer:     scorer,
 		ws:         ws,
@@ -119,10 +123,22 @@ func (r *Router) entityDrainLock(entityID string) *sync.Mutex {
 // HandleEvent is the eventbus subscriber callback. Called asynchronously
 // from the bus's per-subscriber goroutine.
 func (r *Router) HandleEvent(evt domain.Event) {
+	// Defensive: every upstream emitter (poller, per-org loop in
+	// SKY-312) tags events with evt.OrgID. A missing OrgID indicates
+	// an emitter bug — failing loud here prevents tenant-mixed writes
+	// that would silently land on the local sentinel. The check lives
+	// here at the single entry point; downstream helpers take orgID
+	// as a typed parameter and trust it.
+	if evt.OrgID == "" {
+		log.Printf("[router] dropping event %s with no OrgID — emitter bug", evt.EventType)
+		return
+	}
+	orgID := evt.OrgID
+
 	// Step 1: Always record — durable audit log regardless of routing outcome.
 	// Later routing logic relies on evt.ID referring to a persisted event row,
 	// so stop here if the insert fails.
-	id, err := r.events.RecordSystem(context.Background(), runmode.LocalDefaultOrgID, evt)
+	id, err := r.events.RecordSystem(context.Background(), orgID, evt)
 	if err != nil {
 		log.Printf("[router] failed to record event %s: %v", evt.EventType, err)
 		return
@@ -133,7 +149,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	// and cascade-close all its tasks. Return after — no task creation on a
 	// closing entity.
 	if evt.EntityID != nil && EntityTerminatingEvents[evt.EventType] {
-		closed, err := r.closeEntity(*evt.EntityID)
+		closed, err := r.closeEntity(orgID, *evt.EntityID)
 		if err != nil {
 			log.Printf("[router] entity lifecycle error for %s: %v", *evt.EntityID, err)
 		}
@@ -151,7 +167,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 
 	// Step 4: Closed-entity guard — late events on already-closed entities
 	// are recorded (step 1) but don't spawn tasks.
-	entity, err := r.entities.GetSystem(context.Background(), runmode.LocalDefaultOrgID, entityID)
+	entity, err := r.entities.GetSystem(context.Background(), orgID, entityID)
 	if err != nil || entity == nil {
 		log.Printf("[router] failed to load entity %s: %v", entityID, err)
 		return
@@ -164,7 +180,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	// that close stale tasks. They must fire even when no task_rules or
 	// triggers match the event, because close-signal events (ci_check_passed,
 	// review_submitted, review_request_removed) are not task-creating events.
-	if r.runInlineCloseChecks(evt, entityID) {
+	if r.runInlineCloseChecks(orgID, evt, entityID) {
 		r.ws.Broadcast(websocket.Event{Type: "tasks_updated", Data: map[string]any{}})
 	}
 
@@ -188,7 +204,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	// is skipped.
 	teamsToSkip := map[string]struct{}{}
 	if evt.EventType == domain.EventJiraIssueBecameAtomic {
-		active, err := r.tasks.FindActiveByEntitySystem(context.Background(), runmode.LocalDefaultOrg, entityID)
+		active, err := r.tasks.FindActiveByEntitySystem(context.Background(), orgID, entityID)
 		if err != nil {
 			log.Printf("[router] became_atomic: failed to check active tasks on entity %s: %v", entityID, err)
 			return
@@ -202,7 +218,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	// event type. One query, kind-discriminated locally — preserves the
 	// pre-SKY-259 rules-before-triggers order via the store's kind-ASC
 	// ORDER BY.
-	handlers, err := r.handlers.GetEnabledForEventSystem(context.Background(), runmode.LocalDefaultOrg, evt.EventType)
+	handlers, err := r.handlers.GetEnabledForEventSystem(context.Background(), orgID, evt.EventType)
 	if err != nil {
 		log.Printf("[router] failed to query event_handlers for %s: %v", evt.EventType, err)
 	}
@@ -302,22 +318,22 @@ func (r *Router) HandleEvent(evt domain.Event) {
 		if !evt.OccurredAt.IsZero() {
 			createdAt = evt.OccurredAt
 		}
-		task, created, err := r.tasks.FindOrCreateAtSystem(context.Background(), runmode.LocalDefaultOrg, teamID, entityID, evt.EventType, evt.DedupKey, evt.ID, defaultPriority, createdAt)
+		task, created, err := r.tasks.FindOrCreateAtSystem(context.Background(), orgID, teamID, entityID, evt.EventType, evt.DedupKey, evt.ID, defaultPriority, createdAt)
 		if err != nil {
 			log.Printf("[router] failed to find/create task for %s on entity %s (team %s): %v", evt.EventType, entityID, teamID, err)
 			continue
 		}
 
 		if created {
-			if err := r.tasks.RecordEventSystem(context.Background(), runmode.LocalDefaultOrg, task.ID, evt.ID, "spawned"); err != nil {
+			if err := r.tasks.RecordEventSystem(context.Background(), orgID, task.ID, evt.ID, "spawned"); err != nil {
 				log.Printf("[router] failed to record spawned task_event: %v", err)
 			}
 			log.Printf("[router] created task %s (%s) on entity %s (team %s)", task.ID, evt.EventType, entityID, teamID)
 		} else {
-			if err := r.tasks.BumpSystem(context.Background(), runmode.LocalDefaultOrg, task.ID, evt.ID); err != nil {
+			if err := r.tasks.BumpSystem(context.Background(), orgID, task.ID, evt.ID); err != nil {
 				log.Printf("[router] failed to bump task %s: %v", task.ID, err)
 			}
-			if err := r.tasks.RecordEventSystem(context.Background(), runmode.LocalDefaultOrg, task.ID, evt.ID, "bumped"); err != nil {
+			if err := r.tasks.RecordEventSystem(context.Background(), orgID, task.ID, evt.ID, "bumped"); err != nil {
 				log.Printf("[router] failed to record bumped task_event: %v", err)
 			}
 		}
@@ -351,7 +367,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 				if trigger.MinAutonomySuitability != nil && *trigger.MinAutonomySuitability > 0 {
 					continue // deferred to post-scoring handler
 				}
-				r.tryAutoDelegate(task, trigger, entityID, evt.ID)
+				r.tryAutoDelegate(orgID, task, trigger, entityID, evt.ID)
 			}
 		}
 	}
@@ -388,7 +404,7 @@ func handlerTeamID(h domain.EventHandler) string {
 // the gate is closed (active auto run, or older firings already queued
 // for FIFO fairness), the firing enqueues onto pending_firings instead of
 // being dropped silently.
-func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler, entityID string, triggeringEventID string) {
+func (r *Router) tryAutoDelegate(orgID string, task *domain.Task, trigger domain.EventHandler, entityID string, triggeringEventID string) {
 	// SKY-261 bot-disabled-team gate. If the task's team has the bot
 	// turned off in team_agents.enabled, the auto-trigger is a no-op
 	// — the task is already in the team queue (created by HandleEvent
@@ -402,7 +418,7 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 	// with auto-fire," which preserves the pre-SKY-261 behavior.
 	// Production server.New / main.go always passes both.
 	if r.teamAgents != nil && r.agents != nil {
-		a, err := r.agents.GetForOrgSystem(context.Background(), runmode.LocalDefaultOrg)
+		a, err := r.agents.GetForOrgSystem(context.Background(), orgID)
 		if err != nil {
 			log.Printf("[router] auto-trigger skipped: agent lookup: %v", err)
 			return
@@ -429,7 +445,7 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 		if teamID == "" {
 			teamID = runmode.LocalDefaultTeamID
 		}
-		ta, err := r.teamAgents.GetForTeamSystem(context.Background(), runmode.LocalDefaultOrg, teamID, a.ID)
+		ta, err := r.teamAgents.GetForTeamSystem(context.Background(), orgID, teamID, a.ID)
 		if err != nil {
 			log.Printf("[router] auto-trigger skipped on task %s: team_agents lookup: %v", task.ID, err)
 			return
@@ -443,7 +459,7 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 	// is nullable at the schema level (rule rows have NULL); kind='trigger'
 	// rows are guaranteed non-nil by the per-kind CHECK constraint.
 	breakerThreshold := derefIntDefault(trigger.BreakerThreshold, 0)
-	failures, err := r.tasks.CountConsecutiveFailedRunsSystem(context.Background(), runmode.LocalDefaultOrg, entityID, trigger.PromptID)
+	failures, err := r.tasks.CountConsecutiveFailedRunsSystem(context.Background(), orgID, entityID, trigger.PromptID)
 	if err != nil {
 		log.Printf("[router] breaker query error for entity %s prompt %s: %v", entityID, trigger.PromptID, err)
 		return
@@ -455,7 +471,7 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 		// generic message if the lookup fails since the breaker trip itself
 		// is the load-bearing signal. One toast per trip (happens rarely).
 		promptName := ""
-		if p, perr := r.prompts.GetSystem(context.Background(), runmode.LocalDefaultOrg, trigger.PromptID); perr == nil && p != nil {
+		if p, perr := r.prompts.GetSystem(context.Background(), orgID, trigger.PromptID); perr == nil && p != nil {
 			promptName = p.Name
 		}
 		if promptName == "" {
@@ -471,21 +487,26 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 	// AgentRunStore owns the runs-shaped predicate, PendingFiringsStore
 	// owns the queue-shaped one. canFire = neither side blocks.
 	gateCtx := context.Background()
-	hasActive, err := r.agentRuns.HasActiveAutoRunForEntitySystem(gateCtx, runmode.LocalDefaultOrg, entityID)
+	hasActive, err := r.agentRuns.HasActiveAutoRunForEntitySystem(gateCtx, orgID, entityID)
 	if err != nil {
 		log.Printf("[router] entity gate active-run query error for %s: %v", entityID, err)
 		return
 	}
 	hasPending := false
 	if !hasActive {
-		hasPending, err = r.firings.HasPendingForEntity(gateCtx, runmode.LocalDefaultOrg, entityID)
+		hasPending, err = r.firings.HasPendingForEntity(gateCtx, orgID, entityID)
 		if err != nil {
 			log.Printf("[router] entity gate pending query error for %s: %v", entityID, err)
 			return
 		}
 	}
 	if hasActive || hasPending {
-		inserted, err := r.firings.Enqueue(context.Background(), runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, entityID, task.ID, trigger.ID, triggeringEventID)
+		// System-actor firing rows have no human author. Empty user
+		// here lets the Postgres impl's COALESCE walk to the org-
+		// owner fallback (creator_user_id is NOT NULL but the table
+		// has no separate "actor" column); SQLite ignores the column
+		// entirely.
+		inserted, err := r.firings.Enqueue(context.Background(), orgID, "", entityID, task.ID, trigger.ID, triggeringEventID)
 		if err != nil {
 			log.Printf("[router] enqueue firing failed (entity %s task %s trigger %s): %v",
 				entityID, task.ID, trigger.ID, err)
@@ -501,7 +522,7 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 			// task. !inserted means a duplicate firing already in the
 			// queue — the original enqueue already stamped, no re-
 			// stamp needed.
-			r.stampAgentClaim(task)
+			r.stampAgentClaim(orgID, task)
 		} else {
 			log.Printf("[router] firing collapsed on entity %s (task %s, trigger %s) — duplicate already queued",
 				entityID, task.ID, trigger.ID)
@@ -509,7 +530,7 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 		return
 	}
 
-	if _, err := r.fireDelegate(task, trigger); err != nil {
+	if _, err := r.fireDelegate(orgID, task, trigger); err != nil {
 		log.Printf("[router] fire failed for task %s (trigger %s): %v", task.ID, trigger.ID, err)
 		return
 	}
@@ -518,7 +539,7 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 	// so a fireDelegate that fails + reverts to status='queued'
 	// doesn't leave a phantom bot claim on a task that's back in the
 	// human-triage queue.
-	r.stampAgentClaim(task)
+	r.stampAgentClaim(orgID, task)
 }
 
 // stampAgentClaim writes claimed_by_agent_id on a task using the org's
@@ -540,11 +561,11 @@ func (r *Router) tryAutoDelegate(task *domain.Task, trigger domain.EventHandler,
 // the human said "I'll handle this." Same-agent rewrites also
 // short-circuit here, avoiding redundant task_claimed broadcasts on
 // flows that call stampAgentClaim twice in quick succession.
-func (r *Router) stampAgentClaim(task *domain.Task) {
+func (r *Router) stampAgentClaim(orgID string, task *domain.Task) {
 	if r.agents == nil {
 		return
 	}
-	a, err := r.agents.GetForOrgSystem(context.Background(), runmode.LocalDefaultOrg)
+	a, err := r.agents.GetForOrgSystem(context.Background(), orgID)
 	if err != nil {
 		log.Printf("[router] agent lookup failed for task %s claim stamp: %v", task.ID, err)
 		return
@@ -552,7 +573,7 @@ func (r *Router) stampAgentClaim(task *domain.Task) {
 	if a == nil {
 		return
 	}
-	ok, err := r.tasks.StampAgentClaimIfUnclaimedSystem(context.Background(), runmode.LocalDefaultOrg, task.ID, a.ID)
+	ok, err := r.tasks.StampAgentClaimIfUnclaimedSystem(context.Background(), orgID, task.ID, a.ID)
 	if err != nil {
 		log.Printf("[router] failed to stamp agent claim on task %s: %v", task.ID, err)
 		return
@@ -586,7 +607,7 @@ func (r *Router) stampAgentClaim(task *domain.Task) {
 // fireDelegate transitions the task to delegated status, broadcasts the
 // change, then fires the spawner. Returns the run ID on success — used by
 // DrainEntity to record which run a queued firing materialized into.
-func (r *Router) fireDelegate(task *domain.Task, trigger domain.EventHandler) (string, error) {
+func (r *Router) fireDelegate(orgID string, task *domain.Task, trigger domain.EventHandler) (string, error) {
 	if r.spawner == nil {
 		return "", fmt.Errorf("spawner not configured")
 	}
@@ -604,7 +625,7 @@ func (r *Router) fireDelegate(task *domain.Task, trigger domain.EventHandler) (s
 		task.ID, trigger.ID, trigger.PromptID)
 
 	// Re-read task to get entity-joined display fields the spawner needs.
-	fresh, err := r.tasks.GetSystem(context.Background(), runmode.LocalDefaultOrg, task.ID)
+	fresh, err := r.tasks.GetSystem(context.Background(), orgID, task.ID)
 	if err != nil || fresh == nil {
 		if err != nil {
 			return "", fmt.Errorf("re-read task: %w", err)
@@ -613,7 +634,7 @@ func (r *Router) fireDelegate(task *domain.Task, trigger domain.EventHandler) (s
 	}
 
 	runID, err := r.spawner.Delegate(*fresh, delegate.DelegateOpts{
-		OrgID:            runmode.LocalDefaultOrg,
+		OrgID:            orgID,
 		ExplicitPromptID: trigger.PromptID,
 		TriggerType:      "event",
 		TriggerID:        trigger.ID,
@@ -641,7 +662,7 @@ func (r *Router) fireDelegate(task *domain.Task, trigger domain.EventHandler) (s
 // soft-deleted with a skip_reason and the loop continues. At most one
 // firing actually fires per drain — that run becomes the new in-flight
 // for the entity and gates further drains naturally.
-func (r *Router) DrainEntity(entityID string) {
+func (r *Router) DrainEntity(orgID, entityID string) {
 	// Serialize drains per entity. Without this, a fast-terminating run
 	// fired by an earlier drain can spawn a second DrainEntity goroutine
 	// that pops the same pending_firings row before the first drain
@@ -657,7 +678,7 @@ func (r *Router) DrainEntity(entityID string) {
 	defer mu.Unlock()
 
 	for {
-		firing, err := r.firings.PopForEntity(context.Background(), runmode.LocalDefaultOrg, entityID)
+		firing, err := r.firings.PopForEntity(context.Background(), orgID, entityID)
 		if err != nil {
 			log.Printf("[router] drain pop error for entity %s: %v", entityID, err)
 			return
@@ -666,7 +687,7 @@ func (r *Router) DrainEntity(entityID string) {
 			return // queue empty
 		}
 
-		runID, skipReason, transientErr := r.attemptDrainOne(firing)
+		runID, skipReason, transientErr := r.attemptDrainOne(orgID, firing)
 		if transientErr != nil {
 			// Transient failure (DB read, Delegate). Leave the firing in
 			// 'pending' state and bail the drain loop — marking
@@ -678,7 +699,7 @@ func (r *Router) DrainEntity(entityID string) {
 			return
 		}
 		if runID != "" {
-			if err := r.firings.MarkFired(context.Background(), runmode.LocalDefaultOrg, firing.ID, runID); err != nil {
+			if err := r.firings.MarkFired(context.Background(), orgID, firing.ID, runID); err != nil {
 				// Durability race: the run was created (side-effect
 				// committed inside the spawner goroutine) but the UPDATE
 				// that records the firing→run association failed. The
@@ -696,17 +717,17 @@ func (r *Router) DrainEntity(entityID string) {
 				log.Printf("[router] mark firing %d fired (run %s) failed: %v — rolling back: cancelling run + reverting task to queued",
 					firing.ID, runID, err)
 				if r.spawner != nil {
-					if cerr := r.spawner.Cancel(runmode.LocalDefaultOrg, runID, ""); cerr != nil {
+					if cerr := r.spawner.Cancel(orgID, runID, ""); cerr != nil {
 						log.Printf("[router] cancel run %s after mark-fired failure: %v — run may already be terminal, drain still triggers from its defer",
 							runID, cerr)
 					}
 				}
-				r.revertTaskStatus(firing.TaskID, "queued")
+				r.revertTaskStatus(orgID, firing.TaskID, "queued")
 			}
 			return // one fire per drain — the new run gates the rest
 		}
 		// Skipped or fire failed; record reason and continue draining.
-		if err := r.firings.MarkSkipped(context.Background(), runmode.LocalDefaultOrg, firing.ID, skipReason); err != nil {
+		if err := r.firings.MarkSkipped(context.Background(), orgID, firing.ID, skipReason); err != nil {
 			log.Printf("[router] mark firing %d skipped (%s): %v", firing.ID, skipReason, err)
 			return
 		}
@@ -740,23 +761,45 @@ func (r *Router) RunDrainSweeper(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ids, err := r.firings.ListEntitiesWithPending(ctx, runmode.LocalDefaultOrg)
+			// Per-org iteration mirrors the established poller /
+			// classifier pattern. In local mode this collapses to N=1
+			// over the sentinel org (the only row in orgs); in multi
+			// mode it fans across every active tenant. OrgsStore is
+			// a required NewRouter parameter — if it were nil the
+			// dereference below would panic, which is the right
+			// behavior for a wiring bug at startup.
+			orgIDs, err := r.orgs.ListActiveSystem(ctx)
 			if err != nil {
-				log.Printf("[router] drain sweeper: list error: %v", err)
+				log.Printf("[router] drain sweeper: list orgs error: %v", err)
 				continue
 			}
-			for _, eid := range ids {
-				active, err := r.agentRuns.HasActiveAutoRunForEntitySystem(ctx, runmode.LocalDefaultOrg, eid)
-				if err != nil {
-					log.Printf("[router] drain sweeper: active-check error for %s: %v", eid, err)
-					continue
-				}
-				if active {
-					continue
-				}
-				r.DrainEntity(eid)
+			for _, orgID := range orgIDs {
+				r.sweepOrg(ctx, orgID)
 			}
 		}
+	}
+}
+
+// sweepOrg drains every entity in a single org that has at least one
+// pending firing. Factored out of RunDrainSweeper so the per-org loop
+// reads as one statement and per-org errors don't bail the whole
+// cycle.
+func (r *Router) sweepOrg(ctx context.Context, orgID string) {
+	ids, err := r.firings.ListEntitiesWithPending(ctx, orgID)
+	if err != nil {
+		log.Printf("[router] drain sweeper: list error for org %s: %v", orgID, err)
+		return
+	}
+	for _, eid := range ids {
+		active, err := r.agentRuns.HasActiveAutoRunForEntitySystem(ctx, orgID, eid)
+		if err != nil {
+			log.Printf("[router] drain sweeper: active-check error for %s (org %s): %v", eid, orgID, err)
+			continue
+		}
+		if active {
+			continue
+		}
+		r.DrainEntity(orgID, eid)
 	}
 }
 
@@ -785,8 +828,8 @@ func (r *Router) RunDrainSweeper(ctx context.Context, interval time.Duration) {
 // intent is still valid and worth retrying. The breaker handles the
 // "actually broken, repeated failure" case via run-level failure counts —
 // but only once we've started enough runs to trip it. Until then, retry.
-func (r *Router) attemptDrainOne(firing *domain.PendingFiring) (runID, skipReason string, transientErr error) {
-	task, err := r.tasks.GetSystem(context.Background(), runmode.LocalDefaultOrg, firing.TaskID)
+func (r *Router) attemptDrainOne(orgID string, firing *domain.PendingFiring) (runID, skipReason string, transientErr error) {
+	task, err := r.tasks.GetSystem(context.Background(), orgID, firing.TaskID)
 	if err != nil {
 		return "", "", fmt.Errorf("task lookup: %w", err)
 	}
@@ -813,7 +856,7 @@ func (r *Router) attemptDrainOne(firing *domain.PendingFiring) (runID, skipReaso
 		return "", domain.PendingFiringSkipClaimChanged, nil
 	}
 
-	trigger, err := r.handlers.GetSystem(context.Background(), runmode.LocalDefaultOrg, firing.TriggerID)
+	trigger, err := r.handlers.GetSystem(context.Background(), orgID, firing.TriggerID)
 	if err != nil {
 		return "", "", fmt.Errorf("trigger lookup: %w", err)
 	}
@@ -822,7 +865,7 @@ func (r *Router) attemptDrainOne(firing *domain.PendingFiring) (runID, skipReaso
 	}
 
 	breakerThreshold := derefIntDefault(trigger.BreakerThreshold, 0)
-	failures, err := r.tasks.CountConsecutiveFailedRunsSystem(context.Background(), runmode.LocalDefaultOrg, firing.EntityID, trigger.PromptID)
+	failures, err := r.tasks.CountConsecutiveFailedRunsSystem(context.Background(), orgID, firing.EntityID, trigger.PromptID)
 	if err != nil {
 		return "", "", fmt.Errorf("breaker query: %w", err)
 	}
@@ -830,7 +873,7 @@ func (r *Router) attemptDrainOne(firing *domain.PendingFiring) (runID, skipReaso
 		return "", domain.PendingFiringSkipBreakerTripped, nil
 	}
 
-	id, err := r.fireDelegate(task, *trigger)
+	id, err := r.fireDelegate(orgID, task, *trigger)
 	if err != nil {
 		return "", "", fmt.Errorf("fire delegate: %w", err)
 	}
@@ -857,8 +900,8 @@ func (r *Router) attemptDrainOne(firing *domain.PendingFiring) (runID, skipReaso
 // Code paths that DO want to release the claim (user requeue, task
 // completion, swipe-undo) clear the claim cols on their own — they
 // don't go through this helper.
-func (r *Router) revertTaskStatus(taskID, status string) {
-	if err := r.tasks.SetStatusSystem(context.Background(), runmode.LocalDefaultOrg, taskID, status); err != nil {
+func (r *Router) revertTaskStatus(orgID, taskID, status string) {
+	if err := r.tasks.SetStatusSystem(context.Background(), orgID, taskID, status); err != nil {
 		log.Printf("[router] failed to revert task %s to %s: %v", taskID, status, err)
 		return
 	}
@@ -873,8 +916,10 @@ func (r *Router) revertTaskStatus(taskID, status string) {
 // ReDeriveAfterScoring re-checks deferred triggers for tasks that just
 // received AI scores. Triggers with MinAutonomySuitability > 0 are skipped
 // during HandleEvent and deferred to this callback, which fires from the
-// scorer's OnScoringCompleted hook.
-func (r *Router) ReDeriveAfterScoring(taskIDs []string) {
+// scorer's OnScoringCompleted hook. orgID is the scoring context — the
+// scorer batches per-org so every task in the slice belongs to the same
+// tenant.
+func (r *Router) ReDeriveAfterScoring(orgID string, taskIDs []string) {
 	// Global kill switch — same gate as HandleEvent step 9.
 	cfg, err := config.Load()
 	if err != nil || !cfg.AI.AutoDelegateEnabled {
@@ -882,12 +927,12 @@ func (r *Router) ReDeriveAfterScoring(taskIDs []string) {
 	}
 
 	for _, taskID := range taskIDs {
-		r.reDeriveTask(taskID)
+		r.reDeriveTask(orgID, taskID)
 	}
 }
 
-func (r *Router) reDeriveTask(taskID string) {
-	task, err := r.tasks.GetSystem(context.Background(), runmode.LocalDefaultOrg, taskID)
+func (r *Router) reDeriveTask(orgID, taskID string) {
+	task, err := r.tasks.GetSystem(context.Background(), orgID, taskID)
 	if err != nil || task == nil {
 		return
 	}
@@ -927,14 +972,14 @@ func (r *Router) reDeriveTask(taskID string) {
 
 	// Fetch handlers for this event type — same call HandleEvent uses,
 	// kind-discriminated here.
-	handlers, err := r.handlers.GetEnabledForEventSystem(context.Background(), runmode.LocalDefaultOrg, task.EventType)
+	handlers, err := r.handlers.GetEnabledForEventSystem(context.Background(), orgID, task.EventType)
 	if err != nil {
 		log.Printf("[router] re-derive: failed to query event_handlers for %s: %v", task.EventType, err)
 		return
 	}
 
 	// Fetch the primary event's metadata for predicate matching.
-	metadata, err := r.events.GetMetadataSystem(context.Background(), runmode.LocalDefaultOrgID, task.PrimaryEventID)
+	metadata, err := r.events.GetMetadataSystem(context.Background(), orgID, task.PrimaryEventID)
 	if err != nil {
 		log.Printf("[router] re-derive: failed to fetch event metadata for %s: %v", task.PrimaryEventID, err)
 		return
@@ -989,7 +1034,7 @@ func (r *Router) reDeriveTask(taskID string) {
 		// event — that's the one whose match scored autonomously above
 		// threshold. Real-event provenance keeps the audit trail honest
 		// when a re-derived firing ends up enqueued.
-		r.tryAutoDelegate(task, trigger, task.EntityID, task.PrimaryEventID)
+		r.tryAutoDelegate(orgID, task, trigger, task.EntityID, task.PrimaryEventID)
 	}
 }
 
@@ -1022,17 +1067,17 @@ func derefFloatDefault(p *float64, def float64) float64 {
 // lookup and the cancel call — the run ends up terminal either way and
 // the task close will still land. Cancellation itself is fire-and-forget;
 // the spawner's handleCancelled writes the cancelled status asynchronously.
-func (r *Router) cancelActiveRunsForTask(taskID string) {
+func (r *Router) cancelActiveRunsForTask(orgID, taskID string) {
 	if r.spawner == nil {
 		return
 	}
-	ids, err := r.agentRuns.ActiveIDsForTaskSystem(context.Background(), runmode.LocalDefaultOrg, taskID)
+	ids, err := r.agentRuns.ActiveIDsForTaskSystem(context.Background(), orgID, taskID)
 	if err != nil {
 		log.Printf("[router] active-run lookup for task %s failed: %v", taskID, err)
 		return
 	}
 	for _, id := range ids {
-		if err := r.spawner.Cancel(runmode.LocalDefaultOrg, id, ""); err != nil {
+		if err := r.spawner.Cancel(orgID, id, ""); err != nil {
 			log.Printf("[router] cancel run %s on close of task %s: %v", id, taskID, err)
 		}
 	}
@@ -1047,8 +1092,8 @@ func (r *Router) cancelActiveRunsForTask(taskID string) {
 // runs off a context done channel) but the task row is authoritative —
 // subsequent callers see 'done' immediately, and the run lands on
 // 'cancelled' when its goroutine unwinds.
-func (r *Router) closeEntity(entityID string) (int, error) {
-	if tasks, err := r.tasks.FindActiveByEntitySystem(context.Background(), runmode.LocalDefaultOrg, entityID); err != nil {
+func (r *Router) closeEntity(orgID, entityID string) (int, error) {
+	if tasks, err := r.tasks.FindActiveByEntitySystem(context.Background(), orgID, entityID); err != nil {
 		// Non-fatal: better to cascade-close the entity than to abort
 		// because we couldn't enumerate tasks for cancellation. Any
 		// orphaned runs can be cleaned up by the existing startup
@@ -1056,14 +1101,14 @@ func (r *Router) closeEntity(entityID string) (int, error) {
 		log.Printf("[router] entity close: list active tasks for %s failed: %v", entityID, err)
 	} else {
 		for _, t := range tasks {
-			r.cancelActiveRunsForTask(t.ID)
+			r.cancelActiveRunsForTask(orgID, t.ID)
 		}
 	}
 
-	if err := r.entities.CloseSystem(context.Background(), runmode.LocalDefaultOrgID, entityID); err != nil {
+	if err := r.entities.CloseSystem(context.Background(), orgID, entityID); err != nil {
 		return 0, err
 	}
-	closed, err := r.tasks.CloseAllForEntitySystem(context.Background(), runmode.LocalDefaultOrg, entityID, "entity_closed")
+	closed, err := r.tasks.CloseAllForEntitySystem(context.Background(), orgID, entityID, "entity_closed")
 	if err != nil {
 		return closed, err
 	}
@@ -1082,38 +1127,38 @@ func (r *Router) closeEntity(entityID string) (int, error) {
 // from it. Without the cancel, an inline close check that closes a task
 // mid-run would leave the agent churning on work the system already
 // considers resolved.
-func (r *Router) closeTaskWithAudit(taskID, closingEventID, closeReason, closeEventType string) error {
-	r.cancelActiveRunsForTask(taskID)
-	if err := r.tasks.CloseSystem(context.Background(), runmode.LocalDefaultOrg, taskID, closeReason, closeEventType); err != nil {
+func (r *Router) closeTaskWithAudit(orgID, taskID, closingEventID, closeReason, closeEventType string) error {
+	r.cancelActiveRunsForTask(orgID, taskID)
+	if err := r.tasks.CloseSystem(context.Background(), orgID, taskID, closeReason, closeEventType); err != nil {
 		return err
 	}
 	if closingEventID != "" {
-		_ = r.tasks.RecordEventSystem(context.Background(), runmode.LocalDefaultOrg, taskID, closingEventID, "closed")
+		_ = r.tasks.RecordEventSystem(context.Background(), orgID, taskID, closingEventID, "closed")
 	}
 	return nil
 }
 
-func (r *Router) runInlineCloseChecks(evt domain.Event, entityID string) bool {
+func (r *Router) runInlineCloseChecks(orgID string, evt domain.Event, entityID string) bool {
 	switch evt.EventType {
 	case domain.EventGitHubPRCICheckPassed:
-		return r.closeCheckCIPassed(evt, entityID)
+		return r.closeCheckCIPassed(orgID, evt, entityID)
 	case domain.EventGitHubPRReviewApproved,
 		domain.EventGitHubPRReviewCommented,
 		domain.EventGitHubPRReviewDismissed:
-		return r.closeCheckReviewResolved(evt, entityID)
+		return r.closeCheckReviewResolved(orgID, evt, entityID)
 	case domain.EventGitHubPRReviewSubmitted:
-		return r.closeCheckReviewSubmitted(evt, entityID)
+		return r.closeCheckReviewSubmitted(orgID, evt, entityID)
 	case domain.EventGitHubPRReviewRequestRemoved:
-		return r.closeCheckReviewRequestRemoved(evt, entityID)
+		return r.closeCheckReviewRequestRemoved(orgID, evt, entityID)
 	case domain.EventJiraIssueAssigned:
-		return r.closeCheckJiraReassigned(evt, entityID)
+		return r.closeCheckJiraReassigned(orgID, evt, entityID)
 	}
 	return false
 }
 
 // closeCheckCIPassed: if no failing check-runs remain on this entity at the
 // latest SHA, close active ci_check_failed tasks.
-func (r *Router) closeCheckCIPassed(evt domain.Event, entityID string) bool {
+func (r *Router) closeCheckCIPassed(orgID string, evt domain.Event, entityID string) bool {
 	// Parse metadata to get head_sha.
 	var meta events.GitHubPRCICheckPassedMetadata
 	if err := json.Unmarshal([]byte(evt.MetadataJSON), &meta); err != nil {
@@ -1121,13 +1166,13 @@ func (r *Router) closeCheckCIPassed(evt domain.Event, entityID string) bool {
 	}
 
 	// Query: any active ci_check_failed tasks still open on this entity?
-	failedTasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), runmode.LocalDefaultOrg, entityID, domain.EventGitHubPRCICheckFailed)
+	failedTasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), orgID, entityID, domain.EventGitHubPRCICheckFailed)
 	if err != nil || len(failedTasks) == 0 {
 		return false
 	}
 
 	// Check entity snapshot for remaining failures at the current SHA.
-	entity, err := r.entities.GetSystem(context.Background(), runmode.LocalDefaultOrgID, entityID)
+	entity, err := r.entities.GetSystem(context.Background(), orgID, entityID)
 	if err != nil || entity == nil {
 		return false
 	}
@@ -1146,7 +1191,7 @@ func (r *Router) closeCheckCIPassed(evt domain.Event, entityID string) bool {
 	// All green — close the failure tasks.
 	closed := false
 	for _, t := range failedTasks {
-		if err := r.closeTaskWithAudit(t.ID, evt.ID, "auto_closed_by_event", domain.EventGitHubPRCICheckPassed); err != nil {
+		if err := r.closeTaskWithAudit(orgID, t.ID, evt.ID, "auto_closed_by_event", domain.EventGitHubPRCICheckPassed); err != nil {
 			log.Printf("[router] failed to close ci_check_failed task %s: %v", t.ID, err)
 		} else {
 			log.Printf("[router] inline-closed task %s (ci_check_failed → ci_check_passed)", t.ID)
@@ -1159,7 +1204,7 @@ func (r *Router) closeCheckCIPassed(evt domain.Event, entityID string) bool {
 // closeCheckReviewResolved: if the reviewer's prior state was
 // changes_requested and no other reviewer still has outstanding
 // changes_requested, close active review_changes_requested tasks.
-func (r *Router) closeCheckReviewResolved(evt domain.Event, entityID string) bool {
+func (r *Router) closeCheckReviewResolved(orgID string, evt domain.Event, entityID string) bool {
 	// We need to know which reviewer just changed state. Parse metadata.
 	var reviewer string
 	switch evt.EventType {
@@ -1188,7 +1233,7 @@ func (r *Router) closeCheckReviewResolved(evt domain.Event, entityID string) boo
 
 	// Check entity snapshot: does this reviewer's prior state include
 	// changes_requested, and is no other reviewer still requesting changes?
-	entity, err := r.entities.GetSystem(context.Background(), runmode.LocalDefaultOrgID, entityID)
+	entity, err := r.entities.GetSystem(context.Background(), orgID, entityID)
 	if err != nil || entity == nil {
 		return false
 	}
@@ -1209,13 +1254,13 @@ func (r *Router) closeCheckReviewResolved(evt domain.Event, entityID string) boo
 	}
 
 	// Close review_changes_requested tasks on this entity.
-	tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), runmode.LocalDefaultOrg, entityID, domain.EventGitHubPRReviewChangesRequested)
+	tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), orgID, entityID, domain.EventGitHubPRReviewChangesRequested)
 	if err != nil {
 		return false
 	}
 	closed := false
 	for _, t := range tasks {
-		if err := r.closeTaskWithAudit(t.ID, evt.ID, "auto_closed_by_event", evt.EventType); err != nil {
+		if err := r.closeTaskWithAudit(orgID, t.ID, evt.ID, "auto_closed_by_event", evt.EventType); err != nil {
 			log.Printf("[router] failed to close changes_requested task %s: %v", t.ID, err)
 		} else {
 			log.Printf("[router] inline-closed task %s (review resolved by %s)", t.ID, reviewer)
@@ -1232,19 +1277,19 @@ func (r *Router) closeCheckReviewResolved(evt domain.Event, entityID string) boo
 // reviewer (see diff.go's reviewerIsSelf gate), so by construction any
 // review_submitted event we see here is a self-review — no defensive
 // check needed.
-func (r *Router) closeCheckReviewSubmitted(evt domain.Event, entityID string) bool {
+func (r *Router) closeCheckReviewSubmitted(orgID string, evt domain.Event, entityID string) bool {
 	var meta events.GitHubPRReviewSubmittedMetadata
 	if err := json.Unmarshal([]byte(evt.MetadataJSON), &meta); err != nil {
 		return false
 	}
 
-	tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), runmode.LocalDefaultOrg, entityID, domain.EventGitHubPRReviewRequested)
+	tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), orgID, entityID, domain.EventGitHubPRReviewRequested)
 	if err != nil {
 		return false
 	}
 	closed := false
 	for _, t := range tasks {
-		if err := r.closeTaskWithAudit(t.ID, evt.ID, "auto_closed_by_event", domain.EventGitHubPRReviewSubmitted); err != nil {
+		if err := r.closeTaskWithAudit(orgID, t.ID, evt.ID, "auto_closed_by_event", domain.EventGitHubPRReviewSubmitted); err != nil {
 			log.Printf("[router] failed to close review_requested task %s: %v", t.ID, err)
 		} else {
 			log.Printf("[router] inline-closed task %s (review submitted by self)", t.ID)
@@ -1257,14 +1302,14 @@ func (r *Router) closeCheckReviewSubmitted(evt domain.Event, entityID string) bo
 // closeCheckReviewRequestRemoved: user was removed from the PR's requested-
 // reviewers list (reviewed or request rescinded). Close any active
 // review_requested task on this entity.
-func (r *Router) closeCheckReviewRequestRemoved(evt domain.Event, entityID string) bool {
-	tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), runmode.LocalDefaultOrg, entityID, domain.EventGitHubPRReviewRequested)
+func (r *Router) closeCheckReviewRequestRemoved(orgID string, evt domain.Event, entityID string) bool {
+	tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), orgID, entityID, domain.EventGitHubPRReviewRequested)
 	if err != nil {
 		return false
 	}
 	closed := false
 	for _, t := range tasks {
-		if err := r.closeTaskWithAudit(t.ID, evt.ID, "auto_closed_by_event", domain.EventGitHubPRReviewRequestRemoved); err != nil {
+		if err := r.closeTaskWithAudit(orgID, t.ID, evt.ID, "auto_closed_by_event", domain.EventGitHubPRReviewRequestRemoved); err != nil {
 			log.Printf("[router] failed to close review_requested task %s: %v", t.ID, err)
 		} else {
 			log.Printf("[router] inline-closed task %s (review request removed)", t.ID)
@@ -1279,12 +1324,20 @@ func (r *Router) closeCheckReviewRequestRemoved(evt domain.Event, entityID strin
 // tasks on this entity. "Self" here is the local user's jira_account_id;
 // in multi mode the inline close still over-closes acceptably (the next
 // poll reopens via discovery for any other user the assignment landed on).
-func (r *Router) closeCheckJiraReassigned(evt domain.Event, entityID string) bool {
+func (r *Router) closeCheckJiraReassigned(orgID string, evt domain.Event, entityID string) bool {
 	var meta events.JiraIssueAssignedMetadata
 	if err := json.Unmarshal([]byte(evt.MetadataJSON), &meta); err != nil {
 		return false
 	}
 	if r.users != nil {
+		// TODO(SKY-XXX-future): in multi-mode there is no single "the
+		// user" whose Jira identity counts for this inline close
+		// check — the router serves all org members. The current
+		// sentinel-keyed read keeps local-mode behavior intact and
+		// over-closes in multi-mode (acceptable: a still-assigned
+		// member's next poll reopens via discovery). Resolving this
+		// needs a product decision about team-membership-driven
+		// semantics, tracked separately from D9-core.
 		localAccountID, localDisplayName, err := r.users.GetJiraIdentitySystem(context.Background(), runmode.LocalDefaultUserID)
 		if err == nil {
 			if meta.AssigneeAccountID != "" && localAccountID != "" && strings.EqualFold(meta.AssigneeAccountID, localAccountID) {
@@ -1302,12 +1355,12 @@ func (r *Router) closeCheckJiraReassigned(evt domain.Event, entityID string) boo
 	// Close active assigned tasks.
 	closed := false
 	for _, eventType := range []string{domain.EventJiraIssueAssigned, domain.EventJiraIssueAvailable} {
-		tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), runmode.LocalDefaultOrg, entityID, eventType)
+		tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), orgID, entityID, eventType)
 		if err != nil {
 			continue
 		}
 		for _, t := range tasks {
-			if err := r.closeTaskWithAudit(t.ID, evt.ID, "auto_closed_by_event", domain.EventJiraIssueAssigned); err != nil {
+			if err := r.closeTaskWithAudit(orgID, t.ID, evt.ID, "auto_closed_by_event", domain.EventJiraIssueAssigned); err != nil {
 				log.Printf("[router] failed to close %s task %s: %v", eventType, t.ID, err)
 			} else {
 				log.Printf("[router] inline-closed task %s (jira reassigned away)", t.ID)

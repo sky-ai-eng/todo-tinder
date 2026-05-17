@@ -12,9 +12,14 @@ import (
 // fakeDrainer captures DrainEntity invocations so tests can assert
 // the spawner's terminal-state hooks fire correctly. Synchronized
 // because notifyDrainer dispatches the call in a goroutine.
+type drainCall struct {
+	orgID    string
+	entityID string
+}
+
 type fakeDrainer struct {
 	mu     sync.Mutex
-	calls  []string
+	calls  []drainCall
 	called chan struct{}
 }
 
@@ -22,9 +27,9 @@ func newFakeDrainer() *fakeDrainer {
 	return &fakeDrainer{called: make(chan struct{}, 8)}
 }
 
-func (f *fakeDrainer) DrainEntity(entityID string) {
+func (f *fakeDrainer) DrainEntity(orgID, entityID string) {
 	f.mu.Lock()
-	f.calls = append(f.calls, entityID)
+	f.calls = append(f.calls, drainCall{orgID: orgID, entityID: entityID})
 	f.mu.Unlock()
 	select {
 	case f.called <- struct{}{}:
@@ -32,10 +37,10 @@ func (f *fakeDrainer) DrainEntity(entityID string) {
 	}
 }
 
-func (f *fakeDrainer) callsCopy() []string {
+func (f *fakeDrainer) callsCopy() []drainCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]string, len(f.calls))
+	out := make([]drainCall, len(f.calls))
 	copy(out, f.calls)
 	return out
 }
@@ -71,8 +76,11 @@ func TestCancel_AwaitingInputAutoRun_DrainsQueue(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 drain call, got %d (%v)", len(calls), calls)
 	}
-	if calls[0] == "" {
+	if calls[0].entityID == "" {
 		t.Errorf("DrainEntity called with empty entityID")
+	}
+	if calls[0].orgID != runmode.LocalDefaultOrg {
+		t.Errorf("DrainEntity orgID = %q, want %q", calls[0].orgID, runmode.LocalDefaultOrg)
 	}
 }
 
