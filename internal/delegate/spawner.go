@@ -33,9 +33,11 @@ func shortRunID(runID string) string {
 // firing queue that an auto run has reached a terminal state and the
 // entity may be ready to drain its next pending firing. Implemented by
 // the routing.Router. Manual runs do not call this — manual is fully
-// decoupled from the queue per the SKY-189 design.
+// decoupled from the queue per the SKY-189 design. orgID scopes the
+// drain to the run's tenant so multi-mode lookups hit the right
+// pending_firings rows.
 type QueueDrainer interface {
-	DrainEntity(entityID string)
+	DrainEntity(orgID, entityID string)
 }
 
 // Spawner manages delegated agent runs.
@@ -172,7 +174,7 @@ func (s *Spawner) awaitClassification(ctx context.Context, entityID string) {
 // Manual runs are fully decoupled from the queue per SKY-189 — they
 // neither participate in the gate nor trigger drains. Runs in goroutine
 // to keep run-teardown latency unaffected.
-func (s *Spawner) notifyDrainer(triggerType, entityID string) {
+func (s *Spawner) notifyDrainer(orgID, triggerType, entityID string) {
 	if triggerType == "manual" || entityID == "" {
 		return
 	}
@@ -182,7 +184,7 @@ func (s *Spawner) notifyDrainer(triggerType, entityID string) {
 	if d == nil {
 		return
 	}
-	go d.DrainEntity(entityID)
+	go d.DrainEntity(orgID, entityID)
 }
 
 // UpdateCredentials hot-swaps the GitHub client and model without

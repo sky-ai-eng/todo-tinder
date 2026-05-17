@@ -70,7 +70,7 @@ func TestHandleEvent_MultipleTeams_FansOut(t *testing.T) {
 	}
 	metaJSON, _ := json.Marshal(meta)
 
-	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, nil, noopScorer{}, websocket.NewHub())
+	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, sqlitestore.New(database).Orgs, nil, noopScorer{}, websocket.NewHub())
 
 	router.HandleEvent(domain.Event{
 		EventType:    domain.EventGitHubPRCICheckFailed,
@@ -78,6 +78,7 @@ func TestHandleEvent_MultipleTeams_FansOut(t *testing.T) {
 		DedupKey:     "build",
 		MetadataJSON: string(metaJSON),
 		CreatedAt:    time.Now(),
+		OrgID:        runmode.LocalDefaultOrg,
 	})
 
 	active, err := testTaskStore(database).FindActiveByEntity(t.Context(), runmode.LocalDefaultOrg, entity.ID)
@@ -124,13 +125,14 @@ func TestHandleEvent_BackfillCreatedAt_PreservesOccurredAt(t *testing.T) {
 	}
 	metaJSON, _ := json.Marshal(meta)
 
-	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, nil, noopScorer{}, websocket.NewHub())
+	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, sqlitestore.New(database).Orgs, nil, noopScorer{}, websocket.NewHub())
 
 	router.HandleEvent(domain.Event{
 		EventType:    domain.EventGitHubPRReviewRequested,
 		EntityID:     &entity.ID,
 		MetadataJSON: string(metaJSON),
 		OccurredAt:   occurred,
+		OrgID:        runmode.LocalDefaultOrg,
 	})
 
 	active, err := testTaskStore(database).FindActiveByEntity(t.Context(), runmode.LocalDefaultOrg, entity.ID)
@@ -167,13 +169,14 @@ func TestHandleEvent_NoOccurredAt_FallsBackToNow(t *testing.T) {
 	metaJSON, _ := json.Marshal(meta)
 
 	before := time.Now()
-	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, nil, noopScorer{}, websocket.NewHub())
+	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, sqlitestore.New(database).Orgs, nil, noopScorer{}, websocket.NewHub())
 	router.HandleEvent(domain.Event{
 		EventType:    domain.EventGitHubPRCICheckFailed,
 		EntityID:     &entity.ID,
 		DedupKey:     "build",
 		MetadataJSON: string(metaJSON),
 		// OccurredAt deliberately zero.
+		OrgID: runmode.LocalDefaultOrg,
 	})
 
 	active, err := testTaskStore(database).FindActiveByEntity(t.Context(), runmode.LocalDefaultOrg, entity.ID)
@@ -247,11 +250,12 @@ func TestHandleEvent_BecameAtomic_PerTeam(t *testing.T) {
 	}
 	atomicJSON, _ := json.Marshal(atomicMeta)
 
-	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, nil, noopScorer{}, websocket.NewHub())
+	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, sqlitestore.New(database).Orgs, nil, noopScorer{}, websocket.NewHub())
 	router.HandleEvent(domain.Event{
 		EventType:    domain.EventJiraIssueBecameAtomic,
 		EntityID:     &entity.ID,
 		MetadataJSON: string(atomicJSON),
+		OrgID:        runmode.LocalDefaultOrg,
 	})
 
 	active, err := testTaskStore(database).FindActiveByEntity(t.Context(), runmode.LocalDefaultOrg, entity.ID)
@@ -356,14 +360,14 @@ func TestTryAutoDelegate_PerTeamBotGate(t *testing.T) {
 	createTriggerForTestRouting(t, database, trigger)
 
 	stub := &stubDelegator{db: database}
-	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), stores.Agents, stores.TeamAgents, nil, testTaskStore(database), stores.AgentRuns, stores.Entities, stores.PendingFirings, stores.Events, stub, noopScorer{}, websocket.NewHub())
+	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), stores.Agents, stores.TeamAgents, nil, testTaskStore(database), stores.AgentRuns, stores.Entities, stores.PendingFirings, stores.Events, stores.Orgs, stub, noopScorer{}, websocket.NewHub())
 
 	// Direct calls bypass the (config-gated) HandleEvent step 9 to
 	// keep the assertion focused on tryAutoDelegate's gate. The
 	// HandleEvent step-9 wrapper just iterates and dispatches; the
 	// gate logic itself is what we need to pin.
-	router.tryAutoDelegate(taskA, trigger, entity.ID, eventID)
-	router.tryAutoDelegate(taskB, trigger, entity.ID, eventID)
+	router.tryAutoDelegate(runmode.LocalDefaultOrg, taskA, trigger, entity.ID, eventID)
+	router.tryAutoDelegate(runmode.LocalDefaultOrg, taskB, trigger, entity.ID, eventID)
 
 	// Team A's task should have been delegated; team B's task should
 	// have been blocked by the bot-disabled-for-team gate. With the
@@ -407,7 +411,7 @@ func TestHandleEvent_SingleTeam_OneTask(t *testing.T) {
 	}
 	metaJSON, _ := json.Marshal(meta)
 
-	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, nil, noopScorer{}, websocket.NewHub())
+	router := NewRouter(testPromptStore(database), testEventHandlerStore(database), nil, nil, nil, testTaskStore(database), sqlitestore.New(database).AgentRuns, sqlitestore.New(database).Entities, sqlitestore.New(database).PendingFirings, sqlitestore.New(database).Events, sqlitestore.New(database).Orgs, nil, noopScorer{}, websocket.NewHub())
 
 	router.HandleEvent(domain.Event{
 		EventType:    domain.EventGitHubPRCICheckFailed,
@@ -415,6 +419,7 @@ func TestHandleEvent_SingleTeam_OneTask(t *testing.T) {
 		DedupKey:     "build",
 		MetadataJSON: string(metaJSON),
 		CreatedAt:    time.Now(),
+		OrgID:        runmode.LocalDefaultOrg,
 	})
 
 	active, err := testTaskStore(database).FindActiveByEntity(t.Context(), runmode.LocalDefaultOrg, entity.ID)

@@ -254,7 +254,7 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 			// this defer runs unconditionally on goroutine exit.
 			// notifyDrainer itself filters out manual runs — manual
 			// is decoupled from the queue per SKY-189.
-			s.notifyDrainer(triggerType, task.EntityID)
+			s.notifyDrainer(orgID, triggerType, task.EntityID)
 		}()
 
 		// Phase 1: set up worktree + build config based on task source

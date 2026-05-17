@@ -573,7 +573,7 @@ func main() {
 				Data: map[string]any{"task_ids": taskIDs},
 			})
 		},
-		OnScoringCompleted: func(taskIDs []string) {
+		OnScoringCompleted: func(orgID string, taskIDs []string) {
 			wsHub.Broadcast(websocket.Event{
 				Type: "scoring_completed",
 				Data: map[string]any{"task_ids": taskIDs},
@@ -583,7 +583,7 @@ func main() {
 			// Runs async so it doesn't block the scorer from clearing its
 			// running flag and handling subsequent Trigger() calls.
 			if eventRouter != nil {
-				go eventRouter.ReDeriveAfterScoring(taskIDs)
+				go eventRouter.ReDeriveAfterScoring(orgID, taskIDs)
 			}
 		},
 		OnTasksSkipped: func(skipped, total int) {
@@ -703,7 +703,7 @@ func main() {
 	// Event router — records events, creates/bumps tasks, auto-delegates on
 	// matching triggers, runs inline close checks. Also handles post-scoring
 	// re-derive via the scorer callback wired above.
-	eventRouter = routing.NewRouter(stores.Prompts, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Tasks, stores.AgentRuns, stores.Entities, stores.PendingFirings, stores.Events, spawner, scorer, wsHub)
+	eventRouter = routing.NewRouter(stores.Prompts, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Tasks, stores.AgentRuns, stores.Entities, stores.PendingFirings, stores.Events, stores.Orgs, spawner, scorer, wsHub)
 	// System-service profile (D9a): the router branches on evt.OrgID
 	// itself when persisting and fanning out — every event flows here
 	// regardless of tenant. Multi-mode handlers thread the orgID into

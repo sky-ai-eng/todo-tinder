@@ -13,8 +13,14 @@ import (
 // RunnerCallbacks are optional hooks fired during the scoring lifecycle.
 // The caller wires these to WS broadcasts or other side effects.
 type RunnerCallbacks struct {
-	OnScoringStarted   func(taskIDs []string)
-	OnScoringCompleted func(taskIDs []string)
+	OnScoringStarted func(taskIDs []string)
+	// OnScoringCompleted fires once per scoring cycle after the
+	// task_scores writes commit. orgID is the scoring context (the
+	// runner is per-org); the slice is the set of task IDs that
+	// received fresh scores. Downstream re-derive needs orgID
+	// threaded so its store calls hit the right tenant in multi
+	// mode (every task in the slice belongs to orgID by construction).
+	OnScoringCompleted func(orgID string, taskIDs []string)
 	// OnTasksSkipped fires once per scoring cycle if one or more batches
 	// errored. skipped is the exact count of tasks that weren't scored;
 	// total is len(tasks) at cycle start. Wired to a warning toast in main
@@ -226,6 +232,6 @@ func (r *Runner) run(ctx context.Context) {
 	log.Printf("[ai] scored %d tasks successfully", len(updates))
 
 	if r.callbacks.OnScoringCompleted != nil {
-		r.callbacks.OnScoringCompleted(taskIDs)
+		r.callbacks.OnScoringCompleted(r.orgID, taskIDs)
 	}
 }
