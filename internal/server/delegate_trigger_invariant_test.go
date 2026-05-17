@@ -40,16 +40,29 @@ func TestDelegateRequestStructs_NoTriggerTypeFieldFromAPI(t *testing.T) {
 		t.Run(typ.Name(), func(t *testing.T) {
 			for i := 0; i < typ.NumField(); i++ {
 				field := typ.Field(i)
-				// JSON tag is everything before the first comma in the
-				// `json:"..."` value; lowercase to catch case-shifted
-				// variants like "TriggerType".
-				tag := field.Tag.Get("json")
-				if tag == "" {
+				if !field.IsExported() {
+					// encoding/json ignores unexported fields entirely;
+					// no caller-input vector here.
 					continue
 				}
-				name := strings.ToLower(strings.SplitN(tag, ",", 2)[0])
-				if forbidden[name] {
-					t.Errorf("%s.%s has JSON tag %q — delegate trigger_type must be server-side provenance, never caller input (see internal/delegate/delegate.go DelegateOpts.TriggerType)", typ.Name(), field.Name, tag)
+				// encoding/json's name resolution: the tag name (before
+				// the first comma) wins when set; otherwise the field's
+				// Go name is matched case-insensitively. Both branches
+				// must be checked or an untagged `TriggerType string`
+				// or a `json:",omitempty"` (tag options without a name)
+				// would silently accept caller-supplied "triggerType".
+				tag := field.Tag.Get("json")
+				name := strings.SplitN(tag, ",", 2)[0]
+				if name == "-" {
+					// Explicit "skip this field" — encoding/json won't
+					// unmarshal into it regardless of payload.
+					continue
+				}
+				if name == "" {
+					name = field.Name
+				}
+				if forbidden[strings.ToLower(name)] {
+					t.Errorf("%s.%s would accept caller-supplied triggerType (effective JSON name: %q) — delegate trigger_type must be server-side provenance, never caller input (see internal/delegate/delegate.go DelegateOpts.TriggerType)", typ.Name(), field.Name, name)
 				}
 			}
 		})
