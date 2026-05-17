@@ -503,24 +503,10 @@ func (s *Server) handleActiveOrgUpdate(w http.ResponseWriter, r *http.Request) {
 // handleMe returns the authenticated user's identity + org list.
 // Wrapped in SessionMiddleware at mount time.
 //
-// GET /api/me  →  { id, email, display_name, avatar_url, github_username, orgs: [...] }
+// GET /api/me  →  { id, email, display_name, avatar_url, github_username, orgs: [...], active_org_id }
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	claims := ClaimsFrom(r.Context())
 	if claims == nil {
-		writeUnauth(w)
-		return
-	}
-	// The local-mode shim in withSession injects a synthetic claim
-	// carrying LocalDefaultUserID when authDeps is nil — the body below
-	// reads public.users via tf.current_user_id(), both of which are
-	// Postgres-only and would 500 against local SQLite. Gating on the
-	// sentinel Subject (not on runmode) keeps the auth-flow tests
-	// working: they run runmode=local against a real Postgres harness
-	// with authDeps wired, so claims.Subject is a real GoTrue user UUID
-	// and the check falls through. The forthcoming handler-sweep PR
-	// will replace this with a SQLite-compatible local identity path
-	// returning the sentinel user + LocalDefaultOrgID membership.
-	if claims.Subject == runmode.LocalDefaultUserID {
 		writeUnauth(w)
 		return
 	}
@@ -536,11 +522,43 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		AvatarURL      string   `json:"avatar_url,omitempty"`
 		GitHubUsername string   `json:"github_username,omitempty"`
 		Orgs           []orgRow `json:"orgs"`
+		ActiveOrgID    string   `json:"active_org_id,omitempty"`
+	}
+
+	// Local-mode shim path: withSession injects a synthetic claim
+	// carrying LocalDefaultUserID when authDeps is nil. The multi-mode
+	// body below reads public.users via tf.current_user_id() — both
+	// Postgres-only and would 500 against local SQLite. Synthesize the
+	// same response shape from sentinel constants so the FE renders one
+	// signed-in path across both modes (local equals multi at N=1).
+	//
+	// Gated on authDeps==nil (not just the Subject) so a multi-mode
+	// caller whose real GoTrue user UUID happens to collide with the
+	// sentinel (seeded fixtures, deterministic test users) falls through
+	// to the normal DB-backed path instead of receiving a fabricated
+	// Local org that doesn't match their real memberships.
+	if s.authDeps == nil && claims.Subject == runmode.LocalDefaultUserID {
+		resp := response{
+			ID:          runmode.LocalDefaultUserID,
+			DisplayName: "Local",
+			Orgs: []orgRow{{
+				ID:   runmode.LocalDefaultOrgID,
+				Name: "Local",
+				Role: "owner",
+			}},
+			ActiveOrgID: runmode.LocalDefaultOrgID,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
 	}
 
 	var resp response
 	resp.Orgs = []orgRow{}
 	resp.Email = claims.Email
+	if sess := SessionFrom(r.Context()); sess != nil && sess.ActiveOrgID.Valid {
+		resp.ActiveOrgID = sess.ActiveOrgID.UUID.String()
+	}
 
 	// Wrap both reads in a single transaction with request.jwt.claims
 	// populated, so the queries source the identity from
@@ -589,6 +607,25 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[auth] /api/me sub=%s: %v", claims.Subject, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+
+	// Drop a stale ActiveOrgID. sessions.active_org_id's FK only points
+	// at orgs(id), not org_memberships — when a user's membership is
+	// revoked but the org still exists, the session retains the now-
+	// orphaned reference. Surfacing it would let an FE honoring the
+	// active_org_id contract route to an org the caller no longer
+	// belongs to.
+	if resp.ActiveOrgID != "" {
+		stillMember := false
+		for _, o := range resp.Orgs {
+			if o.ID == resp.ActiveOrgID {
+				stillMember = true
+				break
+			}
+		}
+		if !stillMember {
+			resp.ActiveOrgID = ""
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
