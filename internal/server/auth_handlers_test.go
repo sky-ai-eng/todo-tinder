@@ -424,25 +424,25 @@ func TestAuthFlow_Me_StaleActiveOrgMembership_OmitsActiveOrgID(t *testing.T) {
 
 	// Org owned by a different user so the schema CHECK ("each org must
 	// retain at least one owner") doesn't block the revoke below. Our
-	// caller joins as a viewer; revoking their membership leaves the
-	// owner intact.
+	// caller joins as a non-owner member; revoking their membership
+	// leaves the owner intact.
 	ownerID := r.seedUser()
 	orgID, _ := r.seedOrg(ownerID, "real-owner-org")
 
 	userID := r.seedUser()
 	if _, err := r.h.AdminDB.Exec(
-		`INSERT INTO public.org_memberships (user_id, org_id, role) VALUES ($1, $2, 'viewer')`,
+		`INSERT INTO public.org_memberships (user_id, org_id, role) VALUES ($1, $2, 'member')`,
 		userID, orgID,
 	); err != nil {
-		t.Fatalf("seed viewer membership: %v", err)
+		t.Fatalf("seed member: %v", err)
 	}
 
 	resp, _ := r.driveCallback(userID)
 	sid := r.sidFromResp(resp)
 
-	// Revoke the viewer membership. The org row stays (owner intact)
-	// — only this user's tie to it goes away. session.active_org_id
-	// keeps pointing at orgID.
+	// Revoke the member's tie. The org row stays (owner intact) — only
+	// this user's tie to it goes away. session.active_org_id keeps
+	// pointing at orgID.
 	if _, err := r.h.AdminDB.Exec(
 		`DELETE FROM public.org_memberships WHERE user_id = $1 AND org_id = $2`,
 		userID, orgID,
