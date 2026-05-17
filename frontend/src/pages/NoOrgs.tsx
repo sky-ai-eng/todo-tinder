@@ -40,7 +40,7 @@ export default function NoOrgs() {
           <p className="text-[13px] text-text-tertiary leading-relaxed">
             You&apos;re signed in as{' '}
             <span className="text-text-secondary font-medium">
-              {auth.user?.display_name || auth.user?.email || 'this account'}
+              {auth.me?.display_name || auth.me?.email || 'this account'}
             </span>
             , but you&apos;re not yet a member of any organization on this deployment.
           </p>

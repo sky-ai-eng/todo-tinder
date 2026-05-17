@@ -6,6 +6,7 @@
    plumbing. */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { apiFetch, apiJSON, HttpError, setUnauthHandler } from '../lib/apiClient'
+import type { AuthOrg, MeResponse } from '../types'
 
 /**
  * AuthContext owns the multi-mode session state machine.
@@ -27,34 +28,14 @@ import { apiFetch, apiJSON, HttpError, setUnauthHandler } from '../lib/apiClient
  * own 401 → reauth logic.
  */
 
-export interface AuthUser {
-  id: string
-  email: string
-  display_name?: string
-  avatar_url?: string
-  github_username?: string
-}
-
-export interface AuthOrg {
-  id: string
-  name: string
-  role: string
-}
-
-export interface MeResponse extends AuthUser {
-  orgs: AuthOrg[]
-  /** Session-scoped active org. Per-session, not per-user — two tabs
-   *  of the same user can hold different values. Omitted by the server
-   *  when the session has no active org (zero memberships, or the
-   *  previously-selected org membership was revoked). */
-  active_org_id?: string
-}
-
 export type AuthStatus = 'loading' | 'authed' | 'unauth' | 'error'
 
 interface AuthContextValue {
   status: AuthStatus
-  user: AuthUser | null
+  /** Full /api/me payload. The context value also exposes orgs +
+   *  serverActiveOrgId as top-level selectors for consumers that don't
+   *  need the rest of the user; both are derived from `me`. */
+  me: MeResponse | null
   orgs: AuthOrg[]
   /** Session's active org id as reported by /api/me. Null when absent
    *  from the response. OrgContext prefers this over localStorage so
@@ -70,9 +51,7 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('loading')
-  const [user, setUser] = useState<AuthUser | null>(null)
-  const [orgs, setOrgs] = useState<AuthOrg[]>([])
-  const [serverActiveOrgId, setServerActiveOrgId] = useState<string | null>(null)
+  const [me, setMe] = useState<MeResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   // statusRef tracks the latest status so the 401 handler (a closure
@@ -87,17 +66,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const refresh = useCallback(async () => {
     try {
       const data = await apiJSON<MeResponse>('/api/me')
-      const { orgs: orgList, active_org_id, ...userFields } = data
-      setUser(userFields as AuthUser)
-      setOrgs(orgList ?? [])
-      setServerActiveOrgId(active_org_id ?? null)
+      setMe(data)
       setError(null)
       setStatus('authed')
     } catch (err) {
       if (err instanceof HttpError && err.status === 401) {
-        setUser(null)
-        setOrgs([])
-        setServerActiveOrgId(null)
+        setMe(null)
         setError(null)
         setStatus('unauth')
         return
@@ -105,9 +79,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // Network failure or unexpected status — surface as 'error'
       // rather than 'unauth' so the UI can distinguish transient
       // server issues from genuine not-logged-in state.
-      setUser(null)
-      setOrgs([])
-      setServerActiveOrgId(null)
+      setMe(null)
       setError(err instanceof Error ? err.message : String(err))
       setStatus('error')
     }
@@ -121,9 +93,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // logout — we should reflect that locally. The cookie may
       // persist; the next request will surface the failure.
     }
-    setUser(null)
-    setOrgs([])
-    setServerActiveOrgId(null)
+    setMe(null)
     setError(null)
     setStatus('unauth')
   }, [])
@@ -143,17 +113,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     setUnauthHandler(() => {
       if (statusRef.current === 'unauth') return
-      setUser(null)
-      setOrgs([])
-      setServerActiveOrgId(null)
+      setMe(null)
       setStatus('unauth')
     })
     return () => setUnauthHandler(null)
   }, [])
 
   const value = useMemo<AuthContextValue>(
-    () => ({ status, user, orgs, serverActiveOrgId, error, refresh, logout }),
-    [status, user, orgs, serverActiveOrgId, error, refresh, logout],
+    () => ({
+      status,
+      me,
+      orgs: me?.orgs ?? [],
+      serverActiveOrgId: me?.active_org_id ?? null,
+      error,
+      refresh,
+      logout,
+    }),
+    [status, me, error, refresh, logout],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

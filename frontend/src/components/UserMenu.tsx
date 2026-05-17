@@ -30,12 +30,12 @@ export default function UserMenu() {
     }
   }, [open])
 
-  if (!auth.user) return null
+  if (!auth.me) return null
 
   const initial = (
-    auth.user.display_name?.[0] ||
-    auth.user.github_username?.[0] ||
-    auth.user.email?.[0] ||
+    auth.me.display_name?.[0] ||
+    auth.me.github_username?.[0] ||
+    auth.me.email?.[0] ||
     '?'
   ).toUpperCase()
 
@@ -47,10 +47,10 @@ export default function UserMenu() {
         className="w-8 h-8 rounded-full bg-accent-soft text-accent flex items-center justify-center text-[12px] font-semibold hover:ring-2 hover:ring-accent/20 transition-all overflow-hidden"
         aria-haspopup="menu"
         aria-expanded={open}
-        title={auth.user.display_name || auth.user.email}
+        title={auth.me.display_name || auth.me.email}
       >
-        {auth.user.avatar_url ? (
-          <img src={auth.user.avatar_url} alt="" className="w-full h-full object-cover" />
+        {auth.me.avatar_url ? (
+          <img src={auth.me.avatar_url} alt="" className="w-full h-full object-cover" />
         ) : (
           initial
         )}
@@ -63,10 +63,10 @@ export default function UserMenu() {
         >
           <div className="px-3 py-2 border-b border-border-subtle">
             <div className="text-[13px] font-medium text-text-primary truncate">
-              {auth.user.display_name || auth.user.github_username || 'Account'}
+              {auth.me.display_name || auth.me.github_username || 'Account'}
             </div>
-            {auth.user.email && (
-              <div className="text-[11px] text-text-tertiary truncate">{auth.user.email}</div>
+            {auth.me.email && (
+              <div className="text-[11px] text-text-tertiary truncate">{auth.me.email}</div>
             )}
           </div>
           <button

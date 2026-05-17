@@ -207,49 +207,56 @@ func (s *Server) ListenAndServe(addr string) error {
 	return http.ListenAndServe(addr, s.withSecurityHeaders(s.mux))
 }
 
-func (s *Server) routes() {
-	// API routes
-	// Integration credentials (GitHub PAT, Jira PAT). Distinct from the
-	// session-auth routes below — these are per-user-stored credentials
-	// for talking to third-party services on the user's behalf, not the
-	// user's own login. Lived under /api/auth/* historically; renamed in
-	// the post-SKY-251 cleanup so /api/auth/* unambiguously means
-	// "session authentication." D9 wires its session middleware to
-	// /api/* — including these, since you need to be logged in to
-	// manage your integration credentials.
-	s.mux.HandleFunc("POST /api/integrations/setup", s.handleIntegrationsSetup)
-	s.mux.HandleFunc("GET /api/integrations/status", s.handleIntegrationsStatus)
-	// DELETE on the collection = nuke all integration credentials.
-	// Targeted clears (Jira only) get explicit subpaths.
-	s.mux.HandleFunc("DELETE /api/integrations", s.handleIntegrationsClear)
-	s.mux.HandleFunc("DELETE /api/integrations/jira", s.handleIntegrationsDeleteJira)
+// api mounts a read-only /api/* route through withSession so identity
+// context (sentinel claims+orgID in local mode, JWT claims + active org
+// in multi mode) is seeded before the handler runs. Use for routes that
+// do not mutate server state — GETs and the websocket handshake.
+//
+// Pair with apiMutating for state-changing routes, which additionally
+// adds the same-origin (CSRF) defense the cookie session needs.
+func (s *Server) api(pattern string, h http.HandlerFunc) {
+	s.mux.Handle(pattern, s.withSession(h))
+}
 
-	// Multi-mode OAuth flow. Handlers 404 themselves when authDeps is
-	// nil (local mode), so unconditional mount is safe — the routes
-	// are inert until SetAuthDeps wires them.
+// apiMutating mounts a state-changing /api/* route through both the
+// CSRF same-origin check (outer) and withSession (inner). Use for
+// POST/PUT/PATCH/DELETE — anything that changes server-side state when
+// authenticated by the sid cookie.
+//
+// The wrap order is CSRF → session → handler: reject obviously-cross-
+// origin browser POSTs before doing the more expensive session lookup,
+// and ensure handlers always see seeded identity context regardless of
+// CSRF outcome (CSRF rejections short-circuit before the handler runs
+// anyway, so the inner session middleware isn't reached for those).
+func (s *Server) apiMutating(pattern string, h http.HandlerFunc) {
+	s.mux.Handle(pattern, s.withCSRFOriginCheck(s.withSession(h)))
+}
+
+func (s *Server) routes() {
+	// Pre-auth allowlist — these /api/* (and /auth/v1/*, /) routes
+	// intentionally DO NOT go through s.api / s.apiMutating because
+	// they must run before any session exists, or have no identity
+	// dependency at all. Any addition here must be deliberate; the
+	// routes_coverage_test guards against accidental wrap-stripping.
+	//
+	//   GET  /api/auth/oauth/{provider} — initiates the OAuth dance
+	//        before a session is created.
+	//   GET  /api/auth/callback         — completes OAuth and creates
+	//        the session; can't gate on the session it's about to mint.
+	//   POST /api/auth/logout           — reads sid cookie directly so
+	//        logout still works on a stale/invalid session. CSRF only.
+	//   GET  /api/config                — AuthGate reads deployment_mode
+	//        at boot to pick the login flow; must answer before any
+	//        session exists. The handler returns only deployment_mode;
+	//        per-user identity lives on /api/me.
+	//   /auth/v1/                        — GoTrue reverse proxy; auth
+	//        happens upstream, not in our middleware.
+	//   /                                — SPA fallback; static-file
+	//        serving with no identity dependency.
 	s.mux.HandleFunc("GET /api/auth/oauth/{provider}", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/auth/callback", s.handleOAuthCallback)
-	// Logout is the only cookie-authed mutating endpoint in D7. Wrap
-	// in the Origin-check middleware so a cross-site form POST can't
-	// drive-by-log-the-user-out. D9 will apply the same wrapper to
-	// every retrofitted mutating endpoint.
 	s.mux.Handle("POST /api/auth/logout", s.withCSRFOriginCheck(http.HandlerFunc(s.handleLogout)))
-	// Logout-everywhere: must be authenticated to use it (you can only
-	// nuke your own sessions). Wrapped in withSession + the same
-	// CSRF guard as /logout.
-	s.mux.Handle("POST /api/auth/logout/all", s.withCSRFOriginCheck(s.withSession(http.HandlerFunc(s.handleLogoutAll))))
-	// /api/me is the session-protected identity endpoint. withSession
-	// passes through in local mode (no authDeps), so a local-mode
-	// /api/me hit would reach the handler with nil claims and write
-	// 401. The frontend in local mode shouldn't be calling this; D8
-	// handles the conditional mount on the SPA side.
-	s.mux.Handle("GET /api/me", s.withSession(http.HandlerFunc(s.handleMe)))
-	// SKY-313: switch the session's active org. CSRF-origin-checked
-	// because it mutates server-stored state; withSession because we
-	// need the (verified) caller's claims to gate membership.
-	s.mux.Handle("POST /api/me/active-org",
-		s.withCSRFOriginCheck(s.withSession(http.HandlerFunc(s.handleActiveOrgUpdate))))
-
+	s.mux.HandleFunc("GET /api/config", s.handleConfig)
 	// /auth/v1/* reverse-proxy to gotrue, wired lazily inside
 	// SetAuthDeps. The closure here re-reads s.authProxy each
 	// request so local-mode (where it stays nil) returns 404
@@ -263,127 +270,153 @@ func (s *Server) routes() {
 		s.authProxy.ServeHTTP(w, r)
 	}))
 
-	s.mux.HandleFunc("GET /api/queue", s.handleQueue)
-	s.mux.HandleFunc("GET /api/tasks", s.handleTasks)
-	s.mux.HandleFunc("GET /api/tasks/{id}", s.handleTaskGet)
-	s.mux.HandleFunc("POST /api/tasks/{id}/swipe", s.handleSwipe)
-	s.mux.HandleFunc("POST /api/tasks/{id}/snooze", s.handleSnooze)
-	s.mux.HandleFunc("POST /api/tasks/{id}/undo", s.handleUndo)
-	s.mux.HandleFunc("POST /api/tasks/{id}/requeue", s.handleRequeue)
+	// Integration credentials (GitHub PAT, Jira PAT). Distinct from the
+	// session-auth routes above — these are per-user-stored credentials
+	// for talking to third-party services on the user's behalf, not the
+	// user's own login. Lived under /api/auth/* historically; renamed in
+	// the post-SKY-251 cleanup so /api/auth/* unambiguously means
+	// "session authentication." Wrapped via s.api/apiMutating since you
+	// need to be logged in to manage your integration credentials.
+	s.apiMutating("POST /api/integrations/setup", s.handleIntegrationsSetup)
+	s.api("GET /api/integrations/status", s.handleIntegrationsStatus)
+	// DELETE on the collection = nuke all integration credentials.
+	// Targeted clears (Jira only) get explicit subpaths.
+	s.apiMutating("DELETE /api/integrations", s.handleIntegrationsClear)
+	s.apiMutating("DELETE /api/integrations/jira", s.handleIntegrationsDeleteJira)
 
-	s.mux.HandleFunc("GET /api/agent/runs/{runID}", s.handleAgentStatus)
-	s.mux.HandleFunc("GET /api/agent/runs/{runID}/messages", s.handleAgentMessages)
-	s.mux.HandleFunc("POST /api/agent/runs/{runID}/cancel", s.handleAgentCancel)
-	s.mux.HandleFunc("POST /api/agent/runs/{runID}/takeover", s.handleAgentTakeover)
-	s.mux.HandleFunc("POST /api/agent/runs/{runID}/release", s.handleAgentRelease)
-	s.mux.HandleFunc("POST /api/agent/runs/{runID}/respond", s.handleAgentRespond)
-	s.mux.HandleFunc("GET /api/agent/runs", s.handleAgentRuns)
-	s.mux.HandleFunc("GET /api/agent/takeovers/held", s.handleHeldTakeovers)
+	// Logout-everywhere: must be authenticated to use it (you can only
+	// nuke your own sessions).
+	s.apiMutating("POST /api/auth/logout/all", s.handleLogoutAll)
+	// /api/me is the session-protected identity endpoint. In local mode
+	// the shim in withSession injects sentinel claims so the handler
+	// sees a non-nil claims value; in multi mode the handler 401s when
+	// no claims are seeded.
+	s.api("GET /api/me", s.handleMe)
+	// Switch the session's active org.
+	s.apiMutating("POST /api/me/active-org", s.handleActiveOrgUpdate)
+
+	s.api("GET /api/queue", s.handleQueue)
+	s.api("GET /api/tasks", s.handleTasks)
+	s.api("GET /api/tasks/{id}", s.handleTaskGet)
+	s.apiMutating("POST /api/tasks/{id}/swipe", s.handleSwipe)
+	s.apiMutating("POST /api/tasks/{id}/snooze", s.handleSnooze)
+	s.apiMutating("POST /api/tasks/{id}/undo", s.handleUndo)
+	s.apiMutating("POST /api/tasks/{id}/requeue", s.handleRequeue)
+
+	s.api("GET /api/agent/runs/{runID}", s.handleAgentStatus)
+	s.api("GET /api/agent/runs/{runID}/messages", s.handleAgentMessages)
+	s.apiMutating("POST /api/agent/runs/{runID}/cancel", s.handleAgentCancel)
+	s.apiMutating("POST /api/agent/runs/{runID}/takeover", s.handleAgentTakeover)
+	s.apiMutating("POST /api/agent/runs/{runID}/release", s.handleAgentRelease)
+	s.apiMutating("POST /api/agent/runs/{runID}/respond", s.handleAgentRespond)
+	s.api("GET /api/agent/runs", s.handleAgentRuns)
+	s.api("GET /api/agent/takeovers/held", s.handleHeldTakeovers)
 
 	// Projects (SKY-215). Pure CRUD over the projects table; the
 	// Curator runtime that populates curator_session_id lands in
 	// SKY-216 and per-project entity classification in SKY-220.
-	s.mux.HandleFunc("POST /api/projects", s.handleProjectCreate)
-	s.mux.HandleFunc("GET /api/projects", s.handleProjectList)
-	s.mux.HandleFunc("GET /api/projects/{id}", s.handleProjectGet)
-	s.mux.HandleFunc("PATCH /api/projects/{id}", s.handleProjectUpdate)
-	s.mux.HandleFunc("DELETE /api/projects/{id}", s.handleProjectDelete)
-	s.mux.HandleFunc("GET /api/projects/{id}/export/preview", s.handleProjectExportPreview)
-	s.mux.HandleFunc("GET /api/projects/{id}/export", s.handleProjectExport)
-	s.mux.HandleFunc("POST /api/projects/import", s.handleProjectImport)
-	s.mux.HandleFunc("GET /api/projects/{id}/knowledge", s.handleProjectKnowledge)
-	s.mux.HandleFunc("POST /api/projects/{id}/knowledge", s.handleProjectKnowledgeUpload)
-	s.mux.HandleFunc("GET /api/projects/{id}/knowledge/{path}", s.handleProjectKnowledgeFile)
-	s.mux.HandleFunc("DELETE /api/projects/{id}/knowledge/{path}", s.handleProjectKnowledgeDelete)
+	s.apiMutating("POST /api/projects", s.handleProjectCreate)
+	s.api("GET /api/projects", s.handleProjectList)
+	s.api("GET /api/projects/{id}", s.handleProjectGet)
+	s.apiMutating("PATCH /api/projects/{id}", s.handleProjectUpdate)
+	s.apiMutating("DELETE /api/projects/{id}", s.handleProjectDelete)
+	s.api("GET /api/projects/{id}/export/preview", s.handleProjectExportPreview)
+	s.api("GET /api/projects/{id}/export", s.handleProjectExport)
+	s.apiMutating("POST /api/projects/import", s.handleProjectImport)
+	s.api("GET /api/projects/{id}/knowledge", s.handleProjectKnowledge)
+	s.apiMutating("POST /api/projects/{id}/knowledge", s.handleProjectKnowledgeUpload)
+	s.api("GET /api/projects/{id}/knowledge/{path}", s.handleProjectKnowledgeFile)
+	s.apiMutating("DELETE /api/projects/{id}/knowledge/{path}", s.handleProjectKnowledgeDelete)
 	// Project-creation backfill popup (SKY-220 PR B).
-	s.mux.HandleFunc("GET /api/projects/{id}/backfill-candidates", s.handleBackfillCandidates)
-	s.mux.HandleFunc("POST /api/projects/{id}/backfill", s.handleBackfill)
+	s.api("GET /api/projects/{id}/backfill-candidates", s.handleBackfillCandidates)
+	s.apiMutating("POST /api/projects/{id}/backfill", s.handleBackfill)
 	// Project entities panel (SKY-238).
-	s.mux.HandleFunc("GET /api/projects/{id}/entities", s.handleProjectEntities)
+	s.api("GET /api/projects/{id}/entities", s.handleProjectEntities)
 
 	// Curator chat per project (SKY-216). The Curator package owns the
 	// long-lived CC session lifecycle; these endpoints are the API
 	// the Projects page (SKY-217) will hit.
-	s.mux.HandleFunc("POST /api/projects/{id}/curator/messages", s.handleCuratorSend)
-	s.mux.HandleFunc("GET /api/projects/{id}/curator/messages", s.handleCuratorHistory)
-	s.mux.HandleFunc("DELETE /api/projects/{id}/curator/messages/in-flight", s.handleCuratorCancel)
-	s.mux.HandleFunc("POST /api/projects/{id}/curator/reset", s.handleCuratorReset)
+	s.apiMutating("POST /api/projects/{id}/curator/messages", s.handleCuratorSend)
+	s.api("GET /api/projects/{id}/curator/messages", s.handleCuratorHistory)
+	s.apiMutating("DELETE /api/projects/{id}/curator/messages/in-flight", s.handleCuratorCancel)
+	s.apiMutating("POST /api/projects/{id}/curator/reset", s.handleCuratorReset)
 
-	// Websocket
-	s.mux.HandleFunc("GET /api/ws", s.ws.HandleWS)
+	// Websocket: wrapped via s.api so the handshake sees claims in
+	// r.Context() for the WS-connection scoping that D9b will read.
+	// Treated as GET-equivalent — no CSRF wrap.
+	s.api("GET /api/ws", s.ws.HandleWS)
 
-	s.mux.HandleFunc("GET /api/dashboard/stats", s.handleDashboardStats)
-	s.mux.HandleFunc("GET /api/dashboard/prs", s.handleDashboardPRs)
-	s.mux.HandleFunc("GET /api/dashboard/prs/{number}/status", s.handleDashboardPRStatus)
-	s.mux.HandleFunc("POST /api/dashboard/prs/{number}/draft", s.handleDashboardPRDraft)
+	s.api("GET /api/dashboard/stats", s.handleDashboardStats)
+	s.api("GET /api/dashboard/prs", s.handleDashboardPRs)
+	s.api("GET /api/dashboard/prs/{number}/status", s.handleDashboardPRStatus)
+	s.apiMutating("POST /api/dashboard/prs/{number}/draft", s.handleDashboardPRDraft)
 
-	s.mux.HandleFunc("GET /api/brief", s.handleBrief)
-	s.mux.HandleFunc("GET /api/preferences", s.handlePreferences)
+	s.api("GET /api/brief", s.handleBrief)
+	s.api("GET /api/preferences", s.handlePreferences)
 
-	s.mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
-	s.mux.HandleFunc("POST /api/settings", s.handleSettingsPost)
+	s.api("GET /api/settings", s.handleSettingsGet)
+	s.apiMutating("POST /api/settings", s.handleSettingsPost)
 
-	// SKY-264: deployment shape + team roster for the predicate editor.
-	// Both endpoints are fetched fresh on every consumer mount (the FE
-	// hooks dedup concurrent in-flight calls within a render but don't
-	// hold a persistent cache — current_user.github_username and the
-	// roster are both mutable mid-session). Endpoint costs are a single
-	// SELECT each, so re-fetching per editor mount is cheap and correct.
-	s.mux.HandleFunc("GET /api/config", s.handleConfig)
-	s.mux.HandleFunc("GET /api/team/members", s.handleTeamMembers)
-	s.mux.HandleFunc("POST /api/skills/import", s.handleSkillsImport)
-	s.mux.HandleFunc("GET /api/github/repos", s.handleGitHubRepos)
-	s.mux.HandleFunc("POST /api/github/preflight-ssh", s.handleGitHubPreflightSSH)
-	s.mux.HandleFunc("GET /api/repos", s.handleRepoProfiles)
-	s.mux.HandleFunc("POST /api/repos", s.handleReposSave)
-	s.mux.HandleFunc("PATCH /api/repos/{owner}/{repo}", s.handleRepoUpdate)
-	s.mux.HandleFunc("GET /api/repos/{owner}/{repo}/branches", s.handleRepoBranches)
-	s.mux.HandleFunc("POST /api/jira/connect", s.handleJiraConnect)
-	s.mux.HandleFunc("GET /api/jira/statuses", s.handleJiraStatuses)
-	s.mux.HandleFunc("GET /api/jira/stock", s.handleJiraStockGet)
-	s.mux.HandleFunc("POST /api/jira/stock", s.handleJiraStockPost)
+	// SKY-264: team roster for the predicate editor. Fetched fresh on
+	// every consumer mount (the FE dedups concurrent in-flight calls
+	// within a render but doesn't hold a persistent cache — the roster
+	// is mutable mid-session). One SELECT per call. /api/config — the
+	// AuthGate boot endpoint — is mounted pre-auth above; per-user
+	// identity that used to live on /api/config moved to /api/me.
+	s.api("GET /api/team/members", s.handleTeamMembers)
+	s.apiMutating("POST /api/skills/import", s.handleSkillsImport)
+	s.api("GET /api/github/repos", s.handleGitHubRepos)
+	s.apiMutating("POST /api/github/preflight-ssh", s.handleGitHubPreflightSSH)
+	s.api("GET /api/repos", s.handleRepoProfiles)
+	s.apiMutating("POST /api/repos", s.handleReposSave)
+	s.apiMutating("PATCH /api/repos/{owner}/{repo}", s.handleRepoUpdate)
+	s.api("GET /api/repos/{owner}/{repo}/branches", s.handleRepoBranches)
+	s.apiMutating("POST /api/jira/connect", s.handleJiraConnect)
+	s.api("GET /api/jira/statuses", s.handleJiraStatuses)
+	s.api("GET /api/jira/stock", s.handleJiraStockGet)
+	s.apiMutating("POST /api/jira/stock", s.handleJiraStockPost)
 
-	s.mux.HandleFunc("GET /api/reviews/{id}", s.handleReviewGet)
-	s.mux.HandleFunc("PATCH /api/reviews/{id}", s.handleReviewUpdate)
-	s.mux.HandleFunc("GET /api/reviews/{id}/diff", s.handleReviewDiff)
-	s.mux.HandleFunc("POST /api/reviews/{id}/submit", s.handleReviewSubmit)
-	s.mux.HandleFunc("PUT /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentUpdate)
-	s.mux.HandleFunc("DELETE /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentDelete)
-	s.mux.HandleFunc("GET /api/agent/runs/{runID}/review", s.handleRunReview)
+	s.api("GET /api/reviews/{id}", s.handleReviewGet)
+	s.apiMutating("PATCH /api/reviews/{id}", s.handleReviewUpdate)
+	s.api("GET /api/reviews/{id}/diff", s.handleReviewDiff)
+	s.apiMutating("POST /api/reviews/{id}/submit", s.handleReviewSubmit)
+	s.apiMutating("PUT /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentUpdate)
+	s.apiMutating("DELETE /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentDelete)
+	s.api("GET /api/agent/runs/{runID}/review", s.handleRunReview)
 
-	s.mux.HandleFunc("GET /api/pending-prs/{id}", s.handlePendingPRGet)
-	s.mux.HandleFunc("PATCH /api/pending-prs/{id}", s.handlePendingPRUpdate)
-	s.mux.HandleFunc("GET /api/pending-prs/{id}/diff", s.handlePendingPRDiff)
-	s.mux.HandleFunc("POST /api/pending-prs/{id}/submit", s.handlePendingPRSubmit)
-	s.mux.HandleFunc("GET /api/agent/runs/{runID}/pending-pr", s.handleRunPendingPR)
+	s.api("GET /api/pending-prs/{id}", s.handlePendingPRGet)
+	s.apiMutating("PATCH /api/pending-prs/{id}", s.handlePendingPRUpdate)
+	s.api("GET /api/pending-prs/{id}/diff", s.handlePendingPRDiff)
+	s.apiMutating("POST /api/pending-prs/{id}/submit", s.handlePendingPRSubmit)
+	s.api("GET /api/agent/runs/{runID}/pending-pr", s.handleRunPendingPR)
 
-	s.mux.HandleFunc("GET /api/factory/snapshot", s.handleFactorySnapshot)
-	s.mux.HandleFunc("POST /api/factory/delegate", s.handleFactoryDelegate)
+	s.api("GET /api/factory/snapshot", s.handleFactorySnapshot)
+	s.apiMutating("POST /api/factory/delegate", s.handleFactoryDelegate)
 
-	s.mux.HandleFunc("GET /api/event-types", s.handleEventTypes)
-	s.mux.HandleFunc("GET /api/event-schemas", s.handleEventSchemasList)
-	s.mux.HandleFunc("GET /api/event-schemas/{event_type}", s.handleEventSchemaGet)
+	s.api("GET /api/event-types", s.handleEventTypes)
+	s.api("GET /api/event-schemas", s.handleEventSchemasList)
+	s.api("GET /api/event-schemas/{event_type}", s.handleEventSchemaGet)
 	// Unified event_handlers endpoints (SKY-259). Replace the former
 	// /api/task-rules + /api/triggers split — kind is passed as ?kind=
 	// on list, in the body on create, derived on update.
-	s.mux.HandleFunc("GET /api/event-handlers", s.handleEventHandlersList)
-	s.mux.HandleFunc("POST /api/event-handlers", s.handleEventHandlerCreate)
-	s.mux.HandleFunc("PUT /api/event-handlers/reorder", s.handleEventHandlerReorder)
-	s.mux.HandleFunc("PATCH /api/event-handlers/{id}", s.handleEventHandlerUpdate)
-	s.mux.HandleFunc("PUT /api/event-handlers/{id}", s.handleEventHandlerUpdate)
-	s.mux.HandleFunc("DELETE /api/event-handlers/{id}", s.handleEventHandlerDelete)
-	s.mux.HandleFunc("POST /api/event-handlers/{id}/toggle", s.handleEventHandlerToggle)
-	s.mux.HandleFunc("POST /api/event-handlers/{id}/promote", s.handleEventHandlerPromote)
-	s.mux.HandleFunc("GET /api/prompts", s.handlePromptsList)
-	s.mux.HandleFunc("POST /api/prompts", s.handlePromptCreate)
-	s.mux.HandleFunc("GET /api/prompts/{id}", s.handlePromptGet)
-	s.mux.HandleFunc("PUT /api/prompts/{id}", s.handlePromptPut)
-	s.mux.HandleFunc("DELETE /api/prompts/{id}", s.handlePromptDelete)
-	s.mux.HandleFunc("GET /api/prompts/{id}/stats", s.handlePromptStats)
-	s.mux.HandleFunc("GET /api/prompts/{id}/chain-steps", s.handleChainStepsGet)
-	s.mux.HandleFunc("PUT /api/prompts/{id}/chain-steps", s.handleChainStepsPut)
-	s.mux.HandleFunc("GET /api/chain-runs/{id}", s.handleChainRunGet)
-	s.mux.HandleFunc("POST /api/chain-runs/{id}/cancel", s.handleChainRunCancel)
+	s.api("GET /api/event-handlers", s.handleEventHandlersList)
+	s.apiMutating("POST /api/event-handlers", s.handleEventHandlerCreate)
+	s.apiMutating("PUT /api/event-handlers/reorder", s.handleEventHandlerReorder)
+	s.apiMutating("PATCH /api/event-handlers/{id}", s.handleEventHandlerUpdate)
+	s.apiMutating("PUT /api/event-handlers/{id}", s.handleEventHandlerUpdate)
+	s.apiMutating("DELETE /api/event-handlers/{id}", s.handleEventHandlerDelete)
+	s.apiMutating("POST /api/event-handlers/{id}/toggle", s.handleEventHandlerToggle)
+	s.apiMutating("POST /api/event-handlers/{id}/promote", s.handleEventHandlerPromote)
+	s.api("GET /api/prompts", s.handlePromptsList)
+	s.apiMutating("POST /api/prompts", s.handlePromptCreate)
+	s.api("GET /api/prompts/{id}", s.handlePromptGet)
+	s.apiMutating("PUT /api/prompts/{id}", s.handlePromptPut)
+	s.apiMutating("DELETE /api/prompts/{id}", s.handlePromptDelete)
+	s.api("GET /api/prompts/{id}/stats", s.handlePromptStats)
+	s.api("GET /api/prompts/{id}/chain-steps", s.handleChainStepsGet)
+	s.apiMutating("PUT /api/prompts/{id}/chain-steps", s.handleChainStepsPut)
+	s.api("GET /api/chain-runs/{id}", s.handleChainRunGet)
+	s.apiMutating("POST /api/chain-runs/{id}/cancel", s.handleChainRunCancel)
 
 	// Frontend: serve embedded SPA, with fallback to index.html for client-side routing
 	s.mux.HandleFunc("/", s.handleFrontend)

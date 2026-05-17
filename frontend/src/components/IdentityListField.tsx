@@ -1,19 +1,21 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { X } from 'lucide-react'
-import { useDeploymentConfig, useTeamMembers } from '../hooks/useDeploymentConfig'
-import type { DeploymentConfig, TeamMember } from '../types'
+import { useMe, useTeamMembers } from '../hooks/useDeploymentConfig'
+import type { MeResponse, TeamMember } from '../types'
 
 /** IdentityListField is the editor for `author_in` / `reviewer_in` /
  *  `commenter_in` (GitHub, SKY-264) and `assignee_in` / `reporter_in` /
  *  `commenter_in` (Jira, SKY-270) predicate fields. Two variants based
- *  on the active user's team size:
+ *  on the active user's team size, derived from the /api/team/members
+ *  roster:
  *
- *  - Variant A (team_size===1, i.e. local mode or solo team): a single
- *    "Match my <actor>" toggle. ON → ["<current_user.<identityField>>"].
- *    OFF → field omitted (no filter). Disabled when the identity field
- *    is null with a configure-<source> hint.
+ *  - Variant A (solo team — local mode or a multi-mode team with one
+ *    member): a single "Match my <actor>" toggle. ON →
+ *    ["<current_user.<identityField>>"]. OFF → field omitted (no
+ *    filter). Disabled when the identity field is missing with a
+ *    configure-<source> hint.
  *
- *  - Variant B (team_size>1): chips + searchable dropdown of team
+ *  - Variant B (multi-member team): chips + searchable dropdown of team
  *    members. Free-text entry supports external handles (bots,
  *    contractors not on the team). Implements the ARIA combobox
  *    pattern + keyboard navigation (Arrow keys, Enter, Escape).
@@ -38,33 +40,40 @@ export default function IdentityListField({
   value: string[] | undefined
   onChange: (val: string[] | undefined) => void
 }) {
-  const { config, loading, error } = useDeploymentConfig()
+  const { me, loading: meLoading, error: meError } = useMe()
+  const { members, loading: membersLoading, error: membersError } = useTeamMembers()
   const labels = labelsForField(fieldName, identityKind)
 
-  if (loading) {
+  if (meLoading || membersLoading) {
     return <div className="h-10 rounded-lg bg-black/[0.03] animate-pulse" />
   }
-  if (error || !config) {
-    // No fallback form: this field holds a string[] of GitHub logins,
-    // and a plain text input would silently accept comma-strings the
-    // matcher doesn't parse. Refuse to render the editor and tell the
-    // user what's wrong; a page refresh re-fetches /api/config.
+
+  // /api/me is the load-bearing call here — without it the editor has
+  // no current_user identity to scope filters against. /api/team/members
+  // is best-effort: a missing roster collapses to Variant A (toggle
+  // only), which matches today's multi-mode degraded behavior.
+  if (meError || !me) {
     return (
       <div
         role="alert"
         className="rounded-lg border border-red-300/40 bg-red-50/40 px-3 py-2 text-[12px] text-red-700"
       >
-        Couldn’t load deployment config{error ? `: ${error}` : '.'} Refresh the page to retry.
+        Couldn’t load your identity{meError ? `: ${meError}` : '.'} Refresh the page to retry.
       </div>
     )
   }
 
-  if (config.team_size <= 1) {
+  // Variant choice tracks the roster length. Variant B only renders
+  // when the team has more than one member (you + at least one
+  // teammate). Roster-fetch failures or single-member rosters fall to
+  // Variant A — the conservative default.
+  const hasMultiMemberTeam = !membersError && members.length > 1
+  if (!hasMultiMemberTeam) {
     return (
       <VariantA
         value={value}
         onChange={onChange}
-        config={config}
+        me={me}
         labels={labels}
         identityKind={identityKind}
       />
@@ -74,21 +83,27 @@ export default function IdentityListField({
     <VariantB
       value={value}
       onChange={onChange}
-      config={config}
+      members={members}
       labels={labels}
       identityKind={identityKind}
     />
   )
 }
 
-// identityFromUser returns the canonical identifier on a user row for
-// the given identity source. Centralizes the github_username vs
-// jira_account_id branch so call sites don't have to know.
-function identityFromUser(
-  user: { github_username: string | null; jira_account_id: string | null },
-  kind: IdentityKind,
-): string | null {
-  return kind === 'jira' ? user.jira_account_id : user.github_username
+// identityFromMe returns the canonical identifier on the current-user
+// payload for the given identity source. Centralizes the
+// github_username vs jira_account_id branch so call sites don't have
+// to know.
+function identityFromMe(me: MeResponse, kind: IdentityKind): string | null {
+  const v = kind === 'jira' ? me.jira_account_id : me.github_username
+  return v || null
+}
+
+// identityFromMember returns the canonical identifier for a team-roster
+// row. Same shape choice as identityFromMe but the roster type carries
+// explicit `null`s (the server distinguishes "not yet captured").
+function identityFromMember(m: TeamMember, kind: IdentityKind): string | null {
+  return kind === 'jira' ? m.jira_account_id : m.github_username
 }
 
 // --- Actor-specific copy ----------------------------------------------------
@@ -192,17 +207,17 @@ function labelsForField(fieldName: string, kind: IdentityKind): ActorLabels {
 function VariantA({
   value,
   onChange,
-  config,
+  me,
   labels,
   identityKind,
 }: {
   value: string[] | undefined
   onChange: (val: string[] | undefined) => void
-  config: DeploymentConfig
+  me: MeResponse
   labels: ActorLabels
   identityKind: IdentityKind
 }) {
-  const myID = identityFromUser(config.current_user, identityKind)
+  const myID = identityFromMe(me, identityKind)
   const hasIdentity = !!myID
   // The toggle is ON whenever the allowlist contains the current user's
   // identity. If the user has manually added external IDs too, the
@@ -225,8 +240,7 @@ function VariantA({
   // For the Variant A scoped hint, prefer the friendly display name
   // when available (Jira gives us both account ID and display name;
   // GitHub's login doubles as the display string).
-  const displayForHint =
-    identityKind === 'jira' ? config.current_user.jira_display_name || myID || '' : myID || ''
+  const displayForHint = identityKind === 'jira' ? me.jira_display_name || myID || '' : myID || ''
 
   const sourceLabel = identityKind === 'jira' ? 'Jira' : 'GitHub'
 
@@ -292,17 +306,16 @@ type DropdownItem = { kind: 'team'; member: TeamMember } | { kind: 'external'; h
 function VariantB({
   value,
   onChange,
-  config: _config,
+  members,
   labels,
   identityKind,
 }: {
   value: string[] | undefined
   onChange: (val: string[] | undefined) => void
-  config: DeploymentConfig
+  members: TeamMember[]
   labels: ActorLabels
   identityKind: IdentityKind
 }) {
-  const { members, loading, error: rosterError } = useTeamMembers()
   const [search, setSearch] = useState('')
   const [open, setOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(0)
@@ -320,7 +333,7 @@ function VariantB({
   // active identity kind: github_username for GitHub predicates,
   // jira_account_id for Jira predicates. Members without that field
   // captured show up as "no identity" rows below the option list.
-  const memberIdentity = (m: TeamMember): string | null => identityFromUser(m, identityKind)
+  const memberIdentity = (m: TeamMember): string | null => identityFromMember(m, identityKind)
   const sourceLabel = identityKind === 'jira' ? 'Jira' : 'GitHub'
 
   // Close the dropdown when clicking outside the container.
@@ -442,7 +455,9 @@ function VariantB({
     }
   }
 
-  const showDropdown = open && (dropdownItems.length > 0 || loading || !!rosterError)
+  // Parent gates VariantB on members.length > 1 and !membersError, so
+  // we never render with a loading/error roster — drop those branches.
+  const showDropdown = open && dropdownItems.length > 0
   const ariaExpanded = showDropdown
 
   return (
@@ -510,16 +525,6 @@ function VariantB({
           role="listbox"
           className="absolute z-20 mt-1 w-full max-h-[260px] overflow-y-auto rounded-lg border border-border-subtle bg-white shadow-lg list-none p-0 m-0"
         >
-          {loading && (
-            <li className="px-3 py-2 text-[12px] text-text-tertiary" aria-disabled="true">
-              Loading team…
-            </li>
-          )}
-          {!loading && rosterError && (
-            <li role="alert" className="px-3 py-2 text-[12px] text-red-700" aria-disabled="true">
-              Couldn’t load team roster: {rosterError}. Type a handle to add manually.
-            </li>
-          )}
           {dropdownItems.map((item, i) => {
             const isActive = i === safeActiveIndex
             const baseCls = `w-full flex items-center justify-between px-3 py-2 text-left cursor-pointer ${
