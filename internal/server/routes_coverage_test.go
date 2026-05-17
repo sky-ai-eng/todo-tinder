@@ -142,26 +142,20 @@ func TestRoutesCoverage(t *testing.T) {
 	seenAllowlistRaw := make(map[string]bool)
 
 	for _, m := range mounts {
-		isAPIRoute := strings.Contains(m.pattern, "/api/")
-		switch m.via {
-		case "api", "apiMutating":
-			if !isAPIRoute {
-				// Not currently expected, but harmless — s.api/apiMutating
-				// being used for a non-/api/ route just means it gets
-				// session+CSRF wrapping. Allow it.
-			}
-		case "mux.HandleFunc", "mux.Handle":
-			if allow[m.pattern] {
-				seenAllowlistRaw[m.pattern] = true
-				continue
-			}
-			// Raw mount outside the allowlist. If it's an /api/* route,
-			// that's a regression — should be using s.api/s.apiMutating.
-			if isAPIRoute {
-				violations = append(violations,
-					m.pos.String()+": raw "+m.via+`("`+m.pattern+`", ...) — wrap in s.api or s.apiMutating, or add to preAuthAllowlist with justification`,
-				)
-			}
+		if m.via != "mux.HandleFunc" && m.via != "mux.Handle" {
+			// s.api / s.apiMutating mounts are wrapped by construction.
+			continue
+		}
+		if allow[m.pattern] {
+			seenAllowlistRaw[m.pattern] = true
+			continue
+		}
+		// Raw mount outside the allowlist. If it's an /api/* route,
+		// that's a regression — should be using s.api/s.apiMutating.
+		if strings.Contains(m.pattern, "/api/") {
+			violations = append(violations,
+				m.pos.String()+": raw "+m.via+`("`+m.pattern+`", ...) — wrap in s.api or s.apiMutating, or add to preAuthAllowlist with justification`,
+			)
 		}
 	}
 
