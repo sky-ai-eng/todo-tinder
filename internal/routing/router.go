@@ -761,15 +761,13 @@ func (r *Router) RunDrainSweeper(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Per-org iteration mirrors the SKY-312 poller / classifier
-			// pattern. In local mode this collapses to N=1 over the
-			// sentinel org (the only row in orgs); in multi mode it
-			// fans across every active tenant. orgs is nil-safe — a
-			// router built without OrgsStore wiring (older test
-			// fixtures) is silently a no-op rather than a panic.
-			if r.orgs == nil {
-				continue
-			}
+			// Per-org iteration mirrors the established poller /
+			// classifier pattern. In local mode this collapses to N=1
+			// over the sentinel org (the only row in orgs); in multi
+			// mode it fans across every active tenant. OrgsStore is
+			// a required NewRouter parameter — if it were nil the
+			// dereference below would panic, which is the right
+			// behavior for a wiring bug at startup.
 			orgIDs, err := r.orgs.ListActiveSystem(ctx)
 			if err != nil {
 				log.Printf("[router] drain sweeper: list orgs error: %v", err)
