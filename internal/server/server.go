@@ -120,7 +120,7 @@ func (s *Server) projectMutex(id string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-// agentEnabledForLocalTeam returns the resolved agent and whether the
+// agentEnabledForOrg returns the resolved agent and whether the
 // team_agents.enabled flag is true for it. Wraps the two-step lookup
 // (Agents.GetForOrg → TeamAgents.GetForTeam) so swipe-delegate and
 // factory-delegate share one code path for the SKY-261 acceptance
@@ -136,11 +136,15 @@ func (s *Server) projectMutex(id string) *sync.Mutex {
 // distinguishable 500 message rather than a misleading "disabled"
 // 409. Bootstrap is fatal at startup post-D-Claims so this is
 // belt-and-suspenders for tests / degraded states.
-func (s *Server) agentEnabledForLocalTeam(ctx context.Context) (*domain.Agent, bool, error) {
+//
+// Team-agent lookup keeps the local team sentinel — multi-mode team
+// semantics are a separate (post-D9) ticket; this helper sweeps the
+// org dimension only.
+func (s *Server) agentEnabledForOrg(ctx context.Context, orgID string) (*domain.Agent, bool, error) {
 	if s.agents == nil {
 		return nil, false, fmt.Errorf("agent store not configured")
 	}
-	a, err := s.agents.GetForOrg(ctx, runmode.LocalDefaultOrg)
+	a, err := s.agents.GetForOrg(ctx, orgID)
 	if err != nil {
 		return nil, false, fmt.Errorf("agent lookup: %w", err)
 	}
@@ -153,7 +157,7 @@ func (s *Server) agentEnabledForLocalTeam(ctx context.Context) (*domain.Agent, b
 		// teamAgents yet.
 		return a, true, nil
 	}
-	ta, err := s.teamAgents.GetForTeam(ctx, runmode.LocalDefaultOrg, runmode.LocalDefaultTeamID, a.ID)
+	ta, err := s.teamAgents.GetForTeam(ctx, orgID, runmode.LocalDefaultTeamID, a.ID)
 	if err != nil {
 		return a, false, fmt.Errorf("team_agents lookup: %w", err)
 	}

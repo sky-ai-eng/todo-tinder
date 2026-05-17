@@ -11,7 +11,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/agentmeta"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -34,9 +33,13 @@ type pendingPRJSON struct {
 
 // handlePendingPRGet returns a single pending PR.
 func (s *Server) handlePendingPRGet(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
-	pr, err := s.pendingPRs.Get(r.Context(), runmode.LocalDefaultOrgID, id)
+	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "pending-prs", err)
 		return
@@ -52,9 +55,13 @@ func (s *Server) handlePendingPRGet(w http.ResponseWriter, r *http.Request) {
 // handleRunPendingPR is the run-keyed lookup the frontend uses to find
 // "the pending PR for this delegated run." Mirrors handleRunReview.
 func (s *Server) handleRunPendingPR(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	runID := r.PathValue("runID")
 
-	pr, err := s.pendingPRs.ByRunID(r.Context(), runmode.LocalDefaultOrgID, runID)
+	pr, err := s.pendingPRs.ByRunID(r.Context(), orgID, runID)
 	if err != nil {
 		internalError(w, "pending-prs", err)
 		return
@@ -72,6 +79,10 @@ func (s *Server) handleRunPendingPR(w http.ResponseWriter, r *http.Request) {
 // UpdatePendingPRTitleBody so the human-feedback diff at submit time
 // has a stable baseline.
 func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req struct {
@@ -82,7 +93,7 @@ func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pr, err := s.pendingPRs.Get(r.Context(), runmode.LocalDefaultOrgID, id)
+	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "pending-prs", err)
 		return
@@ -111,7 +122,7 @@ func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.pendingPRs.UpdateTitleBody(r.Context(), runmode.LocalDefaultOrgID, id, title, body); err != nil {
+	if err := s.pendingPRs.UpdateTitleBody(r.Context(), orgID, id, title, body); err != nil {
 		if errors.Is(err, db.ErrPendingPRSubmitted) {
 			// 409 Conflict so the overlay can show the user a clean
 			// "submission in flight, your edit was dropped" message
@@ -132,9 +143,13 @@ func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
 // the bare's local ref to whatever the agent pushed (the bare
 // doesn't auto-update on push). Diff is capped at livePRDiffMaxBytes.
 func (s *Server) handlePendingPRDiff(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
-	pr, err := s.pendingPRs.Get(r.Context(), runmode.LocalDefaultOrgID, id)
+	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "pending-prs", err)
 		return
@@ -181,6 +196,11 @@ func (s *Server) handlePendingPRDiff(w http.ResponseWriter, r *http.Request) {
 //     delete the pending row, flip the run to completed, mark the
 //     task done, broadcast the WS event.
 func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	if s.ghClient == nil {
@@ -200,7 +220,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	pr, err := s.pendingPRs.Get(r.Context(), runmode.LocalDefaultOrgID, id)
+	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "pending-prs", err)
 		return
@@ -214,7 +234,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 	// on to call GitHub; the loser sees 409 and can retry once the
 	// winner finishes (which will release the guard on failure or
 	// delete the row on success).
-	if err := s.pendingPRs.MarkSubmitted(r.Context(), runmode.LocalDefaultOrgID, id); err != nil {
+	if err := s.pendingPRs.MarkSubmitted(r.Context(), orgID, id); err != nil {
 		if errors.Is(err, db.ErrPendingPRSubmitInFlight) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "another submit is in flight or has already completed"})
 			return
@@ -246,8 +266,8 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 		// request user's claims so the UPDATE passes RLS in
 		// multi-mode.
 		clearCtx := context.WithoutCancel(r.Context())
-		if clearErr := s.tx.WithTx(clearCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, func(tx db.TxStores) error {
-			return tx.PendingPRs.ClearSubmitted(clearCtx, runmode.LocalDefaultOrgID, id)
+		if clearErr := s.tx.WithTx(clearCtx, orgID, userID, func(tx db.TxStores) error {
+			return tx.PendingPRs.ClearSubmitted(clearCtx, orgID, id)
 		}); clearErr != nil {
 			log.Printf("[pending-prs] failed to release submit guard for %s after CreatePR failure: %v", id, clearErr)
 		}
@@ -273,8 +293,8 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 	// sees what the human changed vs the agent's draft.
 	if pr.RunID != "" {
 		humanContent := FormatHumanFeedbackPR(pr, pr.Title, pr.Body)
-		if err := s.tx.WithTx(cleanupCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, func(tx db.TxStores) error {
-			return tx.TaskMemory.UpdateRunMemoryHumanContent(cleanupCtx, runmode.LocalDefaultOrg, pr.RunID, humanContent)
+		if err := s.tx.WithTx(cleanupCtx, orgID, userID, func(tx db.TxStores) error {
+			return tx.TaskMemory.UpdateRunMemoryHumanContent(cleanupCtx, orgID, pr.RunID, humanContent)
 		}); err != nil {
 			log.Printf("[pending-prs] warning: failed to record human verdict for run %s: %v", pr.RunID, err)
 		}
@@ -285,8 +305,8 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 	// GitHub state — if the delete itself fails, the row stays
 	// visible (and the MarkSubmitted guard returns "in-flight" on
 	// retry), which is the same failure mode as before SKY-300.
-	if err := s.tx.WithTx(cleanupCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, func(tx db.TxStores) error {
-		return tx.PendingPRs.Delete(cleanupCtx, runmode.LocalDefaultOrgID, id)
+	if err := s.tx.WithTx(cleanupCtx, orgID, userID, func(tx db.TxStores) error {
+		return tx.PendingPRs.Delete(cleanupCtx, orgID, id)
 	}); err != nil {
 		log.Printf("[pending-prs] warning: failed to clean up pending PR %s after submit: %v", id, err)
 	}
@@ -297,8 +317,8 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 	// step 2's failure path).
 	var chainRun *domain.ChainRun
 	if pr.RunID != "" {
-		if err := s.tx.WithTx(cleanupCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, func(tx db.TxStores) error {
-			if _, err := tx.AgentRuns.MarkCompletedIfPendingApproval(cleanupCtx, runmode.LocalDefaultOrg, pr.RunID); err != nil {
+		if err := s.tx.WithTx(cleanupCtx, orgID, userID, func(tx db.TxStores) error {
+			if _, err := tx.AgentRuns.MarkCompletedIfPendingApproval(cleanupCtx, orgID, pr.RunID); err != nil {
 				return fmt.Errorf("mark run completed: %w", err)
 			}
 			// Skip the blanket task-mark-done for chain steps;
@@ -306,7 +326,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 			// row finalizes first. A chain lookup error leaves the
 			// task open for human follow-up rather than racing
 			// terminateChain.
-			cr, _, chainLookupErr := tx.Chains.GetRunForRun(cleanupCtx, runmode.LocalDefaultOrg, pr.RunID)
+			cr, _, chainLookupErr := tx.Chains.GetRunForRun(cleanupCtx, orgID, pr.RunID)
 			if chainLookupErr != nil {
 				log.Printf("[pending-prs] warning: chain lookup failed for run %s; skipping task closure: %v", pr.RunID, chainLookupErr)
 				return nil
@@ -317,12 +337,12 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 			}
 			// Stand-alone run: resolve the run's task_id and flip
 			// the task to done.
-			run, runErr := tx.AgentRuns.Get(cleanupCtx, runmode.LocalDefaultOrg, pr.RunID)
+			run, runErr := tx.AgentRuns.Get(cleanupCtx, orgID, pr.RunID)
 			if runErr != nil || run == nil {
 				log.Printf("[pending-prs] warning: read run %s for task closure: %v", pr.RunID, runErr)
 				return nil
 			}
-			if err := tx.Tasks.SetStatus(cleanupCtx, runmode.LocalDefaultOrg, run.TaskID, "done"); err != nil {
+			if err := tx.Tasks.SetStatus(cleanupCtx, orgID, run.TaskID, "done"); err != nil {
 				log.Printf("[pending-prs] warning: failed to update task status for run %s: %v", pr.RunID, err)
 			}
 			return nil
@@ -336,7 +356,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 			Data:  map[string]string{"status": "completed"},
 		})
 		if chainRun != nil && s.spawner != nil {
-			s.spawner.ResumeChainAfterApproval(pr.RunID, runmode.LocalDefaultUserID)
+			s.spawner.ResumeChainAfterApproval(pr.RunID, userID)
 		}
 	}
 

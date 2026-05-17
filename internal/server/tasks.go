@@ -11,7 +11,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -84,7 +83,11 @@ func taskToJSON(t domain.Task) taskJSON {
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
-	tasks, err := s.tasks.Queued(r.Context(), runmode.LocalDefaultOrg)
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	tasks, err := s.tasks.Queued(r.Context(), orgID)
 	if err != nil {
 		internalError(w, "tasks", err)
 		return
@@ -97,13 +100,17 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	status := r.URL.Query().Get("status")
 	var tasks []domain.Task
 	var err error
 	if status != "" {
-		tasks, err = s.tasks.ByStatus(r.Context(), runmode.LocalDefaultOrg, status)
+		tasks, err = s.tasks.ByStatus(r.Context(), orgID, status)
 	} else {
-		tasks, err = s.tasks.Queued(r.Context(), runmode.LocalDefaultOrg)
+		tasks, err = s.tasks.Queued(r.Context(), orgID)
 	}
 	if err != nil {
 		internalError(w, "tasks", err)
@@ -117,8 +124,12 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTaskGet(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
-	task, err := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	task, err := s.tasks.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "tasks", err)
 		return
@@ -137,6 +148,11 @@ type swipeRequest struct {
 }
 
 func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	var req swipeRequest
@@ -176,7 +192,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// (idempotent same-user, takeover from bot, claim from
 		// unclaimed) and one refuse path (different user owns it).
 		// Refused → 409 with NO state mutation and NO audit row.
-		task, lerr := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+		task, lerr := s.tasks.Get(r.Context(), orgID, id)
 		if lerr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": lerr.Error()})
 			return
@@ -198,7 +214,6 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		userID := runmode.LocalDefaultUserID
 		claimChanged := false
 		switch {
 		case task.ClaimedByUserID == userID:
@@ -209,7 +224,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		case task.ClaimedByAgentID != "":
-			ok, err := s.tasks.TakeoverClaimFromAgent(r.Context(), runmode.LocalDefaultOrg, id, userID)
+			ok, err := s.tasks.TakeoverClaimFromAgent(r.Context(), orgID, id, userID)
 			if err != nil {
 				log.Printf("[swipe] takeover claim flip failed on task %s: %v", id, err)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
@@ -223,7 +238,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			}
 			claimChanged = true
 		default:
-			ok, err := s.tasks.ClaimQueuedForUser(r.Context(), runmode.LocalDefaultOrg, id, userID)
+			ok, err := s.tasks.ClaimQueuedForUser(r.Context(), orgID, id, userID)
 			if err != nil {
 				log.Printf("[swipe] user claim stamp failed on task %s: %v", id, err)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
@@ -246,7 +261,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// row. Best-effort: if the insert fails, the claim still
 		// landed; log and continue rather than 500-ing on a
 		// committed state change.
-		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), runmode.LocalDefaultOrg, id, req.Action, req.HesitationMs)
+		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
 		if swipeErr != nil {
 			log.Printf("[swipe] audit write failed for task %s claim: %v (claim mutation already landed)", id, swipeErr)
 			newStatus = "queued"
@@ -271,7 +286,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// can't manually delegate to a disabled bot either.
 		// Refuse with 409 — clear error the FE can surface as
 		// "bot is off; enable it in team settings."
-		a, enabled, err := s.agentEnabledForLocalTeam(r.Context())
+		a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID)
 		if err != nil {
 			log.Printf("[swipe] delegate aborted on task %s: %v", id, err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
@@ -292,7 +307,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// for the response — 404 for missing, 409 + closed-task
 		// message for terminal, 409 + theft message for different
 		// user. Matches the claim path's load-and-branch shape.
-		task, lerr := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+		task, lerr := s.tasks.Get(r.Context(), orgID, id)
 		if lerr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": lerr.Error()})
 			return
@@ -307,7 +322,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		result, err := s.tasks.HandoffAgentClaim(r.Context(), runmode.LocalDefaultOrg, id, a.ID, runmode.LocalDefaultUserID)
+		result, err := s.tasks.HandoffAgentClaim(r.Context(), orgID, id, a.ID, userID)
 		if err != nil {
 			log.Printf("[swipe] failed to stamp agent claim on task %s: %v", id, err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
@@ -328,7 +343,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		}
 		// Accepted path (Changed or NoOp). Audit post-mutation,
 		// best-effort.
-		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), runmode.LocalDefaultOrg, id, req.Action, req.HesitationMs)
+		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
 		if swipeErr != nil {
 			log.Printf("[swipe] audit write failed for task %s delegate: %v (claim mutation already landed)", id, swipeErr)
 			newStatus = "queued"
@@ -353,7 +368,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// the status would flip to 'snoozed' without snooze_until,
 		// which the FE doesn't produce and we don't bother
 		// guarding against beyond defaulting newStatus.)
-		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), runmode.LocalDefaultOrg, id, req.Action, req.HesitationMs)
+		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
 		if swipeErr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": swipeErr.Error()})
 			return
@@ -416,14 +431,14 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// run in pending_approval. WithoutCancel inherits request
 		// values (claims, eventually).
 		cleanupCtx := context.WithoutCancel(r.Context())
-		s.cleanupPendingApprovalRun(cleanupCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, id, outcome)
+		s.cleanupPendingApprovalRun(cleanupCtx, orgID, userID, id, outcome)
 		if s.spawner != nil {
-			ids, err := s.agentRuns.ActiveIDsForTask(r.Context(), runmode.LocalDefaultOrg, id)
+			ids, err := s.agentRuns.ActiveIDsForTask(r.Context(), orgID, id)
 			if err != nil {
 				log.Printf("[swipe] active-run lookup for task %s failed: %v", id, err)
 			} else {
 				for _, runID := range ids {
-					if err := s.spawner.Cancel(runID, runmode.LocalDefaultUserID); err != nil {
+					if err := s.spawner.Cancel(runID, userID); err != nil {
 						log.Printf("[swipe] cancel run %s on %s of task %s: %v", runID, req.Action, id, err)
 					}
 				}
@@ -441,7 +456,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	// "In Review" while canonical is "In Progress", transitioning back to the
 	// canonical would be a spurious status change that would confuse watchers.
 	if req.Action == "claim" && s.jiraClient != nil {
-		task, err := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+		task, err := s.tasks.Get(r.Context(), orgID, id)
 		if err == nil && task != nil && task.EntitySource == "jira" {
 			// config.Load() on the swipe hot path: bounded by O(projects)
 			// settings rows, paced by human swipe rate — sub-millisecond
@@ -482,12 +497,12 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 
 	// Trigger delegation on swipe-up
 	if req.Action == "delegate" && s.spawner != nil {
-		task, err := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+		task, err := s.tasks.Get(r.Context(), orgID, id)
 		if err == nil && task != nil {
 			runID, err := s.spawner.Delegate(*task, delegate.DelegateOpts{
 				ExplicitPromptID: req.PromptID,
 				TriggerType:      "manual",
-				CreatorUserID:    runmode.LocalDefaultUserID,
+				CreatorUserID:    userID,
 			})
 			if err != nil {
 				response["delegate_error"] = err.Error()
@@ -506,6 +521,10 @@ type snoozeRequest struct {
 }
 
 func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req snoozeRequest
@@ -525,7 +544,7 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 	// leaking implementation detail and confusing legitimate 404
 	// callers. The pre-check fails fast before the store gets
 	// involved.
-	task, err := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	task, err := s.tasks.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "tasks", err)
 		return
@@ -535,12 +554,12 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, err := s.swipes.SnoozeTask(r.Context(), runmode.LocalDefaultOrg, id, until, req.HesitationMs)
+	snoozed, err := s.swipes.SnoozeTask(r.Context(), orgID, id, until, req.HesitationMs)
 	if err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
-	if !ok {
+	if !snoozed {
 		// SKY-261 v0.7: snooze is queue-only ("snoozed ↔ both claim
 		// cols NULL"). The store's atomic UPDATE refused because
 		// the task is currently claimed by a user or the bot.
@@ -574,6 +593,10 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 // to queue" button) lives at /requeue and skips the swipe row.
 // Same finalizer, same observable outcome — different audit shape.
 func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
 	// GetTask up front does double duty: existence check for the
@@ -582,7 +605,7 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	// UndoLastSwipe would still fail on the swipe_events FK, but
 	// we'd surface the SQLite error string as a 500 — leaking
 	// implementation detail and confusing legitimate 404 callers.
-	task, err := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	task, err := s.tasks.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "tasks", err)
 		return
@@ -592,12 +615,12 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.swipes.UndoLastSwipe(r.Context(), runmode.LocalDefaultOrg, id); err != nil {
+	if err := s.swipes.UndoLastSwipe(r.Context(), orgID, id); err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
 
-	s.finalizeRequeue(r, id, task)
+	s.finalizeRequeue(r, orgID, ClaimsFrom(r.Context()).Subject, id, task)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }
@@ -617,9 +640,13 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 // check, that race would surface as a misleading 200/queued
 // response for an id that no longer exists.
 func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
-	task, err := s.tasks.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	task, err := s.tasks.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "tasks", err)
 		return
@@ -629,17 +656,17 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, err := s.swipes.RequeueTask(r.Context(), runmode.LocalDefaultOrg, id)
+	requeued, err := s.swipes.RequeueTask(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
-	if !ok {
+	if !requeued {
 		notFound(w, "task")
 		return
 	}
 
-	s.finalizeRequeue(r, id, task)
+	s.finalizeRequeue(r, orgID, ClaimsFrom(r.Context()).Subject, id, task)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }
@@ -710,7 +737,11 @@ const (
 // deleted concurrently) would silently strand the very state this
 // helper is meant to clean up. Jira reversal needs the loaded row so
 // it nil-guards internally.
-func (s *Server) finalizeRequeue(r *http.Request, taskID string, task *domain.Task) {
+//
+// orgID + userID are captured BEFORE the goroutine launches so the
+// detached cleanup context inherits the requesting user's identity
+// without rereading the (possibly nil-claimed) context post-cancel.
+func (s *Server) finalizeRequeue(r *http.Request, orgID, userID, taskID string, task *domain.Task) {
 	// Cleanup must outlive the request — the user already committed
 	// to requeueing via the surrounding /undo or /requeue handler,
 	// and bailing on browser close would strand the run in
@@ -718,7 +749,7 @@ func (s *Server) finalizeRequeue(r *http.Request, taskID string, task *domain.Ta
 	// r.Context() (D9 will put request claims there) while breaking
 	// the cancel chain.
 	cleanupCtx := context.WithoutCancel(r.Context())
-	s.cleanupPendingApprovalRun(cleanupCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, taskID, discardOutcomeRequeued)
+	s.cleanupPendingApprovalRun(cleanupCtx, orgID, userID, taskID, discardOutcomeRequeued)
 	s.revertJiraStateIfApplicable(task)
 }
 
@@ -784,7 +815,7 @@ func (s *Server) cleanupPendingApprovalRun(ctx context.Context, orgID, userID, t
 		// breaks any downstream logic keyed on stop_reason that
 		// needs to tell the two apart.
 		kind := "review"
-		if pr, prErr := tx.PendingPRs.ByRunID(ctx, runmode.LocalDefaultOrgID, runID); prErr != nil {
+		if pr, prErr := tx.PendingPRs.ByRunID(ctx, orgID, runID); prErr != nil {
 			return fmt.Errorf("pendingPRs.ByRunID: %w", prErr)
 		} else if pr != nil {
 			kind = "pr"
@@ -803,7 +834,7 @@ func (s *Server) cleanupPendingApprovalRun(ctx context.Context, orgID, userID, t
 		// Tear down the pending review by run_id directly. The
 		// DELETE-by-run-id helper is transactional across
 		// comments + review and is a no-op when no review exists.
-		if err := tx.Reviews.DeleteByRunID(ctx, runmode.LocalDefaultOrgID, runID); err != nil {
+		if err := tx.Reviews.DeleteByRunID(ctx, orgID, runID); err != nil {
 			return fmt.Errorf("reviews.DeleteByRunID: %w", err)
 		}
 		// Same idempotent no-op when no pending_prs row exists.
@@ -811,7 +842,7 @@ func (s *Server) cleanupPendingApprovalRun(ctx context.Context, orgID, userID, t
 		// tables (the spawner flips on either), but
 		// cleanupPendingApprovalRun runs against the run id without
 		// first determining which kind — so we attempt both deletes.
-		if err := tx.PendingPRs.DeleteByRunID(ctx, runmode.LocalDefaultOrgID, runID); err != nil {
+		if err := tx.PendingPRs.DeleteByRunID(ctx, orgID, runID); err != nil {
 			return fmt.Errorf("pendingPRs.DeleteByRunID: %w", err)
 		}
 

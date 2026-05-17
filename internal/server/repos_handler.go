@@ -8,7 +8,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // handleGitHubRepos returns all repositories the authenticated user has access to.
@@ -37,7 +36,11 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 
 // handleRepoProfiles returns all configured repo profiles from the DB.
 func (s *Server) handleRepoProfiles(w http.ResponseWriter, r *http.Request) {
-	profiles, err := s.repos.List(r.Context(), runmode.LocalDefaultOrgID)
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	profiles, err := s.repos.List(r.Context(), orgID)
 	if err != nil {
 		internalError(w, "repos", err)
 		return
@@ -88,6 +91,10 @@ func (s *Server) handleRepoProfiles(w http.ResponseWriter, r *http.Request) {
 
 // handleRepoUpdate updates per-repo settings like base_branch.
 func (s *Server) handleRepoUpdate(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	owner := r.PathValue("owner")
 	repo := r.PathValue("repo")
 	if owner == "" || repo == "" {
@@ -113,7 +120,7 @@ func (s *Server) handleRepoUpdate(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid base_branch value"})
 			return
 		}
-		if err := s.repos.UpdateBaseBranch(r.Context(), runmode.LocalDefaultOrgID, repoID, branch); err != nil {
+		if err := s.repos.UpdateBaseBranch(r.Context(), orgID, repoID, branch); err != nil {
 			internalError(w, "repos", err)
 			return
 		}
@@ -153,6 +160,10 @@ func (s *Server) handleRepoBranches(w http.ResponseWriter, r *http.Request) {
 
 // handleReposSave updates the configured repos in the DB and triggers re-profiling.
 func (s *Server) handleReposSave(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		Repos []string `json:"repos"`
 	}
@@ -164,7 +175,7 @@ func (s *Server) handleReposSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repos.SetConfigured(r.Context(), runmode.LocalDefaultOrgID, req.Repos); err != nil {
+	if err := s.repos.SetConfigured(r.Context(), orgID, req.Repos); err != nil {
 		internalError(w, "repos", err)
 		return
 	}

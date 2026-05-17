@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // factoryEntityLimit caps how many active entities we ship per snapshot.
@@ -188,6 +187,11 @@ type factorySnapshotJSON struct {
 // derived from existing persistence — no new event stream, no state
 // projection — so repeated calls are cheap and idempotent.
 func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	since := time.Now().Add(-24 * time.Hour)
 
 	// Session user's GitHub login drives the "mine" flag. Identity lives on
@@ -195,15 +199,15 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	// GitHub configured) degrades to everyone-is-other rather than failing
 	// the whole endpoint — the factory should still render for a user who's
 	// only set up Jira.
-	ghUsername, _ := s.users.GetGitHubUsername(r.Context(), runmode.LocalDefaultUserID)
+	ghUsername, _ := s.users.GetGitHubUsername(r.Context(), userID)
 
 	// --- Throughput counters ------------------------------------------------
-	eventCounts, err := s.factory.EventCountsSince(r.Context(), runmode.LocalDefaultOrg, since)
+	eventCounts, err := s.factory.EventCountsSince(r.Context(), orgID, since)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
 	}
-	taskCounts, err := s.factory.TaskCountsSince(r.Context(), runmode.LocalDefaultOrg, since)
+	taskCounts, err := s.factory.TaskCountsSince(r.Context(), orgID, since)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -218,7 +222,7 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Active runs --------------------------------------------------------
-	activeRuns, err := s.factory.ActiveRuns(r.Context(), runmode.LocalDefaultOrg)
+	activeRuns, err := s.factory.ActiveRuns(r.Context(), orgID)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -258,7 +262,7 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 		if _, seen := runAuthors[ar.Task.EntityID]; seen {
 			continue
 		}
-		ent, err := s.entities.Get(r.Context(), runmode.LocalDefaultOrgID, ar.Task.EntityID)
+		ent, err := s.entities.Get(r.Context(), orgID, ar.Task.EntityID)
 		if err != nil || ent == nil {
 			runAuthors[ar.Task.EntityID] = ""
 			continue
@@ -278,7 +282,7 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Active entities ----------------------------------------------------
-	entityRows, err := s.factory.Entities(r.Context(), runmode.LocalDefaultOrg, factoryEntityLimit)
+	entityRows, err := s.factory.Entities(r.Context(), orgID, factoryEntityLimit)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -288,7 +292,7 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	for _, row := range entityRows {
 		entityIDs = append(entityIDs, row.Entity.ID)
 	}
-	recentByEntity, err := s.factory.RecentEventsByEntity(r.Context(), runmode.LocalDefaultOrg, entityIDs, factoryRecentEventsPerEntity)
+	recentByEntity, err := s.factory.RecentEventsByEntity(r.Context(), orgID, entityIDs, factoryRecentEventsPerEntity)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -300,7 +304,7 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	// event_type + dedup_key) rather than the full Task struct so
 	// /api/factory/snapshot doesn't pay for the entity JOIN and the
 	// snapshot_json json_extract on every poll.
-	pendingTasks, err := s.tasks.ListActiveRefsForEntities(r.Context(), runmode.LocalDefaultOrg, entityIDs)
+	pendingTasks, err := s.tasks.ListActiveRefsForEntities(r.Context(), orgID, entityIDs)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -318,7 +322,7 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	awaitingByEntity, err := s.agentRuns.EntitiesWithAwaitingInput(r.Context(), runmode.LocalDefaultOrg, entityIDs)
+	awaitingByEntity, err := s.agentRuns.EntitiesWithAwaitingInput(r.Context(), orgID, entityIDs)
 	if err != nil {
 		internalError(w, "factory", err)
 		return

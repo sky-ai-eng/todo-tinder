@@ -47,19 +47,20 @@ type teamMemberRow struct {
 
 func (s *Server) handleTeamMembers(w http.ResponseWriter, r *http.Request) {
 	// Multi mode would query memberships for the session user's active
-	// team — gated behind SKY-251's middleware which doesn't exist yet.
-	// Refuse rather than return a synthetic local roster that would
+	// team — gated behind the org-team roster work that hasn't landed
+	// yet. Refuse rather than return a synthetic local roster that would
 	// mislead the FE's "you" highlighting.
 	if runmode.Current() != runmode.ModeLocal {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{
-			"error": "/api/team/members is not yet wired for multi mode (see SKY-251)",
+			"error": "/api/team/members is not yet wired for multi mode",
 		})
 		return
 	}
 
-	username, _ := s.users.GetGitHubUsername(r.Context(), runmode.LocalDefaultUserID)
-	displayName, _ := s.users.GetDisplayName(r.Context(), runmode.LocalDefaultUserID)
-	jiraAccount, _, _ := s.users.GetJiraIdentity(r.Context(), runmode.LocalDefaultUserID)
+	userID := ClaimsFrom(r.Context()).Subject
+	username, _ := s.users.GetGitHubUsername(r.Context(), userID)
+	displayName, _ := s.users.GetDisplayName(r.Context(), userID)
+	jiraAccount, _, _ := s.users.GetJiraIdentity(r.Context(), userID)
 	var login, jiraID *string
 	if username != "" {
 		login = &username
@@ -70,7 +71,7 @@ func (s *Server) handleTeamMembers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, teamMembersResponse{
 		Members: []teamMemberRow{
 			{
-				UserID:         runmode.LocalDefaultUserID,
+				UserID:         userID,
 				DisplayName:    displayName,
 				GitHubUsername: login,
 				JiraAccountID:  jiraID,

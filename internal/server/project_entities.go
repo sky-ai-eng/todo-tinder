@@ -4,8 +4,6 @@ import (
 	"log"
 	"net/http"
 	"time"
-
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // projectEntity is the per-row payload returned by
@@ -33,8 +31,12 @@ type projectEntity struct {
 // still in flight; historical context lives elsewhere (entity detail
 // pages, future audit views) so the panel stays scannable.
 func (s *Server) handleProjectEntities(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, projectID)
+	project, err := s.projects.Get(r.Context(), orgID, projectID)
 	if err != nil {
 		log.Printf("[entities] get project %s: %v", projectID, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
@@ -45,7 +47,7 @@ func (s *Server) handleProjectEntities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entities, err := s.entities.ListProjectPanel(r.Context(), runmode.LocalDefaultOrgID, projectID)
+	entities, err := s.entities.ListProjectPanel(r.Context(), orgID, projectID)
 	if err != nil {
 		log.Printf("[entities] list for project %s: %v", projectID, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load entities"})
