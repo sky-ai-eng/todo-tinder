@@ -1145,6 +1145,7 @@ CREATE TABLE public.sessions (
     revoked_at timestamp with time zone,
     user_agent text,
     ip_addr inet,
+    active_org_id uuid,
     CONSTRAINT sessions_check CHECK ((expires_at > created_at)),
     CONSTRAINT sessions_check1 CHECK ((jwt_expires_at <= expires_at))
 );
@@ -2880,6 +2881,19 @@ ALTER TABLE ONLY public.runs
 
 ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: sessions sessions_active_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+-- ON DELETE SET NULL so deleting an org doesn't cascade-delete every
+-- session that pointed at it; the next request from those sessions
+-- falls through to "no active org" behavior (handler returns 409 and
+-- the SPA prompts the user to pick another org).
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_active_org_id_fkey FOREIGN KEY (active_org_id) REFERENCES public.orgs(id) ON DELETE SET NULL;
 
 
 --

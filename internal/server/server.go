@@ -244,6 +244,11 @@ func (s *Server) routes() {
 	// 401. The frontend in local mode shouldn't be calling this; D8
 	// handles the conditional mount on the SPA side.
 	s.mux.Handle("GET /api/me", s.withSession(http.HandlerFunc(s.handleMe)))
+	// SKY-313: switch the session's active org. CSRF-origin-checked
+	// because it mutates server-stored state; withSession because we
+	// need the (verified) caller's claims to gate membership.
+	s.mux.Handle("POST /api/me/active-org",
+		s.withCSRFOriginCheck(s.withSession(http.HandlerFunc(s.handleActiveOrgUpdate))))
 
 	// /auth/v1/* reverse-proxy to gotrue, wired lazily inside
 	// SetAuthDeps. The closure here re-reads s.authProxy each

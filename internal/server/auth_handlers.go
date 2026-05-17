@@ -269,6 +269,25 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SKY-313: default the session's active_org_id to the user's
+	// earliest membership (created_at ASC, org_id ASC as deterministic
+	// tiebreak). Zero memberships → Valid=false → row stores NULL and
+	// handlers 409 until the user calls POST /api/me/active-org.
+	// Admin pool — this read is part of the auth flow itself, before a
+	// claim context is installed for app-pool RLS.
+	var defaultOrg uuid.NullUUID
+	if oerr := s.db.QueryRowContext(r.Context(), `
+		SELECT org_id
+		  FROM public.org_memberships
+		 WHERE user_id = $1
+		 ORDER BY created_at ASC, org_id ASC
+		 LIMIT 1
+	`, userUUID).Scan(&defaultOrg); oerr != nil && !errors.Is(oerr, sql.ErrNoRows) {
+		log.Printf("[auth] default org lookup for user %s: %v", userUUID, oerr)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
 	// Trust the JWT's exp claim. The exchange response also carries
 	// expires_in, but the signed claim is authoritative and the
 	// closure already returns it via Verifier.Claims.ExpiresAt.
@@ -277,7 +296,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	sessExp := timeNow().Add(30 * 24 * time.Hour)
 	sess, err := s.authDeps.sessions.CreateSystem(r.Context(), userUUID,
 		accessToken, refreshToken, jwtExp, sessExp,
-		r.UserAgent(), clientIP(r),
+		r.UserAgent(), clientIP(r), defaultOrg,
 	)
 	if err != nil {
 		log.Printf("[auth] create session: %v", err)
@@ -403,6 +422,82 @@ func (s *Server) handleLogoutAll(w http.ResponseWriter, r *http.Request) {
 		MaxAge: -1, HttpOnly: true, Secure: s.cookieSecure(r), SameSite: http.SameSiteLaxMode,
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleActiveOrgUpdate swaps the active org for the caller's session.
+// Wrapped at mount time in withCSRFOriginCheck + withSession.
+//
+// POST /api/me/active-org  body: { "org_id": "<uuid>" }
+//
+// SKY-313: the active-org primitive. We deliberately store the choice
+// on the session row (single source of truth across tabs) rather than
+// in the URL path. The next request's withSession reads the new value
+// into ctxKeyOrgID; tab B sees the switch on its next round trip.
+//
+// 404-on-non-member mirrors withOrg's posture — don't disclose whether
+// the org exists to a user who isn't in it.
+func (s *Server) handleActiveOrgUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.authDeps == nil {
+		http.NotFound(w, r)
+		return
+	}
+	claims := ClaimsFrom(r.Context())
+	if claims == nil || claims.Subject == runmode.LocalDefaultUserID {
+		// Sentinel-claim caller is the local-mode shim; local mode has
+		// nothing to do here (the shim hardcodes the sentinel org). 401
+		// matches handleMe's sentinel gate.
+		writeUnauth(w)
+		return
+	}
+	sess := SessionFrom(r.Context())
+	if sess == nil {
+		// withSession is responsible for setting this; absence is a
+		// route-wiring bug, not a caller fault.
+		log.Printf("[auth] handleActiveOrgUpdate: no session in context — route missing withSession?")
+		writeUnauth(w)
+		return
+	}
+
+	var body struct {
+		OrgID string `json:"org_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	orgUUID, err := uuid.Parse(body.OrgID)
+	if err != nil {
+		http.Error(w, "invalid org_id", http.StatusBadRequest)
+		return
+	}
+
+	ok, err := s.userHasOrgAccess(r.Context(), claims.Subject, orgUUID.String())
+	if err != nil {
+		log.Printf("[auth] active-org membership check %s/%s: %v", claims.Subject, orgUUID, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		// 404 not 403 — same posture as withOrg.
+		http.NotFound(w, r)
+		return
+	}
+
+	if err := s.authDeps.sessions.UpdateActiveOrgSystem(r.Context(), sess.ID, orgUUID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Session vanished between withSession's lookup and now
+			// (revoked from another tab, reaper raced in). 401 — caller
+			// re-logs in.
+			writeUnauth(w)
+			return
+		}
+		log.Printf("[auth] update active-org sid=%s org=%s: %v", sessions.LogID(sess.ID), orgUUID, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte("{}"))
 }
 
 // handleMe returns the authenticated user's identity + org list.

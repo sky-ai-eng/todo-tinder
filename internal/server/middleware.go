@@ -52,9 +52,18 @@ func SessionFrom(ctx context.Context) *sessions.Session {
 	return v
 }
 
-// OrgIDFrom returns the URL-path org_id that OrgMiddleware validated
-// against the caller's memberships. Empty string for routes without
-// {org_id} or in local mode.
+// OrgIDFrom returns the active org for the request. Sources, in order:
+//
+//   - URL-path {org_id} validated by withOrg against the caller's
+//     memberships (used by org-scoped routes like /api/orgs/{org_id}/...);
+//   - the session's active_org_id, populated by withSession in multi
+//     mode from public.sessions.active_org_id (SKY-313);
+//   - the hardcoded LocalDefaultOrgID set by the local-mode shim in
+//     withSession.
+//
+// Empty string when the caller is multi-mode and has no active org
+// (zero memberships) — handlers that require an org should 409 with a
+// stable code so the SPA can prompt the user to pick/join one.
 func OrgIDFrom(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyOrgID).(string)
 	return v
@@ -183,6 +192,13 @@ func (s *Server) withSession(next http.Handler) http.Handler {
 
 		ctx := context.WithValue(r.Context(), ctxKeyClaims, claims)
 		ctx = context.WithValue(ctx, ctxKeySession, sess)
+		// SKY-313: surface the session's active org so OrgIDFrom() works
+		// uniformly in multi mode without per-handler plumbing. Sessions
+		// whose user has zero memberships carry NULL here — we leave
+		// ctxKeyOrgID unset and handlers that require an org return 409.
+		if sess.ActiveOrgID.Valid {
+			ctx = context.WithValue(ctx, ctxKeyOrgID, sess.ActiveOrgID.UUID.String())
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

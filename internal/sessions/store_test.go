@@ -52,7 +52,7 @@ func TestStore_CreateLookupRoundtrip(t *testing.T) {
 	jwtExp := time.Now().Add(1 * time.Hour).UTC()
 	sessExp := time.Now().Add(30 * 24 * time.Hour).UTC()
 
-	created, err := store.CreateSystem(ctx, uid, jwt, refresh, jwtExp, sessExp, "test-ua", "127.0.0.1")
+	created, err := store.CreateSystem(ctx, uid, jwt, refresh, jwtExp, sessExp, "test-ua", "127.0.0.1", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestStore_CiphertextAtRest(t *testing.T) {
 
 	plainJWT := "header.payload.signature"
 	created, err := store.CreateSystem(ctx, uid, plainJWT, "ref",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestStore_Lookup_FiltersRevoked(t *testing.T) {
 	store, _, uid := newStoreForTest(t)
 	ctx := context.Background()
 	c, err := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestStore_Lookup_FiltersExpired(t *testing.T) {
 	store, h, uid := newStoreForTest(t)
 	ctx := context.Background()
 	c, err := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestStore_UpdateJWT(t *testing.T) {
 	store, _, uid := newStoreForTest(t)
 	ctx := context.Background()
 	c, err := store.CreateSystem(ctx, uid, "old-jwt", "old-ref",
-		time.Now().Add(1*time.Minute), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Minute), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestStore_UpdateJWT_OnRevokedReturnsErr(t *testing.T) {
 	store, _, uid := newStoreForTest(t)
 	ctx := context.Background()
 	c, err := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestStore_Revoke_PreservesRow(t *testing.T) {
 	store, h, uid := newStoreForTest(t)
 	ctx := context.Background()
 	c, err := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestStore_Revoke_Idempotent(t *testing.T) {
 	store, _, uid := newStoreForTest(t)
 	ctx := context.Background()
 	c, err := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestStore_TouchLastSeen(t *testing.T) {
 	store, h, uid := newStoreForTest(t)
 	ctx := context.Background()
 	c, err := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -301,11 +301,11 @@ func TestStore_ListActiveForUser_AndRevokeAll(t *testing.T) {
 	//   active1, active2 — show up in ListActive
 	//   revoked          — pre-revoked, filtered out
 	active1, _ := store.CreateSystem(ctx, uid, "jwt-1", "ref-1",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "ua-1", "1.1.1.1")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "ua-1", "1.1.1.1", uuid.NullUUID{})
 	active2, _ := store.CreateSystem(ctx, uid, "jwt-2", "ref-2",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "ua-2", "2.2.2.2")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "ua-2", "2.2.2.2", uuid.NullUUID{})
 	revoked, _ := store.CreateSystem(ctx, uid, "jwt-3", "ref-3",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	if err := store.RevokeSystem(ctx, revoked.ID); err != nil {
 		t.Fatalf("pre-revoke: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestStore_ListActiveForUser_AndRevokeAll(t *testing.T) {
 	// Another user's session — must NOT appear in our list.
 	other := seedUser(t, h)
 	otherSess, _ := store.CreateSystem(ctx, other, "jwt-other", "ref-other",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 
 	got, err := store.ListActiveForUserSystem(ctx, uid)
 	if err != nil {
@@ -375,6 +375,172 @@ func TestStore_ListActiveForUser_AndRevokeAll(t *testing.T) {
 	}
 }
 
+// seedOrg inserts an org owned by ownerID and returns its UUID. The
+// FK on sessions.active_org_id requires a real public.orgs row, so the
+// active-org tests below seed one before passing it to CreateSystem.
+func seedOrg(t *testing.T, h *pgtest.Harness, ownerID uuid.UUID, slug string) uuid.UUID {
+	t.Helper()
+	var oID string
+	if err := h.AdminDB.QueryRow(`
+		INSERT INTO orgs (slug, name, owner_user_id) VALUES ($1, $1, $2) RETURNING id::text
+	`, slug, ownerID).Scan(&oID); err != nil {
+		t.Fatalf("insert org: %v", err)
+	}
+	if _, err := h.AdminDB.Exec(
+		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')`,
+		ownerID, oID); err != nil {
+		t.Fatalf("insert org_membership: %v", err)
+	}
+	return uuid.MustParse(oID)
+}
+
+// TestStore_CreateLookupRoundtrip_WithActiveOrg pins SKY-313's storage
+// path: a valid active_org_id at create time round-trips through
+// Lookup so the middleware can lift it into ctxKeyOrgID.
+func TestStore_CreateLookupRoundtrip_WithActiveOrg(t *testing.T) {
+	store, h, uid := newStoreForTest(t)
+	ctx := context.Background()
+
+	orgID := seedOrg(t, h, uid, "active-org-test")
+	active := uuid.NullUUID{UUID: orgID, Valid: true}
+
+	created, err := store.CreateSystem(ctx, uid, "j", "r",
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", active)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !created.ActiveOrgID.Valid || created.ActiveOrgID.UUID != orgID {
+		t.Errorf("Create returned ActiveOrgID=%+v, want valid=%s", created.ActiveOrgID, orgID)
+	}
+
+	got, err := store.LookupSystem(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Lookup nil")
+	}
+	if !got.ActiveOrgID.Valid || got.ActiveOrgID.UUID != orgID {
+		t.Errorf("Lookup ActiveOrgID=%+v, want valid=%s", got.ActiveOrgID, orgID)
+	}
+}
+
+// TestStore_CreateLookupRoundtrip_NullActiveOrg pins the zero-membership
+// case: a user with no orgs gets a session whose active_org_id is NULL,
+// and Lookup surfaces that as Valid=false rather than the zero UUID.
+func TestStore_CreateLookupRoundtrip_NullActiveOrg(t *testing.T) {
+	store, _, uid := newStoreForTest(t)
+	ctx := context.Background()
+
+	created, err := store.CreateSystem(ctx, uid, "j", "r",
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.ActiveOrgID.Valid {
+		t.Errorf("Create returned ActiveOrgID valid for NULL input")
+	}
+
+	got, err := store.LookupSystem(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if got.ActiveOrgID.Valid {
+		t.Errorf("Lookup returned ActiveOrgID valid for NULL row, got %s", got.ActiveOrgID.UUID)
+	}
+}
+
+// TestStore_UpdateActiveOrg pins the switch path: a session created
+// with one active org can be swapped to a different org, and the next
+// Lookup reflects the change. This is the storage side of the
+// POST /api/me/active-org endpoint.
+func TestStore_UpdateActiveOrg(t *testing.T) {
+	store, h, uid := newStoreForTest(t)
+	ctx := context.Background()
+
+	orgA := seedOrg(t, h, uid, "org-a")
+	orgB := seedOrg(t, h, uid, "org-b")
+
+	created, err := store.CreateSystem(ctx, uid, "j", "r",
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "",
+		uuid.NullUUID{UUID: orgA, Valid: true})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.UpdateActiveOrgSystem(ctx, created.ID, orgB); err != nil {
+		t.Fatalf("UpdateActiveOrg: %v", err)
+	}
+
+	got, err := store.LookupSystem(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if !got.ActiveOrgID.Valid || got.ActiveOrgID.UUID != orgB {
+		t.Errorf("post-update ActiveOrgID=%+v, want %s", got.ActiveOrgID, orgB)
+	}
+}
+
+// TestStore_UpdateActiveOrg_FromNull pins the "user just got their first
+// org membership" case: a session created with NULL active_org_id can
+// be updated to a valid org without a separate Create.
+func TestStore_UpdateActiveOrg_FromNull(t *testing.T) {
+	store, h, uid := newStoreForTest(t)
+	ctx := context.Background()
+
+	created, err := store.CreateSystem(ctx, uid, "j", "r",
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	orgID := seedOrg(t, h, uid, "later-org")
+	if err := store.UpdateActiveOrgSystem(ctx, created.ID, orgID); err != nil {
+		t.Fatalf("UpdateActiveOrg: %v", err)
+	}
+
+	got, err := store.LookupSystem(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if !got.ActiveOrgID.Valid || got.ActiveOrgID.UUID != orgID {
+		t.Errorf("post-update ActiveOrgID=%+v, want %s", got.ActiveOrgID, orgID)
+	}
+}
+
+// TestStore_UpdateActiveOrg_OnRevokedReturnsNoRows pins the safety
+// posture: UpdateActiveOrgSystem won't silently succeed against a
+// revoked session. The handler turns sql.ErrNoRows into 401.
+func TestStore_UpdateActiveOrg_OnRevokedReturnsNoRows(t *testing.T) {
+	store, h, uid := newStoreForTest(t)
+	ctx := context.Background()
+
+	orgID := seedOrg(t, h, uid, "rev-org")
+	created, err := store.CreateSystem(ctx, uid, "j", "r",
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.RevokeSystem(ctx, created.ID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	err = store.UpdateActiveOrgSystem(ctx, created.ID, orgID)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("UpdateActiveOrg on revoked: err=%v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestStore_UpdateActiveOrg_OnMissingReturnsNoRows pins the same
+// posture for a session that never existed.
+func TestStore_UpdateActiveOrg_OnMissingReturnsNoRows(t *testing.T) {
+	store, _, _ := newStoreForTest(t)
+	err := store.UpdateActiveOrgSystem(context.Background(), uuid.New(), uuid.New())
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("UpdateActiveOrg on missing: err=%v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestStore_ReapExpired(t *testing.T) {
 	store, h, uid := newStoreForTest(t)
 	ctx := context.Background()
@@ -384,11 +550,11 @@ func TestStore_ReapExpired(t *testing.T) {
 	//   reap-rev — revoked 31 days ago (older than retention)
 	//   reap-exp — expired 31 days ago, never revoked
 	keep, _ := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	reapRev, _ := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 	reapExp, _ := store.CreateSystem(ctx, uid, "j", "r",
-		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "")
+		time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "", uuid.NullUUID{})
 
 	if _, err := h.AdminDB.Exec(
 		`UPDATE public.sessions SET revoked_at = now() - interval '31 days' WHERE id = $1`, reapRev.ID); err != nil {
