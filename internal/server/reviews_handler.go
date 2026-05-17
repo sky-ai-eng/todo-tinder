@@ -218,7 +218,7 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 			Data:  map[string]string{"status": "completed"},
 		})
 		if chainRun != nil && s.spawner != nil {
-			s.spawner.ResumeChainAfterApproval(review.RunID, userID)
+			s.spawner.ResumeChainAfterApproval(orgID, review.RunID, userID)
 		}
 	}
 

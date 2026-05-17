@@ -233,7 +233,7 @@ func (s *Server) handleChainRunCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.spawner.CancelChain(id, userID); err != nil {
+	if err := s.spawner.CancelChain(orgID, id, userID); err != nil {
 		internalError(w, "chains", err)
 		return
 	}

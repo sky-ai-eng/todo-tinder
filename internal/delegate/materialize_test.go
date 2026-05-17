@@ -40,7 +40,7 @@ func TestMaterializePriorMemories_CreatesDirEvenWithNoPriors(t *testing.T) {
 		t.Fatalf("expected 0 priors for new entity, got %d", len(mems))
 	}
 
-	materializePriorMemories(stores.TaskMemory, cwd, entity.ID)
+	materializePriorMemories(stores.TaskMemory, runmode.LocalDefaultOrg, cwd, entity.ID)
 
 	memDir := filepath.Join(cwd, "_scratch", "entity-memory")
 	info, err := os.Stat(memDir)
@@ -93,7 +93,7 @@ func TestMaterializePriorMemories_WritesPriors(t *testing.T) {
 		t.Fatalf("upsert memory: %v", err)
 	}
 
-	materializePriorMemories(stores.TaskMemory, cwd, entity.ID)
+	materializePriorMemories(stores.TaskMemory, runmode.LocalDefaultOrg, cwd, entity.ID)
 
 	priorPath := filepath.Join(cwd, "_scratch", "entity-memory", "prior-run.md")
 	body, err := os.ReadFile(priorPath)

@@ -147,7 +147,7 @@ func TestLookupEntityProjectID_RoundTrips(t *testing.T) {
 		t.Fatalf("entity: %v", err)
 	}
 
-	if got := lookupEntityProjectID(sqlitestore.New(database).Entities, entity.ID); got != nil {
+	if got := lookupEntityProjectID(sqlitestore.New(database).Entities, runmode.LocalDefaultOrg, entity.ID); got != nil {
 		t.Errorf("expected nil for unassigned entity, got %q", *got)
 	}
 
@@ -158,7 +158,7 @@ func TestLookupEntityProjectID_RoundTrips(t *testing.T) {
 		t.Fatalf("assign project: %v", err)
 	}
 
-	got := lookupEntityProjectID(sqlitestore.New(database).Entities, entity.ID)
+	got := lookupEntityProjectID(sqlitestore.New(database).Entities, runmode.LocalDefaultOrg, entity.ID)
 	if got == nil {
 		t.Fatal("expected project id after assignment, got nil")
 	}

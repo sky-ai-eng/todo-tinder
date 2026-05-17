@@ -12,7 +12,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
@@ -27,7 +26,7 @@ import (
 // write routes through the admin pool. Local mode handlers pass
 // runmode.LocalDefaultUserID; multi-mode handlers extract from JWT
 // claims.
-func (s *Spawner) Cancel(runID, userID string) error {
+func (s *Spawner) Cancel(orgID, runID, userID string) error {
 	s.mu.Lock()
 	cancel, ok := s.cancels[runID]
 	s.mu.Unlock()
@@ -64,9 +63,9 @@ func (s *Spawner) Cancel(runID, userID string) error {
 	// "no active run" or proceed; drain just won't fire if entityID
 	// stays empty.
 	var triggerType, entityID string
-	if run, _ := s.agentRuns.GetSystem(context.Background(), runmode.LocalDefaultOrg, runID); run != nil {
+	if run, _ := s.agentRuns.GetSystem(context.Background(), orgID, runID); run != nil {
 		triggerType = run.TriggerType
-		if task, _ := s.tasks.GetSystem(context.Background(), runmode.LocalDefaultOrg, run.TaskID); task != nil {
+		if task, _ := s.tasks.GetSystem(context.Background(), orgID, run.TaskID); task != nil {
 			entityID = task.EntityID
 		}
 	}
@@ -83,13 +82,13 @@ func (s *Spawner) Cancel(runID, userID string) error {
 	)
 	bgCtx := context.Background()
 	if userID != "" {
-		err = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-			f, mErr := ts.AgentRuns.MarkCancelledIfActive(bgCtx, runmode.LocalDefaultOrg, runID, "user_cancelled", "Run cancelled by user")
+		err = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, userID, func(ts db.TxStores) error {
+			f, mErr := ts.AgentRuns.MarkCancelledIfActive(bgCtx, orgID, runID, "user_cancelled", "Run cancelled by user")
 			flipped = f
 			return mErr
 		})
 	} else {
-		flipped, err = s.agentRuns.MarkCancelledIfActiveSystem(bgCtx, runmode.LocalDefaultOrg, runID, "system_cancelled", "Run cancelled by system")
+		flipped, err = s.agentRuns.MarkCancelledIfActiveSystem(bgCtx, orgID, runID, "system_cancelled", "Run cancelled by system")
 	}
 	if err != nil {
 		return fmt.Errorf("mark cancelled: %w", err)
@@ -110,7 +109,7 @@ func (s *Spawner) Cancel(runID, userID string) error {
 // deferred cleanup so the bare-repo registration is pruned even if the
 // goroutine returns through one of the early paths that doesn't reach
 // the defer (e.g., setupErr before the defer is installed).
-func (s *Spawner) handleCancelled(runID string, startTime time.Time, wtPath, triggerType, creatorUserID string) {
+func (s *Spawner) handleCancelled(orgID, runID string, startTime time.Time, wtPath, triggerType, creatorUserID string) {
 	if s.wasTakenOver(runID) {
 		// Takeover owns the DB row, the worktree, and the broadcast from
 		// here on — it needs the temp worktree to stay on disk until its
@@ -123,11 +122,11 @@ func (s *Spawner) handleCancelled(runID string, startTime time.Time, wtPath, tri
 	bgCtx := context.Background()
 	var completeErr error
 	if triggerType == "manual" {
-		completeErr = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			return ts.AgentRuns.Complete(bgCtx, runmode.LocalDefaultOrg, runID, "cancelled", 0, elapsed, 0, "cancelled", "Cancelled by user")
+		completeErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			return ts.AgentRuns.Complete(bgCtx, orgID, runID, "cancelled", 0, elapsed, 0, "cancelled", "Cancelled by user")
 		})
 	} else {
-		completeErr = s.agentRuns.CompleteSystem(bgCtx, runmode.LocalDefaultOrg, runID, "cancelled", 0, elapsed, 0, "cancelled", "Cancelled by user")
+		completeErr = s.agentRuns.CompleteSystem(bgCtx, orgID, runID, "cancelled", 0, elapsed, 0, "cancelled", "Cancelled by user")
 	}
 	if completeErr != nil {
 		log.Printf("[delegate] warning: failed to record cancellation for run %s: %v", runID, completeErr)
@@ -139,7 +138,7 @@ func (s *Spawner) handleCancelled(runID string, startTime time.Time, wtPath, tri
 	}
 }
 
-func (s *Spawner) failRun(runID, taskID, triggerType, creatorUserID, errMsg string) {
+func (s *Spawner) failRun(orgID, runID, taskID, triggerType, creatorUserID, errMsg string) {
 	if s.wasTakenOver(runID) {
 		// Takeover finalized this run; whatever error the goroutine
 		// observed is downstream of the SIGKILL we sent it. Don't
@@ -156,12 +155,12 @@ func (s *Spawner) failRun(runID, taskID, triggerType, creatorUserID, errMsg stri
 	// covers takeover; cancel and completion can still race here.
 	var markErr error
 	if triggerType == "manual" {
-		markErr = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			_, mErr := ts.AgentRuns.MarkFailedIfActive(bgCtx, runmode.LocalDefaultOrg, runID)
+		markErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			_, mErr := ts.AgentRuns.MarkFailedIfActive(bgCtx, orgID, runID)
 			return mErr
 		})
 	} else {
-		_, markErr = s.agentRuns.MarkFailedIfActiveSystem(bgCtx, runmode.LocalDefaultOrg, runID)
+		_, markErr = s.agentRuns.MarkFailedIfActiveSystem(bgCtx, orgID, runID)
 	}
 	if markErr != nil {
 		log.Printf("[delegate] warning: failed to mark run %s as failed: %v", runID, markErr)
@@ -176,12 +175,12 @@ func (s *Spawner) failRun(runID, taskID, triggerType, creatorUserID, errMsg stri
 	}
 	var insertErr error
 	if triggerType == "manual" {
-		insertErr = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			_, ierr := ts.AgentRuns.InsertMessage(bgCtx, runmode.LocalDefaultOrg, failMsg)
+		insertErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			_, ierr := ts.AgentRuns.InsertMessage(bgCtx, orgID, failMsg)
 			return ierr
 		})
 	} else {
-		_, insertErr = s.agentRuns.InsertMessageSystem(bgCtx, runmode.LocalDefaultOrg, failMsg)
+		_, insertErr = s.agentRuns.InsertMessageSystem(bgCtx, orgID, failMsg)
 	}
 	if insertErr != nil {
 		log.Printf("[delegate] warning: failed to record failure message for run %s: %v", runID, insertErr)

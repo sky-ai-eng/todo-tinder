@@ -91,7 +91,7 @@ func TestResolvePrompt_ManualBranchesThroughSyntheticClaims(t *testing.T) {
 
 	ensureTestPrompt(t, database, domain.Prompt{ID: "p-manual", Name: "Manual prompt", Body: "x", Source: "user"})
 
-	got, err := s.resolvePrompt(domain.Task{ID: "t"}, "p-manual", "manual", "00000000-0000-0000-0000-000000000aaa")
+	got, err := s.resolvePrompt(runmode.LocalDefaultOrg, domain.Task{ID: "t"}, "p-manual", "manual", "00000000-0000-0000-0000-000000000aaa")
 	if err != nil {
 		t.Fatalf("resolvePrompt: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestResolvePrompt_EventStaysOnAdminPool(t *testing.T) {
 
 	// Event-triggered runs carry creatorUserID="" — the router has
 	// no user. The routing must NOT depend on creatorUserID being set.
-	got, err := s.resolvePrompt(domain.Task{ID: "t"}, "p-event", "event", "")
+	got, err := s.resolvePrompt(runmode.LocalDefaultOrg, domain.Task{ID: "t"}, "p-event", "event", "")
 	if err != nil {
 		t.Fatalf("resolvePrompt: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestTakeover_PreflightUsesSyntheticClaims(t *testing.T) {
 	// Takeover will fail downstream (no active cancel goroutine) but
 	// that's after the preflight read; the spy capture is what we're
 	// asserting.
-	_, _ = s.Takeover(runID, "/tmp/dest", callerID)
+	_, _ = s.Takeover(runmode.LocalDefaultOrg, runID, "/tmp/dest", callerID)
 
 	if len(tx.synthCalls) != 1 {
 		t.Fatalf("SyntheticClaimsWithTx called %d times; want exactly 1 (Takeover preflight must route through synth claims)", len(tx.synthCalls))
@@ -203,7 +203,7 @@ func TestRelease_PreflightUsesSyntheticClaims(t *testing.T) {
 	// Release will likely fail downstream on the path-safety check
 	// (the seeded worktree_path is /tmp/some-wt which isn't under
 	// the configured takeover base); that's after the preflight.
-	_ = s.Release(runID, callerID)
+	_ = s.Release(runmode.LocalDefaultOrg, runID, callerID)
 
 	if len(tx.synthCalls) != 1 {
 		t.Fatalf("SyntheticClaimsWithTx called %d times; want exactly 1 (Release preflight must route through synth claims)", len(tx.synthCalls))

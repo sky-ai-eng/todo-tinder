@@ -6,6 +6,7 @@ import (
 	"time"
 
 	sqlitestore "github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // fakeDrainer captures DrainEntity invocations so tests can assert
@@ -55,7 +56,7 @@ func TestCancel_AwaitingInputAutoRun_DrainsQueue(t *testing.T) {
 	drainer := newFakeDrainer()
 	s.SetQueueDrainer(drainer)
 
-	if err := s.Cancel("r1", ""); err != nil {
+	if err := s.Cancel(runmode.LocalDefaultOrg, "r1", ""); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 
@@ -93,7 +94,7 @@ func TestCancel_AwaitingInputManualRun_NoDrain(t *testing.T) {
 	drainer := newFakeDrainer()
 	s.SetQueueDrainer(drainer)
 
-	if err := s.Cancel("r-manual", ""); err != nil {
+	if err := s.Cancel(runmode.LocalDefaultOrg, "r-manual", ""); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 
@@ -126,7 +127,7 @@ func TestCancel_AlreadyTerminal_NoDrain(t *testing.T) {
 	drainer := newFakeDrainer()
 	s.SetQueueDrainer(drainer)
 
-	if err := s.Cancel("r-done", ""); err == nil {
+	if err := s.Cancel(runmode.LocalDefaultOrg, "r-done", ""); err == nil {
 		t.Fatal("expected 'no active run' error on terminal row")
 	}
 

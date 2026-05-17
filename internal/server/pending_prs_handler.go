@@ -356,7 +356,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 			Data:  map[string]string{"status": "completed"},
 		})
 		if chainRun != nil && s.spawner != nil {
-			s.spawner.ResumeChainAfterApproval(pr.RunID, userID)
+			s.spawner.ResumeChainAfterApproval(orgID, pr.RunID, userID)
 		}
 	}
 

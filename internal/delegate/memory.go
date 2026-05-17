@@ -17,7 +17,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // maxMemoryRetries is the hard cap on how many times the write-gate
@@ -102,7 +101,7 @@ func readAgentMemoryFile(cwd, runID string) (string, memoryFileState) {
 // memory file and flag memory_missing.
 func (s *Spawner) runMemoryGate(
 	ctx context.Context,
-	runID, taskID, cwd string,
+	orgID, runID, taskID, cwd string,
 	initial *agentproc.Result,
 	sessionID, model, repoEnv, extraAllowedTools string,
 	triggerType, creatorUserID string,
@@ -130,7 +129,7 @@ func (s *Spawner) runMemoryGate(
 				"your completion JSON again.",
 			runID,
 		)
-		outcome, err := s.ResumeWithMessage(ctx, runID, sessionID, cwd, msg, resumeOpts, triggerType, creatorUserID)
+		outcome, err := s.ResumeWithMessage(ctx, orgID, runID, sessionID, cwd, msg, resumeOpts, triggerType, creatorUserID)
 		if err != nil {
 			log.Printf("[delegate] run %s: resume attempt %d failed: %v", runID, attempt, err)
 			// Give up on further retries — the caller will mark
@@ -173,14 +172,14 @@ func (s *Spawner) runMemoryGate(
 // cross-run memory benefit. This "advisory" posture only holds for
 // the read side — the write-before-finish gate is enforced separately
 // for NEW memories produced during the run.
-func materializePriorMemories(taskMemory db.TaskMemoryStore, cwd, entityID string) {
+func materializePriorMemories(taskMemory db.TaskMemoryStore, orgID, cwd, entityID string) {
 	memDir := filepath.Join(cwd, "_scratch", "entity-memory")
 	if err := os.MkdirAll(memDir, 0755); err != nil {
 		log.Printf("[delegate] warning: failed to create entity-memory dir at %s: %v", memDir, err)
 		return
 	}
 
-	memories, err := taskMemory.GetMemoriesForEntitySystem(context.Background(), runmode.LocalDefaultOrg, entityID)
+	memories, err := taskMemory.GetMemoriesForEntitySystem(context.Background(), orgID, entityID)
 	if err != nil {
 		log.Printf("[delegate] warning: failed to load prior memories for entity %s: %v", entityID, err)
 		return
@@ -207,8 +206,8 @@ func materializePriorMemories(taskMemory db.TaskMemoryStore, cwd, entityID strin
 // entity is unassigned, missing, or the lookup fails). Failure is
 // logged and treated as "not assigned" — the spawner degrades gracefully
 // rather than blocking the run on a non-essential context lookup.
-func lookupEntityProjectID(entities db.EntityStore, entityID string) *string {
-	entity, err := entities.GetSystem(context.Background(), runmode.LocalDefaultOrgID, entityID)
+func lookupEntityProjectID(entities db.EntityStore, orgID, entityID string) *string {
+	entity, err := entities.GetSystem(context.Background(), orgID, entityID)
 	if err != nil {
 		log.Printf("[delegate] warning: failed to load entity %s for project lookup: %v", entityID, err)
 		return nil
