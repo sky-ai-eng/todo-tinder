@@ -206,7 +206,11 @@ func (s *Spawner) runChain(
 		// event-triggered chain steps stay creator-less (the
 		// trigger_type='event' + creator_user_id IS NULL CHECK is what
 		// the createEventTriggered routing satisfies).
-		if err := s.agentRuns.Create(context.Background(), runmode.LocalDefaultOrg, domain.AgentRun{
+		//
+		// Routing mirrors Delegate's run insert: manual goes through
+		// SyntheticClaimsWithTx so runs_insert's RLS check sees the
+		// step's creator; event-triggered stays on the admin pool.
+		stepRow := domain.AgentRun{
 			ID:             stepRunID,
 			TaskID:         task.ID,
 			PromptID:       stepPrompt.ID,
@@ -217,9 +221,18 @@ func (s *Spawner) runChain(
 			ChainRunID:     chainRunID,
 			ChainStepIndex: &stepIdxCopy,
 			WorktreePath:   cfg.wtPath,
-		}); err != nil {
+		}
+		var stepCreateErr error
+		if triggerType == "manual" {
+			stepCreateErr = s.tx.SyntheticClaimsWithTx(context.Background(), runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
+				return ts.AgentRuns.Create(context.Background(), runmode.LocalDefaultOrg, stepRow)
+			})
+		} else {
+			stepCreateErr = s.agentRuns.Create(context.Background(), runmode.LocalDefaultOrg, stepRow)
+		}
+		if stepCreateErr != nil {
 			s.terminateChain(chainRunID, task.ID, triggerType, creatorUserID, startTime, cfg, domain.ChainRunStatusFailed,
-				fmt.Sprintf("create step %d run: %s", i, err.Error()), &step.StepIndex, false)
+				fmt.Sprintf("create step %d run: %s", i, stepCreateErr.Error()), &step.StepIndex, false)
 			return
 		}
 		s.broadcastRunUpdate(stepRunID, "initializing")

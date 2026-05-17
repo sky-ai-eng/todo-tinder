@@ -17,6 +17,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
@@ -116,9 +117,35 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 	// us mid-rename. See the function-level comment.
 	ctx := context.Background()
 
-	run, err := s.agentRuns.GetSystem(context.Background(), runmode.LocalDefaultOrg, runID)
-	if err != nil {
-		return nil, fmt.Errorf("load run: %w", err)
+	// Preflight reads go through the app pool under the requesting
+	// user's synthetic claims so RLS filters out runs/tasks the user
+	// can't see. Without this, a user with a guessed runID could trip
+	// the side effects below (cancel handle drain, agent SIGKILL,
+	// worktree copy) before the eventual MarkTakenOver write fails
+	// RLS — destroying another user's run while learning nothing
+	// themselves. Two reads in one tx so the task-source gate sees
+	// the same isolation boundary as the run lookup.
+	var (
+		run  *domain.AgentRun
+		task *domain.Task
+	)
+	if err := s.tx.SyntheticClaimsWithTx(ctx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
+		r, rErr := ts.AgentRuns.Get(ctx, runmode.LocalDefaultOrg, runID)
+		if rErr != nil {
+			return fmt.Errorf("load run: %w", rErr)
+		}
+		run = r
+		if r == nil {
+			return nil
+		}
+		t, tErr := ts.Tasks.Get(ctx, runmode.LocalDefaultOrg, r.TaskID)
+		if tErr != nil {
+			return fmt.Errorf("load task for takeover gate: %w", tErr)
+		}
+		task = t
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if run == nil {
 		return nil, fmt.Errorf("%w: run %s not found", ErrTakeoverInvalidState, runID)
@@ -136,10 +163,6 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 	// the agent recorded in its session — out of scope for now. Reject
 	// explicitly via a task-source check rather than papering over with
 	// an empty-path heuristic.
-	task, err := s.tasks.GetSystem(context.Background(), runmode.LocalDefaultOrg, run.TaskID)
-	if err != nil {
-		return nil, fmt.Errorf("load task for takeover gate: %w", err)
-	}
 	if task != nil && task.EntitySource == "jira" {
 		return nil, fmt.Errorf("%w: run %s is a Jira lazy delegation; multi-worktree takeover is not yet supported (use the user-respond / yield-resume flow instead)", ErrTakeoverInvalidState, runID)
 	}
@@ -395,9 +418,21 @@ func (s *Spawner) Release(runID, userID string) error {
 	if userID == "" {
 		return fmt.Errorf("release: empty user id")
 	}
-	run, err := s.agentRuns.GetSystem(context.Background(), runmode.LocalDefaultOrg, runID)
-	if err != nil {
-		return fmt.Errorf("load run: %w", err)
+	// Preflight read under the requesting user's synthetic claims so
+	// RLS filters out runs the user can't see. A guessed runID by
+	// another user would otherwise reach the path-safety + cleanup
+	// machinery below; with this gate it surfaces as
+	// ErrReleaseNothingHeld before any side effect.
+	var run *domain.AgentRun
+	if err := s.tx.SyntheticClaimsWithTx(context.Background(), runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
+		r, rErr := ts.AgentRuns.Get(context.Background(), runmode.LocalDefaultOrg, runID)
+		if rErr != nil {
+			return fmt.Errorf("load run: %w", rErr)
+		}
+		run = r
+		return nil
+	}); err != nil {
+		return err
 	}
 	if run == nil {
 		return fmt.Errorf("%w: run %s not found", ErrReleaseNothingHeld, runID)
