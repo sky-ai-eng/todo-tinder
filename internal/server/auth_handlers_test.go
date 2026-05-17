@@ -412,6 +412,115 @@ func TestAuthFlow_Me_NoMemberships_OmitsActiveOrgID(t *testing.T) {
 	}
 }
 
+// TestAuthFlow_Me_StaleActiveOrgMembership_OmitsActiveOrgID covers the
+// race where sessions.active_org_id outlives the user's membership in
+// that org: the FK only references orgs(id), not org_memberships, so
+// revoking a membership leaves the session pointing at an org that no
+// longer appears in /api/me's orgs list. handleMe must drop the stale
+// reference so an FE honoring the active_org_id contract can't route
+// to an org the caller no longer belongs to.
+func TestAuthFlow_Me_StaleActiveOrgMembership_OmitsActiveOrgID(t *testing.T) {
+	r := newAuthRig(t)
+	userID := r.seedUser()
+	orgID, _ := r.seedOrg(userID, "soon-to-leave")
+
+	resp, _ := r.driveCallback(userID)
+	sid := r.sidFromResp(resp)
+
+	// Revoke the membership. The org row stays — only the user's tie
+	// to it goes away. session.active_org_id keeps pointing at orgID.
+	if _, err := r.h.AdminDB.Exec(
+		`DELETE FROM public.org_memberships WHERE user_id = $1 AND org_id = $2`,
+		userID, orgID,
+	); err != nil {
+		t.Fatalf("delete membership: %v", err)
+	}
+
+	meResp := r.requestWithSid("GET", "/api/me", sid)
+	if meResp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/me status=%d, want 200", meResp.StatusCode)
+	}
+	raw, err := io.ReadAll(meResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode /api/me: %v", err)
+	}
+	if v, present := m["active_org_id"]; present {
+		t.Errorf("active_org_id surfaced for stale membership: %v (body=%s)", v, raw)
+	}
+	// Sanity: orgs[] is filtered through the membership query too, so
+	// the no-longer-member org is absent there as well.
+	orgs, _ := m["orgs"].([]any)
+	if len(orgs) != 0 {
+		t.Errorf("orgs[] non-empty after revoke: %v", orgs)
+	}
+}
+
+// TestAuthFlow_Me_SentinelSubjectInMultiMode_HitsDBPath pins comment 1
+// from PR #201 review: the local-mode synthesis branch must be gated
+// on s.authDeps == nil, not on Subject alone. A multi-mode caller
+// whose real GoTrue user UUID collides with the sentinel (seeded
+// fixtures, deterministic test users) must NOT receive the fabricated
+// Local org — it would mis-route them away from their real
+// memberships. With the gate, they fall through to the normal DB path
+// and get their actual data.
+func TestAuthFlow_Me_SentinelSubjectInMultiMode_HitsDBPath(t *testing.T) {
+	r := newAuthRig(t)
+
+	// Seed a user whose ID IS the sentinel UUID.
+	sentinelID := uuid.MustParse(runmode.LocalDefaultUserID)
+	r.h.SeedAuthUser(t, sentinelID.String(), sentinelID.String()+"@test")
+	if _, err := r.h.AdminDB.Exec(
+		`INSERT INTO users (id, display_name) VALUES ($1, $2)`,
+		sentinelID.String(), "sentinel-collision",
+	); err != nil {
+		t.Fatalf("seed sentinel public.users: %v", err)
+	}
+	orgID, _ := r.seedOrg(sentinelID, "real-org-for-sentinel")
+
+	resp, _ := r.driveCallback(sentinelID)
+	sid := r.sidFromResp(resp)
+
+	meResp := r.requestWithSid("GET", "/api/me", sid)
+	if meResp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/me status=%d, want 200", meResp.StatusCode)
+	}
+	var body struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"display_name"`
+		ActiveOrgID string `json:"active_org_id"`
+		Orgs        []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"orgs"`
+	}
+	if err := json.NewDecoder(meResp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.ID != sentinelID.String() {
+		t.Errorf("id = %q, want %q", body.ID, sentinelID)
+	}
+	// The hallmark of the synthesis path is DisplayName="Local" + the
+	// sentinel org. Either of those leaking through here means we
+	// short-circuited a real multi-mode session.
+	if body.DisplayName == "Local" {
+		t.Error("DisplayName = \"Local\" — local-mode synthesis ran in multi mode")
+	}
+	if body.ActiveOrgID != orgID.String() {
+		t.Errorf("active_org_id = %q, want real org %q (synthesized response would point at LocalDefaultOrgID)",
+			body.ActiveOrgID, orgID)
+	}
+	if len(body.Orgs) != 1 || body.Orgs[0].ID != orgID.String() {
+		t.Errorf("orgs = %+v, want one real org %s", body.Orgs, orgID)
+	}
+	if body.Orgs[0].Name == "Local" {
+		t.Error("orgs[0].name = \"Local\" — sentinel org leaked into multi-mode response")
+	}
+}
+
 // Bullet 2: Logout flips revoked_at; subsequent requests 401; row persists.
 func TestAuthFlow_LogoutFlipsRevoked(t *testing.T) {
 	r := newAuthRig(t)

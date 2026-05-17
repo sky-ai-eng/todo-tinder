@@ -531,7 +531,13 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	// Postgres-only and would 500 against local SQLite. Synthesize the
 	// same response shape from sentinel constants so the FE renders one
 	// signed-in path across both modes (local equals multi at N=1).
-	if claims.Subject == runmode.LocalDefaultUserID {
+	//
+	// Gated on authDeps==nil (not just the Subject) so a multi-mode
+	// caller whose real GoTrue user UUID happens to collide with the
+	// sentinel (seeded fixtures, deterministic test users) falls through
+	// to the normal DB-backed path instead of receiving a fabricated
+	// Local org that doesn't match their real memberships.
+	if s.authDeps == nil && claims.Subject == runmode.LocalDefaultUserID {
 		resp := response{
 			ID:          runmode.LocalDefaultUserID,
 			DisplayName: "Local",
@@ -601,6 +607,25 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[auth] /api/me sub=%s: %v", claims.Subject, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+
+	// Drop a stale ActiveOrgID. sessions.active_org_id's FK only points
+	// at orgs(id), not org_memberships — when a user's membership is
+	// revoked but the org still exists, the session retains the now-
+	// orphaned reference. Surfacing it would let an FE honoring the
+	// active_org_id contract route to an org the caller no longer
+	// belongs to.
+	if resp.ActiveOrgID != "" {
+		stillMember := false
+		for _, o := range resp.Orgs {
+			if o.ID == resp.ActiveOrgID {
+				stillMember = true
+				break
+			}
+		}
+		if !stillMember {
+			resp.ActiveOrgID = ""
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
