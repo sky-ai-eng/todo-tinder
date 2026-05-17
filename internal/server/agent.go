@@ -96,13 +96,17 @@ func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 	if s.spawner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
 		return
 	}
-	if err := s.spawner.Cancel(runID, userID); err != nil {
+	if err := s.spawner.Cancel(orgID, runID, userID); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -110,6 +114,10 @@ func (s *Server) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 	if s.spawner == nil {
@@ -132,7 +140,7 @@ func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
 	// (sets the takenOver flag and SIGKILLs the agent) the operation
 	// must run to completion or roll back cleanly; tying it to the
 	// request context would let a client disconnect destroy the run.
-	result, err := s.spawner.Takeover(runID, baseDir, userID)
+	result, err := s.spawner.Takeover(orgID, runID, baseDir, userID)
 	if err != nil {
 		writeJSON(w, takeoverErrorStatus(err), map[string]string{"error": err.Error()})
 		return
@@ -163,13 +171,17 @@ func shellQuote(s string) string {
 //   - 5xx: filesystem/git/DB failure during teardown — row stays held
 //     so a retry can finish the job
 func (s *Server) handleAgentRelease(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 	if s.spawner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
 		return
 	}
-	if err := s.spawner.Release(runID, userID); err != nil {
+	if err := s.spawner.Release(orgID, runID, userID); err != nil {
 		writeJSON(w, releaseErrorStatus(err), map[string]string{"error": err.Error()})
 		return
 	}
@@ -364,7 +376,7 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 	// silently mark the run cancelled while the resume goroutine
 	// still continues the Claude session.
 	agentText := domain.RenderYieldResponseForAgent(req, &resp)
-	if err := s.spawner.ResumeAfterYield(runID, agentText, userID); err != nil {
+	if err := s.spawner.ResumeAfterYield(orgID, runID, agentText, userID); err != nil {
 		if errors.Is(err, delegate.ErrYieldNotResumable) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return

@@ -14,7 +14,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // ErrYieldNotResumable is returned by ResumeAfterYield when the run
@@ -55,11 +54,11 @@ var ErrYieldNotResumable = errors.New("yield: run not in awaiting_input")
 // claims.
 //
 // SKY-139.
-func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
+func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) error {
 	if userID == "" {
 		return fmt.Errorf("resume: empty user id")
 	}
-	run, err := s.agentRuns.GetSystem(context.Background(), runmode.LocalDefaultOrg, runID)
+	run, err := s.agentRuns.GetSystem(context.Background(), orgID, runID)
 	if err != nil {
 		return fmt.Errorf("load run: %w", err)
 	}
@@ -72,7 +71,7 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
 	if run.WorktreePath == "" {
 		return fmt.Errorf("run has no worktree path; cannot resume")
 	}
-	task, err := s.tasks.GetSystem(context.Background(), runmode.LocalDefaultOrg, run.TaskID)
+	task, err := s.tasks.GetSystem(context.Background(), orgID, run.TaskID)
 	if err != nil {
 		return fmt.Errorf("load task: %w", err)
 	}
@@ -85,7 +84,7 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
 	// without TRIAGE_FACTORY_REPO, the same way Jira-no-match runs do
 	// today.
 	owner, repo := "", ""
-	entity, err := s.entities.GetSystem(context.Background(), runmode.LocalDefaultOrgID, task.EntityID)
+	entity, err := s.entities.GetSystem(context.Background(), orgID, task.EntityID)
 	if err == nil && entity != nil {
 		owner, repo = parseOwnerRepo(entity.SourceID)
 	}
@@ -93,7 +92,7 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
 	// Resolve extra allowed tools from the prompt used for this run.
 	var extraTools string
 	if run.PromptID != "" {
-		if p, err := s.prompts.GetSystem(context.Background(), runmode.LocalDefaultOrg, run.PromptID); err == nil && p != nil {
+		if p, err := s.prompts.GetSystem(context.Background(), orgID, run.PromptID); err == nil && p != nil {
 			extraTools = s.collectExtraTools(p.AllowedTools)
 		}
 	}
@@ -151,8 +150,8 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
 	// always user-initiated regardless of the run's original trigger).
 	bgCtx := context.Background()
 	var flipped bool
-	err = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-		f, fErr := ts.AgentRuns.MarkResuming(bgCtx, runmode.LocalDefaultOrg, runID)
+	err = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, userID, func(ts db.TxStores) error {
+		f, fErr := ts.AgentRuns.MarkResuming(bgCtx, orgID, runID)
 		flipped = f
 		return fErr
 	})
@@ -192,8 +191,8 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
 		markCancelled := func() {
 			cancelCtx := context.Background()
 			var ok bool
-			_ = s.tx.SyntheticClaimsWithTx(cancelCtx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-				f, mErr := ts.AgentRuns.MarkCancelledIfActive(cancelCtx, runmode.LocalDefaultOrg, runID, "user_cancelled", "Run cancelled by user")
+			_ = s.tx.SyntheticClaimsWithTx(cancelCtx, orgID, userID, func(ts db.TxStores) error {
+				f, mErr := ts.AgentRuns.MarkCancelledIfActive(cancelCtx, orgID, runID, "user_cancelled", "Run cancelled by user")
 				ok = f
 				return mErr
 			})
@@ -222,7 +221,7 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
 		// arm. The captured triggerType local (above) stays in scope
 		// for the goroutine's notifyDrainer defer — event-triggered
 		// runs still drive the per-entity firing queue on terminal.
-		outcome, err := s.ResumeWithMessage(ctx, runID, sessionID, cwd, agentMessage, ResumeOptions{
+		outcome, err := s.ResumeWithMessage(ctx, orgID, runID, sessionID, cwd, agentMessage, ResumeOptions{
 			Model:             model,
 			RepoEnv:           repoEnv,
 			ExtraAllowedTools: extraTools,
@@ -235,15 +234,15 @@ func (s *Spawner) ResumeAfterYield(runID, agentMessage, userID string) error {
 			return
 		}
 		if err != nil {
-			s.failRun(runID, taskCopy.ID, "manual", userID, "resume after yield failed: "+err.Error())
+			s.failRun(orgID, runID, taskCopy.ID, "manual", userID, "resume after yield failed: "+err.Error())
 			return
 		}
 		if outcome == nil || outcome.Completion == nil {
-			s.failRun(runID, taskCopy.ID, "manual", userID, "resume after yield produced no completion")
+			s.failRun(orgID, runID, taskCopy.ID, "manual", userID, "resume after yield produced no completion")
 			return
 		}
 
-		s.processCompletion(ctx, runID, taskCopy, outcome.Completion, cwd, sessionID, model, owner, repo, "manual", userID, extraTools)
+		s.processCompletion(ctx, orgID, runID, taskCopy, outcome.Completion, cwd, sessionID, model, owner, repo, "manual", userID, extraTools)
 	}()
 	return nil
 }
@@ -317,7 +316,7 @@ type ResumeOutcome struct {
 // gives up. Mirroring the initial invocation's status updates here
 // would produce double CompleteAgentRun writes with stale
 // cost/duration fields overwriting the real totals.
-func (s *Spawner) ResumeWithMessage(ctx context.Context, runID, sessionID, cwd, message string, opts ResumeOptions, triggerType, creatorUserID string) (*ResumeOutcome, error) {
+func (s *Spawner) ResumeWithMessage(ctx context.Context, orgID, runID, sessionID, cwd, message string, opts ResumeOptions, triggerType, creatorUserID string) (*ResumeOutcome, error) {
 	if sessionID == "" {
 		return nil, fmt.Errorf("resume: missing session id")
 	}
@@ -371,7 +370,7 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, runID, sessionID, cwd, 
 		MaxTurns:     100,
 		ExtraEnv:     extraEnv,
 		TraceID:      runID,
-	}, newRunSink(s, runID, triggerType, creatorUserID))
+	}, newRunSink(s, orgID, runID, triggerType, creatorUserID))
 
 	outcome := &ResumeOutcome{}
 	if apOutcome != nil {

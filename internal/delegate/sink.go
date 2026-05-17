@@ -7,7 +7,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // runSink adapts an agentproc invocation to the delegate's storage:
@@ -30,6 +29,7 @@ import (
 // past on the next OnMessage.
 type runSink struct {
 	spawner       *Spawner
+	orgID         string
 	runID         string
 	triggerType   string
 	creatorUserID string
@@ -44,9 +44,10 @@ type runSink struct {
 	sessionDelivered bool
 }
 
-func newRunSink(s *Spawner, runID, triggerType, creatorUserID string) *runSink {
+func newRunSink(s *Spawner, orgID, runID, triggerType, creatorUserID string) *runSink {
 	return &runSink{
 		spawner:       s,
+		orgID:         orgID,
 		runID:         runID,
 		triggerType:   triggerType,
 		creatorUserID: creatorUserID,
@@ -65,12 +66,12 @@ func (k *runSink) OnSession(sessionID string) error {
 	k.sessionDelivered = true
 	bgCtx := context.Background()
 	if k.triggerType == "manual" {
-		if err := k.spawner.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, k.creatorUserID, func(ts db.TxStores) error {
-			return ts.AgentRuns.SetSession(bgCtx, runmode.LocalDefaultOrg, k.runID, sessionID)
+		if err := k.spawner.tx.SyntheticClaimsWithTx(bgCtx, k.orgID, k.creatorUserID, func(ts db.TxStores) error {
+			return ts.AgentRuns.SetSession(bgCtx, k.orgID, k.runID, sessionID)
 		}); err != nil {
 			return fmt.Errorf("persist session_id: %w", err)
 		}
-	} else if err := k.spawner.agentRuns.SetSessionSystem(bgCtx, runmode.LocalDefaultOrg, k.runID, sessionID); err != nil {
+	} else if err := k.spawner.agentRuns.SetSessionSystem(bgCtx, k.orgID, k.runID, sessionID); err != nil {
 		return fmt.Errorf("persist session_id: %w", err)
 	}
 	k.spawner.broadcastRunUpdate(k.runID, "running")
@@ -85,8 +86,8 @@ func (k *runSink) OnMessage(msg *domain.AgentMessage) error {
 	bgCtx := context.Background()
 	var id int64
 	if k.triggerType == "manual" {
-		if err := k.spawner.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, k.creatorUserID, func(ts db.TxStores) error {
-			i, ierr := ts.AgentRuns.InsertMessage(bgCtx, runmode.LocalDefaultOrg, msg)
+		if err := k.spawner.tx.SyntheticClaimsWithTx(bgCtx, k.orgID, k.creatorUserID, func(ts db.TxStores) error {
+			i, ierr := ts.AgentRuns.InsertMessage(bgCtx, k.orgID, msg)
 			if ierr != nil {
 				return ierr
 			}
@@ -96,7 +97,7 @@ func (k *runSink) OnMessage(msg *domain.AgentMessage) error {
 			return fmt.Errorf("insert message: %w", err)
 		}
 	} else {
-		i, ierr := k.spawner.agentRuns.InsertMessageSystem(bgCtx, runmode.LocalDefaultOrg, msg)
+		i, ierr := k.spawner.agentRuns.InsertMessageSystem(bgCtx, k.orgID, msg)
 		if ierr != nil {
 			return fmt.Errorf("insert message: %w", ierr)
 		}

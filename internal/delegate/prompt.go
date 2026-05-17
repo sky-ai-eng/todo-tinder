@@ -15,7 +15,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/skills"
 )
 
@@ -56,7 +55,7 @@ var (
 //
 // creatorUserID is required when triggerType == "manual"; ignored for
 // "event" since the admin pool doesn't read JWT claims.
-func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID, triggerType, creatorUserID string) (*domain.Prompt, error) {
+func (s *Spawner) resolvePrompt(orgID string, task domain.Task, explicitPromptID, triggerType, creatorUserID string) (*domain.Prompt, error) {
 	if explicitPromptID == "" {
 		return nil, fmt.Errorf("%w — select one from the prompt picker", ErrPromptUnspecified)
 	}
@@ -66,8 +65,8 @@ func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID, triggerType,
 		err error
 	)
 	if triggerType == "manual" {
-		err = s.tx.SyntheticClaimsWithTx(context.Background(), runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			got, gErr := ts.Prompts.Get(context.Background(), runmode.LocalDefaultOrg, explicitPromptID)
+		err = s.tx.SyntheticClaimsWithTx(context.Background(), orgID, creatorUserID, func(ts db.TxStores) error {
+			got, gErr := ts.Prompts.Get(context.Background(), orgID, explicitPromptID)
 			if gErr != nil {
 				return gErr
 			}
@@ -75,7 +74,7 @@ func (s *Spawner) resolvePrompt(task domain.Task, explicitPromptID, triggerType,
 			return nil
 		})
 	} else {
-		p, err = s.prompts.GetSystem(context.Background(), runmode.LocalDefaultOrg, explicitPromptID)
+		p, err = s.prompts.GetSystem(context.Background(), orgID, explicitPromptID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to load prompt %s: %w", explicitPromptID, err)

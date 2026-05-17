@@ -17,7 +17,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
@@ -30,6 +29,7 @@ import (
 // triggered runs (those write through the admin-pool `...System`
 // methods, no JWT-claims context).
 func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, mission string, cfg runConfig, startTime time.Time, model string, triggerType string, creatorUserID string) {
+	orgID := cfg.orgID
 	if cfg.hasWT {
 		// GitHub PR cleanup. Best-effort cleanup on return; the worktree ID is unique per run
 		// so a failed remove just leaves a dangling directory under _worktrees.
@@ -82,7 +82,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 			if cfg.isChainStep {
 				return
 			}
-			rows, err := s.runWorktrees.ListSystem(context.Background(), runmode.LocalDefaultOrg, runID)
+			rows, err := s.runWorktrees.ListSystem(context.Background(), orgID, runID)
 			if err != nil {
 				log.Printf("[delegate] run %s: list run_worktrees for cleanup: %v", runID, err)
 			} else {
@@ -96,7 +96,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 						log.Printf("[delegate] run %s: remove worktree %s: %v", runID, w.Path, rmErr)
 						continue
 					}
-					if delErr := s.runWorktrees.DeleteByPathSystem(cleanupCtx, runmode.LocalDefaultOrg, runID, w.Path); delErr != nil {
+					if delErr := s.runWorktrees.DeleteByPathSystem(cleanupCtx, orgID, runID, w.Path); delErr != nil {
 						log.Printf("[delegate] run %s: delete run_worktrees row for %s: %v", runID, w.Path, delErr)
 					}
 				}
@@ -128,7 +128,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	// already tried. The directory is git-excluded by writeLocalExcludes
 	// (managedExcludePatterns in internal/worktree/worktree.go) so
 	// nothing leaks into the PR.
-	materializePriorMemories(s.taskMemory, claudeCwd, task.EntityID)
+	materializePriorMemories(s.taskMemory, orgID, claudeCwd, task.EntityID)
 
 	// SKY-219: copy the entity's project knowledge-base into
 	// ./_scratch/project-knowledge/ if the entity is assigned to a
@@ -138,7 +138,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	selfBin, err := os.Executable()
 	if err != nil {
-		s.failRun(runID, task.ID, triggerType, creatorUserID, "failed to resolve own binary path: "+err.Error())
+		s.failRun(orgID, runID, task.ID, triggerType, creatorUserID, "failed to resolve own binary path: "+err.Error())
 		return
 	}
 
@@ -148,7 +148,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	// just leaves event-derived placeholders empty. FKs guarantee the
 	// event exists, so a real miss would be a DB-level problem we want
 	// to log and continue through rather than aborting the run.
-	metadataJSON, err := s.events.GetMetadataSystem(context.Background(), runmode.LocalDefaultOrgID, task.PrimaryEventID)
+	metadataJSON, err := s.events.GetMetadataSystem(context.Background(), orgID, task.PrimaryEventID)
 	if err != nil {
 		log.Printf("[delegate] warning: failed to load event metadata for task %s (event %s): %v — event placeholders will render empty", task.ID, task.PrimaryEventID, err)
 		metadataJSON = ""
@@ -156,9 +156,9 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	prompt := buildPrompt(task, metadataJSON, mission, cfg.scope, cfg.toolsRef, selfBin, runID)
 
-	s.updateStatus(runID, "agent_starting")
+	s.updateStatus(orgID, runID, "agent_starting")
 	if ctx.Err() != nil {
-		s.handleCancelled(runID, startTime, cfg.wtPath, triggerType, creatorUserID)
+		s.handleCancelled(orgID, runID, startTime, cfg.wtPath, triggerType, creatorUserID)
 		return
 	}
 
@@ -177,7 +177,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 		extraEnv = append(extraEnv, "TRIAGE_FACTORY_REPO="+cfg.owner+"/"+cfg.repo)
 	}
 
-	s.updateStatus(runID, "running")
+	s.updateStatus(orgID, runID, "running")
 
 	log.Printf("[delegate] claude starting for run %s (cwd: %s)", runID, claudeCwd)
 	outcome, err := agentproc.Run(ctx, agentproc.RunOptions{
@@ -189,7 +189,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 		ExtraEnv:     extraEnv,
 		TraceID:      runID,
 		SystemPrompt: cfg.appendSysPrompt,
-	}, newRunSink(s, runID, triggerType, creatorUserID))
+	}, newRunSink(s, orgID, runID, triggerType, creatorUserID))
 
 	// If Takeover() flipped the takenOver flag while we were streaming,
 	// every code path below — completion ingestion, status updates, fail
@@ -200,24 +200,24 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	}
 
 	if outcome != nil && outcome.Result != nil {
-		s.processCompletion(ctx, runID, task, outcome.Result, claudeCwd, outcome.SessionID, model, cfg.owner, cfg.repo, triggerType, creatorUserID, cfg.extraAllowedTools)
+		s.processCompletion(ctx, orgID, runID, task, outcome.Result, claudeCwd, outcome.SessionID, model, cfg.owner, cfg.repo, triggerType, creatorUserID, cfg.extraAllowedTools)
 		return
 	}
 
 	if err != nil {
 		if ctx.Err() != nil {
-			s.handleCancelled(runID, startTime, cfg.wtPath, triggerType, creatorUserID)
+			s.handleCancelled(orgID, runID, startTime, cfg.wtPath, triggerType, creatorUserID)
 			return
 		}
 		stderr := ""
 		if outcome != nil {
 			stderr = outcome.Stderr
 		}
-		s.failRun(runID, task.ID, triggerType, creatorUserID, fmt.Sprintf("%v\nstderr: %s", err, stderr))
+		s.failRun(orgID, runID, task.ID, triggerType, creatorUserID, fmt.Sprintf("%v\nstderr: %s", err, stderr))
 		return
 	}
 
-	s.failRun(runID, task.ID, triggerType, creatorUserID, "agent runtime exited cleanly without producing a result event")
+	s.failRun(orgID, runID, task.ID, triggerType, creatorUserID, "agent runtime exited cleanly without producing a result event")
 }
 
 // processCompletion handles the post-stream branching for any Claude
@@ -233,7 +233,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 // operates on the parsed completion.
 func (s *Spawner) processCompletion(
 	ctx context.Context,
-	runID string,
+	orgID, runID string,
 	task domain.Task,
 	completion *agentproc.Result,
 	claudeCwd, sessionID, model, owner, repo, triggerType, creatorUserID, extraAllowedTools string,
@@ -250,9 +250,9 @@ func (s *Spawner) processCompletion(
 	// not an intentional pause.
 	if !completion.IsError {
 		if parsed := parseAgentResult(completion.Result); parsed != nil && parsed.Status == "yield" && parsed.Yield != nil {
-			if err := s.persistYield(runID, parsed.Yield, completion, triggerType, creatorUserID); err != nil {
+			if err := s.persistYield(orgID, runID, parsed.Yield, completion, triggerType, creatorUserID); err != nil {
 				log.Printf("[delegate] failed to persist yield for run %s: %v", runID, err)
-				s.failRun(runID, task.ID, triggerType, creatorUserID, "failed to record yield: "+err.Error())
+				s.failRun(orgID, runID, task.ID, triggerType, creatorUserID, "failed to record yield: "+err.Error())
 			}
 			return
 		}
@@ -273,7 +273,7 @@ func (s *Spawner) processCompletion(
 	if owner != "" && repo != "" {
 		repoEnv = owner + "/" + repo
 	}
-	completion = s.runMemoryGate(ctx, runID, task.ID, claudeCwd, completion, sessionID, model, repoEnv, extraAllowedTools, triggerType, creatorUserID)
+	completion = s.runMemoryGate(ctx, orgID, runID, task.ID, claudeCwd, completion, sessionID, model, repoEnv, extraAllowedTools, triggerType, creatorUserID)
 
 	// Unconditional upsert of the run_memory row at termination
 	// (SKY-204): row presence === "termination passed through the
@@ -281,7 +281,7 @@ func (s *Spawner) processCompletion(
 	// the gate after retries" (UpsertAgentMemory normalizes
 	// empty/whitespace input to NULL on the way in).
 	agentContent, fileState := readAgentMemoryFile(claudeCwd, runID)
-	if err := s.taskMemory.UpsertAgentMemorySystem(context.Background(), runmode.LocalDefaultOrg, runID, task.EntityID, agentContent); err != nil {
+	if err := s.taskMemory.UpsertAgentMemorySystem(context.Background(), orgID, runID, task.EntityID, agentContent); err != nil {
 		log.Printf("[delegate] warning: failed to upsert memory for run %s: %v", runID, err)
 	}
 	switch fileState {
@@ -314,12 +314,12 @@ func (s *Spawner) processCompletion(
 	// bypass via the admin pool.
 	bgCtx := context.Background()
 	if triggerType == "manual" {
-		if err := s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			return ts.AgentRuns.Complete(bgCtx, runmode.LocalDefaultOrg, runID, status, completion.CostUSD, completion.DurationMs, completion.NumTurns, completion.StopReason, resultSummary)
+		if err := s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			return ts.AgentRuns.Complete(bgCtx, orgID, runID, status, completion.CostUSD, completion.DurationMs, completion.NumTurns, completion.StopReason, resultSummary)
 		}); err != nil {
 			log.Printf("[delegate] warning: failed to record completion for run %s: %v", runID, err)
 		}
-	} else if err := s.agentRuns.CompleteSystem(bgCtx, runmode.LocalDefaultOrg, runID, status, completion.CostUSD, completion.DurationMs, completion.NumTurns, completion.StopReason, resultSummary); err != nil {
+	} else if err := s.agentRuns.CompleteSystem(bgCtx, orgID, runID, status, completion.CostUSD, completion.DurationMs, completion.NumTurns, completion.StopReason, resultSummary); err != nil {
 		log.Printf("[delegate] warning: failed to record completion for run %s: %v", runID, err)
 	}
 
@@ -362,14 +362,14 @@ func (s *Spawner) processCompletion(
 		// claims in scope at this point in the goroutine, and the
 		// pending-approval bookkeeping survives ctx cancellation
 		// (matches the agentRuns.Complete pattern above).
-		if pendingReview, _ := s.reviews.ByRunIDSystem(bgCtx, runmode.LocalDefaultOrgID, runID); pendingReview != nil {
+		if pendingReview, _ := s.reviews.ByRunIDSystem(bgCtx, orgID, runID); pendingReview != nil {
 			hasPending = true
-		} else if pendingPR, _ := s.pendingPRs.ByRunIDSystem(bgCtx, runmode.LocalDefaultOrgID, runID); pendingPR != nil {
+		} else if pendingPR, _ := s.pendingPRs.ByRunIDSystem(bgCtx, orgID, runID); pendingPR != nil {
 			hasPending = true
 		}
 		if hasPending {
-			if s.isNonFinalChainStep(runID) {
-				verdict, _ := s.chains.GetLatestVerdictSystem(bgCtx, runmode.LocalDefaultOrg, runID)
+			if s.isNonFinalChainStep(orgID, runID) {
+				verdict, _ := s.chains.GetLatestVerdictSystem(bgCtx, orgID, runID)
 				if verdict == nil || verdict.Outcome != domain.ChainVerdictFinal {
 					synthetic := domain.ChainVerdict{
 						Outcome:   domain.ChainVerdictFinal,
@@ -380,11 +380,11 @@ func (s *Spawner) processCompletion(
 						payloadStr := string(payload)
 						var insertErr error
 						if triggerType == "manual" {
-							insertErr = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-								return ts.Chains.InsertVerdict(bgCtx, runmode.LocalDefaultOrg, runID, payloadStr)
+							insertErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+								return ts.Chains.InsertVerdict(bgCtx, orgID, runID, payloadStr)
 							})
 						} else {
-							insertErr = s.chains.InsertVerdictSystem(bgCtx, runmode.LocalDefaultOrg, runID, payloadStr)
+							insertErr = s.chains.InsertVerdictSystem(bgCtx, orgID, runID, payloadStr)
 						}
 						if insertErr != nil {
 							log.Printf("[delegate] warning: insert synthetic --final verdict for run %s: %v", runID, insertErr)
@@ -401,13 +401,13 @@ func (s *Spawner) processCompletion(
 			var flippedToPending bool
 			var flipErr error
 			if triggerType == "manual" {
-				flipErr = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-					f, ferr := ts.AgentRuns.MarkPendingApprovalIfCompleted(bgCtx, runmode.LocalDefaultOrg, runID)
+				flipErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+					f, ferr := ts.AgentRuns.MarkPendingApprovalIfCompleted(bgCtx, orgID, runID)
 					flippedToPending = f
 					return ferr
 				})
 			} else {
-				flippedToPending, flipErr = s.agentRuns.MarkPendingApprovalIfCompletedSystem(bgCtx, runmode.LocalDefaultOrg, runID)
+				flippedToPending, flipErr = s.agentRuns.MarkPendingApprovalIfCompletedSystem(bgCtx, orgID, runID)
 			}
 			if flipErr != nil {
 				log.Printf("[delegate] warning: failed to set pending_approval for run %s: %v", runID, flipErr)
@@ -431,19 +431,19 @@ func (s *Spawner) processCompletion(
 		//    the active-run check because the chain orchestrator creates
 		//    them sequentially (step N+1's row doesn't exist yet when
 		//    step N completes).
-		run, _ := s.agentRuns.GetSystem(bgCtx, runmode.LocalDefaultOrg, runID)
+		run, _ := s.agentRuns.GetSystem(bgCtx, orgID, runID)
 		if run != nil && run.ChainRunID != "" {
 			// Chain step — skip; terminateChain handles task closure.
 		} else {
-			hasOtherActiveRun, _ := s.agentRuns.HasOtherActiveRunForTaskSystem(bgCtx, runmode.LocalDefaultOrg, task.ID, runID)
+			hasOtherActiveRun, _ := s.agentRuns.HasOtherActiveRunForTaskSystem(bgCtx, orgID, task.ID, runID)
 			if !hasOtherActiveRun {
 				var setErr error
 				if triggerType == "manual" {
-					setErr = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-						return ts.Tasks.SetStatus(bgCtx, runmode.LocalDefaultOrg, task.ID, "done")
+					setErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+						return ts.Tasks.SetStatus(bgCtx, orgID, task.ID, "done")
 					})
 				} else {
-					setErr = s.tasks.SetStatusSystem(bgCtx, runmode.LocalDefaultOrg, task.ID, "done")
+					setErr = s.tasks.SetStatusSystem(bgCtx, orgID, task.ID, "done")
 				}
 				if setErr != nil {
 					log.Printf("[delegate] warning: failed to update task %s to done: %v", task.ID, setErr)
@@ -478,26 +478,26 @@ func (s *Spawner) processCompletion(
 // yield_request message for transcript completeness but skip the
 // status flip and the toast. The terminal status the racing path set
 // stands.
-func (s *Spawner) persistYield(runID string, req *domain.YieldRequest, completion *agentproc.Result, triggerType, creatorUserID string) error {
+func (s *Spawner) persistYield(orgID, runID string, req *domain.YieldRequest, completion *agentproc.Result, triggerType, creatorUserID string) error {
 	// Detached context — yield bookkeeping must survive ctx cancel
 	// (a user cancel mid-yield-emit still needs the transcript
 	// row recorded for audit).
 	bgCtx := context.Background()
 
 	if triggerType == "manual" {
-		if err := s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			return ts.AgentRuns.AddPartialTotals(bgCtx, runmode.LocalDefaultOrg, runID, completion.CostUSD, completion.DurationMs, completion.NumTurns)
+		if err := s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			return ts.AgentRuns.AddPartialTotals(bgCtx, orgID, runID, completion.CostUSD, completion.DurationMs, completion.NumTurns)
 		}); err != nil {
 			log.Printf("[delegate] warning: failed to record partial totals for run %s: %v", runID, err)
 		}
-	} else if err := s.agentRuns.AddPartialTotalsSystem(bgCtx, runmode.LocalDefaultOrg, runID, completion.CostUSD, completion.DurationMs, completion.NumTurns); err != nil {
+	} else if err := s.agentRuns.AddPartialTotalsSystem(bgCtx, orgID, runID, completion.CostUSD, completion.DurationMs, completion.NumTurns); err != nil {
 		log.Printf("[delegate] warning: failed to record partial totals for run %s: %v", runID, err)
 	}
 
 	var msg *domain.AgentMessage
 	if triggerType == "manual" {
-		if err := s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			m, ierr := ts.AgentRuns.InsertYieldRequest(bgCtx, runmode.LocalDefaultOrg, runID, req)
+		if err := s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			m, ierr := ts.AgentRuns.InsertYieldRequest(bgCtx, orgID, runID, req)
 			if ierr != nil {
 				return ierr
 			}
@@ -507,7 +507,7 @@ func (s *Spawner) persistYield(runID string, req *domain.YieldRequest, completio
 			return fmt.Errorf("insert yield request: %w", err)
 		}
 	} else {
-		m, ierr := s.agentRuns.InsertYieldRequestSystem(bgCtx, runmode.LocalDefaultOrg, runID, req)
+		m, ierr := s.agentRuns.InsertYieldRequestSystem(bgCtx, orgID, runID, req)
 		if ierr != nil {
 			return fmt.Errorf("insert yield request: %w", ierr)
 		}
@@ -517,8 +517,8 @@ func (s *Spawner) persistYield(runID string, req *domain.YieldRequest, completio
 
 	var flipped bool
 	if triggerType == "manual" {
-		if err := s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			f, ferr := ts.AgentRuns.MarkAwaitingInput(bgCtx, runmode.LocalDefaultOrg, runID)
+		if err := s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			f, ferr := ts.AgentRuns.MarkAwaitingInput(bgCtx, orgID, runID)
 			if ferr != nil {
 				return ferr
 			}
@@ -528,7 +528,7 @@ func (s *Spawner) persistYield(runID string, req *domain.YieldRequest, completio
 			return fmt.Errorf("mark awaiting_input: %w", err)
 		}
 	} else {
-		f, ferr := s.agentRuns.MarkAwaitingInputSystem(bgCtx, runmode.LocalDefaultOrg, runID)
+		f, ferr := s.agentRuns.MarkAwaitingInputSystem(bgCtx, orgID, runID)
 		if ferr != nil {
 			return fmt.Errorf("mark awaiting_input: %w", ferr)
 		}

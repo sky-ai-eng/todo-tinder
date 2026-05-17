@@ -16,7 +16,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -195,12 +194,12 @@ func (s *Spawner) UpdateCredentials(ghClient *ghclient.Client, model string) {
 	s.model = model
 }
 
-func (s *Spawner) updateStatus(runID, status string) {
+func (s *Spawner) updateStatus(orgID, runID, status string) {
 	// Transient progress states (fetching, cloning, agent_starting,
 	// running) — no guard needed; the caller knows the prior row is
 	// non-terminal. Goroutine-internal, no JWT claims in scope, so
 	// admin pool.
-	if err := s.agentRuns.SetStatusSystem(context.Background(), runmode.LocalDefaultOrg, runID, status); err != nil {
+	if err := s.agentRuns.SetStatusSystem(context.Background(), orgID, runID, status); err != nil {
 		log.Printf("[delegate] warning: failed to update status for run %s: %v", runID, err)
 	}
 	s.broadcastRunUpdate(runID, status)

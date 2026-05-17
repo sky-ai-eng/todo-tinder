@@ -438,7 +438,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[swipe] active-run lookup for task %s failed: %v", id, err)
 			} else {
 				for _, runID := range ids {
-					if err := s.spawner.Cancel(runID, userID); err != nil {
+					if err := s.spawner.Cancel(orgID, runID, userID); err != nil {
 						log.Printf("[swipe] cancel run %s on %s of task %s: %v", runID, req.Action, id, err)
 					}
 				}
@@ -500,6 +500,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		task, err := s.tasks.Get(r.Context(), orgID, id)
 		if err == nil && task != nil {
 			runID, err := s.spawner.Delegate(*task, delegate.DelegateOpts{
+				OrgID:            orgID,
 				ExplicitPromptID: req.PromptID,
 				TriggerType:      "manual",
 				CreatorUserID:    userID,

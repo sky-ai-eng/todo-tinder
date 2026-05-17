@@ -259,6 +259,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// reads it correctly.
 	task.ClaimedByAgentID = a.ID
 	runID, err := s.spawner.Delegate(*task, delegate.DelegateOpts{
+		OrgID:            orgID,
 		ExplicitPromptID: req.PromptID,
 		TriggerType:      "manual",
 		CreatorUserID:    userID,

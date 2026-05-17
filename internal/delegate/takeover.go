@@ -18,7 +18,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
@@ -105,7 +104,7 @@ var (
 // userID identifies the taking-over user for audit + the task-claim
 // flip. Local mode handlers pass runmode.LocalDefaultUserID; multi-
 // mode handlers extract from JWT claims.
-func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, error) {
+func (s *Spawner) Takeover(orgID, runID, baseDir, userID string) (*TakeoverResult, error) {
 	if baseDir == "" {
 		return nil, fmt.Errorf("takeover: empty destination base dir")
 	}
@@ -129,8 +128,8 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 		run  *domain.AgentRun
 		task *domain.Task
 	)
-	if err := s.tx.SyntheticClaimsWithTx(ctx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-		r, rErr := ts.AgentRuns.Get(ctx, runmode.LocalDefaultOrg, runID)
+	if err := s.tx.SyntheticClaimsWithTx(ctx, orgID, userID, func(ts db.TxStores) error {
+		r, rErr := ts.AgentRuns.Get(ctx, orgID, runID)
 		if rErr != nil {
 			return fmt.Errorf("load run: %w", rErr)
 		}
@@ -138,7 +137,7 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 		if r == nil {
 			return nil
 		}
-		t, tErr := ts.Tasks.Get(ctx, runmode.LocalDefaultOrg, r.TaskID)
+		t, tErr := ts.Tasks.Get(ctx, orgID, r.TaskID)
 		if tErr != nil {
 			return fmt.Errorf("load task for takeover gate: %w", tErr)
 		}
@@ -210,7 +209,7 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 		// back: clear the flag, do the cleanup ourselves, and mark the
 		// row terminal so it doesn't sit in 'running' forever and so a
 		// retry isn't permanently blocked by a stale takenOver entry.
-		s.abortTakeover(runID, run.WorktreePath, "", userID)
+		s.abortTakeover(orgID, runID, run.WorktreePath, "", userID)
 		return nil, fmt.Errorf("copy worktree: %w", err)
 	}
 
@@ -224,7 +223,7 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 	// leaving the row in 'taken_over' state pointing at a destination
 	// the user can't actually resume from.
 	if err := worktree.MaterializeSessionForTakeover(resolvedOldCwd, destPath, run.SessionID); err != nil {
-		s.abortTakeover(runID, run.WorktreePath, destPath, userID)
+		s.abortTakeover(orgID, runID, run.WorktreePath, destPath, userID)
 		return nil, fmt.Errorf("copy session jsonl: %w", err)
 	}
 
@@ -239,15 +238,15 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 	// transition (takeover is always user-initiated).
 	bgCtx := context.Background()
 	var ok bool
-	err = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-		o, mErr := ts.AgentRuns.MarkTakenOver(bgCtx, runmode.LocalDefaultOrg, runID, destPath, userID)
+	err = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, userID, func(ts db.TxStores) error {
+		o, mErr := ts.AgentRuns.MarkTakenOver(bgCtx, orgID, runID, destPath, userID)
 		ok = o
 		return mErr
 	})
 	if err != nil {
 		// Transaction failed and rolled back — both run and task are
 		// unchanged. Same FS cleanup as the copy-failure path.
-		s.abortTakeover(runID, run.WorktreePath, destPath, userID)
+		s.abortTakeover(orgID, runID, run.WorktreePath, destPath, userID)
 		return nil, fmt.Errorf("mark taken_over: %w", err)
 	}
 	if !ok {
@@ -258,7 +257,7 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 		// by the time they fired — abortTakeover catches them up.
 		// abortTakeover's guarded UPDATE will no-op since the row is
 		// already terminal, so the agent's actual outcome is preserved.
-		s.abortTakeover(runID, run.WorktreePath, destPath, userID)
+		s.abortTakeover(orgID, runID, run.WorktreePath, destPath, userID)
 		return nil, fmt.Errorf("%w: run %s", ErrTakeoverRaceLost, runID)
 	}
 
@@ -313,7 +312,7 @@ func (s *Spawner) Takeover(runID, baseDir, userID string) (*TakeoverResult, erro
 // userID is the taking-over user, passed through from Takeover.
 // Takeover is always user-initiated, so the rollback's status write
 // routes under the user's synthetic claims rather than the admin pool.
-func (s *Spawner) abortTakeover(runID, claudeCwd, destPath, userID string) {
+func (s *Spawner) abortTakeover(orgID, runID, claudeCwd, destPath, userID string) {
 	if destPath != "" {
 		// Use RemoveAt rather than os.RemoveAll so the bare's
 		// worktree registration is pruned. By the time we reach
@@ -349,8 +348,8 @@ func (s *Spawner) abortTakeover(runID, claudeCwd, destPath, userID string) {
 	// action).
 	bgCtx := context.Background()
 	var ok bool
-	err := s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-		f, mErr := ts.AgentRuns.MarkCancelledIfActive(bgCtx, runmode.LocalDefaultOrg, runID, "takeover_failed", "Takeover failed; run was cancelled")
+	err := s.tx.SyntheticClaimsWithTx(bgCtx, orgID, userID, func(ts db.TxStores) error {
+		f, mErr := ts.AgentRuns.MarkCancelledIfActive(bgCtx, orgID, runID, "takeover_failed", "Takeover failed; run was cancelled")
 		ok = f
 		return mErr
 	})
@@ -414,7 +413,7 @@ func (s *Spawner) abortTakeover(runID, claudeCwd, destPath, userID string) {
 // userID identifies the releasing user for audit. Local mode handlers
 // pass runmode.LocalDefaultUserID; multi-mode handlers extract from
 // JWT claims.
-func (s *Spawner) Release(runID, userID string) error {
+func (s *Spawner) Release(orgID, runID, userID string) error {
 	if userID == "" {
 		return fmt.Errorf("release: empty user id")
 	}
@@ -424,8 +423,8 @@ func (s *Spawner) Release(runID, userID string) error {
 	// machinery below; with this gate it surfaces as
 	// ErrReleaseNothingHeld before any side effect.
 	var run *domain.AgentRun
-	if err := s.tx.SyntheticClaimsWithTx(context.Background(), runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-		r, rErr := ts.AgentRuns.Get(context.Background(), runmode.LocalDefaultOrg, runID)
+	if err := s.tx.SyntheticClaimsWithTx(context.Background(), orgID, userID, func(ts db.TxStores) error {
+		r, rErr := ts.AgentRuns.Get(context.Background(), orgID, runID)
 		if rErr != nil {
 			return fmt.Errorf("load run: %w", rErr)
 		}
@@ -515,7 +514,7 @@ func (s *Spawner) Release(runID, userID string) error {
 	headBranch, _ := worktree.WorktreeBranch(takeoverPath)
 
 	// Look up task → entity to derive owner/repo/PR for CleanupPRConfig.
-	task, err := s.tasks.GetSystem(context.Background(), runmode.LocalDefaultOrg, run.TaskID)
+	task, err := s.tasks.GetSystem(context.Background(), orgID, run.TaskID)
 	if err != nil {
 		return fmt.Errorf("load task for release: %w", err)
 	}
@@ -566,8 +565,8 @@ func (s *Spawner) Release(runID, userID string) error {
 	// releasing user's synthetic claims.
 	var ok bool
 	releaseCtx := context.Background()
-	err = s.tx.SyntheticClaimsWithTx(releaseCtx, runmode.LocalDefaultOrg, userID, func(ts db.TxStores) error {
-		o, mErr := ts.AgentRuns.MarkReleased(releaseCtx, runmode.LocalDefaultOrg, runID)
+	err = s.tx.SyntheticClaimsWithTx(releaseCtx, orgID, userID, func(ts db.TxStores) error {
+		o, mErr := ts.AgentRuns.MarkReleased(releaseCtx, orgID, runID)
 		ok = o
 		return mErr
 	})

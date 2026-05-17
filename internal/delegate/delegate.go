@@ -37,6 +37,7 @@ import (
 //     is the source of truth for cleanup, which iterates the table at
 //     runAgent terminal.
 type runConfig struct {
+	orgID     string  // tenant scope for every store call inside this run's goroutine — set once in Delegate from opts.OrgID, then read everywhere via cfg.orgID instead of being threaded positionally
 	scope     string  // what the agent is scoped to (repo, PR, issue)
 	toolsRef  string  // tool documentation to inject
 	wtPath    string  // initial cwd: GitHub PR worktree, or Jira run-root
@@ -70,6 +71,17 @@ type runConfig struct {
 // doesn't force every handler call site to rewrite its positional
 // list.
 type DelegateOpts struct {
+	// OrgID is the tenant scope for every store call this Delegate
+	// call (and the goroutine it spawns) will make. Handler call
+	// sites extract it from r.Context() via the requireOrg /
+	// OrgIDFrom accessors; router-triggered calls pass the local-
+	// mode sentinel until the per-org router lands. The goroutine
+	// caches this on cfg.orgID and every downstream store call
+	// (run row, side-tables, memory, chain steps) routes under it.
+	// Required — callers must always set this; the spawner trusts
+	// the input and does not re-validate.
+	OrgID string
+
 	// ExplicitPromptID forces a specific prompt instead of letting
 	// resolvePrompt walk the entity-type → default chain. Empty for
 	// the default path.
@@ -113,6 +125,8 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 	defaultModel := s.model
 	s.mu.Unlock()
 
+	orgID := opts.OrgID
+
 	// Compute trigger type + creator user up front so resolvePrompt
 	// can route by them (manual delegations must honor prompts_select
 	// RLS; event-triggered ones stay on the admin pool).
@@ -140,7 +154,7 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 
 	// Resolve prompt under the right pool for the trigger type. See
 	// resolvePrompt's docstring for the routing rationale.
-	resolved, err := s.resolvePrompt(task, opts.ExplicitPromptID, triggerType, creatorUserID)
+	resolved, err := s.resolvePrompt(orgID, task, opts.ExplicitPromptID, triggerType, creatorUserID)
 	if err != nil {
 		return "", err
 	}
@@ -160,18 +174,18 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 	bgCtx := context.Background()
 	var incErr error
 	if triggerType == "manual" {
-		incErr = s.tx.SyntheticClaimsWithTx(bgCtx, runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			return ts.Prompts.IncrementUsage(bgCtx, runmode.LocalDefaultOrg, promptID)
+		incErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
+			return ts.Prompts.IncrementUsage(bgCtx, orgID, promptID)
 		})
 	} else {
-		incErr = s.prompts.IncrementUsageSystem(bgCtx, runmode.LocalDefaultOrg, promptID)
+		incErr = s.prompts.IncrementUsageSystem(bgCtx, orgID, promptID)
 	}
 	if incErr != nil {
 		log.Printf("[delegate] warning: failed to increment usage for prompt %s: %v", promptID, incErr)
 	}
 
 	if resolved.Kind == domain.PromptKindChain {
-		return s.delegateChain(task, resolved, triggerType, triggerID, creatorUserID, ghClient, model)
+		return s.delegateChain(orgID, task, resolved, triggerType, triggerID, creatorUserID, ghClient, model)
 	}
 
 	// Stamp actor_agent_id at run start. Prefer the task's stamped
@@ -182,7 +196,7 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 	// agent bootstrap, which is transient.
 	actorAgentID := task.ClaimedByAgentID
 	if actorAgentID == "" && s.agents != nil {
-		if a, err := s.agents.GetForOrgSystem(context.Background(), runmode.LocalDefaultOrg); err == nil && a != nil {
+		if a, err := s.agents.GetForOrgSystem(context.Background(), orgID); err == nil && a != nil {
 			actorAgentID = a.ID
 		}
 	}
@@ -206,11 +220,11 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 	// the router has no user identity to project.
 	var createErr error
 	if triggerType == "manual" {
-		createErr = s.tx.SyntheticClaimsWithTx(context.Background(), runmode.LocalDefaultOrg, creatorUserID, func(ts db.TxStores) error {
-			return ts.AgentRuns.Create(context.Background(), runmode.LocalDefaultOrg, runRow)
+		createErr = s.tx.SyntheticClaimsWithTx(context.Background(), orgID, creatorUserID, func(ts db.TxStores) error {
+			return ts.AgentRuns.Create(context.Background(), orgID, runRow)
 		})
 	} else {
-		createErr = s.agentRuns.Create(context.Background(), runmode.LocalDefaultOrg, runRow)
+		createErr = s.agentRuns.Create(context.Background(), orgID, runRow)
 	}
 	if createErr != nil {
 		return "", fmt.Errorf("create agent run: %w", createErr)
@@ -249,19 +263,20 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 
 		switch task.EntitySource {
 		case "github":
-			cfg, setupErr = s.setupGitHub(ctx, runID, task, ghClient)
+			cfg, setupErr = s.setupGitHub(ctx, orgID, runID, task, ghClient)
 		case "jira":
-			cfg, setupErr = s.setupJira(ctx, runID, task, ghClient)
+			cfg, setupErr = s.setupJira(ctx, orgID, runID, task, ghClient)
 		default:
 			setupErr = fmt.Errorf("unsupported task source: %s", task.EntitySource)
 		}
+		cfg.orgID = orgID
 
 		if setupErr != nil {
 			if ctx.Err() != nil {
-				s.handleCancelled(runID, startTime, cfg.wtPath, triggerType, creatorUserID)
+				s.handleCancelled(orgID, runID, startTime, cfg.wtPath, triggerType, creatorUserID)
 				return
 			}
-			s.failRun(runID, task.ID, triggerType, creatorUserID, setupErr.Error())
+			s.failRun(orgID, runID, task.ID, triggerType, creatorUserID, setupErr.Error())
 			return
 		}
 
@@ -284,7 +299,7 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 }
 
 // setupGitHub prepares a worktree for a GitHub PR task.
-func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Task, ghClient *ghclient.Client) (runConfig, error) {
+func (s *Spawner) setupGitHub(ctx context.Context, orgID, runID string, task domain.Task, ghClient *ghclient.Client) (runConfig, error) {
 	if ghClient == nil {
 		return runConfig{}, fmt.Errorf("GitHub credentials not configured")
 	}
@@ -307,7 +322,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 		return runConfig{}, fmt.Errorf("invalid PR number from task.EntitySourceID: %q", task.EntitySourceID)
 	}
 
-	s.updateStatus(runID, "fetching")
+	s.updateStatus(orgID, runID, "fetching")
 	pr, err := ghClient.GetPR(owner, repo, prNumber, false)
 	if err != nil {
 		return runConfig{}, fmt.Errorf("failed to fetch PR: %w", err)
@@ -359,13 +374,13 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 		return runConfig{}, fmt.Errorf("PR #%d on %s/%s: GitHub did not return a usable upstream URL; cannot create worktree", prNumber, owner, repo)
 	}
 
-	s.updateStatus(runID, "cloning")
+	s.updateStatus(orgID, runID, "cloning")
 	wtPath, err := worktree.CreateForPR(ctx, owner, repo, upstreamCloneURL, headCloneURL, pr.HeadRef, prNumber, runID)
 	if err != nil {
 		return runConfig{}, fmt.Errorf("failed to create worktree: %w", err)
 	}
 
-	if err := s.agentRuns.SetWorktreePathSystem(context.Background(), runmode.LocalDefaultOrg, runID, wtPath); err != nil {
+	if err := s.agentRuns.SetWorktreePathSystem(context.Background(), orgID, runID, wtPath); err != nil {
 		log.Printf("[delegate] warning: failed to update worktree path for run %s: %v", runID, err)
 	}
 
@@ -376,6 +391,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 	s.awaitClassification(ctx, task.EntityID)
 
 	return runConfig{
+		orgID:     orgID,
 		scope:     fmt.Sprintf("Repository: %s/%s\nPR: #%d\nBranch: %s", owner, repo, prNumber, pr.HeadRef),
 		toolsRef:  ai.GHToolsTemplate,
 		wtPath:    wtPath,
@@ -385,7 +401,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 		repo:      repo,
 		prNumber:  prNumber,
 		headRef:   pr.HeadRef,
-		projectID: lookupEntityProjectID(s.entities, task.EntityID),
+		projectID: lookupEntityProjectID(s.entities, orgID, task.EntityID),
 	}, nil
 }
 
@@ -408,12 +424,12 @@ func (s *Spawner) setupGitHub(ctx context.Context, runID string, task domain.Tas
 // the run-root IS the agent's session cwd, which is the load-bearing
 // invariant for resume. Takeover guards against Jira runs explicitly
 // further down.
-func (s *Spawner) setupJira(ctx context.Context, runID string, task domain.Task, ghClient *ghclient.Client) (runConfig, error) {
+func (s *Spawner) setupJira(ctx context.Context, orgID, runID string, task domain.Task, ghClient *ghclient.Client) (runConfig, error) {
 	runRoot, err := worktree.MakeRunRoot(runID)
 	if err != nil {
 		return runConfig{}, fmt.Errorf("create run root: %w", err)
 	}
-	if err := s.agentRuns.SetWorktreePathSystem(context.Background(), runmode.LocalDefaultOrg, runID, runRoot); err != nil {
+	if err := s.agentRuns.SetWorktreePathSystem(context.Background(), orgID, runID, runRoot); err != nil {
 		log.Printf("[delegate] warning: failed to set worktree_path for Jira run %s: %v — yield/resume will reject this run", runID, err)
 	}
 
@@ -422,12 +438,13 @@ func (s *Spawner) setupJira(ctx context.Context, runID string, task domain.Task,
 	s.awaitClassification(ctx, task.EntityID)
 
 	return runConfig{
+		orgID:     orgID,
 		scope:     fmt.Sprintf("Jira issue: %s", task.EntitySourceID),
 		toolsRef:  ai.GHToolsTemplate + "\n\n" + ai.JiraToolsTemplate,
 		wtPath:    runRoot,
 		hasWT:     false,
 		runRoot:   runRoot,
-		projectID: lookupEntityProjectID(s.entities, task.EntityID),
+		projectID: lookupEntityProjectID(s.entities, orgID, task.EntityID),
 		// owner/repo intentionally empty: the agent picks per-ticket via `workspace add`
 	}, nil
 }
