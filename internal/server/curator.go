@@ -7,7 +7,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -41,12 +40,17 @@ type curatorRequestJSON struct {
 }
 
 func (s *Server) handleCuratorSend(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	if s.curator == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "curator runtime not started"})
 		return
 	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, projectID)
+	project, err := s.projects.Get(r.Context(), orgID, projectID)
 	if err != nil {
 		internalError(w, "curator", err)
 		return
@@ -66,12 +70,11 @@ func (s *Server) handleCuratorSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SKY-298: pass the requesting user's identity explicitly so the
-	// per-project goroutine attributes every per-turn write
-	// accordingly. Today the local-mode defaults are hardcoded — the
-	// D9 handler sweep (SKY-253) will replace these with values
-	// extracted from request-scoped auth context.
-	requestID, err := s.curator.SendMessage(r.Context(), projectID, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, content)
+	// Pass the requesting user's identity explicitly so the per-project
+	// goroutine attributes every per-turn write accordingly. Both org
+	// and user come from the request context — sentinel in local mode
+	// via the shim, real values in multi mode.
+	requestID, err := s.curator.SendMessage(r.Context(), projectID, orgID, userID, content)
 	if err != nil {
 		internalError(w, "curator", err)
 		return
@@ -80,8 +83,12 @@ func (s *Server) handleCuratorSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCuratorHistory(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, projectID)
+	project, err := s.projects.Get(r.Context(), orgID, projectID)
 	if err != nil {
 		internalError(w, "curator", err)
 		return
@@ -130,12 +137,16 @@ func (s *Server) handleCuratorHistory(w http.ResponseWriter, r *http.Request) {
 // frontend uses that to clear stale "cancelling…" state when the
 // agent finished between the user's click and the request landing.
 func (s *Server) handleCuratorCancel(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	if s.curator == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "curator runtime not started"})
 		return
 	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, projectID)
+	project, err := s.projects.Get(r.Context(), orgID, projectID)
 	if err != nil {
 		internalError(w, "curator", err)
 		return
@@ -181,8 +192,12 @@ func (s *Server) handleCuratorCancel(w http.ResponseWriter, r *http.Request) {
 // cancel first. The DB op + the WS broadcast are decoupled because a
 // failed broadcast (e.g. hub panicked) shouldn't roll back the wipe.
 func (s *Server) handleCuratorReset(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, projectID)
+	project, err := s.projects.Get(r.Context(), orgID, projectID)
 	if err != nil {
 		internalError(w, "curator", err)
 		return

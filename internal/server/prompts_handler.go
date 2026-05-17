@@ -9,7 +9,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 func (s *Server) handleEventTypes(w http.ResponseWriter, r *http.Request) {
@@ -25,7 +24,11 @@ func (s *Server) handleEventTypes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePromptsList(w http.ResponseWriter, r *http.Request) {
-	prompts, err := s.prompts.List(r.Context(), runmode.LocalDefaultOrg)
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	prompts, err := s.prompts.List(r.Context(), orgID)
 	if err != nil {
 		internalError(w, "prompts", err)
 		return
@@ -37,8 +40,12 @@ func (s *Server) handlePromptsList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePromptGet(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
-	prompt, err := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	prompt, err := s.prompts.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "prompts", err)
 		return
@@ -81,6 +88,10 @@ func invalidPromptModelError() string {
 }
 
 func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	var req createPromptRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -112,12 +123,12 @@ func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
 		Model:  req.Model,
 	}
 
-	if err := s.prompts.Create(r.Context(), runmode.LocalDefaultOrg, prompt); err != nil {
+	if err := s.prompts.Create(r.Context(), orgID, prompt); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
 
-	created, _ := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	created, _ := s.prompts.Get(r.Context(), orgID, id)
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -129,6 +140,10 @@ type updatePromptRequest struct {
 }
 
 func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req updatePromptRequest
@@ -149,7 +164,7 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	existing, err := s.prompts.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "prompts", err)
 		return
@@ -162,7 +177,7 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 	if existing.Kind != kind {
 		if existing.Kind == domain.PromptKindChain {
 			// Reject chain→leaf if any chain steps exist.
-			steps, err := s.chains.ListSteps(r.Context(), runmode.LocalDefaultOrg, id)
+			steps, err := s.chains.ListSteps(r.Context(), orgID, id)
 			if err != nil {
 				internalError(w, "prompts", err)
 				return
@@ -180,17 +195,17 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 			// suddenly point at a chain-kind prompt; the chain-step API
 			// explicitly rejects nested chains, so the chain would fail
 			// at delegate time instead of definition time.
-			triggers, err := s.eventHandlers.ListForPrompt(r.Context(), runmode.LocalDefaultOrg, id)
+			triggers, err := s.eventHandlers.ListForPrompt(r.Context(), orgID, id)
 			if err != nil {
 				internalError(w, "prompts", err)
 				return
 			}
-			runCount, err := s.prompts.CountRunReferences(r.Context(), runmode.LocalDefaultOrg, id)
+			runCount, err := s.prompts.CountRunReferences(r.Context(), orgID, id)
 			if err != nil {
 				internalError(w, "prompts", err)
 				return
 			}
-			stepRefs, err := s.chains.CountStepReferences(r.Context(), runmode.LocalDefaultOrg, id)
+			stepRefs, err := s.chains.CountStepReferences(r.Context(), orgID, id)
 			if err != nil {
 				internalError(w, "prompts", err)
 				return
@@ -204,12 +219,12 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.prompts.Update(r.Context(), runmode.LocalDefaultOrg, id, req.Name, req.Body, string(kind), req.Model); err != nil {
+	if err := s.prompts.Update(r.Context(), orgID, id, req.Name, req.Body, string(kind), req.Model); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
 
-	updated, _ := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	updated, _ := s.prompts.Get(r.Context(), orgID, id)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -225,9 +240,13 @@ func normalizePromptKind(k string) domain.PromptKind {
 }
 
 func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
-	prompt, err := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	prompt, err := s.prompts.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "prompts", err)
 		return
@@ -240,7 +259,7 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 	// Block deletion if the prompt is referenced by any auto-triggers.
 	// Post-SKY-259 triggers live in event_handlers with kind='trigger';
 	// ListForPrompt returns only those.
-	triggers, err := s.eventHandlers.ListForPrompt(r.Context(), runmode.LocalDefaultOrg, id)
+	triggers, err := s.eventHandlers.ListForPrompt(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "prompts", err)
 		return
@@ -255,7 +274,7 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 	// Block deletion if this prompt is a step inside any chain. The FK
 	// is ON DELETE RESTRICT so the underlying constraint would fire
 	// anyway; we surface a friendlier message and the count of chains.
-	chainRefs, err := s.chains.CountStepReferences(r.Context(), runmode.LocalDefaultOrg, id)
+	chainRefs, err := s.chains.CountStepReferences(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "prompts", err)
 		return
@@ -269,7 +288,7 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 
 	// System and imported prompts are soft-deleted (hidden), user prompts are hard-deleted
 	if prompt.Source == "system" || prompt.Source == "imported" {
-		if err := s.prompts.Hide(r.Context(), runmode.LocalDefaultOrg, id); err != nil {
+		if err := s.prompts.Hide(r.Context(), orgID, id); err != nil {
 			internalError(w, "prompts", err)
 			return
 		}
@@ -277,7 +296,7 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.prompts.Delete(r.Context(), runmode.LocalDefaultOrg, id); err != nil {
+	if err := s.prompts.Delete(r.Context(), orgID, id); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
@@ -285,8 +304,12 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePromptStats(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
-	stats, err := s.prompts.Stats(r.Context(), runmode.LocalDefaultOrg, id)
+	stats, err := s.prompts.Stats(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "prompts", err)
 		return

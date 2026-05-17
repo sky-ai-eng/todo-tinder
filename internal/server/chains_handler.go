@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 const maxChainSteps = 50
@@ -14,9 +13,13 @@ const maxChainSteps = 50
 // Always returns an array (never null) so frontend code can iterate
 // without a nil check.
 func (s *Server) handleChainStepsGet(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
-	prompt, err := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	prompt, err := s.prompts.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
@@ -26,7 +29,7 @@ func (s *Server) handleChainStepsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	steps, err := s.chains.ListSteps(r.Context(), runmode.LocalDefaultOrg, id)
+	steps, err := s.chains.ListSteps(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
@@ -50,9 +53,13 @@ type chainStepsPutRequest struct {
 // that the chain prompt exists and is kind='chain', and that no step
 // references another chain prompt (recursion guard at the API layer).
 func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
-	prompt, err := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	prompt, err := s.prompts.Get(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
@@ -89,7 +96,7 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		stepPrompt, err := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, step.StepPromptID)
+		stepPrompt, err := s.prompts.Get(r.Context(), orgID, step.StepPromptID)
 		if err != nil {
 			internalError(w, "chains", err)
 			return
@@ -119,7 +126,7 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 		briefs = append(briefs, step.Brief)
 	}
 
-	if err := s.chains.ReplaceSteps(r.Context(), runmode.LocalDefaultOrg, id, stepIDs, briefs); err != nil {
+	if err := s.chains.ReplaceSteps(r.Context(), orgID, id, stepIDs, briefs); err != nil {
 		internalError(w, "chains", err)
 		return
 	}
@@ -142,9 +149,13 @@ type chainRunStepView struct {
 }
 
 func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
 
-	cr, err := s.chains.GetRun(r.Context(), runmode.LocalDefaultOrg, id)
+	cr, err := s.chains.GetRun(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
@@ -154,13 +165,13 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	steps, err := s.chains.ListSteps(r.Context(), runmode.LocalDefaultOrg, cr.ChainPromptID)
+	steps, err := s.chains.ListSteps(r.Context(), orgID, cr.ChainPromptID)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
 	}
 
-	stepRuns, err := s.chains.RunsForChain(r.Context(), runmode.LocalDefaultOrg, id)
+	stepRuns, err := s.chains.RunsForChain(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
@@ -174,7 +185,7 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	verdictsByRun, err := s.chains.LatestVerdictsForRuns(r.Context(), runmode.LocalDefaultOrg, runIDs)
+	verdictsByRun, err := s.chains.LatestVerdictsForRuns(r.Context(), orgID, runIDs)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
@@ -194,13 +205,18 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChainRunCancel(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	if s.spawner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
 		return
 	}
 	id := r.PathValue("id")
 
-	cr, err := s.chains.GetRun(r.Context(), runmode.LocalDefaultOrg, id)
+	cr, err := s.chains.GetRun(r.Context(), orgID, id)
 	if err != nil {
 		internalError(w, "chains", err)
 		return
@@ -217,7 +233,7 @@ func (s *Server) handleChainRunCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.spawner.CancelChain(id, runmode.LocalDefaultUserID); err != nil {
+	if err := s.spawner.CancelChain(id, userID); err != nil {
 		internalError(w, "chains", err)
 		return
 	}

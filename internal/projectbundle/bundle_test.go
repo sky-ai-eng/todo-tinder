@@ -180,7 +180,7 @@ func seedFixture(t *testing.T, database *sql.DB, projectName string) fixture {
 
 func exportFixtureBundle(t *testing.T, database *sql.DB, projectID string) []byte {
 	t.Helper()
-	reader, err := Export(context.Background(), database, sqlitestore.New(database).Projects, projectID)
+	reader, err := Export(context.Background(), database, sqlitestore.New(database).Projects, runmode.LocalDefaultOrg, projectID)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}

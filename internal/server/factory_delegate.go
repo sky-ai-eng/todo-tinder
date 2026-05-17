@@ -47,6 +47,11 @@ type factoryDelegateResponse struct {
 // (entity_id, event_type, dedup_key) WHERE status NOT IN ('done',
 // 'dismissed') — concurrent drops resolve to the same task.
 func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	var req factoryDelegateRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -64,7 +69,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// clean it up — it'd run to completion against a closed PR).
 	// Mirrors the router's "task creation requires active entity"
 	// contract at routing/router.go.
-	entity, err := s.entities.Get(r.Context(), runmode.LocalDefaultOrgID, req.EntityID)
+	entity, err := s.entities.Get(r.Context(), orgID, req.EntityID)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -87,7 +92,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// (label_added "bug"). If no matching event exists the entity
 	// isn't actually at this station; refuse rather than fabricate
 	// an anchor.
-	primaryEvent, err := s.events.LatestForEntityTypeAndDedupKey(r.Context(), runmode.LocalDefaultOrg, req.EntityID, req.EventType, req.DedupKey)
+	primaryEvent, err := s.events.LatestForEntityTypeAndDedupKey(r.Context(), orgID, req.EntityID, req.EventType, req.DedupKey)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -119,7 +124,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// the events package contract.
 	defaultPriority := 0.5
 	schema, schemaOK := events.Get(req.EventType)
-	handlers, err := s.eventHandlers.GetEnabledForEvent(r.Context(), runmode.LocalDefaultOrg, req.EventType)
+	handlers, err := s.eventHandlers.GetEnabledForEvent(r.Context(), orgID, req.EventType)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -149,7 +154,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	task, created, err := s.tasks.FindOrCreate(r.Context(), runmode.LocalDefaultOrg, runmode.LocalDefaultTeamID, req.EntityID, req.EventType, req.DedupKey, primaryEvent.ID, defaultPriority)
+	task, created, err := s.tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, req.EntityID, req.EventType, req.DedupKey, primaryEvent.ID, defaultPriority)
 	if err != nil {
 		internalError(w, "factory", err)
 		return
@@ -168,7 +173,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// RecordSwipe), not a fresh event landing — there's nothing new
 	// to link the existing task to.
 	if created {
-		if err := s.tasks.RecordEvent(r.Context(), runmode.LocalDefaultOrg, task.ID, primaryEvent.ID, "spawned"); err != nil {
+		if err := s.tasks.RecordEvent(r.Context(), orgID, task.ID, primaryEvent.ID, "spawned"); err != nil {
 			log.Printf("[factory] failed to record spawned task_event for %s: %v", task.ID, err)
 		}
 	}
@@ -189,7 +194,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// time. Factory drag-to-bot is the same semantic as swipe-up
 	// "delegate to bot" — both refuse with 409 when the bot is off
 	// for this team.
-	a, enabled, err := s.agentEnabledForLocalTeam(r.Context())
+	a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
 		return
@@ -205,7 +210,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// (a chip the user previously claimed via the Board), and the
 	// idempotent same-agent no-op. Refuses on a different-user
 	// claim — the factory drop shouldn't steal.
-	switch result, err := s.tasks.HandoffAgentClaim(r.Context(), runmode.LocalDefaultOrg, task.ID, a.ID, runmode.LocalDefaultUserID); {
+	switch result, err := s.tasks.HandoffAgentClaim(r.Context(), orgID, task.ID, a.ID, userID); {
 	case err != nil:
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
 		return
@@ -241,7 +246,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// failure stays non-fatal because the claim col + WS broadcast
 	// already captured the state-level effect; the audit is best-
 	// effort.
-	if _, err := s.swipes.RecordSwipe(r.Context(), runmode.LocalDefaultOrg, task.ID, "delegate", 0); err != nil {
+	if _, err := s.swipes.RecordSwipe(r.Context(), orgID, task.ID, "delegate", 0); err != nil {
 		log.Printf("[factory] failed to record delegate swipe for task %s: %v", task.ID, err)
 	}
 
@@ -256,7 +261,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	runID, err := s.spawner.Delegate(*task, delegate.DelegateOpts{
 		ExplicitPromptID: req.PromptID,
 		TriggerType:      "manual",
-		CreatorUserID:    runmode.LocalDefaultUserID,
+		CreatorUserID:    userID,
 	})
 	if err != nil {
 		// Claim is already stamped (and broadcast), swipe audit

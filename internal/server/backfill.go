@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -46,8 +45,12 @@ type backfillCandidate struct {
 // Entities already assigned to this project are excluded — there's
 // nothing to backfill for them.
 func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, projectID)
+	project, err := s.projects.Get(r.Context(), orgID, projectID)
 	if err != nil {
 		log.Printf("[backfill] candidates: get project %s: %v", projectID, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
@@ -60,7 +63,7 @@ func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request
 
 	var collected []domain.Entity
 
-	github, err := s.entities.ListActive(r.Context(), runmode.LocalDefaultOrgID, "github")
+	github, err := s.entities.ListActive(r.Context(), orgID, "github")
 	if err != nil {
 		log.Printf("[backfill] candidates: list github entities: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load github entities"})
@@ -73,7 +76,7 @@ func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request
 		collected = append(collected, e)
 	}
 
-	jira, err := s.entities.ListActive(r.Context(), runmode.LocalDefaultOrgID, "jira")
+	jira, err := s.entities.ListActive(r.Context(), orgID, "jira")
 	if err != nil {
 		log.Printf("[backfill] candidates: list jira entities: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load jira entities"})
@@ -108,7 +111,7 @@ func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request
 			c.CurrentProjectID = *e.ProjectID
 			name, ok := nameCache[*e.ProjectID]
 			if !ok {
-				if p, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, *e.ProjectID); err == nil && p != nil {
+				if p, err := s.projects.Get(r.Context(), orgID, *e.ProjectID); err == nil && p != nil {
 					name = p.Name
 				}
 				nameCache[*e.ProjectID] = name
@@ -145,8 +148,12 @@ type backfillFailure struct {
 // `failed: [{entity_id, error}]` and the call returns 200 with the
 // applied count rather than failing the whole batch on a single row.
 func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), runmode.LocalDefaultOrg, projectID)
+	project, err := s.projects.Get(r.Context(), orgID, projectID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
@@ -186,7 +193,7 @@ func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
 		// Without this gate, a malicious client could reassign any
 		// entity row by id, and a stale UI could quietly stamp
 		// classified_at on closed work.
-		entity, lookupErr := s.entities.Get(r.Context(), runmode.LocalDefaultOrgID, eid)
+		entity, lookupErr := s.entities.Get(r.Context(), orgID, eid)
 		if lookupErr != nil {
 			failures = append(failures, backfillFailure{EntityID: eid, Error: "lookup failed: " + lookupErr.Error()})
 			continue
@@ -210,7 +217,7 @@ func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
 		// supersedes the classifier's vote, and showing the stale
 		// model rationale next to a human-claimed assignment would
 		// be misleading.
-		if assignErr := s.entities.AssignProject(r.Context(), runmode.LocalDefaultOrgID, eid, &projectID, manualAssignmentMessage); assignErr != nil {
+		if assignErr := s.entities.AssignProject(r.Context(), orgID, eid, &projectID, manualAssignmentMessage); assignErr != nil {
 			if errors.Is(assignErr, sql.ErrNoRows) {
 				failures = append(failures, backfillFailure{EntityID: eid, Error: "entity not found"})
 			} else {

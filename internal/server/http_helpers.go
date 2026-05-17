@@ -37,6 +37,26 @@ func badRequest(w http.ResponseWriter, msg string) {
 	writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 }
 
+// requireOrg returns the active org ID from request context. In multi
+// mode an empty value means the user has no active org (zero
+// memberships, or POST /api/me/active-org hasn't been called yet);
+// the response is 409 with the stable "no_active_org" error code so
+// the frontend can prompt the user to pick one. In local mode the
+// shim guarantees a sentinel orgID so the empty branch never fires.
+//
+// Usage: `orgID, ok := s.requireOrg(w, r); if !ok { return }`.
+func (s *Server) requireOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
+	orgID := OrgIDFrom(r.Context())
+	if orgID != "" {
+		return orgID, true
+	}
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error":   "no_active_org",
+		"message": "no active org selected; call POST /api/me/active-org to choose one",
+	})
+	return "", false
+}
+
 // decodeJSON decodes the request body into v. On failure it writes a
 // 400 with the given message (or "invalid request body" if msg is empty)
 // and returns false; callers should `return` immediately.

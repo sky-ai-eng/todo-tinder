@@ -14,23 +14,27 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // handleDashboardStats returns aggregated PR statistics from entity snapshots.
 func (s *Server) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	creds, err := auth.Load()
 	if err != nil || creds.GitHubPAT == "" {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
-	username, _ := s.users.GetGitHubUsername(r.Context(), runmode.LocalDefaultUserID)
+	username, _ := s.users.GetGitHubUsername(r.Context(), userID)
 	if username == "" {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
 
-	stats, err := s.dashboard.Stats(r.Context(), runmode.LocalDefaultOrg, username, 30)
+	stats, err := s.dashboard.Stats(r.Context(), orgID, username, 30)
 	if err != nil {
 		internalError(w, "dashboard", err)
 		return
@@ -41,18 +45,23 @@ func (s *Server) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 
 // handleDashboardPRs returns open PRs from entity snapshots.
 func (s *Server) handleDashboardPRs(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	creds, err := auth.Load()
 	if err != nil || creds.GitHubPAT == "" {
 		writeJSON(w, http.StatusOK, []domain.PRSummaryRow{})
 		return
 	}
-	username, _ := s.users.GetGitHubUsername(r.Context(), runmode.LocalDefaultUserID)
+	username, _ := s.users.GetGitHubUsername(r.Context(), userID)
 	if username == "" {
 		writeJSON(w, http.StatusOK, []domain.PRSummaryRow{})
 		return
 	}
 
-	prs, err := s.dashboard.PRs(r.Context(), runmode.LocalDefaultOrg, username)
+	prs, err := s.dashboard.PRs(r.Context(), orgID, username)
 	if err != nil {
 		internalError(w, "dashboard", err)
 		return
@@ -127,6 +136,16 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// requireOrg must run BEFORE the GitHub mutation below — a 409 after
+	// the external draft flip would have already changed the PR on
+	// GitHub while reporting failure to the client, with the local
+	// snapshot patch never reached. Gate org access first; mutate
+	// external + local state only once the request is authorized.
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+
 	creds, _ := auth.Load()
 	cfg, _ := config.Load()
 	baseURL := cfg.GitHub.BaseURL
@@ -156,7 +175,7 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	// the audit trail. Revisit if a user reports "my trigger didn't fire
 	// when I dragged the card."
 	sourceID := fmt.Sprintf("%s/%s#%d", parts[0], parts[1], number)
-	if patchErr := patchPRSnapshotDraft(r.Context(), s.entities, sourceID, body.Draft); patchErr != nil {
+	if patchErr := patchPRSnapshotDraft(r.Context(), s.entities, orgID, sourceID, body.Draft); patchErr != nil {
 		log.Printf("[dashboard] warning: failed to patch snapshot for %s after draft toggle: %v", sourceID, patchErr)
 	}
 
@@ -171,8 +190,8 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 // its pre-mutation snapshot. Acceptable for beta — the next poll corrects
 // it, and the window is small. PatchSnapshot intentionally does NOT bump
 // last_polled_at so the next poll still refreshes the row.
-func patchPRSnapshotDraft(ctx context.Context, entities db.EntityStore, sourceID string, draft bool) error {
-	entity, err := entities.GetBySource(ctx, runmode.LocalDefaultOrgID, "github", sourceID)
+func patchPRSnapshotDraft(ctx context.Context, entities db.EntityStore, orgID, sourceID string, draft bool) error {
+	entity, err := entities.GetBySource(ctx, orgID, "github", sourceID)
 	if err != nil {
 		return err
 	}
@@ -192,5 +211,5 @@ func patchPRSnapshotDraft(ctx context.Context, entities db.EntityStore, sourceID
 	if err != nil {
 		return err
 	}
-	return entities.PatchSnapshot(ctx, runmode.LocalDefaultOrgID, entity.ID, string(patched))
+	return entities.PatchSnapshot(ctx, orgID, entity.ID, string(patched))
 }

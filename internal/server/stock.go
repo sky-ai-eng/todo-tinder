@@ -57,6 +57,11 @@ type stockTicket struct {
 // while the Jira poller hasn't completed its first cycle since the last
 // config change — snapshots are seeded on first poll.
 func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	creds, _ := auth.Load()
 	cfg, err := config.Load()
 	if err != nil {
@@ -70,7 +75,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 	// synthesized event metadata reads correctly. Both come from the same
 	// auth.ValidateJira response at PAT setup; missing either means the
 	// bootstrap hasn't run yet or Jira isn't connected.
-	localAccountID, localDisplayName, err := s.users.GetJiraIdentity(r.Context(), runmode.LocalDefaultUserID)
+	localAccountID, localDisplayName, err := s.users.GetJiraIdentity(r.Context(), userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
 		return
@@ -90,7 +95,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entities, err := s.entities.ListActive(r.Context(), runmode.LocalDefaultOrgID, "jira")
+	entities, err := s.entities.ListActive(r.Context(), orgID, "jira")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list entities: " + err.Error()})
 		return
@@ -99,7 +104,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 	// Batch-fetch the set of Jira entity IDs that already have an active task
 	// so we don't run N queries inside the loop. If this fails we can't tell
 	// which entities are safe to show, so fail the request outright.
-	taskedEntityIDs, err := s.tasks.EntityIDsWithActiveTasks(r.Context(), runmode.LocalDefaultOrg, "jira")
+	taskedEntityIDs, err := s.tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check active tasks: " + err.Error()})
 		return
@@ -285,6 +290,11 @@ type stockFailure struct {
 //
 // Transition failures are surfaced per-row; other actions still apply.
 func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	var req struct {
 		Actions []stockAction `json:"actions"`
 	}
@@ -298,7 +308,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	creds, _ := auth.Load()
-	localAccountID, localDisplayName, err := s.users.GetJiraIdentity(r.Context(), runmode.LocalDefaultUserID)
+	localAccountID, localDisplayName, err := s.users.GetJiraIdentity(r.Context(), userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
 		return
@@ -312,7 +322,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	// eligibility checks run in O(1) per action. Fail the request if this
 	// fails — otherwise we'd act on tickets without knowing whether they're
 	// already being tracked.
-	taskedEntityIDs, err := s.tasks.EntityIDsWithActiveTasks(r.Context(), runmode.LocalDefaultOrg, "jira")
+	taskedEntityIDs, err := s.tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check active tasks: " + err.Error()})
 		return
@@ -338,7 +348,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		entity, err := s.entities.GetBySource(r.Context(), runmode.LocalDefaultOrgID, "jira", issueKey)
+		entity, err := s.entities.GetBySource(r.Context(), orgID, "jira", issueKey)
 		if err != nil {
 			failed = append(failed, stockFailure{issueKey, a.Action, "failed to load entity"})
 			continue
@@ -422,16 +432,16 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			var eventID string
 			if isAvailable {
 				eventType = domain.EventJiraIssueAvailable
-				eventID, err = recordCarryOverAvailableEvent(r.Context(), s.events, entity.ID, snap)
+				eventID, err = recordCarryOverAvailableEvent(r.Context(), s.events, orgID, entity.ID, snap)
 			} else {
 				eventType = domain.EventJiraIssueAssigned
-				eventID, err = recordCarryOverAssignedEvent(r.Context(), s.events, entity.ID, snap)
+				eventID, err = recordCarryOverAssignedEvent(r.Context(), s.events, orgID, entity.ID, snap)
 			}
 			if err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, "record event: " + err.Error()})
 				continue
 			}
-			if _, _, err := s.tasks.FindOrCreate(r.Context(), runmode.LocalDefaultOrg, runmode.LocalDefaultTeamID, entity.ID, eventType, "", eventID, 0.5); err != nil {
+			if _, _, err := s.tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, eventType, "", eventID, 0.5); err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
 			}
@@ -480,12 +490,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			// jira:issue:assigned event — after the AssignToSelf call, the
 			// user is the assignee in Jira too, so the event metadata is
 			// accurate for either starting state.
-			eventID, err := recordCarryOverAssignedEvent(r.Context(), s.events, entity.ID, snap)
+			eventID, err := recordCarryOverAssignedEvent(r.Context(), s.events, orgID, entity.ID, snap)
 			if err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, "record event: " + err.Error()})
 				continue
 			}
-			task, _, err := s.tasks.FindOrCreate(r.Context(), runmode.LocalDefaultOrg, runmode.LocalDefaultTeamID, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5)
+			task, _, err := s.tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5)
 			if err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
@@ -498,12 +508,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			// non-queued state or was already claimed by someone
 			// else, surface that as a failed action rather than
 			// stealing.
-			ok, err := s.tasks.ClaimQueuedForUser(r.Context(), runmode.LocalDefaultOrg, task.ID, runmode.LocalDefaultUserID)
+			claimOK, err := s.tasks.ClaimQueuedForUser(r.Context(), orgID, task.ID, userID)
 			if err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, "claim stamp: " + err.Error()})
 				continue
 			}
-			if !ok {
+			if !claimOK {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, "task already claimed or no longer queued"})
 				continue
 			}
@@ -526,7 +536,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			if err := s.entities.MarkClosed(r.Context(), runmode.LocalDefaultOrgID, entity.ID); err != nil {
+			if err := s.entities.MarkClosed(r.Context(), orgID, entity.ID); err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
 			}
@@ -578,7 +588,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 // SKY-270: account ID flows through from the (caller-mutated) snap so the
 // metadata carries the stable identifier the matcher needs. The display
 // name in metadata is informational; matching keys on account ID.
-func recordCarryOverAssignedEvent(ctx context.Context, events_ db.EventStore, entityID string, snap domain.JiraSnapshot) (string, error) {
+func recordCarryOverAssignedEvent(ctx context.Context, events_ db.EventStore, orgID, entityID string, snap domain.JiraSnapshot) (string, error) {
 	meta := jiraevents.JiraIssueAssignedMetadata{
 		Assignee:          snap.Assignee,
 		AssigneeAccountID: snap.AssigneeAccountID,
@@ -594,7 +604,7 @@ func recordCarryOverAssignedEvent(ctx context.Context, events_ db.EventStore, en
 		return "", err
 	}
 	eid := entityID
-	return events_.Record(ctx, runmode.LocalDefaultOrg, domain.Event{
+	return events_.Record(ctx, orgID, domain.Event{
 		EntityID:     &eid,
 		EventType:    domain.EventJiraIssueAssigned,
 		MetadataJSON: string(metaJSON),
@@ -607,7 +617,7 @@ func recordCarryOverAssignedEvent(ctx context.Context, events_ db.EventStore, en
 // row to hang the task off. Mirrors the tracker's own emission path for
 // first-discovered available tickets (diff.go). No actor identity carried
 // on this event — the ticket is unassigned by definition.
-func recordCarryOverAvailableEvent(ctx context.Context, events_ db.EventStore, entityID string, snap domain.JiraSnapshot) (string, error) {
+func recordCarryOverAvailableEvent(ctx context.Context, events_ db.EventStore, orgID, entityID string, snap domain.JiraSnapshot) (string, error) {
 	meta := jiraevents.JiraIssueAvailableMetadata{
 		IssueKey:  snap.Key,
 		Project:   projectFromKey(snap.Key),
@@ -621,7 +631,7 @@ func recordCarryOverAvailableEvent(ctx context.Context, events_ db.EventStore, e
 		return "", err
 	}
 	eid := entityID
-	return events_.Record(ctx, runmode.LocalDefaultOrg, domain.Event{
+	return events_.Record(ctx, orgID, domain.Event{
 		EntityID:     &eid,
 		EventType:    domain.EventJiraIssueAvailable,
 		MetadataJSON: string(metaJSON),

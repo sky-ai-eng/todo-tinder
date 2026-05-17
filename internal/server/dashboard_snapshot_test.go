@@ -88,7 +88,7 @@ func TestPatchPRSnapshotDraft_FlipsIsDraft(t *testing.T) {
 	})
 
 	// Draft → ready
-	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, sourceID, false); err != nil {
+	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, runmode.LocalDefaultOrgID, sourceID, false); err != nil {
 		t.Fatalf("patch draft=false: %v", err)
 	}
 	if got := readPRSnapshot(t, s, sourceID); got.IsDraft {
@@ -96,7 +96,7 @@ func TestPatchPRSnapshotDraft_FlipsIsDraft(t *testing.T) {
 	}
 
 	// Ready → draft
-	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, sourceID, true); err != nil {
+	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, runmode.LocalDefaultOrgID, sourceID, true); err != nil {
 		t.Fatalf("patch draft=true: %v", err)
 	}
 	if got := readPRSnapshot(t, s, sourceID); !got.IsDraft {
@@ -129,7 +129,7 @@ func TestPatchPRSnapshotDraft_PreservesOtherFields(t *testing.T) {
 	}
 	sourceID := seedPRSnapshot(t, s, "sky-ai-eng", "triage-factory", 7, original)
 
-	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, sourceID, false); err != nil {
+	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, runmode.LocalDefaultOrgID, sourceID, false); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
 
@@ -159,7 +159,7 @@ func TestPatchPRSnapshotDraft_MissingEntity_NoError(t *testing.T) {
 	// silently rather than failing the whole request.
 	s := newTestServer(t)
 
-	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, "sky-ai-eng/triage-factory#999", false); err != nil {
+	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, runmode.LocalDefaultOrgID, "sky-ai-eng/triage-factory#999", false); err != nil {
 		t.Errorf("expected nil for missing entity, got: %v", err)
 	}
 }
@@ -172,7 +172,7 @@ func TestPatchPRSnapshotDraft_EmptySnapshot_NoError(t *testing.T) {
 		t.Fatalf("seed empty entity: %v", err)
 	}
 
-	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, "sky-ai-eng/triage-factory#100", true); err != nil {
+	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, runmode.LocalDefaultOrgID, "sky-ai-eng/triage-factory#100", true); err != nil {
 		t.Errorf("expected nil for empty snapshot, got: %v", err)
 	}
 }
@@ -191,7 +191,7 @@ func TestPatchPRSnapshotDraft_MalformedSnapshot_ReturnsError(t *testing.T) {
 		t.Fatalf("seed malformed snapshot: %v", err)
 	}
 
-	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, "sky-ai-eng/triage-factory#101", true); err == nil {
+	if err := patchPRSnapshotDraft(context.Background(), sqlitestore.New(s.db).Entities, runmode.LocalDefaultOrgID, "sky-ai-eng/triage-factory#101", true); err == nil {
 		t.Error("expected error on malformed snapshot, got nil")
 	}
 }

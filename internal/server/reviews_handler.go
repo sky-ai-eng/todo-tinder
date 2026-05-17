@@ -10,7 +10,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -37,9 +36,13 @@ type pendingReviewCommentJSON struct {
 
 // handleReviewGet returns a pending review and its comments.
 func (s *Server) handleReviewGet(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	reviewID := r.PathValue("id")
 
-	review, err := s.reviews.Get(r.Context(), runmode.LocalDefaultOrgID, reviewID)
+	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return
@@ -49,7 +52,7 @@ func (s *Server) handleReviewGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	comments, err := s.reviews.ListComments(r.Context(), runmode.LocalDefaultOrgID, reviewID)
+	comments, err := s.reviews.ListComments(r.Context(), orgID, reviewID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return
@@ -82,6 +85,11 @@ func (s *Server) handleReviewGet(w http.ResponseWriter, r *http.Request) {
 
 // handleReviewSubmit posts a pending review to GitHub, then cleans up local state.
 func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	reviewID := r.PathValue("id")
 
 	if s.ghClient == nil {
@@ -89,7 +97,7 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	review, err := s.reviews.Get(r.Context(), runmode.LocalDefaultOrgID, reviewID)
+	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return
@@ -104,7 +112,7 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load comments (potentially edited by the user)
-	comments, err := s.reviews.ListComments(r.Context(), runmode.LocalDefaultOrgID, reviewID)
+	comments, err := s.reviews.ListComments(r.Context(), orgID, reviewID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return
@@ -142,7 +150,7 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 	// surface as a 5xx and confuse the user about what landed.
 	if review.RunID != "" {
 		humanContent := FormatHumanFeedback(buildHumanFeedbackInput(review, comments, actualEvent))
-		if err := s.taskMemory.UpdateRunMemoryHumanContent(r.Context(), runmode.LocalDefaultOrg, review.RunID, humanContent); err != nil {
+		if err := s.taskMemory.UpdateRunMemoryHumanContent(r.Context(), orgID, review.RunID, humanContent); err != nil {
 			log.Printf("[reviews] warning: failed to record human verdict for run %s: %v", review.RunID, err)
 		}
 	}
@@ -164,8 +172,8 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 	// Step 1: clear the pending review. Must commit on its own to
 	// prevent a double-submit on retry (no guard equivalent to
 	// pending_prs.submitted_at exists on this path).
-	if err := s.tx.WithTx(cleanupCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, func(tx db.TxStores) error {
-		return tx.Reviews.Delete(cleanupCtx, runmode.LocalDefaultOrgID, reviewID)
+	if err := s.tx.WithTx(cleanupCtx, orgID, userID, func(tx db.TxStores) error {
+		return tx.Reviews.Delete(cleanupCtx, orgID, reviewID)
 	}); err != nil {
 		log.Printf("[reviews] warning: failed to clean up review %s: %v", reviewID, err)
 	}
@@ -173,8 +181,8 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 	// Step 2: run/task bookkeeping. Independent of the delete above.
 	var chainRun *domain.ChainRun
 	if review.RunID != "" {
-		if err := s.tx.WithTx(cleanupCtx, runmode.LocalDefaultOrg, runmode.LocalDefaultUserID, func(tx db.TxStores) error {
-			if _, err := tx.AgentRuns.MarkCompletedIfPendingApproval(cleanupCtx, runmode.LocalDefaultOrg, review.RunID); err != nil {
+		if err := s.tx.WithTx(cleanupCtx, orgID, userID, func(tx db.TxStores) error {
+			if _, err := tx.AgentRuns.MarkCompletedIfPendingApproval(cleanupCtx, orgID, review.RunID); err != nil {
 				return fmt.Errorf("mark run completed: %w", err)
 			}
 			// Skip the blanket task-mark-done for chain steps;
@@ -182,7 +190,7 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 			// row finalizes first. A chain lookup error leaves the
 			// task open for human follow-up rather than racing
 			// terminateChain.
-			cr, _, chainLookupErr := tx.Chains.GetRunForRun(cleanupCtx, runmode.LocalDefaultOrg, review.RunID)
+			cr, _, chainLookupErr := tx.Chains.GetRunForRun(cleanupCtx, orgID, review.RunID)
 			if chainLookupErr != nil {
 				log.Printf("[reviews] warning: chain lookup failed for run %s; skipping task closure: %v", review.RunID, chainLookupErr)
 				return nil
@@ -191,12 +199,12 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 			if cr != nil {
 				return nil
 			}
-			run, runErr := tx.AgentRuns.Get(cleanupCtx, runmode.LocalDefaultOrg, review.RunID)
+			run, runErr := tx.AgentRuns.Get(cleanupCtx, orgID, review.RunID)
 			if runErr != nil || run == nil {
 				log.Printf("[reviews] warning: read run %s for task closure: %v", review.RunID, runErr)
 				return nil
 			}
-			if err := tx.Tasks.SetStatus(cleanupCtx, runmode.LocalDefaultOrg, run.TaskID, "done"); err != nil {
+			if err := tx.Tasks.SetStatus(cleanupCtx, orgID, run.TaskID, "done"); err != nil {
 				log.Printf("[reviews] warning: failed to update task status for run %s: %v", review.RunID, err)
 			}
 			return nil
@@ -210,7 +218,7 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 			Data:  map[string]string{"status": "completed"},
 		})
 		if chainRun != nil && s.spawner != nil {
-			s.spawner.ResumeChainAfterApproval(review.RunID, runmode.LocalDefaultUserID)
+			s.spawner.ResumeChainAfterApproval(review.RunID, userID)
 		}
 	}
 
@@ -223,9 +231,13 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 
 // handleRunReview looks up the pending review associated with an agent run.
 func (s *Server) handleRunReview(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	runID := r.PathValue("runID")
 
-	review, err := s.reviews.ByRunID(r.Context(), runmode.LocalDefaultOrgID, runID)
+	review, err := s.reviews.ByRunID(r.Context(), orgID, runID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return
@@ -236,7 +248,7 @@ func (s *Server) handleRunReview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delegate to the full review GET which includes comments
-	comments, err := s.reviews.ListComments(r.Context(), runmode.LocalDefaultOrgID, review.ID)
+	comments, err := s.reviews.ListComments(r.Context(), orgID, review.ID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return
@@ -269,6 +281,10 @@ func (s *Server) handleRunReview(w http.ResponseWriter, r *http.Request) {
 
 // handleReviewUpdate updates the review body and/or event type.
 func (s *Server) handleReviewUpdate(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	reviewID := r.PathValue("id")
 
 	var req struct {
@@ -279,7 +295,7 @@ func (s *Server) handleReviewUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	review, err := s.reviews.Get(r.Context(), runmode.LocalDefaultOrgID, reviewID)
+	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return
@@ -298,7 +314,7 @@ func (s *Server) handleReviewUpdate(w http.ResponseWriter, r *http.Request) {
 		event = *req.ReviewEvent
 	}
 
-	if err := s.reviews.SetSubmission(r.Context(), runmode.LocalDefaultOrgID, reviewID, body, event); err != nil {
+	if err := s.reviews.SetSubmission(r.Context(), orgID, reviewID, body, event); err != nil {
 		internalError(w, "reviews", err)
 		return
 	}
@@ -308,6 +324,10 @@ func (s *Server) handleReviewUpdate(w http.ResponseWriter, r *http.Request) {
 
 // handleReviewCommentUpdate edits the body of a pending review comment.
 func (s *Server) handleReviewCommentUpdate(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	commentID := r.PathValue("commentId")
 
 	var req struct {
@@ -321,7 +341,7 @@ func (s *Server) handleReviewCommentUpdate(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := s.reviews.UpdateComment(r.Context(), runmode.LocalDefaultOrgID, commentID, req.Body); err != nil {
+	if err := s.reviews.UpdateComment(r.Context(), orgID, commentID, req.Body); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -331,9 +351,13 @@ func (s *Server) handleReviewCommentUpdate(w http.ResponseWriter, r *http.Reques
 
 // handleReviewCommentDelete removes a pending review comment.
 func (s *Server) handleReviewCommentDelete(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	commentID := r.PathValue("commentId")
 
-	if err := s.reviews.DeleteComment(r.Context(), runmode.LocalDefaultOrgID, commentID); err != nil {
+	if err := s.reviews.DeleteComment(r.Context(), orgID, commentID); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -343,6 +367,10 @@ func (s *Server) handleReviewCommentDelete(w http.ResponseWriter, r *http.Reques
 
 // handleReviewDiff proxies the PR diff from GitHub for the review's PR.
 func (s *Server) handleReviewDiff(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	reviewID := r.PathValue("id")
 
 	if s.ghClient == nil {
@@ -350,7 +378,7 @@ func (s *Server) handleReviewDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	review, err := s.reviews.Get(r.Context(), runmode.LocalDefaultOrgID, reviewID)
+	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
 	if err != nil {
 		internalError(w, "reviews", err)
 		return

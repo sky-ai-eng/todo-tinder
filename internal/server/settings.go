@@ -14,7 +14,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -284,6 +283,7 @@ type settingsUpdateRequest struct {
 }
 
 func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
+	userID := ClaimsFrom(r.Context()).Subject
 	var req settingsUpdateRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -336,23 +336,20 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			creds.GitHubPAT = req.GitHubPAT
-			// Username persistence targets the LocalDefaultUserID row —
-			// only safe in local mode. Multi mode must derive the
-			// authenticated user ID from the session (SKY-251).
-			if runmode.Current() == runmode.ModeLocal {
-				if err := s.users.SetGitHubUsername(r.Context(), runmode.LocalDefaultUserID, ghUser.Login); err != nil {
-					log.Printf("[settings] failed to persist users.github_username: %v", err)
-				}
+			// Username persists onto the requesting user's row, identified
+			// by the JWT claim's subject (sentinel in local mode via the
+			// shim, real UUID in multi mode).
+			if err := s.users.SetGitHubUsername(r.Context(), userID, ghUser.Login); err != nil {
+				log.Printf("[settings] failed to persist users.github_username: %v", err)
 			}
 		}
 		// Backfill username on the users row when we have a PAT but the row
 		// is empty (e.g. user saves a PAT for the first time without changing
 		// it through the validation branch above). Skip on DB error — a
 		// transient read failure shouldn't fan out into a GitHub API call;
-		// the next Settings save retries naturally. Local mode only — same
-		// reasoning as the validation-branch write above.
-		if creds.GitHubPAT != "" && runmode.Current() == runmode.ModeLocal {
-			stored, err := s.users.GetGitHubUsername(r.Context(), runmode.LocalDefaultUserID)
+		// the next Settings save retries naturally.
+		if creds.GitHubPAT != "" {
+			stored, err := s.users.GetGitHubUsername(r.Context(), userID)
 			if err != nil {
 				log.Printf("[settings] failed to read users.github_username for backfill: %v (skipping backfill this save)", err)
 			} else if stored == "" {
@@ -362,7 +359,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 				}
 				if url != "" {
 					if ghUser, err := auth.ValidateGitHub(url, creds.GitHubPAT); err == nil {
-						if err := s.users.SetGitHubUsername(r.Context(), runmode.LocalDefaultUserID, ghUser.Login); err != nil {
+						if err := s.users.SetGitHubUsername(r.Context(), userID, ghUser.Login); err != nil {
 							log.Printf("[settings] failed to backfill users.github_username: %v", err)
 						}
 					}
@@ -384,11 +381,8 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		// Also clear the captured login on the users row so a downstream
 		// "are we connected to GitHub" check via DB stays in sync with the
 		// keychain reality (PAT gone → username should be gone too).
-		// Local mode only — multi mode must clear the session user's row.
-		if runmode.Current() == runmode.ModeLocal {
-			if err := s.users.SetGitHubUsername(r.Context(), runmode.LocalDefaultUserID, ""); err != nil {
-				log.Printf("[settings] failed to clear users.github_username: %v", err)
-			}
+		if err := s.users.SetGitHubUsername(r.Context(), userID, ""); err != nil {
+			log.Printf("[settings] failed to clear users.github_username: %v", err)
 		}
 	}
 
@@ -418,13 +412,9 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			creds.JiraPAT = req.JiraPAT
 			// SKY-270: Jira identity (account ID + display name) lives on
 			// the users row, derived from the same /myself response. Same
-			// pattern as the GitHub branch above. Local mode only — multi
-			// mode derives identity from the session user via Atlassian
-			// OAuth (separate ticket, not yet shipped).
-			if runmode.Current() == runmode.ModeLocal {
-				if err := s.users.SetJiraIdentity(r.Context(), runmode.LocalDefaultUserID, jiraUser.StableID(), jiraUser.DisplayName); err != nil {
-					log.Printf("[settings] failed to persist users.jira_identity: %v", err)
-				}
+			// pattern as the GitHub branch above.
+			if err := s.users.SetJiraIdentity(r.Context(), userID, jiraUser.StableID(), jiraUser.DisplayName); err != nil {
+				log.Printf("[settings] failed to persist users.jira_identity: %v", err)
 			}
 		}
 	} else {
@@ -438,11 +428,8 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		// Clear the captured identity on the users row so downstream
 		// "are we connected to Jira" checks stay in sync with the
 		// keychain reality (PAT gone → identity should be gone too).
-		// Local mode only — multi mode clears via the session user path.
-		if runmode.Current() == runmode.ModeLocal {
-			if err := s.users.SetJiraIdentity(r.Context(), runmode.LocalDefaultUserID, "", ""); err != nil {
-				log.Printf("[settings] failed to clear users.jira_identity: %v", err)
-			}
+		if err := s.users.SetJiraIdentity(r.Context(), userID, "", ""); err != nil {
+			log.Printf("[settings] failed to clear users.jira_identity: %v", err)
 		}
 	}
 
@@ -592,6 +579,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 // the rest of the settings. This powers the two-stage settings flow: connect
 // first, then configure projects and statuses.
 func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
+	userID := ClaimsFrom(r.Context()).Subject
 	var req struct {
 		URL string `json:"url"`
 		PAT string `json:"pat"`
@@ -641,13 +629,10 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// SKY-270: persist the captured Jira identity on the users row.
-	// Local mode only — multi mode derives identity from the session
-	// user via Atlassian OAuth (not yet shipped). Failure is logged
-	// but non-fatal; the next save (or the boot-time bootstrap) retries.
-	if runmode.Current() == runmode.ModeLocal {
-		if err := s.users.SetJiraIdentity(r.Context(), runmode.LocalDefaultUserID, jiraUser.StableID(), jiraUser.DisplayName); err != nil {
-			log.Printf("[settings] failed to persist users.jira_identity: %v", err)
-		}
+	// Failure is logged but non-fatal; the next save (or the boot-time
+	// bootstrap) retries.
+	if err := s.users.SetJiraIdentity(r.Context(), userID, jiraUser.StableID(), jiraUser.DisplayName); err != nil {
+		log.Printf("[settings] failed to persist users.jira_identity: %v", err)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{

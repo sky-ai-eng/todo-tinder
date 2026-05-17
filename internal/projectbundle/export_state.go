@@ -18,7 +18,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -36,8 +35,8 @@ type exportState struct {
 	sessionInZip bool
 }
 
-func collectExportState(ctx context.Context, database *sql.DB, projects db.ProjectStore, projectID string) (*exportState, error) {
-	project, err := projects.Get(ctx, runmode.LocalDefaultOrg, projectID)
+func collectExportState(ctx context.Context, database *sql.DB, projects db.ProjectStore, orgID, projectID string) (*exportState, error) {
+	project, err := projects.Get(ctx, orgID, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("load project: %w", err)
 	}

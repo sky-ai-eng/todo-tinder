@@ -11,13 +11,16 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
 func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	runID := r.PathValue("runID")
-	run, err := s.agentRuns.Get(r.Context(), runmode.LocalDefaultOrg, runID)
+	run, err := s.agentRuns.Get(r.Context(), orgID, runID)
 	if err != nil {
 		internalError(w, "agent", err)
 		return
@@ -26,7 +29,7 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "run")
 		return
 	}
-	writeJSON(w, http.StatusOK, runResponse(r.Context(), s.reviews, s.pendingPRs, run))
+	writeJSON(w, http.StatusOK, runResponse(r.Context(), s.reviews, s.pendingPRs, orgID, run))
 }
 
 // runResponse projects an AgentRun into the wire shape the frontend
@@ -42,7 +45,7 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 // row). Both errors swallow + log — pending_kind is informational
 // for the UI; an erroring lookup shouldn't fail the whole status
 // fetch.
-func runResponse(ctx context.Context, reviews db.ReviewStore, pendingPRs db.PendingPRStore, run *domain.AgentRun) map[string]any {
+func runResponse(ctx context.Context, reviews db.ReviewStore, pendingPRs db.PendingPRStore, orgID string, run *domain.AgentRun) map[string]any {
 	out := map[string]any{
 		"ID":               run.ID,
 		"TaskID":           run.TaskID,
@@ -66,9 +69,9 @@ func runResponse(ctx context.Context, reviews db.ReviewStore, pendingPRs db.Pend
 	}
 	// pending_kind only relevant when the run is parked.
 	if run.Status == "pending_approval" {
-		if review, err := reviews.ByRunID(ctx, runmode.LocalDefaultOrgID, run.ID); err == nil && review != nil {
+		if review, err := reviews.ByRunID(ctx, orgID, run.ID); err == nil && review != nil {
 			out["pending_kind"] = "review"
-		} else if pr, err := pendingPRs.ByRunID(ctx, runmode.LocalDefaultOrgID, run.ID); err == nil && pr != nil {
+		} else if pr, err := pendingPRs.ByRunID(ctx, orgID, run.ID); err == nil && pr != nil {
 			out["pending_kind"] = "pr"
 		}
 	}
@@ -76,8 +79,12 @@ func runResponse(ctx context.Context, reviews db.ReviewStore, pendingPRs db.Pend
 }
 
 func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	runID := r.PathValue("runID")
-	messages, err := s.agentRuns.Messages(r.Context(), runmode.LocalDefaultOrg, runID)
+	messages, err := s.agentRuns.Messages(r.Context(), orgID, runID)
 	if err != nil {
 		internalError(w, "agent", err)
 		return
@@ -89,12 +96,13 @@ func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 	if s.spawner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
 		return
 	}
-	if err := s.spawner.Cancel(runID, runmode.LocalDefaultUserID); err != nil {
+	if err := s.spawner.Cancel(runID, userID); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -102,6 +110,7 @@ func (s *Server) handleAgentCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 	if s.spawner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
@@ -123,7 +132,7 @@ func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
 	// (sets the takenOver flag and SIGKILLs the agent) the operation
 	// must run to completion or roll back cleanly; tying it to the
 	// request context would let a client disconnect destroy the run.
-	result, err := s.spawner.Takeover(runID, baseDir, runmode.LocalDefaultUserID)
+	result, err := s.spawner.Takeover(runID, baseDir, userID)
 	if err != nil {
 		writeJSON(w, takeoverErrorStatus(err), map[string]string{"error": err.Error()})
 		return
@@ -154,12 +163,13 @@ func shellQuote(s string) string {
 //   - 5xx: filesystem/git/DB failure during teardown — row stays held
 //     so a retry can finish the job
 func (s *Server) handleAgentRelease(w http.ResponseWriter, r *http.Request) {
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 	if s.spawner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
 		return
 	}
-	if err := s.spawner.Release(runID, runmode.LocalDefaultUserID); err != nil {
+	if err := s.spawner.Release(runID, userID); err != nil {
 		writeJSON(w, releaseErrorStatus(err), map[string]string{"error": err.Error()})
 		return
 	}
@@ -189,7 +199,11 @@ func releaseErrorStatus(err error) int {
 // server-side using the same shellQuote() rule the takeover endpoint
 // uses, so the banner's modal renders an identical paste-safe command.
 func (s *Server) handleHeldTakeovers(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.agentRuns.ListTakenOverForResume(r.Context(), runmode.LocalDefaultOrg)
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	runs, err := s.agentRuns.ListTakenOverForResume(r.Context(), orgID)
 	if err != nil {
 		internalError(w, "agent", err)
 		return
@@ -229,12 +243,16 @@ func takeoverErrorStatus(err error) int {
 }
 
 func (s *Server) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	taskID := r.URL.Query().Get("task_id")
 	if taskID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "task_id query parameter required"})
 		return
 	}
-	runs, err := s.agentRuns.ListForTask(r.Context(), runmode.LocalDefaultOrg, taskID)
+	runs, err := s.agentRuns.ListForTask(r.Context(), orgID, taskID)
 	if err != nil {
 		internalError(w, "agent", err)
 		return
@@ -249,7 +267,7 @@ func (s *Server) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	// flicker on first paint and only settle after the per-run fetch.
 	out := make([]map[string]any, len(runs))
 	for i := range runs {
-		out[i] = runResponse(r.Context(), s.reviews, s.pendingPRs, &runs[i])
+		out[i] = runResponse(r.Context(), s.reviews, s.pendingPRs, orgID, &runs[i])
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -276,6 +294,11 @@ func (s *Server) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 // runs in a background goroutine; the client refreshes via the
 // existing run-update WS broadcast.
 func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 	if s.spawner == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
@@ -287,7 +310,7 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := s.agentRuns.Get(r.Context(), runmode.LocalDefaultOrg, runID)
+	run, err := s.agentRuns.Get(r.Context(), orgID, runID)
 	if err != nil {
 		internalError(w, "agent", err)
 		return
@@ -301,7 +324,7 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, err := s.agentRuns.LatestYieldRequest(r.Context(), runmode.LocalDefaultOrg, runID)
+	req, err := s.agentRuns.LatestYieldRequest(r.Context(), orgID, runID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "load yield request: " + err.Error()})
 		return
@@ -327,7 +350,7 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 	// took the run to a terminal state and the message is the
 	// historical record of what the user submitted.
 	displayContent := domain.RenderYieldResponseForDisplay(req, &resp)
-	msg, err := s.agentRuns.InsertYieldResponse(r.Context(), runmode.LocalDefaultOrg, runID, &resp, displayContent)
+	msg, err := s.agentRuns.InsertYieldResponse(r.Context(), orgID, runID, &resp, displayContent)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "record response: " + err.Error()})
 		return
@@ -341,7 +364,7 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 	// silently mark the run cancelled while the resume goroutine
 	// still continues the Claude session.
 	agentText := domain.RenderYieldResponseForAgent(req, &resp)
-	if err := s.spawner.ResumeAfterYield(runID, agentText, runmode.LocalDefaultUserID); err != nil {
+	if err := s.spawner.ResumeAfterYield(runID, agentText, userID); err != nil {
 		if errors.Is(err, delegate.ErrYieldNotResumable) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return

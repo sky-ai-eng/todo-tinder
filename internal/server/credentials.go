@@ -9,7 +9,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -31,6 +30,7 @@ type setupResponse struct {
 }
 
 func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request) {
+	userID := ClaimsFrom(r.Context()).Subject
 	var req setupRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -107,11 +107,10 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 	// Capture the GitHub login on the users row when we validated GitHub.
 	// Skip when GitHub wasn't validated (Jira-only setup) — the dashboard /
 	// poller short-circuit on empty username and Settings can re-capture
-	// later. This write is local-mode-only because it targets the
-	// LocalDefaultUserID row; multi-user modes must use a session-derived
-	// user ID instead.
-	if resp.GitHub != nil && resp.GitHub.Login != "" && runmode.Current() == runmode.ModeLocal {
-		if err := s.users.SetGitHubUsername(r.Context(), runmode.LocalDefaultUserID, resp.GitHub.Login); err != nil {
+	// later. userID is extracted from the request context — sentinel in
+	// local mode (via the shim), real user UUID in multi mode.
+	if resp.GitHub != nil && resp.GitHub.Login != "" {
+		if err := s.users.SetGitHubUsername(r.Context(), userID, resp.GitHub.Login); err != nil {
 			log.Printf("[setup] failed to persist users.github_username: %v", err)
 		}
 	}
@@ -143,6 +142,10 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	creds, err := auth.Load()
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -152,7 +155,7 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	repoCount, _ := s.repos.CountConfigured(r.Context(), runmode.LocalDefaultOrgID)
+	repoCount, _ := s.repos.CountConfigured(r.Context(), orgID)
 
 	// GitHub is mandatory — configured requires GitHub creds + at least one repo
 	result := map[string]any{
