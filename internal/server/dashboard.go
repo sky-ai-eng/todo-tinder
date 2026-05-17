@@ -136,6 +136,16 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// requireOrg must run BEFORE the GitHub mutation below — a 409 after
+	// the external draft flip would have already changed the PR on
+	// GitHub while reporting failure to the client, with the local
+	// snapshot patch never reached. Gate org access first; mutate
+	// external + local state only once the request is authorized.
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+
 	creds, _ := auth.Load()
 	cfg, _ := config.Load()
 	baseURL := cfg.GitHub.BaseURL
@@ -164,10 +174,6 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	// signal and a second event would race the next poll's diff and confuse
 	// the audit trail. Revisit if a user reports "my trigger didn't fire
 	// when I dragged the card."
-	orgID, ok := s.requireOrg(w, r)
-	if !ok {
-		return
-	}
 	sourceID := fmt.Sprintf("%s/%s#%d", parts[0], parts[1], number)
 	if patchErr := patchPRSnapshotDraft(r.Context(), s.entities, orgID, sourceID, body.Draft); patchErr != nil {
 		log.Printf("[dashboard] warning: failed to patch snapshot for %s after draft toggle: %v", sourceID, patchErr)

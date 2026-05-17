@@ -192,8 +192,12 @@ const (
 )
 
 func (s *Server) handleProjectExportPreview(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	id := r.PathValue("id")
-	preview, err := projectbundle.Preview(r.Context(), s.db, s.projects, id)
+	preview, err := projectbundle.Preview(r.Context(), s.db, s.projects, orgID, id)
 	if err != nil {
 		if errors.Is(err, projectbundle.ErrProjectNotFound) {
 			notFound(w, "project")
@@ -220,7 +224,7 @@ func (s *Server) handleProjectExport(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "project")
 		return
 	}
-	stream, err := projectbundle.Export(r.Context(), s.db, s.projects, id)
+	stream, err := projectbundle.Export(r.Context(), s.db, s.projects, orgID, id)
 	if err != nil {
 		if errors.Is(err, projectbundle.ErrProjectNotFound) {
 			notFound(w, "project")
