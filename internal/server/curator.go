@@ -50,8 +50,12 @@ func (s *Server) handleCuratorSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, projectID)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, projectID)
+		return e
+	}); err != nil {
 		internalError(w, "curator", err)
 		return
 	}
@@ -87,9 +91,14 @@ func (s *Server) handleCuratorHistory(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, projectID)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, projectID)
+		return e
+	}); err != nil {
 		internalError(w, "curator", err)
 		return
 	}
@@ -145,9 +154,14 @@ func (s *Server) handleCuratorCancel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "curator runtime not started"})
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, projectID)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, projectID)
+		return e
+	}); err != nil {
 		internalError(w, "curator", err)
 		return
 	}
@@ -196,9 +210,14 @@ func (s *Server) handleCuratorReset(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, projectID)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, projectID)
+		return e
+	}); err != nil {
 		internalError(w, "curator", err)
 		return
 	}
