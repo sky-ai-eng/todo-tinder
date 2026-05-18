@@ -2883,6 +2883,78 @@ func TestRLS_TasksClaimXorRejection(t *testing.T) {
 	_ = teamA
 }
 
+// TestRLS_UserSelfWriteWithoutOrgClaim pins the invariant that the
+// SKY-327 D9 follow-up sweep relies on: a tf_app caller can write to
+// their own public.users row even when the JWT claim's org_id is
+// empty. The users_modify policy gates USING + WITH CHECK on
+// (id = tf.current_user_id()) and never references
+// tf.current_org_id() — pre-org users (multi-mode signups before
+// active_org_id is set on the session) need this path to work so
+// integrations setup, Jira connect, and settings updates can persist
+// per-user identity (github_username, jira_account_id) before the
+// user has joined an org.
+//
+// The settings.go / credentials.go handlers extract orgID via
+// OrgIDFrom(r.Context()) and pass it through to s.tx.WithTx; in the
+// pre-org multi-mode case that orgID is empty. This test exercises
+// the same shape directly on the users table under tf_app via the
+// pgtest WithUser helper so a future users_modify policy change that
+// introduces an org_id dependency breaks the test instead of silently
+// breaking the production handler chain.
+func TestRLS_UserSelfWriteWithoutOrgClaim(t *testing.T) {
+	h := Shared(t)
+	h.Reset(t)
+
+	// Seed a fresh user with no org membership — mirrors the multi-mode
+	// "JWT verified, callback handled, no active_org_id yet" state.
+	userID := SeedUser(t, h, "no-org-user")
+
+	// Bare self-write under empty org claim must succeed (users_modify
+	// USING/WITH CHECK both gate only on id = tf.current_user_id()).
+	if err := h.WithUser(t, userID, "", func(tx *sql.Tx) error {
+		_, e := tx.ExecContext(context.Background(),
+			`UPDATE public.users SET github_username = $1 WHERE id = $2`,
+			"test-login", userID)
+		return e
+	}); err != nil {
+		t.Fatalf("self-write with empty org claim should succeed under users_modify; got: %v", err)
+	}
+
+	// Confirm the write landed.
+	var landed sql.NullString
+	if err := h.AdminDB.QueryRow(
+		`SELECT github_username FROM public.users WHERE id = $1`, userID,
+	).Scan(&landed); err != nil {
+		t.Fatalf("read-back: %v", err)
+	}
+	if landed.String != "test-login" {
+		t.Errorf("github_username = %q after self-write, want %q", landed.String, "test-login")
+	}
+
+	// Negative half: same empty-org claim must NOT let userA touch
+	// userB's row. The user-id branch of users_modify is the safety
+	// net here — without it, an empty-org caller could spray any
+	// users.id they guessed. UPDATE under USING filter returns 0 rows
+	// affected on policy violation (no SQLSTATE), so check the row
+	// count rather than expecting an error.
+	otherUser := SeedUser(t, h, "other-user")
+	if err := h.WithUser(t, userID, "", func(tx *sql.Tx) error {
+		res, e := tx.ExecContext(context.Background(),
+			`UPDATE public.users SET github_username = $1 WHERE id = $2`,
+			"spoofed", otherUser)
+		if e != nil {
+			return e
+		}
+		n, _ := res.RowsAffected()
+		if n != 0 {
+			t.Errorf("cross-user UPDATE under empty-org claim affected %d rows, want 0 (users_modify USING should filter)", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("cross-user write under empty org claim should silently no-op, not error: %v", err)
+	}
+}
+
 // assertPgCode asserts that err is a *pgconn.PgError with the given
 // SQLSTATE. Postgres error message text drifts across versions, but
 // SQLSTATE codes are spec-stable — assert codes, not text. The
