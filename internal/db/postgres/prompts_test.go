@@ -133,9 +133,10 @@ func TestPromptStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
 	orgB, bob := seedPgOrgAndUserForPrompts(t, h)
 	_ = bob
 
-	// Seed a prompt in orgA via admin so the row exists. Use the
-	// shared seedPgPrompt helper from chains_test.go (same package),
-	// which lands a 'private' visibility prompt owned by alice.
+	// Seed a prompt in orgA directly via the admin connection so the row
+	// exists independent of user-scoped RLS. The insert sets
+	// visibility='team' and attaches teamA so the same-org read path
+	// exercises the team_visibility branch of prompts_select.
 	promptA := "prompt-rls-" + orgA[:8]
 	teamA := firstTeamForOrg(t, h, orgA)
 	if _, err := h.AdminDB.Exec(`
