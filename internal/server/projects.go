@@ -144,7 +144,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		created, getErr = tx.Projects.Get(r.Context(), orgID, id)
 		return getErr
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "create failed: " + err.Error()})
+		internalError(w, "projects", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, created)
