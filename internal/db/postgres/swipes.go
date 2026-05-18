@@ -35,16 +35,25 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 	// claim + delegate are responsibility-only — the handler stamps
 	// claim columns; this UPDATE leaves status at 'queued'. Only
 	// dismiss/snooze/complete are genuine lifecycle moves.
-	var newStatus string
+	//
+	// SKY-330: closed_at + close_reason are written on terminal
+	// swipes (dismiss/complete) and cleared on re-open paths
+	// (claim/delegate of a previously-terminal task). The Board's
+	// Done-column 7-day cap reads closed_at, so NULL means the cap
+	// doesn't apply — must be cleared back to NULL when the task
+	// leaves a terminal state.
+	var newStatus, closeReason string
 	switch action {
 	case "claim", "delegate":
 		newStatus = "queued"
 	case "dismiss":
 		newStatus = "dismissed"
+		closeReason = "user_dismissed"
 	case "snooze":
 		newStatus = "snoozed"
 	case "complete":
 		newStatus = "done"
+		closeReason = "user_completed"
 	default:
 		newStatus = "queued"
 	}
@@ -52,13 +61,26 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 		if err := insertSwipeEvent(ctx, tx, orgID, taskID, action, &hesitationMs); err != nil {
 			return err
 		}
-		// clearSnooze=true on every action this method handles —
-		// dismiss/complete are terminal lifecycle moves; claim/delegate's
-		// snooze_until clear is redundant with the claim helpers'
-		// atomic snooze-wake under the v0.7 "snoozed ↔ unclaimed"
-		// invariant but harmless. SnoozeTask is the only method that
-		// SETS snooze_until; every other path clears it.
-		return updateTaskStatus(ctx, tx, orgID, taskID, newStatus, nil, true)
+		// Inline UPDATE rather than routing through updateTaskStatus
+		// because the helper doesn't take close-metadata params and
+		// growing it to four-axis-aware would proliferate booleans
+		// across every callsite for one path's needs.
+		var closedAt any
+		var reason any
+		if newStatus == "done" || newStatus == "dismissed" {
+			closedAt = time.Now()
+			reason = closeReason
+		}
+		_, err := tx.ExecContext(ctx,
+			`UPDATE tasks
+			    SET status = $1,
+			        snooze_until = NULL,
+			        closed_at = $2,
+			        close_reason = $3
+			  WHERE org_id = $4 AND id = $5`,
+			newStatus, closedAt, reason, orgID, taskID,
+		)
+		return err
 	}); err != nil {
 		return "", err
 	}
@@ -121,12 +143,16 @@ func (s *swipeStore) RequeueTask(ctx context.Context, orgID string, taskID strin
 		// filter (claim cols all NULL + status 'queued') picks the
 		// row up immediately. Status reset to 'queued' covers the
 		// snoozed-back-to-queue path too.
+		// SKY-330: also clear close metadata — re-queueing a
+		// previously-terminal task means it isn't terminal anymore.
 		res, err := tx.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'queued',
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE org_id = $1 AND id = $2`,
 			orgID, taskID,
 		)
@@ -158,12 +184,16 @@ func (s *swipeStore) UndoLastSwipe(ctx context.Context, orgID string, taskID str
 		// helper only handles the (status, snooze_until) axis pair —
 		// growing it to take claim cols too would proliferate
 		// boolean flags across every callsite for one path's needs.
+		// SKY-330: clear close metadata too — undoing a dismiss /
+		// complete swipe means the task isn't terminal anymore.
 		_, err := tx.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = $1,
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE org_id = $2 AND id = $3`,
 			"queued", orgID, taskID,
 		)

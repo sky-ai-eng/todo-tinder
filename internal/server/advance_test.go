@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
@@ -150,18 +152,35 @@ func TestHandleAdvance_HappyPath_InProgressToInReview(t *testing.T) {
 	}
 }
 
-// TestHandleAdvance_409OnUnknownTask covers the not-found case.
-// AdvanceStatusForUser returns ok=false for any missing-row query,
-// so the handler can't distinguish "task not found" from "guard
-// tripped" — both surface as 409. Test name reflects the actual
-// expected status code so `go test -run` output isn't misleading.
-func TestHandleAdvance_409OnUnknownTask(t *testing.T) {
+// TestHandleAdvance_404OnUnknownTask covers the not-found case.
+// With the pre-load Get in the handler, "task not found" cleanly
+// produces 404 — distinct from the 409 "guard tripped" path
+// (RejectsUnclaimedTask / RejectsBotClaimedTask / RejectsTerminalTask
+// above). The 00000000-…-0bad id is a valid UUID format so it
+// passes the uuid.Parse gate and reaches the Get call.
+func TestHandleAdvance_404OnUnknownTask(t *testing.T) {
 	s := newTestServer(t)
 	rec := doJSON(t, s, http.MethodPost,
 		"/api/tasks/00000000-0000-0000-0000-000000000bad/advance",
 		map[string]any{"to": "in_progress"})
-	if rec.Code != http.StatusConflict {
-		t.Errorf("status = %d, want 409 (guard-tripped vs not-found are merged); body=%s",
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (task not found); body=%s",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleAdvance_404OnMalformedID covers the Postgres-portability
+// case: a non-UUID path id would surface as SQLSTATE 22P02 from the
+// store layer without the handler-side uuid.Parse guard. We treat
+// it as 404 (same as a missing UUID-shaped id) rather than 400 so
+// the API doesn't expose backend-specific id-format quirks.
+func TestHandleAdvance_404OnMalformedID(t *testing.T) {
+	s := newTestServer(t)
+	rec := doJSON(t, s, http.MethodPost,
+		"/api/tasks/not-a-uuid/advance",
+		map[string]any{"to": "in_progress"})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (malformed id treated as not found); body=%s",
 			rec.Code, rec.Body.String())
 	}
 }
@@ -178,6 +197,11 @@ type advanceTaskOpts struct {
 // pendingApprovalFixture pattern in requeue_test.go but without the
 // run / review / memory machinery — /advance tests only touch the
 // task row. Each call uses a unique suffix to dodge the dedup index.
+//
+// taskID uses a real UUID since the /advance handler validates the
+// path id as a UUID up front (defense against Postgres' 22P02 on
+// malformed input). Entity + event ids stay suffix-based strings
+// since no handler validates those.
 func seedAdvanceTask(t *testing.T, database *sql.DB, suffix string, opts advanceTaskOpts) string {
 	t.Helper()
 	ctx := context.Background()
@@ -185,7 +209,7 @@ func seedAdvanceTask(t *testing.T, database *sql.DB, suffix string, opts advance
 	const eventType = "github:pr:ci_check_passed"
 	entityID := "e_adv_" + suffix
 	eventID := "ev_adv_" + suffix
-	taskID := "t_adv_" + suffix
+	taskID := uuid.New().String()
 
 	if _, err := database.ExecContext(ctx,
 		`INSERT INTO entities (id, source, source_id, kind, state)

@@ -126,18 +126,31 @@ export default function Board() {
   // previous user's. We initialise from the anon key for the brief
   // pre-/api/me window; once currentUserID resolves, the effect below
   // re-loads from the per-user key.
+  //
+  // filtersOwnerID tracks which user the current filter STATE was
+  // loaded for (separate from currentUserID, which is the LATEST
+  // user). The save effect gates on the two matching — otherwise the
+  // first render after /api/me resolves would write the still-in-
+  // state anon defaults to the per-user key before the load effect's
+  // setFilters lands, silently clobbering the user's saved filters.
+  // React batches the load effect's two setState calls into one
+  // re-render, so on the following effect pass owner === current and
+  // the save proceeds with the loaded filters.
   const [filters, setFilters] = useState<FilterMap>(() => loadFilters(''))
+  const [filtersOwnerID, setFiltersOwnerID] = useState<string>('')
   useEffect(() => {
     if (!currentUserID) return
     setFilters(loadFilters(currentUserID))
+    setFiltersOwnerID(currentUserID)
   }, [currentUserID])
   useEffect(() => {
+    if (filtersOwnerID !== currentUserID) return
     try {
       localStorage.setItem(filterStorageKey(currentUserID), JSON.stringify(filters))
     } catch {
       // Quota / disabled storage — silently skip; filters work in-memory.
     }
-  }, [filters, currentUserID])
+  }, [filters, filtersOwnerID, currentUserID])
 
   // Snoozed visibility toggle for the Queued column. Off by default;
   // snoozed tasks are intentionally deferred and don't need to clutter

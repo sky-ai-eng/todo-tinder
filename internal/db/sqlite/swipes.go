@@ -33,16 +33,27 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 	// Only dismiss/snooze/complete (genuine lifecycle moves) transition
 	// status. Unknown action defaults to 'queued' so a typo doesn't
 	// strand the task; same fallback as pre-SKY-261.
-	var newStatus string
+	//
+	// SKY-330: closed_at is also written on the terminal transitions
+	// so the Board's Done-column 7-day cap actually applies to
+	// user-completed/dismissed tasks. Cleared on re-open paths
+	// (claim/delegate of a previously-terminal task) so re-opened
+	// rows aren't perpetually filed under "closed at <stale date>".
+	// closeReason mirrors the value Close() writes; doc enum in
+	// domain/task.go lists user_completed + user_dismissed alongside
+	// run_completed / auto_closed_by_event / entity_closed.
+	var newStatus, closeReason string
 	switch action {
 	case "claim", "delegate":
 		newStatus = "queued"
 	case "dismiss":
 		newStatus = "dismissed"
+		closeReason = "user_dismissed"
 	case "snooze":
 		newStatus = "snoozed"
 	case "complete":
 		newStatus = "done"
+		closeReason = "user_completed"
 	default:
 		newStatus = "queued"
 	}
@@ -53,18 +64,30 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 		); err != nil {
 			return err
 		}
-		// snooze_until is cleared on every transition this method
-		// handles — dismiss/complete (genuine lifecycle moves) are
-		// terminal so a leftover deferral makes no sense, and
-		// claim/delegate's snooze_until clear is redundant with the
-		// claim helpers (Stamp/Handoff/Takeover/ClaimQueued all do
-		// their own atomic snooze wake under the v0.7 "snoozed ↔
-		// unclaimed" invariant) but harmless. SnoozeTask is the
-		// only method that should SET snooze_until; everything
-		// else clears it.
+		// snooze_until cleared on every transition this method handles
+		// (see prior comment). closed_at + close_reason are populated
+		// on terminal swipes and cleared on the re-open paths so the
+		// column means "currently terminal at X" rather than "ever
+		// reached terminal at X." The Done column's 7-day cap reads
+		// closed_at, so any NULL here means the cap doesn't apply —
+		// must be cleared back to NULL when a task transitions out
+		// of a terminal state.
+		var closedAt any
+		var reason any
+		if newStatus == "done" || newStatus == "dismissed" {
+			closedAt = time.Now()
+			reason = closeReason
+		}
+		// Otherwise both stay nil → SQLite writes NULL, clearing any
+		// prior close metadata from a previous terminal pass.
 		_, err := q.ExecContext(ctx,
-			`UPDATE tasks SET status = ?, snooze_until = NULL WHERE id = ?`,
-			newStatus, taskID,
+			`UPDATE tasks
+			   SET status = ?,
+			       snooze_until = NULL,
+			       closed_at = ?,
+			       close_reason = ?
+			 WHERE id = ?`,
+			newStatus, closedAt, reason, taskID,
 		)
 		return err
 	})
@@ -141,12 +164,18 @@ func (s *swipeStore) RequeueTask(ctx context.Context, orgID string, taskID strin
 		// task back in the team's triage queue means it's no longer
 		// claimed by anyone (the derived queue filter requires both
 		// claim cols NULL).
+		// SKY-330: also clear close metadata — re-queueing a
+		// previously-terminal task means it isn't terminal anymore,
+		// and the Board's Done-column 7-day cap reads closed_at to
+		// gate visibility.
 		res, err := q.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'queued',
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE id = ?`,
 			taskID,
 		)
@@ -183,12 +212,16 @@ func (s *swipeStore) UndoLastSwipe(ctx context.Context, orgID string, taskID str
 		// owner's lane even after status returns to 'queued'. Clear
 		// both cols so the task lands back in the team's unclaimed
 		// triage queue, the same shape /requeue produces.
+		// SKY-330: clear close metadata too — undoing a dismiss /
+		// complete swipe means the task isn't terminal anymore.
 		_, err := q.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'queued',
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE id = ?`,
 			taskID,
 		)

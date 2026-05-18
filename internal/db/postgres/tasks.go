@@ -148,17 +148,19 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`, orgID)
 	case "done", "dismissed":
-		// SKY-330: cap the Done column at the last 7 days so the
-		// board doesn't accumulate an unbounded history. Mirrors the
-		// SQLite branch.
+		// SKY-330: cap the Done column at the last 7 days. Mirrors
+		// the SQLite branch — every close path now populates
+		// closed_at, so the NOT NULL guard turns missing values into
+		// surfacable bugs rather than letting them accumulate.
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+pgTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
 			WHERE t.org_id = $1
 				AND t.status = $2
-				AND (t.closed_at IS NULL OR t.closed_at >= NOW() - INTERVAL '7 days')
-			ORDER BY t.closed_at DESC NULLS LAST, COALESCE(t.priority_score, 0.5) DESC
+				AND t.closed_at IS NOT NULL
+				AND t.closed_at >= NOW() - INTERVAL '7 days'
+			ORDER BY t.closed_at DESC, COALESCE(t.priority_score, 0.5) DESC
 		`, orgID, status)
 	}
 	return queryTasksCtx(ctx, s.q, `

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
@@ -816,13 +818,40 @@ func (s *Server) handleTaskAdvance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SKY-330: validate the path id as a UUID up front. On Postgres
+	// tasks.id is the uuid column type, so a malformed id surfaces as
+	// SQLSTATE 22P02 from the store call → 500. Treating malformed
+	// ids as "task not found" keeps the API portable across SQLite
+	// (id TEXT, no parse error) and Postgres.
+	if _, err := uuid.Parse(id); err != nil {
+		notFound(w, "task")
+		return
+	}
+
+	// Pre-load mirrors the /requeue + /undo shape: gives us a clean
+	// 404 for genuinely missing rows. 409 on the store's ok=false
+	// means "guard tripped" (task exists but isn't claimed by you,
+	// or is terminal) — distinct from "task not found" rather than
+	// merged like the pre-fix shape.
+	var task *domain.Task
 	var advanced bool
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
+		task, e = tx.Tasks.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if task == nil {
+			return nil
+		}
 		advanced, e = tx.Tasks.AdvanceStatusForUser(r.Context(), orgID, id, userID, body.To)
 		return e
 	}); err != nil {
 		internalError(w, "tasks", err)
+		return
+	}
+	if task == nil {
+		notFound(w, "task")
 		return
 	}
 	if !advanced {

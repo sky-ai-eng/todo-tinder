@@ -144,15 +144,19 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 	case "done", "dismissed":
 		// SKY-330: cap the Done column at the last 7 days so the
 		// board doesn't accumulate an unbounded history. closed_at
-		// is set by Close/CloseAllForEntity; rows missing it (legacy
-		// or future-modified) fall through the filter so they still
-		// surface — preferred over silent disappearance.
+		// is now populated by every close path — Close(),
+		// RecordSwipe (complete/dismiss), spawner auto-close — so
+		// requiring it here means rows that bypass those paths
+		// surface as bugs (column empty) rather than accumulating
+		// silently. Legacy pre-330 rows with NULL closed_at fall
+		// out of the cap; they're old enough to be excluded anyway.
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+sqliteTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id
 			WHERE t.status = ?
-				AND (t.closed_at IS NULL OR t.closed_at >= datetime('now', '-7 days'))
+				AND t.closed_at IS NOT NULL
+				AND t.closed_at >= datetime('now', '-7 days')
 			ORDER BY t.closed_at DESC, COALESCE(t.priority_score, 0.5) DESC
 		`, status)
 	}
