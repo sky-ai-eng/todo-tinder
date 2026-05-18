@@ -61,8 +61,13 @@ export default function BoardColumn({
 
   const showFilteredCount = filteredCount !== totalCount
 
+  // SKY-330: column width matches the pre-redesign grid-cols-3
+  // column (~400px on a typical viewport). Fixed width here rather
+  // than fluid because the board is horizontally scrollable — a
+  // viewport-relative width would compress cards as the user
+  // scrolls reveals additional columns.
   return (
-    <div className="flex flex-col w-[300px] shrink-0">
+    <div className="flex flex-col w-[400px] shrink-0">
       <div className="flex items-center justify-between mb-3 px-1">
         <div className="flex items-center gap-2">
           <h2 className="text-[13px] font-medium text-text-secondary">{title}</h2>

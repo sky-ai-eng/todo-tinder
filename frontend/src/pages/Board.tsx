@@ -486,8 +486,9 @@ export default function Board() {
   useEffect(() => {
     if (loading || didInitialScroll.current || !scrollRef.current) return
     // Scroll so Claimed (the second column) is leftmost-visible.
-    // Each column is 300px wide + 24px gap, so offset = 1 column = 324.
-    scrollRef.current.scrollLeft = 324
+    // Each column is 400px wide + 24px gap (gap-6), so offset = 1
+    // column = 424. Width is set in BoardColumn.tsx; keep in sync.
+    scrollRef.current.scrollLeft = 424
     didInitialScroll.current = true
   }, [loading])
 
