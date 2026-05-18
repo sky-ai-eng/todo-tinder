@@ -51,6 +51,12 @@ type taskJSON struct {
 	// subtasks — the "consider decomposing" signal (SKY-173). Zero for
 	// GitHub tasks and Jira tickets without subtasks.
 	OpenSubtaskCount int `json:"open_subtask_count"`
+	// Claim cols (SKY-330): exposed so the per-card assignee picker
+	// can render the current assignee without a second round-trip.
+	// Exactly one is set when claimed; both empty when unclaimed.
+	// omitempty keeps the wire shape clean for the unclaimed-queue case.
+	ClaimedByAgentID string `json:"claimed_by_agent_id,omitempty"`
+	ClaimedByUserID  string `json:"claimed_by_user_id,omitempty"`
 }
 
 func taskToJSON(t domain.Task) taskJSON {
@@ -80,6 +86,8 @@ func taskToJSON(t domain.Task) taskJSON {
 		CloseReason:         t.CloseReason,
 		SnoozeUntil:         snoozeUntil,
 		OpenSubtaskCount:    t.OpenSubtaskCount,
+		ClaimedByAgentID:    t.ClaimedByAgentID,
+		ClaimedByUserID:     t.ClaimedByUserID,
 	}
 }
 
@@ -89,10 +97,20 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
+	// SKY-330: ?include_snoozed=true keeps future-snoozed rows in the
+	// response so the Board's "show snoozed" toggle can render them
+	// at the tail of the Queued column. Default = false so /api/queue
+	// stays the canonical "pickable right now" projection for the
+	// Cards triage view.
+	includeSnoozed := r.URL.Query().Get("include_snoozed") == "true"
 	var tasks []domain.Task
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
-		tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+		if includeSnoozed {
+			tasks, e = tx.Tasks.QueuedIncludingSnoozed(r.Context(), orgID)
+		} else {
+			tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+		}
 		return e
 	}); err != nil {
 		internalError(w, "tasks", err)

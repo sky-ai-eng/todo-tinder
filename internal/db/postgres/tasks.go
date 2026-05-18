@@ -95,6 +95,25 @@ func (s *taskStore) Queued(ctx context.Context, orgID string) ([]domain.Task, er
 	`, orgID)
 }
 
+func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error) {
+	return queryTasksCtx(ctx, s.q, `
+		SELECT `+pgTaskColumnsWithEntity+`
+		FROM tasks t
+		JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
+		LEFT JOIN (
+			SELECT org_id, event_type, MIN(sort_order) AS sort_order
+			FROM event_handlers
+			WHERE enabled = true AND kind = 'rule'
+			GROUP BY org_id, event_type
+		) tr ON t.event_type = tr.event_type AND t.org_id = tr.org_id
+		WHERE t.org_id = $1
+			AND t.status IN ('queued', 'snoozed')
+			AND t.claimed_by_agent_id IS NULL
+			AND t.claimed_by_user_id  IS NULL
+		ORDER BY COALESCE(tr.sort_order, 999) ASC, COALESCE(t.priority_score, 0.5) DESC
+	`, orgID)
+}
+
 func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error) {
 	switch status {
 	case "claimed":

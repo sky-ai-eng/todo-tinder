@@ -1,0 +1,301 @@
+import { useEffect, useRef, useState } from 'react'
+import type { Task, TeamMember, TeamBot } from '../../types'
+
+// AssigneePicker is SKY-330's per-card assignee selector. Replaces
+// the drag-to-Agent gesture that broke when the Agent column was
+// removed. Order is fixed: Me, Bot (when enabled), [teammates...].
+// v1 only supports self-assign, self-unassign, and delegate-to-bot;
+// teammate rows render for awareness (whoever currently holds the
+// claim) but are not interactive.
+//
+// State semantics (toggle behavior):
+//   - unclaimed + click Me           → claim self
+//   - claimed by me + click Me       → unclaim (calls /requeue, which
+//                                      clears both claim cols + resets
+//                                      status to queued — same path
+//                                      the drag-to-Queue gesture uses)
+//   - claimed by bot + click Me      → take over (claim self, displaces bot)
+//   - claimed by user + click Bot    → delegate (opens prompt picker
+//                                      via onDelegateRequested; flips
+//                                      claim from user → agent through
+//                                      the existing /swipe delegate path)
+//   - claimed by bot + click Bot     → no-op (already there; would just
+//                                      prompt for a duplicate run)
+//
+// Errors are surfaced via the parent's onError callback rather than
+// inline — the picker collapses on action and the Board's toast
+// surface owns visible failure reporting.
+interface Props {
+  task: Task
+  currentUserID: string
+  members: TeamMember[]
+  bot: TeamBot | null
+  onClaim: (task: Task) => Promise<void>
+  onUnclaim: (task: Task) => Promise<void>
+  onDelegate: (task: Task) => void
+  // SKY-330: terminal tasks (done/dismissed) skip the toggle UI —
+  // the picker still renders the avatar showing who finished it for
+  // audit/history but ignores clicks. Caller passes true for tasks
+  // in the Done column.
+  readOnly?: boolean
+}
+
+export default function AssigneePicker({
+  task,
+  currentUserID,
+  members,
+  bot,
+  onClaim,
+  onUnclaim,
+  onDelegate,
+  readOnly = false,
+}: Props) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  // Close on outside click. Picker is a small popover; full overlay
+  // backdrop would intercept drag gestures on the surrounding card.
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  const claimedByMe = task.claimed_by_user_id === currentUserID && currentUserID !== ''
+  const claimedByOtherUser = !!task.claimed_by_user_id && task.claimed_by_user_id !== currentUserID
+  const claimedByBot = !!task.claimed_by_agent_id
+
+  // Resolve the "who's on this" entry for the avatar display.
+  const currentAssignee = resolveAssignee(task, members, bot)
+
+  const handleMe = async () => {
+    setOpen(false)
+    if (claimedByMe) {
+      await onUnclaim(task)
+    } else {
+      // Covers unclaimed + bot-claimed (takeover) + cross-user
+      // claim-takeover (the backend's ClaimQueuedForUser / takeover
+      // path gates on whether the source claim is legitimate to
+      // override; v1 just lets the call go and surfaces 409 if
+      // refused).
+      await onClaim(task)
+    }
+  }
+
+  const handleBot = () => {
+    setOpen(false)
+    if (claimedByBot) return // already there; click is a no-op
+    onDelegate(task) // parent opens the prompt picker
+  }
+
+  // SKY-330 chip styling: keeps the picker chrome small so it doesn't
+  // dominate the card. Avatar is the click target; the dropdown
+  // appears below the card and is dismissible by clicking outside.
+  return (
+    <div ref={ref} className="relative inline-block">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation()
+          if (readOnly) return
+          setOpen((v) => !v)
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+        title={readOnly ? `Finished by ${currentAssignee.label}` : currentAssignee.label}
+        className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium border transition-colors ${
+          readOnly
+            ? 'border-border-subtle bg-black/[0.02] text-text-tertiary cursor-default'
+            : 'border-border-subtle bg-white/60 text-text-secondary hover:border-accent/30 hover:text-text-primary cursor-pointer'
+        }`}
+      >
+        <AssigneeAvatar entry={currentAssignee} />
+        <span>{currentAssignee.shortLabel}</span>
+      </button>
+
+      {open && !readOnly && (
+        <div
+          className="absolute z-50 mt-1 right-0 min-w-[180px] bg-surface-raised backdrop-blur-xl border border-border-glass rounded-xl shadow-lg shadow-black/[0.08] py-1"
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {/* Me */}
+          <PickerRow
+            avatar={<AvatarCircle initials="ME" tone="user" />}
+            label={meLabel(members, currentUserID)}
+            sublabel={claimedByMe ? 'Click to unassign' : 'Click to claim'}
+            onClick={handleMe}
+            selected={claimedByMe}
+          />
+
+          {/* Bot — only when enabled for this team */}
+          {bot && (
+            <PickerRow
+              avatar={<AvatarCircle initials="🤖" tone="bot" />}
+              label={bot.display_name || 'Bot'}
+              sublabel={
+                claimedByBot
+                  ? 'Currently delegated'
+                  : claimedByMe
+                    ? 'Click to delegate (transfers from you)'
+                    : 'Click to delegate'
+              }
+              onClick={handleBot}
+              selected={claimedByBot}
+              disabled={claimedByBot}
+            />
+          )}
+
+          {/* Teammates: display-only in v1. Show the holding teammate
+              if a cross-user claim landed somehow (shouldn't normally
+              happen since v1 doesn't allow cross-user assign, but the
+              data model permits it via SetClaimedByUser primitives). */}
+          {claimedByOtherUser && (
+            <PickerRow
+              avatar={<AvatarCircle initials={initialsFor(currentAssignee.label)} tone="user" />}
+              label={currentAssignee.label}
+              sublabel="Currently claimed (reassignment not supported in v1)"
+              selected
+              disabled
+            />
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface AssigneeEntry {
+  label: string
+  shortLabel: string
+  kind: 'unclaimed' | 'user' | 'bot' | 'unknown'
+}
+
+// resolveAssignee maps the task's claim cols into a displayable entry.
+// Unclaimed renders as "Unassigned"; the picker still opens to let the
+// user claim. Unknown means we have a claim id we couldn't resolve
+// against the members list (cross-team caller, stale roster); the
+// avatar falls back to initials + the raw id, not silently empty.
+function resolveAssignee(task: Task, members: TeamMember[], bot: TeamBot | null): AssigneeEntry {
+  if (task.claimed_by_agent_id) {
+    const name = bot?.agent_id === task.claimed_by_agent_id ? bot.display_name : 'Bot'
+    return { label: name, shortLabel: 'Bot', kind: 'bot' }
+  }
+  if (task.claimed_by_user_id) {
+    const m = members.find((x) => x.user_id === task.claimed_by_user_id)
+    if (m) {
+      const label = m.display_name || m.github_username || m.user_id
+      return {
+        label,
+        shortLabel: m.is_current_user ? 'You' : firstName(label),
+        kind: 'user',
+      }
+    }
+    return { label: 'User', shortLabel: 'User', kind: 'unknown' }
+  }
+  return { label: 'Unassigned', shortLabel: 'Assign', kind: 'unclaimed' }
+}
+
+function meLabel(members: TeamMember[], currentUserID: string): string {
+  const me = members.find((m) => m.user_id === currentUserID && m.is_current_user)
+  if (me) {
+    return `Me (${me.display_name || me.github_username || 'you'})`
+  }
+  return 'Me'
+}
+
+function firstName(s: string): string {
+  const trimmed = s.trim()
+  if (!trimmed) return ''
+  const space = trimmed.indexOf(' ')
+  return space === -1 ? trimmed : trimmed.slice(0, space)
+}
+
+function initialsFor(s: string): string {
+  const parts = s.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
+}
+
+function AssigneeAvatar({ entry }: { entry: AssigneeEntry }) {
+  switch (entry.kind) {
+    case 'bot':
+      return <span className="text-[11px]">🤖</span>
+    case 'user':
+      return <AvatarCircle initials={initialsFor(entry.label)} tone="user" small />
+    case 'unknown':
+      return <AvatarCircle initials="?" tone="user" small />
+    case 'unclaimed':
+    default:
+      return (
+        <span className="inline-block w-3.5 h-3.5 rounded-full border border-dashed border-text-tertiary" />
+      )
+  }
+}
+
+function AvatarCircle({
+  initials,
+  tone,
+  small,
+}: {
+  initials: string
+  tone: 'user' | 'bot'
+  small?: boolean
+}) {
+  const size = small ? 'w-3.5 h-3.5 text-[7px]' : 'w-5 h-5 text-[9px]'
+  const colors =
+    tone === 'bot' ? 'bg-accent/15 text-accent' : 'bg-text-primary/10 text-text-primary'
+  return (
+    <span
+      className={`inline-flex items-center justify-center rounded-full font-semibold ${size} ${colors}`}
+      aria-hidden
+    >
+      {initials}
+    </span>
+  )
+}
+
+function PickerRow({
+  avatar,
+  label,
+  sublabel,
+  onClick,
+  selected,
+  disabled,
+}: {
+  avatar: React.ReactNode
+  label: string
+  sublabel?: string
+  onClick?: () => void
+  selected?: boolean
+  disabled?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`w-full flex items-center gap-2 px-3 py-2 text-left transition-colors ${
+        disabled ? 'cursor-default opacity-60' : 'hover:bg-black/[0.04] cursor-pointer'
+      } ${selected ? 'bg-accent/[0.06]' : ''}`}
+    >
+      <span className="shrink-0">{avatar}</span>
+      <span className="flex-1 min-w-0">
+        <span className="block text-[12px] font-medium text-text-primary truncate">{label}</span>
+        {sublabel && (
+          <span className="block text-[10px] text-text-tertiary truncate">{sublabel}</span>
+        )}
+      </span>
+      {selected && (
+        <span className="text-accent text-[12px]" aria-hidden>
+          ✓
+        </span>
+      )}
+    </button>
+  )
+}

@@ -77,6 +77,31 @@ func (s *taskStore) Queued(ctx context.Context, orgID string) ([]domain.Task, er
 	`)
 }
 
+func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return nil, err
+	}
+	// SKY-330: drops the snooze-window filter so the Board's "show
+	// snoozed" toggle surfaces deferred entries. Status='queued' +
+	// status='snoozed' both qualify; SKY-261 enforces snoozed↔unclaimed
+	// so the claim guards are still safe to apply.
+	return queryTasksCtx(ctx, s.q, `
+		SELECT `+sqliteTaskColumnsWithEntity+`
+		FROM tasks t
+		JOIN entities e ON t.entity_id = e.id
+		LEFT JOIN (
+			SELECT org_id, event_type, MIN(sort_order) AS sort_order
+			FROM event_handlers
+			WHERE enabled = 1 AND kind = 'rule'
+			GROUP BY org_id, event_type
+		) tr ON t.event_type = tr.event_type AND t.org_id = tr.org_id
+		WHERE t.status IN ('queued', 'snoozed')
+			AND t.claimed_by_agent_id IS NULL
+			AND t.claimed_by_user_id  IS NULL
+		ORDER BY COALESCE(tr.sort_order, 999) ASC, COALESCE(t.priority_score, 0.5) DESC
+	`)
+}
+
 func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error) {
 	if err := assertLocalOrg(orgID); err != nil {
 		return nil, err

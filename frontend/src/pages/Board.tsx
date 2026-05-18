@@ -1,5 +1,13 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import type { Task, AgentRun, AgentMessage, WSEvent } from '../types'
+import type {
+  Task,
+  AgentRun,
+  AgentMessage,
+  WSEvent,
+  TeamMembersResponse,
+  TeamMember,
+  TeamBot,
+} from '../types'
 import { useWebSocket } from '../hooks/useWebSocket'
 import AgentCard from '../components/AgentCard'
 import HeldTakeoversBanner from '../components/HeldTakeoversBanner'
@@ -7,8 +15,13 @@ import TaskCard from '../components/TaskCard'
 import PromptPicker from '../components/PromptPicker'
 import ReviewOverlay from '../components/ReviewOverlay'
 import PendingPROverlay from '../components/PendingPROverlay'
-import EventBadge from '../components/EventBadge'
-import SourceBadge from '../components/SourceBadge'
+import AssigneePicker from '../components/board/AssigneePicker'
+import BoardColumn from '../components/board/BoardColumn'
+import {
+  applyColumnFilter,
+  emptyFilter,
+  type ColumnFilterState,
+} from '../components/board/columnFilter'
 import { motion, AnimatePresence } from 'motion/react'
 import {
   DndContext,
@@ -21,24 +34,73 @@ import {
   type DragEndEvent,
   type DragOverEvent,
 } from '@dnd-kit/core'
-import {
-  SortableContext,
-  verticalListSortingStrategy,
-  useSortable,
-  arrayMove,
-} from '@dnd-kit/sortable'
+import { SortableContext, verticalListSortingStrategy, useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 
-type ColumnId = 'queue' | 'you' | 'agent' | 'done'
+// SKY-330: five columns on the board. Default view scrolls so Claimed
+// is leftmost-visible; user scrolls left for Queued, right for Done.
+// Column ids double as drop targets — keep them lowercase + stable
+// since they're persisted in localStorage filter keys.
+type ColumnId = 'queued' | 'claimed' | 'in_progress' | 'in_review' | 'done'
+
+const ALL_COLUMNS: ColumnId[] = ['queued', 'claimed', 'in_progress', 'in_review', 'done']
+
+const COLUMN_TITLES: Record<ColumnId, string> = {
+  queued: 'Queued',
+  claimed: 'Claimed',
+  in_progress: 'In Progress',
+  in_review: 'In Review',
+  done: 'Done',
+}
+
+// Filter persistence: per-user, per-column. localStorage key prefix
+// is global so a re-login (different user) doesn't see the prior
+// user's filters — we don't have the userID at module-load time so
+// this is a "best effort" partition, refined per-mount.
+const FILTER_STORAGE_KEY = 'sky330.board.filters.v1'
+
+type FilterMap = Record<ColumnId, ColumnFilterState>
+
+function loadFilters(): FilterMap {
+  try {
+    const raw = localStorage.getItem(FILTER_STORAGE_KEY)
+    if (!raw) return defaultFilters()
+    const parsed = JSON.parse(raw) as Partial<FilterMap>
+    const out = defaultFilters()
+    for (const col of ALL_COLUMNS) {
+      if (parsed[col]) {
+        out[col] = { ...emptyFilter, ...parsed[col] }
+      }
+    }
+    return out
+  } catch {
+    return defaultFilters()
+  }
+}
+
+function defaultFilters(): FilterMap {
+  return {
+    queued: { ...emptyFilter },
+    claimed: { ...emptyFilter },
+    in_progress: { ...emptyFilter },
+    in_review: { ...emptyFilter },
+    done: { ...emptyFilter },
+  }
+}
 
 export default function Board() {
+  // SKY-330: one bucket per column. Bot/user auto-routing keeps these
+  // disjoint at the backend, so a task only appears in one list.
   const [queued, setQueued] = useState<Task[]>([])
   const [claimed, setClaimed] = useState<Task[]>([])
-  const [delegated, setDelegated] = useState<Task[]>([])
+  const [inProgress, setInProgress] = useState<Task[]>([])
+  const [inReview, setInReview] = useState<Task[]>([])
   const [done, setDone] = useState<Task[]>([])
   const [loading, setLoading] = useState(true)
 
-  // Agent run state
+  // Agent run state — runs render on cards regardless of which column
+  // the card is in (a user-claimed in_progress task can also have a
+  // run; a bot-claimed in_review task definitely has one).
   const [agentRuns, setAgentRuns] = useState<Record<string, AgentRun>>({})
   const [agentMessages, setAgentMessages] = useState<Record<string, AgentMessage[]>>({})
   const [chainStepRuns, setChainStepRuns] = useState<Record<string, AgentRun[]>>({})
@@ -47,30 +109,40 @@ export default function Board() {
     chainStepRunsRef.current = chainStepRuns
   }, [chainStepRuns])
 
-  // Sidebar state
-  const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [search, setSearch] = useState('')
-  const [sourceFilter, setSourceFilter] = useState<'all' | 'github' | 'jira'>('all')
+  // Team roster for the assignee picker. Includes bot when enabled.
+  const [members, setMembers] = useState<TeamMember[]>([])
+  const [bot, setBot] = useState<TeamBot | null>(null)
+  const [currentUserID, setCurrentUserID] = useState<string>('')
 
-  // Drag state
+  // Per-column filter state. Persisted to localStorage.
+  const [filters, setFilters] = useState<FilterMap>(() => loadFilters())
+  useEffect(() => {
+    try {
+      localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filters))
+    } catch {
+      // Quota / disabled storage — silently skip; filters work in-memory.
+    }
+  }, [filters])
+
+  // Snoozed visibility toggle for the Queued column. Off by default;
+  // snoozed tasks are intentionally deferred and don't need to clutter
+  // the column. When on, they render at the tail with a "wakes Mar 5"
+  // badge (handled by TaskCard's existing SnoozedBadge).
+  const [showSnoozed, setShowSnoozed] = useState(false)
+
+  // Drag state. The "over column" highlight is owned by BoardColumn
+  // itself (via useDroppable's isOver), so we don't need to track it
+  // up here anymore.
   const [activeId, setActiveId] = useState<string | null>(null)
-  const [overColumn, setOverColumn] = useState<ColumnId | null>(null)
-  const [draggingFromSidebar, setDraggingFromSidebar] = useState(false)
 
   // Delegate flow
   const [showPromptPicker, setShowPromptPicker] = useState(false)
   const pendingDelegateTask = useRef<Task | null>(null)
-  // SKY-261 B+: tracks bot-claimed tasks where the delegate run
-  // failed to fire. Keyed by task.id; cleared when a run for the
-  // task lands (handled in fetchTasks / WS update). Drives the
-  // "delegate didn't fire — retry" badge + button on the agent-
-  // lane TaskCard. claim is commitment, runs are execution; this
-  // map captures the divergence so the user can act on it.
+  // SKY-261 B+: tracks bot-claimed tasks where the delegate run failed
+  // to fire. Cleared when a run for the task lands.
   const [delegateFailures, setDelegateFailures] = useState<Record<string, string>>({})
 
-  // Approval overlay — review or PR depending on which side table the
-  // run's pending_approval came from. The run's pending_kind field
-  // (set server-side in runResponse) drives which overlay opens.
+  // Approval overlay for pending_approval runs.
   const [approvalCtx, setApprovalCtx] = useState<{
     runID: string
     kind: 'review' | 'pr'
@@ -104,35 +176,64 @@ export default function Board() {
     }
   }, [])
 
+  // Fetch members + bot once at mount. The picker degrades gracefully
+  // if this fails (members=[], bot=null → only the avatar renders,
+  // picker dropdown is empty).
+  useEffect(() => {
+    void (async () => {
+      try {
+        const [meRes, rosterRes] = await Promise.all([
+          fetch('/api/me').then((r) => (r.ok ? r.json() : null)),
+          fetch('/api/team/members').then((r) => (r.ok ? r.json() : null)),
+        ])
+        if (meRes && typeof meRes === 'object' && 'user_id' in meRes) {
+          setCurrentUserID((meRes as { user_id: string }).user_id ?? '')
+        }
+        if (rosterRes) {
+          const roster = rosterRes as TeamMembersResponse
+          setMembers(roster.members ?? [])
+          setBot(roster.bot ?? null)
+        }
+      } catch {
+        // Picker degrades; board still works.
+      }
+    })()
+  }, [])
+
+  // SKY-330: derive the five column lists from a single /api/tasks
+  // multi-status fetch. /api/queue is still the canonical Queued
+  // source (it handles the snooze-window filter); the others fetch
+  // by status. The done query is backend-capped at 7 days.
   const fetchTasks = useCallback(async () => {
     try {
-      const [queuedRes, claimedRes, delegatedRes, doneRes] = await Promise.all([
-        fetch('/api/queue').then((r) => (r.ok ? r.json() : [])),
+      const includeSnoozed = showSnoozed ? '?include_snoozed=true' : ''
+      const [queuedRes, claimedRes, inProgressRes, inReviewRes, doneRes] = await Promise.all([
+        fetch(`/api/queue${includeSnoozed}`).then((r) => (r.ok ? r.json() : [])),
+        // "claimed" stays a derived pseudo-status (status=queued + a
+        // claim col set) — the backend's ByStatus(claimed) branch
+        // already handles this for back-compat.
         fetch('/api/tasks?status=claimed').then((r) => (r.ok ? r.json() : [])),
-        fetch('/api/tasks?status=delegated').then((r) => (r.ok ? r.json() : [])),
+        fetch('/api/tasks?status=in_progress').then((r) => (r.ok ? r.json() : [])),
+        fetch('/api/tasks?status=in_review').then((r) => (r.ok ? r.json() : [])),
         fetch('/api/tasks?status=done').then((r) => (r.ok ? r.json() : [])),
       ])
       setQueued(queuedRes)
       setClaimed(claimedRes)
-      setDelegated(delegatedRes)
+      setInProgress(inProgressRes)
+      setInReview(inReviewRes)
       setDone(doneRes)
 
-      // Fetch agent runs for any task that might carry one — claimed
-      // tasks count too once an AgentCard can land in You via Board's
-      // drag-to-claim path. Without claimed in this set, a hard reload
-      // would render those cards as plain TaskCards, losing the
-      // activity log + result summary that the You-column AgentCard
-      // rendering is meant to preserve.
-      for (const task of [...claimedRes, ...delegatedRes, ...doneRes]) {
+      // Fetch agent runs for any task that might carry one — claimed,
+      // in_progress, in_review, and done can all have runs attached.
+      // Queued tasks never do (claim cleared = no active run).
+      const withRuns = [...claimedRes, ...inProgressRes, ...inReviewRes, ...doneRes]
+      for (const task of withRuns) {
         try {
           const runsRes = await fetch(`/api/agent/runs?task_id=${task.id}`)
           if (!runsRes.ok) continue
           const runs: AgentRun[] = await runsRes.json()
           if (runs.length > 0) {
             const latestRun = runs[0]
-
-            // Chain runs: collect all step runs and use the active step
-            // (or the latest) as the "main" run for the AgentCard.
             const chainRunID = latestRun.chain_run_id
             if (chainRunID) {
               const stepRuns = runs
@@ -173,17 +274,20 @@ export default function Board() {
     } finally {
       setLoading(false)
     }
-  }, [seedChainStepRuns])
+  }, [seedChainStepRuns, showSnoozed])
 
   useEffect(() => {
     fetchTasks()
   }, [fetchTasks])
 
+  // WS listener — covers agent_run_update (the existing path) and the
+  // new task_updated / task_claimed events that SKY-330 fires from
+  // every claim/status mutation. task_updated is the catch-all for
+  // "this card may have moved columns; refetch."
   useWebSocket(
     useCallback(
       (event: WSEvent) => {
         if (event.type === 'agent_run_update') {
-          // Optimistic status update for an already-tracked run.
           let matched = false
           setAgentRuns((prev) => {
             const updated = { ...prev }
@@ -196,18 +300,12 @@ export default function Board() {
             }
             return updated
           })
-          // Refetch the full run and key by TaskID. Refreshes an existing
-          // entry and also seeds when the WS update arrives before
-          // agentRuns has the run (auto-delegation, cross-tab, or swipe
-          // response that hasn't landed yet).
           fetch(`/api/agent/runs/${event.run_id}`)
             .then((r) => (r.ok ? r.json() : null))
             .then((fullRun: AgentRun | null) => {
               if (!fullRun) return
               setAgentRuns((p) => {
                 const existing = p[fullRun.TaskID]
-                // Don't let a delayed event for a prior run clobber a
-                // newer run already tracked for this task.
                 if (
                   existing &&
                   existing.ID !== fullRun.ID &&
@@ -217,9 +315,6 @@ export default function Board() {
                 }
                 return { ...p, [fullRun.TaskID]: fullRun }
               })
-              // First WS update for a chain step seeds the chain
-              // indicator. Without this, the first step of a brand-new
-              // chain renders alone until step 2 starts.
               if (fullRun.chain_run_id) {
                 seedChainStepRuns(fullRun.TaskID, fullRun.chain_run_id)
               }
@@ -239,9 +334,6 @@ export default function Board() {
               }
             }
             if (isChainStep) {
-              // Only refetch on terminal transitions; mid-flight status
-              // pings (initializing → cloning → running) are covered by
-              // the per-run patch above.
               if (
                 [
                   'completed',
@@ -266,36 +358,13 @@ export default function Board() {
                 .catch(() => {})
             }
           }
-          // 'cancelled' triggers a task refetch so the
-          // pending_approval-cleanup broadcast (SKY-206) collapses
-          // the AgentCard and swaps in the queued SortableTaskCard
-          // even when the cleanup originated outside this tab —
-          // another browser session, a swipe-dismiss path, etc.
-          // The handleRequeue handler already calls fetchTasks()
-          // after its own POST, so this is the cross-source case.
-          if (
-            ['completed', 'failed', 'cancelled', 'pending_approval'].includes(event.data.status)
-          ) {
-            fetchTasks()
-          }
-        }
-        if (event.type === 'agent_message') {
-          setAgentMessages((prev) => ({
-            ...prev,
-            [event.run_id]: [...(prev[event.run_id] || []), event.data as AgentMessage],
-          }))
-        }
-        if (event.type === 'tasks_updated' || event.type === 'scoring_completed') {
+        } else if (event.type === 'task_updated' || event.type === 'task_claimed') {
+          // SKY-330: any column-affecting change re-pulls the whole
+          // board. The 5-column buckets are cheap to refetch (each is
+          // a single indexed query) and this avoids the per-column
+          // patch logic getting out of sync with backend rules.
           fetchTasks()
-        }
-        // SKY-261 B+: task_claimed fires when claim columns change
-        // (delegate, user-claim, takeover, requeue). The Board's per-
-        // claim lanes are derived from claim cols, so any claim-axis
-        // change requires a refetch to re-bucket cards across lanes.
-        // task_updated stays for genuine status transitions (done,
-        // dismissed, snoozed) which also re-bucket but on a different
-        // axis.
-        if (event.type === 'task_claimed' || event.type === 'task_updated') {
+        } else if (event.type === 'tasks_updated') {
           fetchTasks()
         }
       },
@@ -303,220 +372,182 @@ export default function Board() {
     ),
   )
 
-  // Agent column: attention-weighted ordering
-  // Top: needs review (pending_approval), then failed/cancelled/unsolvable, then running at bottom
-  const agentItems = useMemo(() => {
-    const weight = (t: Task) => {
-      const run = agentRuns[t.id]
-      if (!run) return 2
-      if (run.Status === 'pending_approval') return 0
-      if (run.Status === 'failed' || run.Status === 'cancelled' || run.Status === 'task_unsolvable')
-        return 1
-      if (run.Status === 'completed') return 3
-      return 2 // running/active
-    }
-    return [...delegated].sort((a, b) => weight(a) - weight(b))
-  }, [delegated, agentRuns])
+  // Sort tasks with active runs in a meaningful order. Used for
+  // In Progress and In Review where the run state matters for
+  // attention. Pending_approval > failed/cancelled/unsolvable >
+  // running > completed.
+  const sortByRunAttention = useCallback(
+    (tasks: Task[]) => {
+      const weight = (t: Task) => {
+        const run = agentRuns[t.id]
+        if (!run) return 2
+        if (run.Status === 'pending_approval') return 0
+        if (
+          run.Status === 'failed' ||
+          run.Status === 'cancelled' ||
+          run.Status === 'task_unsolvable'
+        )
+          return 1
+        if (run.Status === 'completed') return 3
+        return 2
+      }
+      return [...tasks].sort((a, b) => weight(a) - weight(b))
+    },
+    [agentRuns],
+  )
 
-  // Filtered queue for sidebar
-  const filteredQueue = useMemo(() => {
-    let items = queued
-    if (sourceFilter !== 'all') {
-      items = items.filter((t) => t.source === sourceFilter)
+  const filtered = useMemo<Record<ColumnId, Task[]>>(() => {
+    return {
+      queued: applyColumnFilter(queued, filters.queued),
+      claimed: applyColumnFilter(claimed, filters.claimed),
+      in_progress: applyColumnFilter(sortByRunAttention(inProgress), filters.in_progress),
+      in_review: applyColumnFilter(sortByRunAttention(inReview), filters.in_review),
+      done: applyColumnFilter(done, filters.done),
     }
-    if (search.trim()) {
-      const q = search.toLowerCase()
-      items = items.filter(
-        (t) =>
-          t.title.toLowerCase().includes(q) ||
-          t.source_id.toLowerCase().includes(q) ||
-          t.ai_summary?.toLowerCase().includes(q) ||
-          t.event_type.toLowerCase().includes(q),
-      )
-    }
-    return items
-  }, [queued, search, sourceFilter])
+  }, [queued, claimed, inProgress, inReview, done, filters, sortByRunAttention])
 
-  // Unique event types in queue for filter display
-  const queueEventTypes = useMemo(() => {
-    const types = new Set<string>()
-    for (const t of queued) {
-      if (t.event_type) types.add(t.event_type)
-    }
-    return Array.from(types)
-  }, [queued])
+  const totalCounts = useMemo<Record<ColumnId, number>>(
+    () => ({
+      queued: queued.length,
+      claimed: claimed.length,
+      in_progress: inProgress.length,
+      in_review: inReview.length,
+      done: done.length,
+    }),
+    [queued, claimed, inProgress, inReview, done],
+  )
 
-  // All tasks indexed for drag lookup
+  const rawByColumn = useMemo<Record<ColumnId, Task[]>>(
+    () => ({
+      queued,
+      claimed,
+      in_progress: inProgress,
+      in_review: inReview,
+      done,
+    }),
+    [queued, claimed, inProgress, inReview, done],
+  )
+
   const allTasks = useMemo(() => {
     const map = new Map<string, Task>()
-    for (const t of [...queued, ...claimed, ...delegated, ...done]) {
+    for (const t of [...queued, ...claimed, ...inProgress, ...inReview, ...done]) {
       map.set(t.id, t)
     }
     return map
-  }, [queued, claimed, delegated, done])
+  }, [queued, claimed, inProgress, inReview, done])
 
-  // Column membership for dragging
   const getColumn = useCallback(
     (taskId: string): ColumnId | null => {
-      if (queued.some((t) => t.id === taskId)) return 'queue'
-      if (claimed.some((t) => t.id === taskId)) return 'you'
-      if (delegated.some((t) => t.id === taskId)) return 'agent'
+      if (queued.some((t) => t.id === taskId)) return 'queued'
+      if (claimed.some((t) => t.id === taskId)) return 'claimed'
+      if (inProgress.some((t) => t.id === taskId)) return 'in_progress'
+      if (inReview.some((t) => t.id === taskId)) return 'in_review'
       if (done.some((t) => t.id === taskId)) return 'done'
       return null
     },
-    [queued, claimed, delegated, done],
+    [queued, claimed, inProgress, inReview, done],
   )
+
+  // SKY-330: default scroll position centers Claimed/In Progress/
+  // In Review in the viewport on mount. Queued (left) and Done (right)
+  // require explicit scroll. The scroll container snaps once, then
+  // the user has full control.
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const didInitialScroll = useRef(false)
+  useEffect(() => {
+    if (loading || didInitialScroll.current || !scrollRef.current) return
+    // Scroll so Claimed (the second column) is leftmost-visible.
+    // Each column is 300px wide + 24px gap, so offset = 1 column = 324.
+    scrollRef.current.scrollLeft = 324
+    didInitialScroll.current = true
+  }, [loading])
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
 
   const handleDragStart = (event: DragStartEvent) => {
-    const id = String(event.active.id)
-    setActiveId(id)
-    // Auto-collapse sidebar when dragging from it
-    if (sidebarOpen && getColumn(id) === 'queue') {
-      setDraggingFromSidebar(true)
-      setSidebarOpen(false)
-    }
+    setActiveId(String(event.active.id))
   }
 
-  const handleDragOver = (event: DragOverEvent) => {
-    const { over } = event
-    if (!over) {
-      setOverColumn(null)
-      return
-    }
-
-    const overId = String(over.id)
-    if (['you', 'agent', 'done'].includes(overId)) {
-      setOverColumn(overId as ColumnId)
-    } else {
-      const col = getColumn(overId)
-      setOverColumn(col)
-    }
+  const handleDragOver = (_event: DragOverEvent) => {
+    // BoardColumn owns its own isOver highlight via useDroppable;
+    // nothing to track at this level. Kept as a hook for future
+    // cross-column behaviors (e.g. preview-the-drop-effect).
   }
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event
-    const wasDraggingFromSidebar = draggingFromSidebar
-
     setActiveId(null)
-    setOverColumn(null)
-    setDraggingFromSidebar(false)
-
-    // Re-expand sidebar if drag came from there (regardless of outcome)
-    if (wasDraggingFromSidebar) {
-      setSidebarOpen(true)
-    }
 
     if (!over) return
-
     const taskId = String(active.id)
     const sourceCol = getColumn(taskId)
     const task = allTasks.get(taskId)
     if (!sourceCol || !task) return
 
-    // Determine target column
     const overId = String(over.id)
     let targetCol: ColumnId
-    if (['you', 'agent', 'done'].includes(overId)) {
+    if (ALL_COLUMNS.includes(overId as ColumnId)) {
       targetCol = overId as ColumnId
     } else {
       targetCol = getColumn(overId) || sourceCol
     }
 
-    // Same column — reorder (local state only, no backend persistence)
-    if (sourceCol === targetCol) {
-      if (sourceCol === 'you') {
-        const oldIndex = claimed.findIndex((t) => t.id === taskId)
-        const overTaskIndex = claimed.findIndex((t) => t.id === overId)
-        if (oldIndex !== -1 && overTaskIndex !== -1 && oldIndex !== overTaskIndex) {
-          setClaimed(arrayMove(claimed, oldIndex, overTaskIndex))
-        }
-      } else if (sourceCol === 'done') {
-        const oldIndex = done.findIndex((t) => t.id === taskId)
-        const overTaskIndex = done.findIndex((t) => t.id === overId)
-        if (oldIndex !== -1 && overTaskIndex !== -1 && oldIndex !== overTaskIndex) {
-          setDone(arrayMove(done, oldIndex, overTaskIndex))
-        }
-      } else if (sourceCol === 'agent') {
-        // Agent is rendered through the attention-weighted agentItems
-        // memo, so reordering only sticks for items in the same
-        // weight bucket (e.g., two pending_approval cards). Reorder
-        // the underlying delegated state and let the stable sort
-        // preserve relative position within the bucket. Without this
-        // branch SortableContext animates items into new positions
-        // during drag and they snap back on drop — the visible jolt
-        // PR #77 review flagged.
-        const oldIndex = delegated.findIndex((t) => t.id === taskId)
-        const overTaskIndex = delegated.findIndex((t) => t.id === overId)
-        if (oldIndex !== -1 && overTaskIndex !== -1 && oldIndex !== overTaskIndex) {
-          setDelegated(arrayMove(delegated, oldIndex, overTaskIndex))
-        }
-      }
-      return
-    }
+    // Same column — no-op (we don't persist intra-column order).
+    if (sourceCol === targetCol) return
 
-    // Block cross-column moves for externally terminal tasks (merged/closed PRs)
+    // Externally terminal tasks (merged/closed PRs) can't be dragged.
     const terminalEvents = ['github:pr:merged', 'github:pr:closed']
     if (terminalEvents.includes(task.event_type)) return
 
-    // Queue → You: claim
-    if (sourceCol === 'queue' && targetCol === 'you') {
+    // Bot-claimed tasks in In Progress / In Review are bot-managed —
+    // the user shouldn't drag them around (status is set by the
+    // spawner's auto-advance). Takeover happens via the assignee
+    // picker. Silently refuse the drag rather than nag.
+    if (task.claimed_by_agent_id && (sourceCol === 'in_progress' || sourceCol === 'in_review')) {
+      return
+    }
+
+    // Queue → anywhere: requires a claim first. Queue → Claimed is
+    // the natural drag; Queue → In Progress / In Review skips a step
+    // (rare but allowed for the user's convenience — claims then
+    // advances). Queue → Done is dismiss.
+    if (sourceCol === 'queued') {
+      if (targetCol === 'done') {
+        await fetch(`/api/tasks/${taskId}/swipe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'dismiss', hesitation_ms: 0 }),
+        })
+        fetchTasks()
+        return
+      }
+      // Claim first, then advance if needed.
       await fetch(`/api/tasks/${taskId}/swipe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'claim', hesitation_ms: 0 }),
       })
+      if (targetCol === 'in_progress' || targetCol === 'in_review') {
+        await fetch(`/api/tasks/${taskId}/advance`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to: targetCol }),
+        })
+      }
       fetchTasks()
       return
     }
 
-    // Queue → Agent: delegate (prompt picker)
-    if (sourceCol === 'queue' && targetCol === 'agent') {
-      pendingDelegateTask.current = task
-      setShowPromptPicker(true)
-      return
-    }
-
-    // Queue → Done: dismiss
-    if (sourceCol === 'queue' && targetCol === 'done') {
-      await fetch(`/api/tasks/${taskId}/swipe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'dismiss', hesitation_ms: 0 }),
-      })
+    // Any → Queued: requeue. Clears the claim and resets status.
+    if (targetCol === 'queued') {
+      await fetch(`/api/tasks/${taskId}/requeue`, { method: 'POST' })
       fetchTasks()
       return
     }
 
-    // You → Agent: delegate claimed task (SKY-133)
-    if (sourceCol === 'you' && targetCol === 'agent') {
-      pendingDelegateTask.current = task
-      setShowPromptPicker(true)
-      return
-    }
-
-    // Done → Agent: re-delegate. spawner.Delegate inserts a new run
-    // row with a fresh UUID; the prior run stays in the DB for
-    // history. The AgentCard reflects the newest run (the runs API
-    // returns newest-first and Board takes the first), so the card
-    // visually flips to the new run as soon as fetchTasks lands.
-    if (sourceCol === 'done' && targetCol === 'agent') {
-      pendingDelegateTask.current = task
-      setShowPromptPicker(true)
-      return
-    }
-
-    // Drag to Done from a non-queue source → complete. The
-    // 'complete' swipe action flips task.status to 'done' (so the
-    // card stays visible in the Done column) and runs the same
-    // cleanup as dismiss — cancels any in-flight run, tears down
-    // the pending review if one exists. Distinct from queue → done
-    // (dismiss), which removes the task from the board entirely:
-    // by the time a card is in You/Agent/Done, the user has
-    // engaged with it, and "I'm finished with this" is more
-    // truthful than "I'm walking away."
-    if (targetCol === 'done' && sourceCol !== 'queue') {
+    // Any → Done: complete (preserves the card in Done; distinct
+    // from queue → done which dismisses).
+    if (targetCol === 'done') {
       await fetch(`/api/tasks/${taskId}/swipe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -526,41 +557,27 @@ export default function Board() {
       return
     }
 
-    // Agent/Done → You: claim. The /swipe claim handler is now
-    // backend-authoritative for the SKY-206 cleanup — it runs
-    // cleanupPendingApprovalRun unconditionally, idempotent and a
-    // no-op when the task has no pending_approval run. So the
-    // frontend doesn't need to gate on agentRuns[taskId]?.Status,
-    // which would race with the post-fetchTasks window where the
-    // run hasn't been re-fetched yet (a pending_approval card
-    // briefly looks like a plain TaskCard without a run, and a
-    // gated /requeue would skip the cleanup that's actually
-    // needed).
-    if (targetCol === 'you' && (sourceCol === 'agent' || sourceCol === 'done')) {
-      await fetch(`/api/tasks/${taskId}/swipe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'claim', hesitation_ms: 0 }),
-      })
-      fetchTasks()
+    // Claimed / In Progress / In Review transitions (user-claimed
+    // only — bot tasks short-circuited above). Backward transitions
+    // (e.g. In Review → In Progress) are allowed by the backend
+    // AdvanceStatusForUser guard.
+    if (targetCol === 'claimed') {
+      // Claimed isn't a real status — it's "status=queued + claim
+      // held". Going "back to Claimed" from In Progress/In Review
+      // means flipping status to queued without releasing the claim.
+      // The current store doesn't expose that exact transition; the
+      // closest is requeue (which clears claim too). For v1, the
+      // back-to-Claimed gesture isn't supported — the user can drag
+      // forward through stages or all the way back to Queued.
       return
     }
-
-    // Any → Queue: state-driven requeue. Distinct from /undo (the
-    // Cards swipe-toast UX): drag-to-queue isn't reversing the user's
-    // last gesture, it's a deliberate state change. /requeue runs the
-    // same cleanup (Jira reversal, pending_approval review teardown
-    // via SKY-206) without polluting swipe_events with phantom 'undo'
-    // rows for every drag.
-    if (
-      targetCol === 'queue' ||
-      (wasDraggingFromSidebar && !['you', 'agent', 'done'].includes(overId))
-    ) {
-      // Don't requeue if source is already queue
-      if (sourceCol !== 'queue') {
-        await fetch(`/api/tasks/${taskId}/requeue`, { method: 'POST' })
-        fetchTasks()
-      }
+    if (targetCol === 'in_progress' || targetCol === 'in_review') {
+      await fetch(`/api/tasks/${taskId}/advance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: targetCol }),
+      })
+      fetchTasks()
       return
     }
   }
@@ -573,16 +590,41 @@ export default function Board() {
     [fetchTasks],
   )
 
+  // Assignee picker callbacks. The picker is the primary surface for
+  // claim mutations in the SKY-330 board; drag is for column moves.
+  const handlePickerClaim = useCallback(
+    async (task: Task) => {
+      await fetch(`/api/tasks/${task.id}/swipe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'claim', hesitation_ms: 0 }),
+      })
+      fetchTasks()
+    },
+    [fetchTasks],
+  )
+
+  const handlePickerUnclaim = useCallback(
+    async (task: Task) => {
+      // Unclaim = requeue (clears both claim cols + resets status to
+      // queued). Same path the drag-to-Queue gesture uses.
+      await fetch(`/api/tasks/${task.id}/requeue`, { method: 'POST' })
+      fetchTasks()
+    },
+    [fetchTasks],
+  )
+
+  const handlePickerDelegate = useCallback((task: Task) => {
+    pendingDelegateTask.current = task
+    setShowPromptPicker(true)
+  }, [])
+
   const handlePromptSelected = useCallback(
     async (promptId: string) => {
       setShowPromptPicker(false)
       const task = pendingDelegateTask.current
       if (!task) return
       pendingDelegateTask.current = null
-      // Seed agentRuns from the swipe response so the AgentCard renders
-      // immediately, before the first WS update or fetchTasks resolves.
-      // Without this the card can appear to skip early phases on slow
-      // connections. The WS handler's follow-up fetch replaces the stub.
       const res = await fetch(`/api/tasks/${task.id}/swipe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -593,8 +635,6 @@ export default function Board() {
           const body = (await res.json()) as { run_id?: string; delegate_error?: string }
           const runID = body.run_id
           if (runID) {
-            // Spawn succeeded — seed the AgentCard immediately,
-            // clear any prior failure marker for this task.
             setAgentRuns((prev) => ({
               ...prev,
               [task.id]: {
@@ -613,11 +653,6 @@ export default function Board() {
               return next
             })
           } else if (body.delegate_error) {
-            // SKY-261 B+: spawn failed but the claim was stamped
-            // (the user's commitment is recorded; the run just
-            // didn't fire on this attempt). Surface it on the
-            // agent-lane card via the "delegate didn't fire" badge
-            // + Retry button.
             setDelegateFailures((prev) => ({
               ...prev,
               [task.id]: body.delegate_error || 'spawn failed',
@@ -642,6 +677,31 @@ export default function Board() {
     )
   }
 
+  // Per-column header extras
+  const queuedHeader = (
+    <button
+      type="button"
+      onClick={() => setShowSnoozed((v) => !v)}
+      title={showSnoozed ? 'Hide snoozed tasks' : 'Show snoozed tasks'}
+      className={`text-[10px] px-2 py-0.5 rounded-full transition-colors ${
+        showSnoozed
+          ? 'bg-snooze/10 text-snooze font-medium'
+          : 'text-text-tertiary hover:text-text-secondary'
+      }`}
+    >
+      {showSnoozed ? '⏾ snoozed shown' : '⏾ show snoozed'}
+    </button>
+  )
+
+  const doneHeader = (
+    <span
+      className="text-[10px] text-text-tertiary"
+      title="Done column shows the last 7 days; older entries are hidden"
+    >
+      last 7 days
+    </span>
+  )
+
   return (
     <DndContext
       sensors={sensors}
@@ -650,320 +710,60 @@ export default function Board() {
       onDragOver={handleDragOver}
       onDragEnd={handleDragEnd}
     >
-      <div className="relative min-h-[70vh]">
-        {/* Queue sidebar — collapsed strip */}
-        <AnimatePresence mode="wait">
-          {!sidebarOpen && (
-            <motion.button
-              key="collapsed"
-              aria-label="Open queue sidebar"
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              transition={{ duration: 0.2, ease: 'easeOut' }}
-              onClick={() => setSidebarOpen(true)}
-              className="fixed left-4 top-20 bottom-4 w-10 z-30 bg-surface-raised/80 backdrop-blur-xl border border-border-glass rounded-2xl shadow-sm shadow-black/[0.03] flex flex-col items-center pt-4 gap-3 hover:border-accent/20 transition-colors group"
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 16 16"
-                fill="none"
-                className="text-text-tertiary group-hover:text-accent transition-colors shrink-0"
-              >
-                <path
-                  d="M6 3l5 5-5 5"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-              <span className="text-[11px] font-medium text-text-tertiary bg-black/[0.04] rounded-full px-2 py-0.5 shrink-0">
-                {queued.length}
-              </span>
-              <span className="text-[10px] text-text-tertiary [writing-mode:vertical-lr] rotate-180 tracking-wider uppercase font-medium mt-1">
-                Queue
-              </span>
-            </motion.button>
-          )}
-        </AnimatePresence>
+      <HeldTakeoversBanner />
 
-        {/* Queue sidebar — expanded overlay */}
-        <AnimatePresence>
-          {sidebarOpen && (
-            <>
-              {/* Backdrop */}
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.2 }}
-                className="fixed inset-0 z-30"
-                onClick={() => setSidebarOpen(false)}
+      {/* SKY-330: horizontal-scroll container for 5 columns. Default
+          scroll position (set on mount) shows Claimed → In Review;
+          user scrolls left for Queued, right for Done. */}
+      <div ref={scrollRef} className="overflow-x-auto pb-4">
+        <div className="flex gap-6 min-h-[70vh] px-1">
+          {ALL_COLUMNS.map((colId) => (
+            <BoardColumn
+              key={colId}
+              id={colId}
+              title={COLUMN_TITLES[colId]}
+              totalCount={totalCounts[colId]}
+              filteredCount={filtered[colId].length}
+              tasks={rawByColumn[colId]}
+              filter={filters[colId]}
+              onFilterChange={(next) => setFilters((prev) => ({ ...prev, [colId]: next }))}
+              headerExtra={
+                colId === 'queued' ? queuedHeader : colId === 'done' ? doneHeader : undefined
+              }
+            >
+              <ColumnContents
+                colId={colId}
+                tasks={filtered[colId]}
+                agentRuns={agentRuns}
+                agentMessages={agentMessages}
+                chainStepRuns={chainStepRuns}
+                currentUserID={currentUserID}
+                members={members}
+                bot={bot}
+                delegateFailures={delegateFailures}
+                onRequeue={handleRequeue}
+                onPickerClaim={handlePickerClaim}
+                onPickerUnclaim={handlePickerUnclaim}
+                onPickerDelegate={handlePickerDelegate}
+                onReview={(runID, kind) => setApprovalCtx({ runID, kind })}
+                onRetry={(task) => {
+                  pendingDelegateTask.current = task
+                  setShowPromptPicker(true)
+                }}
               />
-              <motion.div
-                initial={{ x: -290, opacity: 0 }}
-                animate={{ x: 0, opacity: 1 }}
-                exit={{ x: -290, opacity: 0 }}
-                transition={{ type: 'spring', damping: 28, stiffness: 300 }}
-                className="fixed left-4 top-20 bottom-4 w-[280px] z-40 bg-surface-raised/95 backdrop-blur-xl border border-border-glass rounded-2xl shadow-xl shadow-black/[0.08] flex flex-col overflow-hidden"
-              >
-                {/* Header */}
-                <div className="px-4 pt-4 pb-3 border-b border-border-subtle shrink-0">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-[13px] font-semibold text-text-primary">Queue</h2>
-                      <span className="text-[11px] text-text-tertiary bg-black/[0.04] rounded-full px-2 py-0.5">
-                        {filteredQueue.length}
-                        {filteredQueue.length !== queued.length ? `/${queued.length}` : ''}
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => setSidebarOpen(false)}
-                      aria-label="Close queue sidebar"
-                      className="text-text-tertiary hover:text-text-secondary transition-colors text-lg leading-none px-1"
-                    >
-                      &times;
-                    </button>
-                  </div>
-
-                  {/* Search */}
-                  <input
-                    type="text"
-                    placeholder="Search tasks..."
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                    className="w-full bg-white/50 border border-border-subtle rounded-xl px-3 py-2 text-[12px] text-text-primary placeholder-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent/40 transition-colors mb-2"
-                    autoFocus
-                  />
-
-                  {/* Source filter */}
-                  <div className="flex gap-1 mb-1">
-                    {(['all', 'github', 'jira'] as const).map((f) => (
-                      <button
-                        key={f}
-                        onClick={() => setSourceFilter(f)}
-                        className={`text-[10px] px-2 py-0.5 rounded-full transition-colors ${
-                          sourceFilter === f
-                            ? 'bg-accent/10 text-accent font-medium'
-                            : 'text-text-tertiary hover:text-text-secondary'
-                        }`}
-                      >
-                        {f === 'all' ? 'All' : f === 'github' ? 'GitHub' : 'Jira'}
-                      </button>
-                    ))}
-                  </div>
-
-                  {/* Event type quick-filter chips */}
-                  {queueEventTypes.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-1">
-                      {queueEventTypes.map((et) => (
-                        <button
-                          key={et}
-                          onClick={() => setSearch(et)}
-                          className="opacity-70 hover:opacity-100 transition-opacity"
-                        >
-                          <EventBadge eventType={et} compact />
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* Scrollable task list */}
-                <div className="flex-1 overflow-y-auto p-2 space-y-2">
-                  <p className="text-[10px] text-text-tertiary px-2 py-1">Drag tasks to a column</p>
-                  {filteredQueue.length === 0 ? (
-                    <p className="text-[12px] text-text-tertiary text-center py-8">
-                      {queued.length === 0 ? 'Queue is empty' : 'No matching tasks'}
-                    </p>
-                  ) : (
-                    <SortableContext
-                      items={filteredQueue.map((t) => t.id)}
-                      strategy={verticalListSortingStrategy}
-                    >
-                      {filteredQueue.map((task) => (
-                        <SidebarTaskCard key={task.id} task={task} />
-                      ))}
-                    </SortableContext>
-                  )}
-                </div>
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
-
-        <div style={{ marginLeft: '3rem' }}>
-          <HeldTakeoversBanner />
-        </div>
-
-        {/* Main board — 3 columns */}
-        <div className="grid grid-cols-3 gap-6 min-h-[70vh]" style={{ marginLeft: '3rem' }}>
-          {/* You column */}
-          <DroppableColumn
-            id="you"
-            title="You"
-            count={claimed.length}
-            isOver={overColumn === 'you'}
-          >
-            <SortableContext
-              items={claimed.map((t) => t.id)}
-              strategy={verticalListSortingStrategy}
-            >
-              {claimed.length === 0 ? (
-                <EmptyColumn>Nothing claimed</EmptyColumn>
-              ) : (
-                claimed.map((task) =>
-                  agentRuns[task.id] ? (
-                    <SortableAgentCard
-                      key={task.id}
-                      task={task}
-                      run={agentRuns[task.id]}
-                      chainSteps={chainStepRuns[task.id]}
-                      messages={agentMessages[agentRuns[task.id].ID] || []}
-                      onRequeue={() => handleRequeue(task.id)}
-                      onReview={() => {
-                        const run = agentRuns[task.id]
-                        const kind: 'review' | 'pr' = run.pending_kind === 'pr' ? 'pr' : 'review'
-                        setApprovalCtx({ runID: run.ID, kind })
-                      }}
-                    />
-                  ) : (
-                    <SortableTaskCard
-                      key={task.id}
-                      task={task}
-                      onRequeue={() => handleRequeue(task.id)}
-                    />
-                  ),
-                )
-              )}
-            </SortableContext>
-          </DroppableColumn>
-
-          {/* Agent column — attention-weighted */}
-          <DroppableColumn
-            id="agent"
-            title="Agent"
-            count={agentItems.length}
-            isOver={overColumn === 'agent'}
-          >
-            <SortableContext
-              items={agentItems.map((t) => t.id)}
-              strategy={verticalListSortingStrategy}
-            >
-              {agentItems.length === 0 ? (
-                <EmptyColumn>No delegated tasks</EmptyColumn>
-              ) : (
-                agentItems.map((task) =>
-                  agentRuns[task.id] ? (
-                    <SortableAgentCard
-                      key={task.id}
-                      task={task}
-                      run={agentRuns[task.id]}
-                      chainSteps={chainStepRuns[task.id]}
-                      messages={agentMessages[agentRuns[task.id].ID] || []}
-                      onRequeue={() => handleRequeue(task.id)}
-                      onReview={() => {
-                        const run = agentRuns[task.id]
-                        const kind: 'review' | 'pr' = run.pending_kind === 'pr' ? 'pr' : 'review'
-                        setApprovalCtx({ runID: run.ID, kind })
-                      }}
-                    />
-                  ) : (
-                    <SortableTaskCard
-                      key={task.id}
-                      task={task}
-                      onRequeue={() => handleRequeue(task.id)}
-                      // SKY-261: bot-claimed cards without an
-                      // agentRuns entry land here. Three legitimate
-                      // shapes share this state:
-                      //   (a) explicit partial-success — delegate
-                      //       response returned delegate_error; we
-                      //       have an entry in delegateFailures.
-                      //   (b) trigger fired but the entity is busy
-                      //       and the firing is queued in
-                      //       pending_firings; no run row yet, will
-                      //       fire on the next drain.
-                      //   (c) transient race — the claim WS event
-                      //       arrived before the run WS event /
-                      //       fetchTasks refresh.
-                      // Only (a) deserves the "delegate didn't fire,
-                      // retry" badge. For (b) and (c) the neutral
-                      // card is right; the run will land via the WS
-                      // path. We gate the badge + Retry button on
-                      // explicit delegateFailures membership; absent
-                      // = render the neutral TaskCard.
-                      delegateFailed={
-                        delegateFailures[task.id]
-                          ? { message: delegateFailures[task.id] }
-                          : undefined
-                      }
-                      onRetry={
-                        delegateFailures[task.id]
-                          ? () => {
-                              pendingDelegateTask.current = task
-                              setShowPromptPicker(true)
-                            }
-                          : undefined
-                      }
-                    />
-                  ),
-                )
-              )}
-            </SortableContext>
-          </DroppableColumn>
-
-          {/* Done column */}
-          <DroppableColumn
-            id="done"
-            title="Done"
-            count={done.length}
-            isOver={overColumn === 'done'}
-          >
-            <SortableContext items={done.map((t) => t.id)} strategy={verticalListSortingStrategy}>
-              {done.length === 0 ? (
-                <EmptyColumn>No completed items</EmptyColumn>
-              ) : (
-                done.map((task) =>
-                  agentRuns[task.id] ? (
-                    <SortableAgentCard
-                      key={task.id}
-                      task={task}
-                      run={agentRuns[task.id]}
-                      chainSteps={chainStepRuns[task.id]}
-                      messages={agentMessages[agentRuns[task.id].ID] || []}
-                      onRequeue={() => handleRequeue(task.id)}
-                      onReview={() => {
-                        const run = agentRuns[task.id]
-                        const kind: 'review' | 'pr' = run.pending_kind === 'pr' ? 'pr' : 'review'
-                        setApprovalCtx({ runID: run.ID, kind })
-                      }}
-                    />
-                  ) : (
-                    <SortableTaskCard
-                      key={task.id}
-                      task={task}
-                      onRequeue={() => handleRequeue(task.id)}
-                    />
-                  ),
-                )
-              )}
-            </SortableContext>
-          </DroppableColumn>
+            </BoardColumn>
+          ))}
         </div>
       </div>
 
-      {/* Drag overlay — floating card that follows cursor */}
       <DragOverlay dropAnimation={null}>
         {activeTask && (
-          <div className="w-[250px]">
+          <div className="w-[280px]">
             <TaskCard task={activeTask} isDragging />
           </div>
         )}
       </DragOverlay>
 
-      {/* Prompt picker for delegation */}
       <PromptPicker
         open={showPromptPicker}
         onSelect={handlePromptSelected}
@@ -978,10 +778,6 @@ export default function Board() {
         }}
       />
 
-      {/* Approval overlay for pending_approval runs.
-          Branches on the run's pending_kind so a queued review opens
-          ReviewOverlay (with inline-comment editing) and a queued PR
-          opens PendingPROverlay (title/body editor). */}
       <ReviewOverlay
         runID={approvalCtx?.kind === 'review' ? approvalCtx.runID : ''}
         open={approvalCtx?.kind === 'review'}
@@ -1002,35 +798,112 @@ export default function Board() {
   )
 }
 
-/** Compact card for the sidebar queue — smaller than a full TaskCard */
-function SidebarTaskCard({ task }: { task: Task }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: task.id,
-  })
-
-  const style: React.CSSProperties = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-    opacity: isDragging ? 0.3 : 1,
+// ColumnContents is the per-column body — handles empty state, the
+// SortableContext, and the per-task card-vs-agentcard branching. Kept
+// inline here (not split further) because the card-rendering branching
+// is tightly coupled to the assignee picker + agentRuns state lookups,
+// and splitting would require threading every callback through one
+// more layer of props.
+function ColumnContents({
+  colId,
+  tasks,
+  agentRuns,
+  agentMessages,
+  chainStepRuns,
+  currentUserID,
+  members,
+  bot,
+  delegateFailures,
+  onRequeue,
+  onPickerClaim,
+  onPickerUnclaim,
+  onPickerDelegate,
+  onReview,
+  onRetry,
+}: {
+  colId: ColumnId
+  tasks: Task[]
+  agentRuns: Record<string, AgentRun>
+  agentMessages: Record<string, AgentMessage[]>
+  chainStepRuns: Record<string, AgentRun[]>
+  currentUserID: string
+  members: TeamMember[]
+  bot: TeamBot | null
+  delegateFailures: Record<string, string>
+  onRequeue: (taskID: string) => void
+  onPickerClaim: (task: Task) => Promise<void>
+  onPickerUnclaim: (task: Task) => Promise<void>
+  onPickerDelegate: (task: Task) => void
+  onReview: (runID: string, kind: 'review' | 'pr') => void
+  onRetry: (task: Task) => void
+}) {
+  if (tasks.length === 0) {
+    return <EmptyColumn>{emptyLabelFor(colId)}</EmptyColumn>
   }
 
   return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className="bg-white/60 backdrop-blur border border-border-subtle rounded-xl px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-accent/20 transition-colors"
-      {...attributes}
-      {...listeners}
-    >
-      <div className="flex items-center gap-1.5 mb-1">
-        <SourceBadge task={task} />
-        <EventBadge eventType={task.event_type} compact />
-      </div>
-      <h4 className="text-[12px] font-medium text-text-primary leading-snug line-clamp-2">
-        {task.title}
-      </h4>
-    </div>
+    <SortableContext items={tasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+      {tasks.map((task) => {
+        const run = agentRuns[task.id]
+        const picker = (
+          <AssigneePicker
+            task={task}
+            currentUserID={currentUserID}
+            members={members}
+            bot={bot}
+            onClaim={onPickerClaim}
+            onUnclaim={onPickerUnclaim}
+            onDelegate={onPickerDelegate}
+            readOnly={colId === 'done'}
+          />
+        )
+        if (run) {
+          return (
+            <SortableAgentCard
+              key={task.id}
+              task={task}
+              run={run}
+              chainSteps={chainStepRuns[task.id]}
+              messages={agentMessages[run.ID] || []}
+              onRequeue={() => onRequeue(task.id)}
+              onReview={() => {
+                const kind: 'review' | 'pr' = run.pending_kind === 'pr' ? 'pr' : 'review'
+                onReview(run.ID, kind)
+              }}
+              assigneeSlot={picker}
+            />
+          )
+        }
+        return (
+          <SortableTaskCard
+            key={task.id}
+            task={task}
+            onRequeue={() => onRequeue(task.id)}
+            delegateFailed={
+              delegateFailures[task.id] ? { message: delegateFailures[task.id] } : undefined
+            }
+            onRetry={delegateFailures[task.id] ? () => onRetry(task) : undefined}
+            assigneeSlot={picker}
+          />
+        )
+      })}
+    </SortableContext>
   )
+}
+
+function emptyLabelFor(colId: ColumnId): string {
+  switch (colId) {
+    case 'queued':
+      return 'Queue is empty'
+    case 'claimed':
+      return 'Nothing claimed'
+    case 'in_progress':
+      return 'Nothing in progress'
+    case 'in_review':
+      return 'Nothing in review'
+    case 'done':
+      return 'Nothing done in last 7 days'
+  }
 }
 
 function SortableTaskCard({
@@ -1038,43 +911,52 @@ function SortableTaskCard({
   onRequeue,
   delegateFailed,
   onRetry,
+  assigneeSlot,
 }: {
   task: Task
   onRequeue?: () => void
   delegateFailed?: { message: string }
   onRetry?: () => void
+  assigneeSlot?: React.ReactNode
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
   })
-
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.3 : 1,
   }
-
   return (
-    <TaskCard
-      ref={setNodeRef}
-      task={task}
-      style={style}
-      isDragging={false}
-      onRequeue={onRequeue}
-      delegateFailed={delegateFailed}
-      onRetry={onRetry}
-      {...attributes}
-      {...listeners}
-    />
+    <div style={{ position: 'relative' }}>
+      <TaskCard
+        ref={setNodeRef}
+        task={task}
+        style={style}
+        isDragging={false}
+        onRequeue={onRequeue}
+        delegateFailed={delegateFailed}
+        onRetry={onRetry}
+        {...attributes}
+        {...listeners}
+      />
+      {assigneeSlot && (
+        <div
+          className="absolute top-3 right-3 z-10"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {assigneeSlot}
+        </div>
+      )}
+    </div>
   )
 }
 
 // Run statuses where the AgentCard is safe to drag between columns.
 // Active states (running, cloning, etc.) stay anchored — the cancel
 // button is the right intent there, and dragging mid-run would race
-// with the spawner's status transitions. taken_over and the various
-// terminal states all describe runs whose process has exited, so a
-// task-status flip is decoupled from any in-flight work.
+// with the spawner's status transitions.
 const draggableRunStatuses = new Set([
   'pending_approval',
   'failed',
@@ -1091,6 +973,7 @@ function SortableAgentCard({
   messages,
   onRequeue,
   onReview,
+  assigneeSlot,
 }: {
   task: Task
   run: AgentRun
@@ -1098,25 +981,20 @@ function SortableAgentCard({
   messages: AgentMessage[]
   onRequeue?: () => void
   onReview?: () => void
+  assigneeSlot?: React.ReactNode
 }) {
   const draggable = draggableRunStatuses.has(run.Status)
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
     disabled: !draggable,
   })
-
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.3 : 1,
     cursor: draggable ? 'grab' : undefined,
+    position: 'relative',
   }
-
-  // Spread listeners on the outer wrapper so the whole card surface is
-  // a drag handle — except buttons inside, which @dnd-kit's pointer
-  // sensor leaves alone via its 5px activation distance (a click stays
-  // a click). Active-state cards skip this entirely so the Cancel and
-  // Take over buttons keep their normal hover/click semantics.
   return (
     <div
       ref={setNodeRef}
@@ -1132,43 +1010,15 @@ function SortableAgentCard({
         onRequeue={onRequeue}
         onReview={onReview}
       />
-    </div>
-  )
-}
-
-function DroppableColumn({
-  id,
-  title,
-  count,
-  isOver,
-  children,
-}: {
-  id: string
-  title: string
-  count: number
-  isOver: boolean
-  children: React.ReactNode
-}) {
-  const { setNodeRef } = useSortable({ id, data: { type: 'column' } })
-
-  return (
-    <div className="flex flex-col">
-      <div className="flex items-center justify-between mb-3 px-1">
-        <div className="flex items-center gap-2">
-          <h2 className="text-[13px] font-medium text-text-secondary">{title}</h2>
-          <span className="text-[11px] text-text-tertiary bg-black/[0.04] rounded-full px-2 py-0.5">
-            {count}
-          </span>
+      {assigneeSlot && (
+        <div
+          className="absolute top-3 right-3 z-10"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {assigneeSlot}
         </div>
-      </div>
-      <div
-        ref={setNodeRef}
-        className={`flex-1 rounded-2xl border bg-black/[0.01] p-3 space-y-3 overflow-y-auto max-h-[calc(100vh-180px)] transition-colors ${
-          isOver ? 'border-accent/30 bg-accent/[0.03]' : 'border-border-subtle'
-        }`}
-      >
-        {children}
-      </div>
+      )}
     </div>
   )
 }
@@ -1176,3 +1026,9 @@ function DroppableColumn({
 function EmptyColumn({ children }: { children: React.ReactNode }) {
   return <p className="text-[12px] text-text-tertiary text-center py-12">{children}</p>
 }
+
+// AnimatePresence import retained for future motion polish on column
+// transitions / card enter-exit animations. Currently unused in this
+// minimal redesign — the existing motion/react dep stays in the tree.
+void AnimatePresence
+void motion

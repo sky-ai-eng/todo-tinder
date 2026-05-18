@@ -31,6 +31,39 @@ export interface Task {
   // the task was created before subtasks appeared, or the user added them
   // after starting work. Always 0 for GitHub tasks.
   open_subtask_count?: number
+  // SKY-330: claim cols, exposed so the assignee picker on the board
+  // can render current state without a second fetch. Exactly one is
+  // set when claimed; both absent (omitempty on the wire) when
+  // unclaimed. The XOR is enforced server-side.
+  claimed_by_agent_id?: string
+  claimed_by_user_id?: string
+}
+
+// TeamMember is the per-user roster row from /api/team/members. SKY-330's
+// assignee picker renders these alongside the bot entry. is_current_user
+// flags the caller so the picker can sort "Me" to the top and gate
+// click-to-toggle to the caller's own row (cross-user reassignment is
+// not supported in v1).
+export interface TeamMember {
+  user_id: string
+  display_name: string
+  github_username: string | null
+  jira_account_id: string | null
+  is_current_user: boolean
+}
+
+// TeamBot mirrors the bot half of /api/team/members. Null when no
+// agent is bootstrapped OR team_agents.enabled is false for the
+// caller's team — same gate the swipe-delegate handler enforces.
+// Frontend hides the Bot row in the picker when this is null.
+export interface TeamBot {
+  agent_id: string
+  display_name: string
+}
+
+export interface TeamMembersResponse {
+  members: TeamMember[]
+  bot: TeamBot | null
 }
 
 export interface AgentRun {

@@ -47,6 +47,13 @@ type TaskStore interface {
 	// status='queued' AND both claim cols NULL AND not future-snoozed.
 	Queued(ctx context.Context, orgID string) ([]domain.Task, error)
 
+	// QueuedIncludingSnoozed mirrors Queued but drops the snooze-
+	// window filter so future-snoozed rows surface too. SKY-330's
+	// Board Queued column uses this when the user toggles "show
+	// snoozed"; the default Queued() stays the canonical "what's
+	// actually pickable right now" projection.
+	QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error)
+
 	// ByStatus returns tasks with the given lifecycle status,
 	// ordered by priority. Two pseudo-values are mapped to claim-
 	// axis queries for API back-compat (SKY-261 B+):
