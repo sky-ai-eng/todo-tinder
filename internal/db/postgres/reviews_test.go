@@ -94,6 +94,79 @@ func TestReviewStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	}
 }
 
+// TestReviewStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for pending_reviews. Where CrossOrgLeakage above wires both
+// pools against AdminDB to prove the defense-in-depth WHERE-clause
+// filter is intact, this test runs the store through the app pool
+// under tf_app with real JWT claims so the actual
+// pending_reviews_select / pending_reviews_modify policies are
+// exercised. Same-org reads succeed; cross-org reads are silently
+// filtered (USING); cross-org Create raises 42501 from WITH CHECK.
+func TestReviewStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice, _ := seedPgReviewOrg(t, h)
+	orgB, bob, _ := seedPgReviewOrg(t, h)
+	_ = alice
+	_ = bob
+
+	// Seed a review in orgA via admin so the row exists.
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	ctx := context.Background()
+	revA := uuid.New().String()
+	if err := stores.Reviews.Create(ctx, orgA, domain.PendingReview{
+		ID: revA, PRNumber: 1, Owner: "o", Repo: "r", CommitSHA: "sha",
+	}); err != nil {
+		t.Fatalf("seed review in orgA: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Reviews.Get(ctx, orgA, revA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice Get(orgA, revA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Reviews.Get(ctx, orgA, revA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob Get(orgA, revA) returned %+v; RLS USING filter leaked orgA's review to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; Create against orgA would land
+		// a row with org_id=orgA. pending_reviews_modify WITH CHECK
+		// requires org_id = tf.current_org_id(), so 42501 is the
+		// expected outcome.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			return pgstore.NewForTx(tx).Reviews.Create(ctx, orgA, domain.PendingReview{
+				ID: uuid.New().String(), PRNumber: 2, Owner: "o", Repo: "r", CommitSHA: "x-write",
+			})
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 func seedPgReviewOrg(t *testing.T, h *pgtest.Harness) (orgID, userID, agentID string) {
 	t.Helper()
 	orgID = uuid.New().String()

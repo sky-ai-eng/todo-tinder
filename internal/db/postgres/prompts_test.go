@@ -113,6 +113,86 @@ func TestPromptStore_Postgres_SeedOrUpdate_AdminOnly(t *testing.T) {
 	}
 }
 
+// TestPromptStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for prompts. Runs the store through the app pool under tf_app
+// with real JWT claims so the actual prompts_select / prompts_insert
+// policies are exercised. Same-org reads succeed; cross-org reads are
+// silently filtered (USING); cross-org Create raises 42501 from
+// prompts_insert WITH CHECK.
+//
+// Prompts carry a visibility column ('org'|'team'|'private'); the
+// store's Create path always lands 'team' via the SQL default in the
+// INSERT. The test seeds an admin-pool 'team'-visibility prompt in
+// orgA so the same-org user (an org member) can see it through the
+// team_visibility branch of prompts_select.
+func TestPromptStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice := seedPgOrgAndUserForPrompts(t, h)
+	orgB, bob := seedPgOrgAndUserForPrompts(t, h)
+	_ = bob
+
+	// Seed a prompt in orgA directly via the admin connection so the row
+	// exists independent of user-scoped RLS. The insert sets
+	// visibility='team' and attaches teamA so the same-org read path
+	// exercises the team_visibility branch of prompts_select.
+	promptA := "prompt-rls-" + orgA[:8]
+	teamA := firstTeamForOrg(t, h, orgA)
+	if _, err := h.AdminDB.Exec(`
+		INSERT INTO prompts (id, org_id, creator_user_id, team_id, name, body, source, kind, allowed_tools, visibility, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'RLS Prompt', 'body', 'user', 'leaf', '', 'team', now(), now())
+	`, promptA, orgA, alice, teamA); err != nil {
+		t.Fatalf("seed prompt: %v", err)
+	}
+	ctx := context.Background()
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Prompts.Get(ctx, orgA, promptA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice Get(orgA, promptA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Prompts.Get(ctx, orgA, promptA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob Get(orgA, promptA) returned %+v; RLS USING filter leaked orgA's prompt to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; Create against orgA would land
+		// a row with org_id=orgA. prompts_insert WITH CHECK requires
+		// org_id = tf.current_org_id(), so 42501 is the expected
+		// outcome.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			return pgstore.NewForTx(tx).Prompts.Create(ctx, orgA, domain.Prompt{
+				ID: "p-rls-write-" + orgA[:8], Name: "x-write", Body: "x", Source: "user",
+			})
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 // seedPgOrgAndUserForPrompts is the prompts-test fixture analogue of
 // seedPgOrgAndUser in scores_test.go. Distinct name keeps both test
 // files self-contained (Go disallows reusing a top-level identifier

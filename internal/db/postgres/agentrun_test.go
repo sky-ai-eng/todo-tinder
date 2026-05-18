@@ -249,6 +249,108 @@ func TestAgentRunStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	}
 }
 
+// TestAgentRunStore_Postgres_CrossOrgRLSDenied pins the production
+// RLS layer for runs. Where TestAgentRunStore_Postgres_CrossOrgLeakage
+// above wires both pools against AdminDB to prove the defense-in-depth
+// WHERE-clause filter is intact, this test runs the store through the
+// app pool under tf_app with real JWT claims so the actual
+// runs_select / runs_insert policies are exercised. Same-org reads
+// succeed; cross-org reads are silently filtered (USING); cross-org
+// Create raises 42501 from runs_insert WITH CHECK.
+func TestAgentRunStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice, _ := seedPgAgentRunOrg(t, h)
+	orgB, bob, _ := seedPgAgentRunOrg(t, h)
+	seedPgAgentRunPromptIn(t, h, "p_rls_A", orgA, alice)
+	seedPgAgentRunPromptIn(t, h, "p_rls_B", orgB, bob)
+
+	// Seed entity + event + task + run in orgA via admin so the row
+	// exists. Whether bob (claims orgB) can see/mutate it is the
+	// question.
+	entityA := uuid.New().String()
+	eventA := uuid.New().String()
+	taskA := uuid.New().String()
+	runA := uuid.New().String()
+	if _, err := h.AdminDB.Exec(`
+		INSERT INTO entities (id, org_id, source, source_id, kind, title, url, snapshot_json, created_at)
+		VALUES ($1, $2, 'github', $3, 'pr', 'RLS Cross-org', '', '{}'::jsonb, now())
+	`, entityA, orgA, "rls-cross-"+orgA[:8]); err != nil {
+		t.Fatalf("entity: %v", err)
+	}
+	if _, err := h.AdminDB.Exec(`
+		INSERT INTO events (id, org_id, entity_id, event_type, dedup_key, metadata_json, created_at)
+		VALUES ($1, $2, $3, 'github:pr:ci_check_failed', '', '{}'::jsonb, now())
+	`, eventA, orgA, entityA); err != nil {
+		t.Fatalf("event: %v", err)
+	}
+	if _, err := h.AdminDB.Exec(`
+		INSERT INTO tasks (id, org_id, creator_user_id, team_id, visibility, entity_id, event_type, dedup_key, primary_event_id, status, scoring_status, priority_score)
+		VALUES ($1, $2, $3,
+		        (SELECT id FROM teams WHERE org_id = $2 ORDER BY created_at ASC LIMIT 1),
+		        'team', $4, 'github:pr:ci_check_failed', '', $5, 'queued', 'pending', 0.5)
+	`, taskA, orgA, alice, entityA, eventA); err != nil {
+		t.Fatalf("task: %v", err)
+	}
+	if _, err := h.AdminDB.Exec(`
+		INSERT INTO runs (id, org_id, task_id, team_id, prompt_id, status, model, creator_user_id, trigger_type)
+		VALUES ($1, $2, $3,
+		        (SELECT id FROM teams WHERE org_id = $2 ORDER BY created_at ASC LIMIT 1),
+		        'p_rls_A', 'running', 'm', $4, 'manual')
+	`, runA, orgA, taskA, alice); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	ctx := context.Background()
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			run, err := pgstore.NewForTx(tx).AgentRuns.Get(ctx, orgA, runA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if run == nil {
+				t.Errorf("alice Get(orgA, runA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			run, err := pgstore.NewForTx(tx).AgentRuns.Get(ctx, orgA, runA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if run != nil {
+				t.Errorf("bob Get(orgA, runA) returned %+v; RLS USING filter leaked orgA's run to orgB", run)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; the row would land with
+		// org_id=orgA referencing orgA's task. We want runs_insert
+		// WITH CHECK to reject, not a missing FK target.
+		newRunID := uuid.New().String()
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			return pgstore.NewForTx(tx).AgentRuns.Create(ctx, orgA, domain.AgentRun{
+				ID: newRunID, TaskID: taskA, PromptID: "p_rls_A",
+				Status: "running", Model: "m",
+				TriggerType: "manual", CreatorUserID: bob,
+			})
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 // TestAgentRunStore_Postgres_Create_UnderAppPoolRLS pins the two
 // app-pool fixes against actual RLS, not the AdminDB-bypassed
 // conformance setup:

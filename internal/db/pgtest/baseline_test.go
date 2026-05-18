@@ -158,9 +158,9 @@ func TestBaseline_JiraStatusRulesPopulated_CHECKsFire(t *testing.T) {
 
 	// Need a team_id to satisfy the FK. Use the same seed helpers as
 	// the rest of the suite so org bootstrap stays consistent.
-	owner := seedUser(t, h, "check-owner")
-	orgID := seedOrg(t, h, "check-org", owner)
-	teamID := seedTeam(t, h, orgID, "check-team")
+	owner := SeedUser(t, h, "check-owner")
+	orgID := SeedOrg(t, h, "check-org", owner)
+	teamID := SeedTeam(t, h, orgID, "check-team")
 	_ = orgID // referenced only for FK chain
 
 	cases := []struct {
@@ -254,8 +254,8 @@ func TestRLS_AdminConnectionBypassesRLS(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, _, _ := seedOrgWithUser(t, h, "alice")
-	orgB, _, _ := seedOrgWithUser(t, h, "bob")
+	orgA, _, _ := SeedOrgWithUser(t, h, "alice")
+	orgB, _, _ := SeedOrgWithUser(t, h, "bob")
 
 	var n int
 	if err := h.AdminDB.QueryRow(`SELECT COUNT(*) FROM orgs WHERE id IN ($1, $2)`, orgA, orgB).Scan(&n); err != nil {
@@ -273,8 +273,8 @@ func TestRLS_CrossOrgIsolation(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, userA, _ := seedOrgWithUser(t, h, "alice")
-	orgB, userB, _ := seedOrgWithUser(t, h, "bob")
+	orgA, userA, _ := SeedOrgWithUser(t, h, "alice")
+	orgB, userB, _ := SeedOrgWithUser(t, h, "bob")
 
 	// Seed an entity + task under each org via AdminDB (RLS-bypassed).
 	entityA := seedEntity(t, h, orgA, "github", "octo/repo#1")
@@ -361,18 +361,18 @@ func TestRLS_CuratorChatPerUserIsolation(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	org, alice, _ := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
+	org, alice, _ := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
 	// Add bob to the same team (org member + team member).
 	teamID := getOrgTeam(t, h, org)
-	addOrgMember(t, h, bob, org, teamID, "member", "member")
+	AddOrgMember(t, h, bob, org, teamID, "member", "member")
 
 	projectID := seedProject(t, h, org, alice, "demo")
 	aliceReq := seedCuratorRequest(t, h, org, alice, projectID, "alice asking")
 	bobReq := seedCuratorRequest(t, h, org, bob, projectID, "bob asking")
 
 	// Shared KB row.
-	mustExec(t, h.AdminDB,
+	MustExec(t, h.AdminDB,
 		`INSERT INTO project_knowledge (org_id, project_id, key, content) VALUES ($1, $2, 'overview', 'shared notes')`,
 		org, projectID)
 
@@ -448,7 +448,7 @@ func TestVault_PutGetDelete(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, userA, _ := seedOrgWithUser(t, h, "alice")
+	orgA, userA, _ := SeedOrgWithUser(t, h, "alice")
 
 	err := h.WithUser(t, userA, orgA, func(tx *sql.Tx) error {
 		var id string
@@ -505,8 +505,8 @@ func TestVault_ClaimMismatchDenied(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, userA, _ := seedOrgWithUser(t, h, "alice")
-	orgB, _, _ := seedOrgWithUser(t, h, "bob")
+	orgA, userA, _ := SeedOrgWithUser(t, h, "alice")
+	orgB, _, _ := SeedOrgWithUser(t, h, "bob")
 
 	// Alice's session (claims org_id = orgA) tries to put a secret
 	// with p_org_id = orgB. Must error.
@@ -551,12 +551,12 @@ func TestRLS_UsersIsolation(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, _ := seedOrgWithUser(t, h, "alice")
-	_, bob, _ := seedOrgWithUser(t, h, "bob") // separate org
+	orgA, alice, _ := SeedOrgWithUser(t, h, "alice")
+	_, bob, _ := SeedOrgWithUser(t, h, "bob") // separate org
 	// Co-worker: charlie joins alice's team.
-	charlie := seedUser(t, h, "charlie")
+	charlie := SeedUser(t, h, "charlie")
 	teamA := getOrgTeam(t, h, orgA)
-	addOrgMember(t, h, charlie, orgA, teamA, "member", "member")
+	AddOrgMember(t, h, charlie, orgA, teamA, "member", "member")
 
 	err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
 		var ids []string
@@ -631,16 +631,16 @@ func TestRLS_UsersVisibleWithoutTeamMembership(t *testing.T) {
 	h.Reset(t)
 
 	// Founder: org owner with org_memberships row, NO memberships row.
-	founder := seedUser(t, h, "founder")
-	orgID := seedOrg(t, h, "founder-org", founder)
-	teamID := seedTeam(t, h, orgID, "default")
-	mustExec(t, h.AdminDB,
+	founder := SeedUser(t, h, "founder")
+	orgID := SeedOrg(t, h, "founder-org", founder)
+	teamID := SeedTeam(t, h, orgID, "default")
+	MustExec(t, h.AdminDB,
 		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')`, founder, orgID)
 	// (deliberately no memberships row for founder)
 
 	// Joiner: org member via org_memberships AND on the team.
-	joiner := seedUser(t, h, "joiner")
-	addOrgMember(t, h, joiner, orgID, teamID, "member", "member")
+	joiner := SeedUser(t, h, "joiner")
+	AddOrgMember(t, h, joiner, orgID, teamID, "member", "member")
 
 	// Joiner must be able to see the founder via the users table
 	// even though founder isn't on any team.
@@ -666,11 +666,11 @@ func TestRLS_TeamSettingsIsTeamMemberOnly(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
 	// teamB is a second team in the same org; bob is on teamB only.
-	teamB := seedTeam(t, h, orgA, "team-b")
-	bob := seedUser(t, h, "bob")
-	addOrgMember(t, h, bob, orgA, teamB, "member", "admin")
+	teamB := SeedTeam(t, h, orgA, "team-b")
+	bob := SeedUser(t, h, "bob")
+	AddOrgMember(t, h, bob, orgA, teamB, "member", "admin")
 
 	// Alice writes team_settings for HER team (teamA).
 	if _, err := h.AdminDB.Exec(`INSERT INTO team_settings (team_id) VALUES ($1)`, teamA); err != nil {
@@ -814,7 +814,7 @@ func TestProjectKnowledge_OCC(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	org, user, _ := seedOrgWithUser(t, h, "alice")
+	org, user, _ := SeedOrgWithUser(t, h, "alice")
 	projectID := seedProject(t, h, org, user, "demo")
 	var pkID string
 	if err := h.AdminDB.QueryRow(`
@@ -875,8 +875,8 @@ func TestProjectKnowledge_RunValidation(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, _ := seedOrgWithUser(t, h, "alice")
-	_, bob, _ := seedOrgWithUser(t, h, "bob")
+	orgA, alice, _ := SeedOrgWithUser(t, h, "alice")
+	_, bob, _ := SeedOrgWithUser(t, h, "bob")
 
 	projectID := seedProject(t, h, orgA, alice, "demo")
 	var pkID string
@@ -889,9 +889,9 @@ func TestProjectKnowledge_RunValidation(t *testing.T) {
 
 	// Seed bob's run in his own org. Use AdminDB so we don't have to
 	// build the full task/event/prompt chain.
-	bobOrg := seedOrg(t, h, "bob-other-org", bob)
-	bobTeam := seedTeam(t, h, bobOrg, "default")
-	addOrgMember(t, h, bob, bobOrg, bobTeam, "owner", "admin")
+	bobOrg := SeedOrg(t, h, "bob-other-org", bob)
+	bobTeam := SeedTeam(t, h, bobOrg, "default")
+	AddOrgMember(t, h, bob, bobOrg, bobTeam, "owner", "admin")
 	bobEntity := seedEntity(t, h, bobOrg, "github", "octo/repo#99")
 	bobTask := seedTask(t, h, bobOrg, bob, bobEntity, "github:pr:opened")
 	bobPrompt := seedPrompt(t, h, bobOrg, bob, "p1")
@@ -938,14 +938,14 @@ func TestRLS_TeamVisibilityIsTeamScoped(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
-	carol := seedUser(t, h, "carol")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	carol := SeedUser(t, h, "carol")
 	// Bob joins teamA; carol joins a NEW team in the same org. Both
 	// are org-level 'member' (only alice as founder is org-level admin).
-	addOrgMember(t, h, bob, orgA, teamA, "member", "member")
-	teamB := seedTeam(t, h, orgA, "team-b")
-	addOrgMember(t, h, carol, orgA, teamB, "member", "member")
+	AddOrgMember(t, h, bob, orgA, teamA, "member", "member")
+	teamB := SeedTeam(t, h, orgA, "team-b")
+	AddOrgMember(t, h, carol, orgA, teamB, "member", "member")
 
 	// Seed one team-scoped row in each of the four tables.
 	prompt := seedPrompt(t, h, orgA, alice, "p1")
@@ -1037,9 +1037,9 @@ func TestRLS_RevokedMembership(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, _, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
-	addOrgMember(t, h, bob, orgA, teamA, "member", "member")
+	orgA, _, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	AddOrgMember(t, h, bob, orgA, teamA, "member", "member")
 
 	entityA := seedEntity(t, h, orgA, "github", "octo/repo#1")
 	taskB := seedTask(t, h, orgA, bob, entityA, "github:pr:opened")
@@ -1056,8 +1056,8 @@ func TestRLS_RevokedMembership(t *testing.T) {
 	// Revoke bob's membership at BOTH levels. Removing the team
 	// membership alone is no longer enough — user_has_org_access
 	// queries org_memberships in the two-axis model.
-	mustExec(t, h.AdminDB, `DELETE FROM memberships WHERE user_id = $1`, bob)
-	mustExec(t, h.AdminDB, `DELETE FROM org_memberships WHERE user_id = $1`, bob)
+	MustExec(t, h.AdminDB, `DELETE FROM memberships WHERE user_id = $1`, bob)
+	MustExec(t, h.AdminDB, `DELETE FROM org_memberships WHERE user_id = $1`, bob)
 
 	// Bob's session still carries claims {sub: bob, org_id: orgA}
 	// but org_memberships row is gone → tf.user_has_org_access(orgA) now
@@ -1094,9 +1094,9 @@ func TestRLS_OrgAdminGate(t *testing.T) {
 	h.Reset(t)
 
 	// Alice is the org owner; bob is a plain org+team member.
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
-	addOrgMember(t, h, bob, orgA, teamA, "member", "member")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	AddOrgMember(t, h, bob, orgA, teamA, "member", "member")
 
 	// Alice (owner) can rename the org.
 	err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
@@ -1186,9 +1186,9 @@ func TestRLS_SettingsAdminOnly(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
-	addOrgMember(t, h, bob, orgA, teamA, "member", "member")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	AddOrgMember(t, h, bob, orgA, teamA, "member", "member")
 
 	// Alice (owner) creates an org_settings row.
 	err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
@@ -1289,8 +1289,8 @@ func TestRLS_OrgBootstrap(t *testing.T) {
 	h.Reset(t)
 
 	// Seed a fresh auth.users + public.users row but no memberships.
-	dave := seedUser(t, h, "dave")
-	alice := seedUser(t, h, "alice") // for the negative cross-owner test
+	dave := SeedUser(t, h, "dave")
+	alice := SeedUser(t, h, "alice") // for the negative cross-owner test
 
 	// Phase 1: dave creates an org where HE is owner. Each negative
 	// assertion gets its own tx so a Postgres tx-abort doesn't
@@ -1398,15 +1398,15 @@ func TestRLS_MembershipManagement(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
-	carol := seedUser(t, h, "carol")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	carol := SeedUser(t, h, "carol")
 	// Bob and carol are org members but not yet on any team. This
 	// test asserts the team-membership write policies; the org-
 	// membership ones are exercised by TestRLS_OrgBootstrap.
-	mustExec(t, h.AdminDB,
+	MustExec(t, h.AdminDB,
 		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'member')`, bob, orgA)
-	mustExec(t, h.AdminDB,
+	MustExec(t, h.AdminDB,
 		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'member')`, carol, orgA)
 
 	// 1. Alice (team admin / org owner) can add bob to the team.
@@ -1480,8 +1480,8 @@ func TestFK_CrossOrgRejected(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, _ := seedOrgWithUser(t, h, "alice")
-	orgB, bob, _ := seedOrgWithUser(t, h, "bob")
+	orgA, alice, _ := SeedOrgWithUser(t, h, "alice")
+	orgB, bob, _ := SeedOrgWithUser(t, h, "bob")
 
 	entityB := seedEntity(t, h, orgB, "github", "octo/repo#1")
 
@@ -1530,9 +1530,9 @@ func TestRLS_ChildTablesInheritParentVisibility(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
-	addOrgMember(t, h, bob, orgA, teamA, "member", "member")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	AddOrgMember(t, h, bob, orgA, teamA, "member", "member")
 
 	// Alice creates a task + a run + child rows. All in orgA. Post-
 	// SKY-262 the team-default would make these rows visible to bob too
@@ -1563,18 +1563,18 @@ func TestRLS_ChildTablesInheritParentVisibility(t *testing.T) {
 		t.Fatalf("seed run: %v", err)
 	}
 	// Seed one child row per parent kind we care about.
-	mustExec(t, h.AdminDB, `INSERT INTO task_events (org_id, task_id, event_id, kind)
+	MustExec(t, h.AdminDB, `INSERT INTO task_events (org_id, task_id, event_id, kind)
 		SELECT $1, $2, e.id, 'closed' FROM events e WHERE e.entity_id = $3 LIMIT 1`,
 		orgA, taskID, entityA)
-	mustExec(t, h.AdminDB, `INSERT INTO run_artifacts (org_id, run_id, kind) VALUES ($1, $2, 'pr')`,
+	MustExec(t, h.AdminDB, `INSERT INTO run_artifacts (org_id, run_id, kind) VALUES ($1, $2, 'pr')`,
 		orgA, runID)
-	mustExec(t, h.AdminDB, `INSERT INTO run_messages (org_id, run_id, role, content) VALUES ($1, $2, 'assistant', 'hi')`,
+	MustExec(t, h.AdminDB, `INSERT INTO run_messages (org_id, run_id, role, content) VALUES ($1, $2, 'assistant', 'hi')`,
 		orgA, runID)
-	mustExec(t, h.AdminDB, `INSERT INTO run_memory (org_id, run_id, entity_id, agent_content) VALUES ($1, $2, $3, 'note')`,
+	MustExec(t, h.AdminDB, `INSERT INTO run_memory (org_id, run_id, entity_id, agent_content) VALUES ($1, $2, $3, 'note')`,
 		orgA, runID, entityA)
-	mustExec(t, h.AdminDB, `INSERT INTO run_worktrees (org_id, run_id, repo_id, path, feature_branch) VALUES ($1, $2, 'octo/repo', '/tmp/x', 'feat/x')`,
+	MustExec(t, h.AdminDB, `INSERT INTO run_worktrees (org_id, run_id, repo_id, path, feature_branch) VALUES ($1, $2, 'octo/repo', '/tmp/x', 'feat/x')`,
 		orgA, runID)
-	mustExec(t, h.AdminDB, `INSERT INTO pending_prs (org_id, run_id, owner, repo, head_branch, head_sha, base_branch, title) VALUES ($1, $2, 'octo', 'repo', 'feat/x', 'sha', 'main', 'PR')`,
+	MustExec(t, h.AdminDB, `INSERT INTO pending_prs (org_id, run_id, owner, repo, head_branch, head_sha, base_branch, title) VALUES ($1, $2, 'octo', 'repo', 'feat/x', 'sha', 'main', 'PR')`,
 		orgA, runID)
 
 	// Alice sees all her child rows.
@@ -1654,7 +1654,7 @@ func TestOrgOwnership_LastOwnerProtected(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, _ := seedOrgWithUser(t, h, "alice")
+	orgA, alice, _ := SeedOrgWithUser(t, h, "alice")
 
 	// Demoting the sole owner must fail.
 	_, err := h.AdminDB.Exec(
@@ -1678,8 +1678,8 @@ func TestOrgOwnership_LastOwnerProtected(t *testing.T) {
 	}
 
 	// Add a second owner; THEN demoting alice works (transfer flow).
-	bob := seedUser(t, h, "bob")
-	mustExec(t, h.AdminDB,
+	bob := SeedUser(t, h, "bob")
+	MustExec(t, h.AdminDB,
 		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')`, bob, orgA)
 	if _, err := h.AdminDB.Exec(
 		`UPDATE org_memberships SET role = 'member' WHERE user_id = $1 AND org_id = $2`,
@@ -1697,10 +1697,10 @@ func TestOrgOwnership_OnlyOwnerCanTransfer(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
 	// Bob is an org-level admin (not owner) and a team admin.
-	addOrgMember(t, h, bob, orgA, teamA, "admin", "admin")
+	AddOrgMember(t, h, bob, orgA, teamA, "admin", "admin")
 
 	// Bob tries to take over (set himself as owner_user_id). Trigger
 	// refuses — only the current owner can transfer.
@@ -1726,7 +1726,7 @@ func TestOrgOwnership_OnlyOwnerCanTransfer(t *testing.T) {
 	}
 
 	// Promote bob to org_memberships owner, then transfer works.
-	mustExec(t, h.AdminDB,
+	MustExec(t, h.AdminDB,
 		`UPDATE org_memberships SET role = 'owner' WHERE user_id = $1 AND org_id = $2`,
 		bob, orgA)
 	err = h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
@@ -1744,7 +1744,7 @@ func TestVisibilityCheck_TeamRequiresTeamID(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, _ := seedOrgWithUser(t, h, "alice")
+	orgA, alice, _ := SeedOrgWithUser(t, h, "alice")
 
 	_, err := h.AdminDB.Exec(`
 		INSERT INTO prompts (org_id, creator_user_id, visibility, name, body)
@@ -1771,7 +1771,7 @@ func TestUpdatedAtAutoBump(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, _, _ := seedOrgWithUser(t, h, "alice")
+	orgA, _, _ := SeedOrgWithUser(t, h, "alice")
 
 	var before time.Time
 	if err := h.AdminDB.QueryRow(
@@ -1809,12 +1809,12 @@ func TestVault_NullOrgIdRejected(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	_, alice, _ := seedOrgWithUser(t, h, "alice")
-	orgA, _, _ := seedOrgWithUser(t, h, "alice2")
+	_, alice, _ := SeedOrgWithUser(t, h, "alice")
+	orgA, _, _ := SeedOrgWithUser(t, h, "alice2")
 	_ = alice
 	_ = orgA
 
-	_, userB, _ := seedOrgWithUser(t, h, "bob")
+	_, userB, _ := SeedOrgWithUser(t, h, "bob")
 
 	// User session with NULL org_id claim (e.g., post-signup, before
 	// joining any org). Call vault wrapper with NULL p_org_id.
@@ -1852,9 +1852,9 @@ func TestRLS_PendingReviewsInheritParentVisibility(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	bob := seedUser(t, h, "bob")
-	addOrgMember(t, h, bob, orgA, teamA, "member", "member")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	AddOrgMember(t, h, bob, orgA, teamA, "member", "member")
 
 	// Alice creates a task + run + a pending review tied to that run.
 	// Forced visibility='private' on parents so the inheritance check is
@@ -1887,7 +1887,7 @@ func TestRLS_PendingReviewsInheritParentVisibility(t *testing.T) {
 	`, orgA, runID).Scan(&reviewID); err != nil {
 		t.Fatalf("seed pending_review: %v", err)
 	}
-	mustExec(t, h.AdminDB, `
+	MustExec(t, h.AdminDB, `
 		INSERT INTO pending_review_comments (org_id, review_id, path, line, body)
 		VALUES ($1, $2, 'main.go', 10, 'nit')
 	`, orgA, reviewID)
@@ -1944,7 +1944,7 @@ func TestPrompts_SemanticIDsAccepted(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, _ := seedOrgWithUser(t, h, "alice")
+	orgA, alice, _ := SeedOrgWithUser(t, h, "alice")
 
 	// System prompt with a semantic ID. creator_user_id is NULL +
 	// visibility='org' per the prompts_system_has_no_creator CHECK
@@ -2003,7 +2003,7 @@ func TestSystemPromptSeeding_DeployActorOnly(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, _ := seedOrgWithUser(t, h, "alice")
+	orgA, alice, _ := SeedOrgWithUser(t, h, "alice")
 
 	// Deploy actor (AdminDB) can INSERT both prompts and
 	// system_prompt_versions. System rows ship with creator_user_id
@@ -2146,10 +2146,10 @@ func TestRLS_TeamAdminNotOrgAdmin(t *testing.T) {
 
 	// Alice founds the org. Carol is added as a regular org member,
 	// then made admin of a subteam (mobile-team).
-	orgA, alice, teamMain := seedOrgWithUser(t, h, "alice")
-	carol := seedUser(t, h, "carol")
-	teamMobile := seedTeam(t, h, orgA, "mobile-team")
-	addOrgMember(t, h, carol, orgA, teamMobile, "member", "admin")
+	orgA, alice, teamMain := SeedOrgWithUser(t, h, "alice")
+	carol := SeedUser(t, h, "carol")
+	teamMobile := SeedTeam(t, h, orgA, "mobile-team")
+	AddOrgMember(t, h, carol, orgA, teamMobile, "member", "admin")
 	_ = teamMain // unused; alice's team
 
 	// Carol CAN manage her team's settings.
@@ -2250,70 +2250,9 @@ func TestRLS_TeamAdminNotOrgAdmin(t *testing.T) {
 }
 
 // --- fixture helpers ---
-
-// addOrgMember adds a user to an org with the given org_role and the
-// given team_role on the named team. Modeled on the production
-// "admin invites a user" flow (D7's auth middleware will materialize
-// both rows together).
-func addOrgMember(t *testing.T, h *Harness, userID, orgID, teamID, orgRole, teamRole string) {
-	t.Helper()
-	mustExec(t, h.AdminDB,
-		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, $3)`, userID, orgID, orgRole)
-	mustExec(t, h.AdminDB,
-		`INSERT INTO memberships (user_id, team_id, role) VALUES ($1, $2, $3)`, userID, teamID, teamRole)
-}
-
-func seedOrgWithUser(t *testing.T, h *Harness, displayName string) (orgID, userID, teamID string) {
-	t.Helper()
-	userID = seedUser(t, h, displayName)
-	orgID = seedOrg(t, h, displayName+"-org", userID)
-	teamID = seedTeam(t, h, orgID, "default")
-	// Two-axis roles (matches GitHub/GitLab/Linear): the founder is
-	// org-level 'owner' (via org_memberships) AND team-level 'admin'
-	// (via memberships). Membership_role no longer has 'owner';
-	// owning is an org concept now.
-	mustExec(t, h.AdminDB,
-		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')`, userID, orgID)
-	mustExec(t, h.AdminDB,
-		`INSERT INTO memberships (user_id, team_id, role) VALUES ($1, $2, 'admin')`, userID, teamID)
-	return
-}
-
-func seedUser(t *testing.T, h *Harness, displayName string) string {
-	t.Helper()
-	var id string
-	if err := h.AdminDB.QueryRow(
-		`SELECT gen_random_uuid()`,
-	).Scan(&id); err != nil {
-		t.Fatalf("gen uuid: %v", err)
-	}
-	h.SeedAuthUser(t, id, displayName+"@test")
-	mustExec(t, h.AdminDB,
-		`INSERT INTO users (id, display_name) VALUES ($1, $2)`, id, displayName)
-	return id
-}
-
-func seedOrg(t *testing.T, h *Harness, slug, ownerID string) string {
-	t.Helper()
-	var id string
-	if err := h.AdminDB.QueryRow(`
-		INSERT INTO orgs (slug, name, owner_user_id) VALUES ($1, $1, $2) RETURNING id
-	`, slug, ownerID).Scan(&id); err != nil {
-		t.Fatalf("seed org: %v", err)
-	}
-	return id
-}
-
-func seedTeam(t *testing.T, h *Harness, orgID, slug string) string {
-	t.Helper()
-	var id string
-	if err := h.AdminDB.QueryRow(`
-		INSERT INTO teams (org_id, slug, name) VALUES ($1, $2, $2) RETURNING id
-	`, orgID, slug).Scan(&id); err != nil {
-		t.Fatalf("seed team: %v", err)
-	}
-	return id
-}
+//
+// SeedUser, SeedOrg, SeedTeam, SeedOrgWithUser, AddOrgMember, and
+// MustExec live in seed.go (exported so postgres_test can call them).
 
 func seedPrompt(t *testing.T, h *Harness, orgID, creatorID, name string) string {
 	t.Helper()
@@ -2434,24 +2373,24 @@ func TestRLS_BaselineCrossOrgPin_MultiOrgUser(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, aliceID, teamA := seedOrgWithUser(t, h, "alice")
-	orgB, bobID, teamB := seedOrgWithUser(t, h, "bob")
+	orgA, aliceID, teamA := SeedOrgWithUser(t, h, "alice")
+	orgB, bobID, teamB := SeedOrgWithUser(t, h, "bob")
 
 	// Charlie: org admin in both orgA and orgB; team admin in both teams.
-	charlieID := seedUser(t, h, "charlie")
+	charlieID := SeedUser(t, h, "charlie")
 	for _, orgID := range []string{orgA, orgB} {
-		mustExec(t, h.AdminDB,
+		MustExec(t, h.AdminDB,
 			`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'admin')`,
 			charlieID, orgID)
 	}
 	for _, teamID := range []string{teamA, teamB} {
-		mustExec(t, h.AdminDB,
+		MustExec(t, h.AdminDB,
 			`INSERT INTO memberships (user_id, team_id, role) VALUES ($1, $2, 'admin')`,
 			charlieID, teamID)
 	}
-	mustExec(t, h.AdminDB,
+	MustExec(t, h.AdminDB,
 		`INSERT INTO team_settings (team_id) VALUES ($1)`, teamA)
-	mustExec(t, h.AdminDB,
+	MustExec(t, h.AdminDB,
 		`INSERT INTO team_settings (team_id) VALUES ($1)`, teamB)
 
 	// (1) users_select pinned to current_org_id.
@@ -2514,7 +2453,7 @@ func TestRLS_BaselineCrossOrgPin_MultiOrgUser(t *testing.T) {
 	// into orgA's org_memberships. Pre-fix this would pass because
 	// user_is_org_admin(orgA) returns true regardless of current_org_id.
 	// With the pin (org_id = tf.current_org_id()), refused.
-	someoneID := seedUser(t, h, "newbie")
+	someoneID := SeedUser(t, h, "newbie")
 	err = h.WithUser(t, charlieID, orgB, func(tx *sql.Tx) error {
 		_, e := tx.Exec(
 			`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'member')`,
@@ -2582,7 +2521,7 @@ func TestRLS_OrgMembershipsBootstrapStillWorks(t *testing.T) {
 	h.Reset(t)
 
 	// Shape (1): claims re-issued with new org_id.
-	founder1ID := seedUser(t, h, "founder1")
+	founder1ID := SeedUser(t, h, "founder1")
 	var org1ID string
 	if err := h.AdminDB.QueryRow(`
 		INSERT INTO orgs (slug, name, owner_user_id) VALUES ('founder-org-1', 'Founder Org 1', $1) RETURNING id
@@ -2604,7 +2543,7 @@ func TestRLS_OrgMembershipsBootstrapStillWorks(t *testing.T) {
 	// tf.current_org_id() short-circuits the empty string to NULL.
 	// That matches the realistic no-org-claim shape during first
 	// signup before the auth flow has issued an org cookie.
-	founder2ID := seedUser(t, h, "founder2")
+	founder2ID := SeedUser(t, h, "founder2")
 	var org2ID string
 	if err := h.AdminDB.QueryRow(`
 		INSERT INTO orgs (slug, name, owner_user_id) VALUES ('founder-org-2', 'Founder Org 2', $1) RETURNING id
@@ -2656,13 +2595,13 @@ func TestRLS_TeamMembershipWithoutOrgAccessDenied(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
 
 	// Mallory has a memberships row for teamA (orgA's team) but no
 	// org_memberships row in orgA. Constructed with raw INSERTs so we
 	// bypass the addOrgMember helper that pairs the two rows.
-	mallory := seedUser(t, h, "mallory")
-	mustExec(t, h.AdminDB,
+	mallory := SeedUser(t, h, "mallory")
+	MustExec(t, h.AdminDB,
 		`INSERT INTO memberships (user_id, team_id, role) VALUES ($1, $2, 'member')`, mallory, teamA)
 	// NB: intentionally NO INSERT INTO org_memberships for mallory in orgA.
 
@@ -2784,9 +2723,9 @@ func TestRLS_NonAdminCannotInsertOrgVisible(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
-	carol := seedUser(t, h, "carol")
-	addOrgMember(t, h, carol, orgA, teamA, "member", "member") // org member but not admin
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	carol := SeedUser(t, h, "carol")
+	AddOrgMember(t, h, carol, orgA, teamA, "member", "member") // org member but not admin
 
 	// Seed an entity + event + parent task + prompt so the task/runs
 	// INSERTs below have parents to reference (created via AdminDB so
@@ -2898,9 +2837,9 @@ func TestRLS_TasksClaimXorRejection(t *testing.T) {
 	h := Shared(t)
 	h.Reset(t)
 
-	orgA, alice, teamA := seedOrgWithUser(t, h, "alice")
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
 	// agents row is required so the FK on tasks.claimed_by_agent_id
-	// resolves. seedOrgWithUser doesn't auto-create one.
+	// resolves. SeedOrgWithUser doesn't auto-create one.
 	if _, err := h.AdminDB.Exec(`
 		INSERT INTO agents (id, org_id, display_name)
 		VALUES (gen_random_uuid(), $1, 'Test Bot')
@@ -2961,12 +2900,5 @@ func assertPgCode(t *testing.T, err error, code, what string) {
 	}
 	if pgErr.Code != code {
 		t.Errorf("%s: SQLSTATE = %s (msg %q), want %s", what, pgErr.Code, pgErr.Message, code)
-	}
-}
-
-func mustExec(t *testing.T, db *sql.DB, query string, args ...any) {
-	t.Helper()
-	if _, err := db.Exec(query, args...); err != nil {
-		t.Fatalf("exec %q: %v", query, err)
 	}
 }

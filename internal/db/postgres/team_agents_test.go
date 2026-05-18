@@ -288,6 +288,108 @@ func TestTeamAgentStore_Postgres_BlocksOtherOrgWhileInActiveOrg(t *testing.T) {
 	}
 }
 
+// TestTeamAgentStore_Postgres_CrossOrgRLSDenied pins the production
+// RLS layer for team_agents with the same 3-subtest shape used across
+// the store suite. team_agents has no org_id column — the policies
+// gate via team_in_current_org + user_in_team — so the cross-org
+// write denial fires when an orgB-claimed user tries to INSERT a
+// team_agents row pointing at orgA's team. Mirrors the existing
+// BlocksCrossOrgInsert test, structured under the canonical 3-subtest
+// rubric.
+func TestTeamAgentStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA := seedPgOrgForAgents(t, h)
+	orgB := seedPgOrgForAgents(t, h)
+	teamA := seedPgTeam(t, h, orgA, "team-a")
+	teamB := seedPgTeam(t, h, orgB, "team-b")
+
+	aliceID := seedPgMember(t, h, orgA, "alice", "member")
+	if _, err := h.AdminDB.Exec(
+		`INSERT INTO memberships (user_id, team_id, role) VALUES ($1, $2, 'member')`,
+		aliceID, teamA,
+	); err != nil {
+		t.Fatalf("alice team-a membership: %v", err)
+	}
+	bobID := seedPgMember(t, h, orgB, "bob", "member")
+	if _, err := h.AdminDB.Exec(
+		`INSERT INTO memberships (user_id, team_id, role) VALUES ($1, $2, 'member')`,
+		bobID, teamB,
+	); err != nil {
+		t.Fatalf("bob team-b membership: %v", err)
+	}
+
+	adminStores := pgstore.New(h.AdminDB, h.AdminDB)
+	if _, err := adminStores.Agents.Create(context.Background(), orgA, domain.Agent{DisplayName: "Bot A"}); err != nil {
+		t.Fatalf("seed agent A: %v", err)
+	}
+	if _, err := adminStores.Agents.Create(context.Background(), orgB, domain.Agent{DisplayName: "Bot B"}); err != nil {
+		t.Fatalf("seed agent B: %v", err)
+	}
+	agentA := mustAgentIDForOrg(t, h, orgA)
+	agentB := mustAgentIDForOrg(t, h, orgB)
+	if err := adminStores.TeamAgents.AddForTeam(context.Background(), orgA, teamA, agentA); err != nil {
+		t.Fatalf("seed team_agents A: %v", err)
+	}
+	if err := adminStores.TeamAgents.AddForTeam(context.Background(), orgB, teamB, agentB); err != nil {
+		t.Fatalf("seed team_agents B: %v", err)
+	}
+	ctx := context.Background()
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, aliceID, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).TeamAgents.GetForTeam(ctx, orgA, teamA, agentA)
+			if err != nil {
+				return fmt.Errorf("GetForTeam: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice GetForTeam(orgA, teamA, agentA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		// bob in orgB asking about orgA's team_agents — RLS's
+		// team_in_current_org predicate fails (teamA.org_id != orgB).
+		err := h.WithUser(t, bobID, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).TeamAgents.GetForTeam(ctx, orgA, teamA, agentA)
+			if err != nil {
+				return fmt.Errorf("GetForTeam: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob GetForTeam(orgA, teamA, agentA) returned %+v; RLS USING filter leaked orgA's team_agents row to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob in orgB attempts a direct INSERT of a team_agents row
+		// for orgA's team. team_agents_insert WITH CHECK requires
+		// team_in_current_org(team_id) AND user_in_team(team_id);
+		// both fail for bob/teamA. Expect 42501. The store's
+		// AddForTeam goes through the admin pool (production
+		// bootstrap), so the policy is exercised via raw SQL — same
+		// shape as TestTeamAgentStore_Postgres_BlocksCrossOrgInsert.
+		err := h.WithUser(t, bobID, orgB, func(tx *sql.Tx) error {
+			_, e := tx.Exec(
+				`INSERT INTO team_agents (team_id, agent_id, enabled) VALUES ($1, $2, TRUE)`,
+				teamA, agentA,
+			)
+			return e
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 // mustAgentIDForOrg reads the deterministic agent id back. Used by
 // the cross-org test which needs both orgs' agent ids without going
 // through GetForOrg (which is itself app-pool-gated and would need a

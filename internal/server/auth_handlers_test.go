@@ -22,6 +22,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth/verify"
 	"github.com/sky-ai-eng/triage-factory/internal/db/pgtest"
+	pgstore "github.com/sky-ai-eng/triage-factory/internal/db/postgres"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/sessions"
 )
@@ -152,12 +153,15 @@ func newAuthRig(t *testing.T) *authRig {
 	}
 	store := sessions.NewStore(h.AdminDB, sessions.Key(encKey))
 
-	// Construct Server with nil store dependencies — auth tests don't
-	// touch the prompt/swipe/etc. handlers. server.New panics if it
-	// tries to do anything with them at construction time, but a
-	// quick scan of New shows it only stashes the pointers, doesn't
-	// call methods.
-	s := New(h.AdminDB, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	// Wire real pgstore-backed stores. Auth-only tests don't exercise
+	// these (handlers like /api/me touch sessions, not pg stores), but
+	// the cross-org HTTP tests in cross_org_http_test.go need real
+	// stores to prove the handler→WithTx→RLS chain actually filters
+	// by session orgID end-to-end. Use the production pool split:
+	// admin for system reads, app (tf_app) for request-equivalent
+	// paths under RLS.
+	stores := pgstore.New(h.AdminDB, h.AppDB)
+	s := New(h.AdminDB, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Tx)
 
 	// Per-test context bound to t.Cleanup so the reaper goroutine
 	// spawned inside SetAuthDeps exits with the test rather than

@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 
@@ -106,6 +107,81 @@ func TestRepoStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	if got, _ := stores.Repos.Get(ctx, orgA, "octo/widget"); got == nil {
 		t.Errorf("orgA's repo was deleted by orgB SetConfigured")
 	}
+}
+
+// TestRepoStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for repo_profiles. Where CrossOrgLeakage above wires both
+// pools against AdminDB to prove the defense-in-depth WHERE-clause
+// filter is intact, this test runs the store through the app pool
+// under tf_app with real JWT claims so the actual repo_profiles_all
+// policy is exercised. Same-org reads succeed; cross-org reads are
+// silently filtered (USING); cross-org Upsert raises 42501 from the
+// WITH CHECK side of the same policy.
+func TestRepoStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice, _ := seedPgRepoOrg(t, h)
+	orgB, bob, _ := seedPgRepoOrg(t, h)
+	_ = alice
+	_ = bob
+
+	// Seed a repo in orgA via admin so the row exists.
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	ctx := context.Background()
+	if err := stores.Repos.UpsertSystem(ctx, orgA, domain.RepoProfile{
+		ID: "octo/rls", Owner: "octo", Repo: "rls",
+		Description: "orgA rls repo", ProfileText: "body",
+		DefaultBranch: "main",
+	}); err != nil {
+		t.Fatalf("seed repo in orgA: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Repos.Get(ctx, orgA, "octo/rls")
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice Get(orgA, octo/rls) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Repos.Get(ctx, orgA, "octo/rls")
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob Get(orgA, octo/rls) returned %+v; RLS USING filter leaked orgA's repo to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; Upsert against orgA would land
+		// a row with org_id=orgA. The repo_profiles_all policy's
+		// WITH CHECK requires org_id = tf.current_org_id(), so 42501
+		// is the expected outcome.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			return pgstore.NewForTx(tx).Repos.Upsert(ctx, orgA, domain.RepoProfile{
+				ID: "octo/rls-write", Owner: "octo", Repo: "rls-write",
+				Description: "x", ProfileText: "x", DefaultBranch: "main",
+			})
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
 }
 
 func seedPgRepoOrg(t *testing.T, h *pgtest.Harness) (orgID, userID, agentID string) {

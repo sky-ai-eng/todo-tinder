@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -112,6 +113,83 @@ func TestTaskMemoryStore_Postgres_CrossOrgLeakage(t *testing.T) {
 		t.Errorf("orgA Content mutated by orgB-scoped UPDATE: got %q, want %q", memA.Content, "orgA narrative")
 	}
 	_ = entB
+}
+
+// TestTaskMemoryStore_Postgres_CrossOrgRLSDenied pins the production
+// RLS layer for run_memory. Where CrossOrgLeakage above wires both
+// pools against AdminDB to prove the defense-in-depth WHERE-clause
+// filter is intact, this test runs the store through the app pool
+// under tf_app with real JWT claims so the actual run_memory_all
+// policy is exercised. Same-org reads succeed; cross-org reads are
+// silently filtered (USING); cross-org UpsertAgentMemory raises
+// 42501 from the WITH CHECK side of the same policy.
+func TestTaskMemoryStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice := seedPgTaskMemoryOrg(t, h)
+	orgB, bob := seedPgTaskMemoryOrg(t, h)
+	promptA := seedPgTaskMemoryPrompt(t, h, orgA, alice)
+	promptB := seedPgTaskMemoryPrompt(t, h, orgB, bob)
+
+	runA, entA := seedPgRunForTaskMemory(t, h, orgA, alice, promptA, "rls-A")
+	_, _ = seedPgRunForTaskMemory(t, h, orgB, bob, promptB, "rls-B")
+
+	// Seed a memory row in orgA via admin so the row exists.
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	ctx := context.Background()
+	if err := stores.TaskMemory.UpsertAgentMemorySystem(ctx, orgA, runA, entA, "orgA memory"); err != nil {
+		t.Fatalf("seed memory in orgA: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).TaskMemory.GetRunMemory(ctx, orgA, runA)
+			if err != nil {
+				return fmt.Errorf("GetRunMemory: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice GetRunMemory(orgA, runA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).TaskMemory.GetRunMemory(ctx, orgA, runA)
+			if err != nil {
+				return fmt.Errorf("GetRunMemory: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob GetRunMemory(orgA, runA) returned %+v; RLS USING filter leaked orgA's memory to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; UpsertAgentMemory against orgA
+		// would land a row with org_id=orgA. run_memory_all WITH CHECK
+		// requires org_id = tf.current_org_id(), so 42501 is the
+		// expected outcome. Seed a second run in orgA with NO existing
+		// memory row so the UPSERT exercises the INSERT side of the
+		// policy (WITH CHECK) rather than the ON CONFLICT UPDATE side
+		// (USING) — runA above already has a seeded memory row from
+		// line 141 above, which would route through ON CONFLICT and
+		// hit USING instead.
+		freshRun, freshEnt := seedPgRunForTaskMemory(t, h, orgA, alice, promptA, "rls-write")
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			return pgstore.NewForTx(tx).TaskMemory.UpsertAgentMemory(ctx, orgA, freshRun, freshEnt, "cross-org write")
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
 }
 
 // seedPgTaskMemoryOrg builds the auth user + public user + org +
