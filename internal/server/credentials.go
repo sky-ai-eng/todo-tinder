@@ -32,11 +32,10 @@ type setupResponse struct {
 
 func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — integrations setup is a
-	// user-scoped write to users.github_username that runs even before
-	// a multi-mode user has picked an active org. Empty orgID is
-	// acceptable: users-table RLS policies don't gate on
-	// tf.current_org_id().
+	// orgID via OrgIDFrom (not requireOrg) — integrations setup updates
+	// the authenticated user's own users row and can run before a
+	// multi-mode user has picked an active org. For these current-user
+	// row operations, an empty orgID is acceptable.
 	orgID := OrgIDFrom(r.Context())
 	var req setupRequest
 	if !decodeJSON(w, r, &req, "") {
