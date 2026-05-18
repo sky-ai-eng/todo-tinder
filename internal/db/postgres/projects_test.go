@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 
@@ -73,6 +74,79 @@ func TestProjectStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	if got, _ := stores.Projects.Get(ctx, orgA, id); got == nil || got.Name != "orgA project" {
 		t.Errorf("orgA's row was clobbered by cross-org mutation: got=%+v", got)
 	}
+}
+
+// TestProjectStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for projects. Where CrossOrgLeakage above wires both pools
+// against AdminDB to prove the defense-in-depth WHERE-clause filter
+// is intact, this test runs the store through the app pool under
+// tf_app with real JWT claims so the actual projects_select /
+// projects_modify policies are exercised. Same-org reads succeed;
+// cross-org reads are silently filtered (USING); cross-org Create
+// raises 42501 from projects_modify WITH CHECK.
+func TestProjectStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice, _ := seedPgProjectOrg(t, h)
+	orgB, bob, _ := seedPgProjectOrg(t, h)
+	teamA := firstTeamForOrg(t, h, orgA)
+
+	// Seed a project in orgA via admin so the row exists.
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	ctx := context.Background()
+	projA, err := stores.Projects.Create(ctx, orgA, teamA, domain.Project{
+		Name: "orgA RLS project", Description: "secret",
+	})
+	if err != nil {
+		t.Fatalf("seed project in orgA: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Projects.Get(ctx, orgA, projA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice Get(orgA, projA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Projects.Get(ctx, orgA, projA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob Get(orgA, projA) returned %+v; RLS USING filter leaked orgA's project to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; Create against orgA would
+		// land a row with org_id=orgA. projects_modify WITH CHECK
+		// requires org_id = tf.current_org_id(), so 42501 is the
+		// expected outcome.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			_, e := pgstore.NewForTx(tx).Projects.Create(ctx, orgA, teamA, domain.Project{
+				Name: "cross-org write attempt",
+			})
+			return e
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
 }
 
 // TestProjectStore_Postgres_CreateRefusesTeamSentinel pins the team

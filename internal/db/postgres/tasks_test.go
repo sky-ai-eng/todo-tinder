@@ -194,6 +194,79 @@ func TestTaskStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	}
 }
 
+// TestTaskStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for tasks. Where TestTaskStore_Postgres_CrossOrgLeakage above
+// wires both pools against AdminDB to prove the defense-in-depth
+// WHERE-clause filter is intact, this test runs the store through the
+// app pool under tf_app with real JWT claims so the actual
+// tasks_select / tasks_insert policies are exercised. Same-org reads
+// succeed; cross-org reads are silently filtered (USING); cross-org
+// FindOrCreate raises 42501 from the INSERT WITH CHECK.
+func TestTaskStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice, _ := pgtest.SeedOrgWithUser(t, h, "alice")
+	orgB, bob, _ := pgtest.SeedOrgWithUser(t, h, "bob")
+
+	// Seed a task in orgA via admin so the row exists. Whether bob
+	// (claims orgB) can see or mutate it is the question.
+	_, _, taskA := seedPgTaskChain(t, h.AdminDB, orgA, alice, "rls")
+	ctx := context.Background()
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			task, err := pgstore.NewForTx(tx).Tasks.Get(ctx, orgA, taskA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if task == nil {
+				t.Errorf("alice Get(orgA, taskA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			task, err := pgstore.NewForTx(tx).Tasks.Get(ctx, orgA, taskA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if task != nil {
+				t.Errorf("bob Get(orgA, taskA) returned %+v; RLS USING filter leaked orgA's task to orgB", task)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// Seed a fresh entity+event in orgA so the FK chain is satisfied
+		// — the rejection we want is from tasks_insert WITH CHECK
+		// (bob's claims point at orgB; the row would land with
+		// org_id=orgA), not from a missing FK target. Fetch orgA's team
+		// via admin to fill the required teamID arg; in production a
+		// user wouldn't know the cross-org team, but we're proving the
+		// policy holds even if they did.
+		entityID, eventID := seedPgEntityEvent(t, h.AdminDB, orgA, "rls-write")
+		orgATeam := firstTeamForOrg(t, h, orgA)
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			_, _, e := pgstore.NewForTx(tx).Tasks.FindOrCreate(
+				ctx, orgA, orgATeam,
+				entityID, "github:pr:ci_check_failed", "", eventID, 0.5,
+			)
+			return e
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 // TestTaskStore_Postgres_OrgHandlerSentinel pins the fix for the case
 // where org-visible event handlers (visibility='org', team_id NULL)
 // route through handlerTeamID to runmode.LocalDefaultTeamID. The

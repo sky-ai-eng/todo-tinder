@@ -2,6 +2,8 @@ package postgres_test
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -119,6 +121,90 @@ func TestCuratorStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	if count != 0 {
 		t.Errorf("alice has %d rows in orgB after cross-org attempt, want 0", count)
 	}
+}
+
+// TestCuratorStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for curator_requests. Where TestCuratorStore_Postgres_CrossOrgLeakage
+// above relies on the projects(id, org_id) FK to reject a cross-org
+// write (the orgB caller passes a project id that doesn't exist in
+// orgB), this test seeds a real project in EACH org so the FK isn't
+// what blocks bob's attempt. The rejection then has to come from
+// curator_requests_modify WITH CHECK on (org_id = tf.current_org_id()).
+// Same-org reads succeed; cross-org reads are silently filtered
+// (USING); cross-org CreateRequest raises 42501.
+func TestCuratorStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	stores := pgstore.New(h.AdminDB, h.AppDB)
+	ctx := context.Background()
+
+	orgA, alice, _ := seedPgProjectOrg(t, h)
+	orgB, bob, _ := seedPgProjectOrg(t, h)
+
+	// Real projects in BOTH orgs so the FK target exists from bob's
+	// claim point — leaves RLS as the only barrier.
+	projectA := seedPgEntityProject(t, h, orgA, alice, "rls-a")
+
+	// Seed a request in orgA via alice's synthetic claims so the row
+	// exists.
+	var requestA string
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgA, alice, func(ts db.TxStores) error {
+		id, err := ts.Curator.CreateRequest(ctx, orgA, projectA, alice, "alice rls seed")
+		if err != nil {
+			return err
+		}
+		requestA = id
+		return nil
+	}); err != nil {
+		t.Fatalf("alice seed under synth claims: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Curator.GetRequest(ctx, orgA, requestA)
+			if err != nil {
+				return fmt.Errorf("GetRequest: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice GetRequest(orgA, requestA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Curator.GetRequest(ctx, orgA, requestA)
+			if err != nil {
+				return fmt.Errorf("GetRequest: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob GetRequest(orgA, requestA) returned %+v; RLS USING filter leaked orgA's request to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; CreateRequest against orgA on
+		// orgA's project would land a row with org_id=orgA. The
+		// projectA FK target exists in orgA so the FK doesn't fire
+		// first — curator_requests_modify WITH CHECK requires
+		// org_id = tf.current_org_id() and raises 42501.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			_, e := pgstore.NewForTx(tx).Curator.CreateRequest(ctx, orgA, projectA, bob, "bob cross-org")
+			return e
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+
+	_ = orgB
 }
 
 // TestCuratorStore_Postgres_GetRequestRLS pins that GetRequest under

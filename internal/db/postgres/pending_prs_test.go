@@ -112,6 +112,87 @@ func TestPendingPRStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	}
 }
 
+// TestPendingPRStore_Postgres_CrossOrgRLSDenied pins the production
+// RLS layer for pending_prs. Where CrossOrgLeakage above wires both
+// pools against AdminDB to prove the defense-in-depth WHERE-clause
+// filter is intact, this test runs the store through the app pool
+// under tf_app with real JWT claims so the actual pending_prs_all
+// policy is exercised. Same-org reads succeed; cross-org reads are
+// silently filtered (USING); cross-org Create raises 42501 from
+// WITH CHECK.
+func TestPendingPRStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice, _ := seedPgPendingPROrg(t, h)
+	promptA := seedPgPendingPRPrompt(t, h, orgA, alice)
+	orgB, bob, _ := seedPgPendingPROrg(t, h)
+	_ = bob
+
+	// Seed a pending PR in orgA via admin so the row exists.
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	ctx := context.Background()
+	seedA := newPgPendingPRSeeder(h, stores, orgA, alice, promptA)
+	runA := seedA.Run(t)
+	prA := uuid.New().String()
+	if err := stores.PendingPRs.Create(ctx, orgA, domain.PendingPR{
+		ID: prA, RunID: runA,
+		Owner: "o", Repo: "r",
+		HeadBranch: "h", HeadSHA: "s", BaseBranch: "main",
+		Title: "T", Body: "B",
+	}); err != nil {
+		t.Fatalf("seed pending PR in orgA: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).PendingPRs.Get(ctx, orgA, prA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice Get(orgA, prA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).PendingPRs.Get(ctx, orgA, prA)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob Get(orgA, prA) returned %+v; RLS USING filter leaked orgA's pending PR to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; Create against orgA would land
+		// a row with org_id=orgA. pending_prs_all WITH CHECK requires
+		// org_id = tf.current_org_id(), so 42501 is the expected
+		// outcome.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			return pgstore.NewForTx(tx).PendingPRs.Create(ctx, orgA, domain.PendingPR{
+				ID: uuid.New().String(), RunID: runA,
+				Owner: "o", Repo: "r",
+				HeadBranch: "h2", HeadSHA: "s2", BaseBranch: "main",
+				Title: "x-write", Body: "x",
+			})
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 func seedPgPendingPROrg(t *testing.T, h *pgtest.Harness) (orgID, userID, agentID string) {
 	t.Helper()
 	orgID = uuid.New().String()

@@ -433,6 +433,98 @@ func TestChainStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	}
 }
 
+// TestChainStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for chain_runs. Where CrossOrgLeakage above proves the
+// defense-in-depth WHERE-clause filter is intact, this test runs the
+// store through the app pool under tf_app with real JWT claims so the
+// actual chain_runs_select / chain_runs_modify policies are exercised.
+// Same-org reads succeed; cross-org reads are silently filtered (USING);
+// cross-org manual CreateRun raises 42501 from chain_runs_modify
+// WITH CHECK.
+func TestChainStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice := seedPgOrgForChains(t, h)
+	orgB, bob := seedPgOrgForChains(t, h)
+	seedPgDefaultTeam(t, h, orgA, alice)
+	seedPgDefaultTeam(t, h, orgB, bob)
+
+	chainIDA := "chain-rls-a-" + orgA[:8]
+	stepIDA := "step-rls-a-" + orgA[:8]
+	seedPgPrompt(t, h, orgA, alice, chainIDA, "chain")
+	seedPgPrompt(t, h, orgA, alice, stepIDA, "leaf")
+	taskA := seedPgTask(t, h, orgA, alice)
+
+	stores := pgstore.New(h.AdminDB, h.AppDB)
+	ctx := context.Background()
+
+	// Seed a chain run in orgA via WithTx (manual path lands in
+	// chain_runs with creator_user_id=alice). Whether bob can see or
+	// mutate it is the question.
+	var chainRunA string
+	if err := stores.Tx.WithTx(ctx, orgA, alice, func(tx db.TxStores) error {
+		id, err := tx.Chains.CreateRun(ctx, orgA, domain.ChainRun{
+			ChainPromptID: chainIDA, TaskID: taskA,
+			TriggerType: domain.ChainTriggerManual, WorktreePath: "/tmp/rls-a",
+		})
+		if err != nil {
+			return err
+		}
+		chainRunA = id
+		return nil
+	}); err != nil {
+		t.Fatalf("seed chain run A: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			cr, err := pgstore.NewForTx(tx).Chains.GetRun(ctx, orgA, chainRunA)
+			if err != nil {
+				return fmt.Errorf("GetRun: %w", err)
+			}
+			if cr == nil {
+				t.Errorf("alice GetRun(orgA, chainRunA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			cr, err := pgstore.NewForTx(tx).Chains.GetRun(ctx, orgA, chainRunA)
+			if err != nil {
+				return fmt.Errorf("GetRun: %w", err)
+			}
+			if cr != nil {
+				t.Errorf("bob GetRun(orgA, chainRunA) returned %+v; RLS USING filter leaked orgA's chain run to orgB", cr)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; the manual CreateRun would
+		// land with org_id=orgA. chain_runs_modify WITH CHECK
+		// requires the row's org_id to match tf.current_org_id(), so
+		// 42501 is the expected outcome.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			_, e := pgstore.NewForTx(tx).Chains.CreateRun(ctx, orgA, domain.ChainRun{
+				ChainPromptID: chainIDA, TaskID: taskA,
+				TriggerType: domain.ChainTriggerManual, WorktreePath: "/tmp/rls-x",
+			})
+			return e
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 // seedPgOrgForChains creates the (org, user, membership) triplet
 // chain row writes need to satisfy creator_user_id FK resolution.
 // Returns both ids — chain tests also need the userID directly for

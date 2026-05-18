@@ -106,6 +106,77 @@ func TestEntityStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	}
 }
 
+// TestEntityStore_Postgres_CrossOrgRLSDenied pins the production RLS
+// layer for entities. Where CrossOrgLeakage above wires both pools
+// against AdminDB to prove the defense-in-depth WHERE-clause filter
+// is intact, this test runs the store through the app pool under
+// tf_app with real JWT claims so the actual entities_select /
+// entities_modify policies are exercised. Same-org reads succeed;
+// cross-org reads are silently filtered (USING); cross-org
+// FindOrCreate raises 42501 from entities_modify WITH CHECK.
+func TestEntityStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+
+	orgA, alice := seedPgEntityOrg(t, h)
+	orgB, bob := seedPgEntityOrg(t, h)
+	_ = bob
+
+	// Seed an entity in orgA via admin so the row exists.
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	ctx := context.Background()
+	entA, _, err := stores.Entities.FindOrCreateSystem(ctx, orgA, "github", "owner/repo#rls", "pr", "RLS Entity", "https://example/rls")
+	if err != nil {
+		t.Fatalf("seed entity in orgA: %v", err)
+	}
+
+	t.Run("same_org_user_can_read", func(t *testing.T) {
+		err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Entities.Get(ctx, orgA, entA.ID)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got == nil {
+				t.Errorf("alice Get(orgA, entA) returned nil; same-org RLS USING filter wrongly excluded the row")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("alice path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_read_filtered", func(t *testing.T) {
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			got, err := pgstore.NewForTx(tx).Entities.Get(ctx, orgA, entA.ID)
+			if err != nil {
+				return fmt.Errorf("Get: %w", err)
+			}
+			if got != nil {
+				t.Errorf("bob Get(orgA, entA) returned %+v; RLS USING filter leaked orgA's entity to orgB", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("bob read path: %v", err)
+		}
+	})
+
+	t.Run("cross_org_write_denied", func(t *testing.T) {
+		// bob's claims point at orgB; FindOrCreate against orgA
+		// would land a row with org_id=orgA. entities_modify
+		// WITH CHECK requires org_id = tf.current_org_id(), so 42501
+		// is the expected outcome.
+		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
+			_, _, e := pgstore.NewForTx(tx).Entities.FindOrCreate(
+				ctx, orgA, "github", "owner/repo#rls-write", "pr", "Cross-org write", "",
+			)
+			return e
+		})
+		pgtest.AssertRLSViolation(t, err)
+	})
+}
+
 func seedPgEntityOrg(t *testing.T, h *pgtest.Harness) (orgID, userID string) {
 	t.Helper()
 	orgID = uuid.New().String()
