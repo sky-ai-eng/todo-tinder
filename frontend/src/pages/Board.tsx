@@ -908,7 +908,14 @@ function ColumnContents({
   return (
     <SortableContext items={tasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
       {tasks.map((task) => {
-        const run = agentRuns[task.id]
+        // Queued tasks never render as AgentCards even if the
+        // agentRuns map has a stale entry from a prior delegate.
+        // After requeue, the run row stays in the DB but the task
+        // is back in the team queue with claim cols cleared —
+        // showing an AgentCard there would lie about who's working
+        // on it. The map is cleaned up on the next WS update; this
+        // gate covers the window before that lands.
+        const run = colId === 'queued' ? undefined : agentRuns[task.id]
         const picker = (
           <AssigneePicker
             task={task}

@@ -56,6 +56,18 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 	case "complete":
 		newStatus = "done"
 		closeReason = "user_completed"
+	case "snooze":
+		// Defensive: the FE routes snoozing through
+		// /api/tasks/{id}/snooze → SnoozeTask, but handleSwipe still
+		// accepts action='snooze' and falls into the dismiss/snooze/
+		// complete branch that calls RecordSwipe. If a request ever
+		// lands here, write status='snoozed' so the audit row at least
+		// matches the lifecycle write — without this, the default arm
+		// below would silently write 'queued' and the snooze "would
+		// have happened" without happening. snooze_until stays NULL
+		// (handler doesn't pass it through this path), which the FE
+		// doesn't produce in practice.
+		newStatus = "snoozed"
 	default:
 		// Unknown action — same fallback as pre-SKY-261, write 'queued'.
 		newStatus = "queued"

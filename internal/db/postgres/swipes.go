@@ -48,6 +48,14 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 	case "complete":
 		newStatus = "done"
 		closeReason = "user_completed"
+	case "snooze":
+		// Defensive: handleSwipe accepts action='snooze' and routes
+		// it here; the production FE uses /snooze + SnoozeTask
+		// instead, but a stray /swipe action=snooze should at least
+		// produce a consistent status='snoozed' rather than falling
+		// through to the 'queued' default. See SQLite mirror for the
+		// full rationale.
+		newStatus = "snoozed"
 	default:
 		newStatus = "queued"
 	}
