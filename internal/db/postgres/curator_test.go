@@ -127,11 +127,13 @@ func TestCuratorStore_Postgres_CrossOrgLeakage(t *testing.T) {
 // layer for curator_requests. Where TestCuratorStore_Postgres_CrossOrgLeakage
 // above relies on the projects(id, org_id) FK to reject a cross-org
 // write (the orgB caller passes a project id that doesn't exist in
-// orgB), this test seeds a real project in EACH org so the FK isn't
-// what blocks bob's attempt. The rejection then has to come from
-// curator_requests_modify WITH CHECK on (org_id = tf.current_org_id()).
-// Same-org reads succeed; cross-org reads are silently filtered
-// (USING); cross-org CreateRequest raises 42501.
+// orgB), this test seeds a real project in orgA and proves the WITH
+// CHECK predicate on curator_requests_modify fires BEFORE the FK
+// resolution — bob's claims (org_id=orgB) immediately fail the
+// org_id = tf.current_org_id() gate, so no orgB-side project seed is
+// needed for the rejection to be RLS-attributable. Same-org reads
+// succeed; cross-org reads are silently filtered (USING); cross-org
+// CreateRequest raises 42501.
 func TestCuratorStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
 	h := pgtest.Shared(t)
 	h.Reset(t)
@@ -141,8 +143,10 @@ func TestCuratorStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
 	orgA, alice, _ := seedPgProjectOrg(t, h)
 	orgB, bob, _ := seedPgProjectOrg(t, h)
 
-	// Real projects in BOTH orgs so the FK target exists from bob's
-	// claim point — leaves RLS as the only barrier.
+	// Only orgA needs a project seeded — RLS WITH CHECK on the
+	// insert fires before the project_id FK is evaluated, so an
+	// absent orgB project doesn't change the test outcome. See the
+	// outer docstring for the ordering rationale.
 	projectA := seedPgEntityProject(t, h, orgA, alice, "rls-a")
 
 	// Seed a request in orgA via alice's synthetic claims so the row

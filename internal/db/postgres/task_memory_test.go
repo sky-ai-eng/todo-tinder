@@ -178,11 +178,15 @@ func TestTaskMemoryStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
 		// bob's claims point at orgB; UpsertAgentMemory against orgA
 		// would land a row with org_id=orgA. run_memory_all WITH CHECK
 		// requires org_id = tf.current_org_id(), so 42501 is the
-		// expected outcome. Use a fresh runID to avoid the ON CONFLICT
-		// path (which would still do an UPDATE under USING — same
-		// 42501 either way).
+		// expected outcome. Seed a second run in orgA with NO existing
+		// memory row so the UPSERT exercises the INSERT side of the
+		// policy (WITH CHECK) rather than the ON CONFLICT UPDATE side
+		// (USING) — runA above already has a seeded memory row from
+		// line 141 above, which would route through ON CONFLICT and
+		// hit USING instead.
+		freshRun, freshEnt := seedPgRunForTaskMemory(t, h, orgA, alice, promptA, "rls-write")
 		err := h.WithUser(t, bob, orgB, func(tx *sql.Tx) error {
-			return pgstore.NewForTx(tx).TaskMemory.UpsertAgentMemory(ctx, orgA, runA, entA, "cross-org write")
+			return pgstore.NewForTx(tx).TaskMemory.UpsertAgentMemory(ctx, orgA, freshRun, freshEnt, "cross-org write")
 		})
 		pgtest.AssertRLSViolation(t, err)
 	})
