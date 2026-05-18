@@ -19,9 +19,22 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
-	run, err := s.agentRuns.Get(r.Context(), orgID, runID)
-	if err != nil {
+	var run *domain.AgentRun
+	var resp map[string]any
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		run, e = tx.AgentRuns.Get(r.Context(), orgID, runID)
+		if e != nil {
+			return e
+		}
+		if run == nil {
+			return nil
+		}
+		resp = runResponse(r.Context(), tx.Reviews, tx.PendingPRs, orgID, run)
+		return nil
+	}); err != nil {
 		internalError(w, "agent", err)
 		return
 	}
@@ -29,7 +42,7 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "run")
 		return
 	}
-	writeJSON(w, http.StatusOK, runResponse(r.Context(), s.reviews, s.pendingPRs, orgID, run))
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // runResponse projects an AgentRun into the wire shape the frontend
@@ -83,9 +96,14 @@ func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
-	messages, err := s.agentRuns.Messages(r.Context(), orgID, runID)
-	if err != nil {
+	var messages []domain.AgentMessage
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		messages, e = tx.AgentRuns.Messages(r.Context(), orgID, runID)
+		return e
+	}); err != nil {
 		internalError(w, "agent", err)
 		return
 	}
@@ -215,8 +233,13 @@ func (s *Server) handleHeldTakeovers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	runs, err := s.agentRuns.ListTakenOverForResume(r.Context(), orgID)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var runs []domain.TakenOverRun
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		runs, e = tx.AgentRuns.ListTakenOverForResume(r.Context(), orgID)
+		return e
+	}); err != nil {
 		internalError(w, "agent", err)
 		return
 	}
@@ -259,27 +282,36 @@ func (s *Server) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	taskID := r.URL.Query().Get("task_id")
 	if taskID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "task_id query parameter required"})
 		return
 	}
-	runs, err := s.agentRuns.ListForTask(r.Context(), orgID, taskID)
-	if err != nil {
+	var runs []domain.AgentRun
+	var out []map[string]any
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		runs, e = tx.AgentRuns.ListForTask(r.Context(), orgID, taskID)
+		if e != nil {
+			return e
+		}
+		if runs == nil {
+			runs = []domain.AgentRun{}
+		}
+		// Project each run through runResponse so pending_kind rides
+		// alongside on the list endpoint too. Board's useWebSocket calls
+		// this on every status transition; without the discriminator on
+		// the list response the Open-PR vs Review button choice would
+		// flicker on first paint and only settle after the per-run fetch.
+		out = make([]map[string]any, len(runs))
+		for i := range runs {
+			out[i] = runResponse(r.Context(), tx.Reviews, tx.PendingPRs, orgID, &runs[i])
+		}
+		return nil
+	}); err != nil {
 		internalError(w, "agent", err)
 		return
-	}
-	if runs == nil {
-		runs = []domain.AgentRun{}
-	}
-	// Project each run through runResponse so pending_kind rides
-	// alongside on the list endpoint too. Board's useWebSocket calls
-	// this on every status transition; without the discriminator on
-	// the list response the Open-PR vs Review button choice would
-	// flicker on first paint and only settle after the per-run fetch.
-	out := make([]map[string]any, len(runs))
-	for i := range runs {
-		out[i] = runResponse(r.Context(), s.reviews, s.pendingPRs, orgID, &runs[i])
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -322,8 +354,20 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := s.agentRuns.Get(r.Context(), orgID, runID)
-	if err != nil {
+	var run *domain.AgentRun
+	var req *domain.YieldRequest
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		run, e = tx.AgentRuns.Get(r.Context(), orgID, runID)
+		if e != nil {
+			return e
+		}
+		if run == nil {
+			return nil
+		}
+		req, e = tx.AgentRuns.LatestYieldRequest(r.Context(), orgID, runID)
+		return e
+	}); err != nil {
 		internalError(w, "agent", err)
 		return
 	}
@@ -333,12 +377,6 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 	}
 	if run.Status != "awaiting_input" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "run is not awaiting input (status=" + run.Status + ")"})
-		return
-	}
-
-	req, err := s.agentRuns.LatestYieldRequest(r.Context(), orgID, runID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "load yield request: " + err.Error()})
 		return
 	}
 	if req == nil {
@@ -362,8 +400,12 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 	// took the run to a terminal state and the message is the
 	// historical record of what the user submitted.
 	displayContent := domain.RenderYieldResponseForDisplay(req, &resp)
-	msg, err := s.agentRuns.InsertYieldResponse(r.Context(), orgID, runID, &resp, displayContent)
-	if err != nil {
+	var msg *domain.AgentMessage
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		msg, e = tx.AgentRuns.InsertYieldResponse(r.Context(), orgID, runID, &resp, displayContent)
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "record response: " + err.Error()})
 		return
 	}
