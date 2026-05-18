@@ -28,10 +28,9 @@ interface Props {
   // snoozed toggle on Queued, "see more" on Done). Renders to the
   // right of the title/count.
   headerExtra?: React.ReactNode
-  // SKY-330: Queued is the leftmost column under the horizontal-scroll
-  // layout; its width should match the rest. width="standard" gives the
-  // pre-redesign 3-column-grid width; downstream we can add "wide" if
-  // we want one column to breathe.
+  // Column width is hard-coded in the JSX below (520px) so all five
+  // columns line up under the horizontal-scroll layout; expose a
+  // width prop later if a column needs to breathe differently.
   children: React.ReactNode
 }
 

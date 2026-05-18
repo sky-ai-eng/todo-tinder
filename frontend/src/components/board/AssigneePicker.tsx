@@ -238,7 +238,11 @@ function resolveAssignee(task: Task, members: TeamMember[], bot: TeamBot | null)
         kind: 'user',
       }
     }
-    return { label: 'User', shortLabel: 'User', kind: 'unknown' }
+    // Cross-team / stale-roster claimant — show a truncated id so
+    // the row isn't silently empty. Matches the docstring above and
+    // is debugger-friendly.
+    const shortID = task.claimed_by_user_id.slice(0, 8)
+    return { label: 'User ' + shortID, shortLabel: shortID, kind: 'unknown' }
   }
   return { label: 'Unassigned', shortLabel: 'Assign', kind: 'unclaimed' }
 }

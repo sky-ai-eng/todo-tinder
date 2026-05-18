@@ -26,35 +26,38 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 	if err := assertLocalOrg(orgID); err != nil {
 		return "", err
 	}
-	// Action → status mapping. SKY-261 B+ split the responsibility axis
+	// Action → effect mapping. SKY-261 B+ split the responsibility axis
 	// (who owns this) off the lifecycle axis (where in its life the
-	// task is). claim + delegate are responsibility-only now — the
-	// handler stamps claim columns; the status stays 'queued' here.
-	// Only dismiss/snooze/complete (genuine lifecycle moves) transition
-	// status. Unknown action defaults to 'queued' so a typo doesn't
-	// strand the task; same fallback as pre-SKY-261.
+	// task is). claim + delegate are responsibility-only — the handler
+	// stamps claim columns and may already have moved the lifecycle
+	// status (e.g. snooze-wake inside ClaimQueuedForUser). This audit
+	// path MUST NOT write status for those actions or it would clobber
+	// the lifecycle status of an in_progress / in_review task during a
+	// takeover/delegate (SKY-330's assignee picker exercises both).
+	// Only dismiss + complete are genuine lifecycle moves recorded
+	// here; snooze flows through SnoozeTask separately.
 	//
-	// SKY-330: closed_at is also written on the terminal transitions
-	// so the Board's Done-column 7-day cap actually applies to
-	// user-completed/dismissed tasks. Cleared on re-open paths
-	// (claim/delegate of a previously-terminal task) so re-opened
-	// rows aren't perpetually filed under "closed at <stale date>".
-	// closeReason mirrors the value Close() writes; doc enum in
-	// domain/task.go lists user_completed + user_dismissed alongside
-	// run_completed / auto_closed_by_event / entity_closed.
+	// SKY-330: closed_at + close_reason are written on terminal swipes
+	// so the Board's Done-column 7-day cap actually applies. They're
+	// NOT cleared on claim/delegate because the swipe handler refuses
+	// claim transitions on terminal tasks at the entry — so a row
+	// reaching this path with stale close metadata isn't a state the
+	// handler permits. Re-open paths (RequeueTask / UndoLastSwipe)
+	// clear the close columns explicitly.
+	terminal := action == "dismiss" || action == "complete"
 	var newStatus, closeReason string
 	switch action {
 	case "claim", "delegate":
-		newStatus = "queued"
+		// Audit-only path — read the current status to return so the
+		// caller's WS broadcast carries the right value.
 	case "dismiss":
 		newStatus = "dismissed"
 		closeReason = "user_dismissed"
-	case "snooze":
-		newStatus = "snoozed"
 	case "complete":
 		newStatus = "done"
 		closeReason = "user_completed"
 	default:
+		// Unknown action — same fallback as pre-SKY-261, write 'queued'.
 		newStatus = "queued"
 	}
 	err := inTx(ctx, s.q, func(q queryer) error {
@@ -64,22 +67,35 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 		); err != nil {
 			return err
 		}
-		// snooze_until cleared on every transition this method handles
-		// (see prior comment). closed_at + close_reason are populated
-		// on terminal swipes and cleared on the re-open paths so the
-		// column means "currently terminal at X" rather than "ever
-		// reached terminal at X." The Done column's 7-day cap reads
-		// closed_at, so any NULL here means the cap doesn't apply —
-		// must be cleared back to NULL when a task transitions out
-		// of a terminal state.
+		if newStatus == "" {
+			// claim / delegate: preserve in_progress / in_review across
+			// takeover, but flip 'snoozed' → 'queued' so the SKY-261
+			// "snoozed ↔ unclaimed" invariant holds even when a code
+			// path bypasses the claim helpers (which do the wake
+			// atomically under normal operation). The CASE expression
+			// keeps every non-snoozed status intact — load-bearing for
+			// the assignee picker's take-over-from-bot path, which
+			// hits an in_progress / in_review row.
+			if _, err := q.ExecContext(ctx,
+				`UPDATE tasks
+				   SET status = CASE WHEN status = 'snoozed' THEN 'queued' ELSE status END,
+				       snooze_until = NULL
+				 WHERE id = ?`,
+				taskID,
+			); err != nil {
+				return err
+			}
+			// Read-back so the caller's WS broadcast carries the
+			// actual post-mutation status.
+			row := q.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, taskID)
+			return row.Scan(&newStatus)
+		}
 		var closedAt any
 		var reason any
-		if newStatus == "done" || newStatus == "dismissed" {
+		if terminal {
 			closedAt = time.Now()
 			reason = closeReason
 		}
-		// Otherwise both stay nil → SQLite writes NULL, clearing any
-		// prior close metadata from a previous terminal pass.
 		_, err := q.ExecContext(ctx,
 			`UPDATE tasks
 			   SET status = ?,

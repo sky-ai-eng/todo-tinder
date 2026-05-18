@@ -31,26 +31,20 @@ func newSwipeStore(q queryer) db.SwipeStore { return &swipeStore{q: q} }
 var _ db.SwipeStore = (*swipeStore)(nil)
 
 func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, action string, hesitationMs int) (string, error) {
-	// SKY-261 B+ split the responsibility axis off the lifecycle axis.
-	// claim + delegate are responsibility-only — the handler stamps
-	// claim columns; this UPDATE leaves status at 'queued'. Only
-	// dismiss/snooze/complete are genuine lifecycle moves.
-	//
-	// SKY-330: closed_at + close_reason are written on terminal
-	// swipes (dismiss/complete) and cleared on re-open paths
-	// (claim/delegate of a previously-terminal task). The Board's
-	// Done-column 7-day cap reads closed_at, so NULL means the cap
-	// doesn't apply — must be cleared back to NULL when the task
-	// leaves a terminal state.
+	// See sqlite/swipes.go for the full rationale. Summary: claim +
+	// delegate are responsibility-only and MUST NOT touch the
+	// lifecycle status (or in_progress / in_review tasks lose their
+	// stage during takeover/delegate via the assignee picker).
+	// Terminal swipes (dismiss / complete) write status + closed_at
+	// + close_reason. Snooze flows through SnoozeTask.
+	terminal := action == "dismiss" || action == "complete"
 	var newStatus, closeReason string
 	switch action {
 	case "claim", "delegate":
-		newStatus = "queued"
+		// Audit-only path.
 	case "dismiss":
 		newStatus = "dismissed"
 		closeReason = "user_dismissed"
-	case "snooze":
-		newStatus = "snoozed"
 	case "complete":
 		newStatus = "done"
 		closeReason = "user_completed"
@@ -61,13 +55,30 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 		if err := insertSwipeEvent(ctx, tx, orgID, taskID, action, &hesitationMs); err != nil {
 			return err
 		}
-		// Inline UPDATE — the four axes (status, snooze_until,
-		// closed_at, close_reason) all move together for each swipe
-		// action so threading a helper signature with that many
-		// nullable params would obscure more than it shares.
+		if newStatus == "" {
+			// claim / delegate: preserve in_progress / in_review
+			// across takeover, but flip 'snoozed' → 'queued' so the
+			// SKY-261 "snoozed ↔ unclaimed" invariant holds when a
+			// path bypasses the claim helpers. See SQLite mirror for
+			// the full rationale.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE tasks
+				    SET status = CASE WHEN status = 'snoozed' THEN 'queued' ELSE status END,
+				        snooze_until = NULL
+				  WHERE org_id = $1 AND id = $2`,
+				orgID, taskID,
+			); err != nil {
+				return err
+			}
+			row := tx.QueryRowContext(ctx,
+				`SELECT status FROM tasks WHERE org_id = $1 AND id = $2`,
+				orgID, taskID,
+			)
+			return row.Scan(&newStatus)
+		}
 		var closedAt any
 		var reason any
-		if newStatus == "done" || newStatus == "dismissed" {
+		if terminal {
 			closedAt = time.Now()
 			reason = closeReason
 		}

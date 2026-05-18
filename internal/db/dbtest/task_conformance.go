@@ -185,6 +185,35 @@ func RunTaskStoreConformance(t *testing.T, mk TaskStoreFactory) {
 		}
 	})
 
+	// SKY-330: bot-claimed status='queued' tasks (just-delegated, run
+	// not yet advanced) also belong in the Claimed projection so the
+	// board's Claimed column surfaces them and the delegate-spawn-
+	// failure retry UI can render. Without this they'd disappear
+	// between the delegate stamp and the first non-initializing
+	// run-status transition.
+	t.Run("ByStatus_claimed_includes_bot_claimed_queued", func(t *testing.T) {
+		s, orgID, _, agentID, _, seed, _ := mk(t)
+		_, _, taskID := seed(t, "bs-claimed-bot")
+		if _, err := s.StampAgentClaimIfUnclaimed(ctx, orgID, taskID, agentID); err != nil {
+			t.Fatalf("stamp agent: %v", err)
+		}
+
+		claimed, err := s.ByStatus(ctx, orgID, "claimed")
+		if err != nil {
+			t.Fatalf("ByStatus claimed: %v", err)
+		}
+		var seen bool
+		for _, x := range claimed {
+			if x.ID == taskID {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			t.Errorf("Claimed projection missing bot-claimed queued task %s; delegate-failure retry UI would have nothing to render against", taskID)
+		}
+	})
+
 	t.Run("FindOrCreate_idempotent_on_dedup_key", func(t *testing.T) {
 		s, orgID, teamID, _, _, seed, _ := mk(t)
 		entityID, eventID, _ := seed(t, "foc-dedup")

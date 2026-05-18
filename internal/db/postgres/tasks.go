@@ -123,17 +123,17 @@ func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([
 func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error) {
 	switch status {
 	case "claimed":
-		// SKY-330: "claimed" now means specifically "user has claimed
-		// but hasn't advanced" (status='queued' + user claim). The
-		// pre-330 derivation included in_progress / in_review tasks,
-		// which double-renders on the board now that those have their
-		// own columns. Mirrors the SQLite branch.
+		// SKY-330: "claimed" = any claim (user or bot) at
+		// status='queued'. Mirrors the SQLite branch — see that
+		// file's comment for the full rationale around the
+		// status='queued' filter and including bot claims to
+		// surface the delegate-spawn-failure retry case.
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+pgTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
 			WHERE t.org_id = $1
-				AND t.claimed_by_user_id IS NOT NULL
+				AND (t.claimed_by_user_id IS NOT NULL OR t.claimed_by_agent_id IS NOT NULL)
 				AND t.status = 'queued'
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`, orgID)

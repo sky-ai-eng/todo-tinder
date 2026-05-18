@@ -1042,7 +1042,15 @@ function SortableAgentCard({
   onReview?: () => void
   assigneeSlot?: React.ReactNode
 }) {
-  const draggable = draggableRunStatuses.has(run.Status)
+  // SKY-330: bot-managed cards in in_progress / in_review are
+  // read-only — column placement is owned by the spawner's run-state
+  // mirror. The drop handler also short-circuits these drags, but
+  // baking the guard into `disabled` here removes the misleading
+  // grab cursor + drag preview so the user doesn't see a draggable
+  // affordance that always snaps back.
+  const botManaged =
+    !!task.claimed_by_agent_id && (task.status === 'in_progress' || task.status === 'in_review')
+  const draggable = draggableRunStatuses.has(run.Status) && !botManaged
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
     disabled: !draggable,

@@ -117,18 +117,20 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 	// SKY-261 B+: 'claimed' and 'delegated' aren't real lifecycle
 	// values — they're derived filters on the claim columns.
 	// SKY-330 added in_progress + in_review as first-class statuses,
-	// so the "claimed" derivation now means specifically "user has
-	// claimed but hasn't advanced yet" (status='queued' + user
-	// claim). Without the status='queued' filter, a user-claimed
-	// task in in_progress would render in BOTH the Claimed and
-	// In Progress columns on the board.
+	// so the "claimed" derivation now means specifically "any claim
+	// (user or bot) at status='queued'." Status='queued' avoids
+	// double-rendering once a task advances to in_progress / in_review
+	// (those have their own columns). Including bot claims here
+	// surfaces the brief window between delegate-stamp and the run's
+	// first non-initializing status — plus delegate-spawn-failure
+	// rows that stay claimed-queued indefinitely until retry.
 	switch status {
 	case "claimed":
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+sqliteTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id
-			WHERE t.claimed_by_user_id IS NOT NULL
+			WHERE (t.claimed_by_user_id IS NOT NULL OR t.claimed_by_agent_id IS NOT NULL)
 				AND t.status = 'queued'
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`)
