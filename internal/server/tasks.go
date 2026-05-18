@@ -827,7 +827,7 @@ func (s *Server) handleTaskAdvance(w http.ResponseWriter, r *http.Request) {
 	}
 	if !advanced {
 		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "task not advancable — must be claimed by you and currently in queued/in_progress/in_review",
+			"error": "task not advanceable — must be claimed by you and currently in queued/in_progress/in_review",
 		})
 		return
 	}

@@ -186,8 +186,12 @@ export default function Board() {
           fetch('/api/me').then((r) => (r.ok ? r.json() : null)),
           fetch('/api/team/members').then((r) => (r.ok ? r.json() : null)),
         ])
-        if (meRes && typeof meRes === 'object' && 'user_id' in meRes) {
-          setCurrentUserID((meRes as { user_id: string }).user_id ?? '')
+        // /api/me returns the caller's identity as `id`, not `user_id`
+        // (see auth_handlers.go:514). The picker uses currentUserID to
+        // recognize "claimed by me" — without this read, every click on
+        // Me would take the claim path instead of toggling unclaim.
+        if (meRes && typeof meRes === 'object' && 'id' in meRes) {
+          setCurrentUserID((meRes as { id: string }).id ?? '')
         }
         if (rosterRes) {
           const roster = rosterRes as TeamMembersResponse
@@ -358,6 +362,16 @@ export default function Board() {
                 .catch(() => {})
             }
           }
+        } else if (event.type === 'agent_message') {
+          // Live run-log append. AgentCard renders from agentMessages
+          // keyed by run.ID; without this, new agent output only
+          // surfaces after a status-change fetchTasks pass. Was
+          // present pre-SKY-330; lost in the board rewrite, restored
+          // here per PR #212 review.
+          setAgentMessages((prev) => ({
+            ...prev,
+            [event.run_id]: [...(prev[event.run_id] || []), event.data as AgentMessage],
+          }))
         } else if (event.type === 'task_updated' || event.type === 'task_claimed') {
           // SKY-330: any column-affecting change re-pulls the whole
           // board. The 5-column buckets are cheap to refetch (each is

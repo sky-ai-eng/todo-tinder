@@ -240,6 +240,15 @@ func (s *Spawner) advanceTaskFromRunStatus(orgID, runID, runStatus string) {
 	if err != nil || run == nil || run.TaskID == "" {
 		return
 	}
+	// Chain step: the chain orchestrator owns task lifecycle (it
+	// closes the task only when the chain itself terminates). A
+	// pending_approval / completed mid-chain step must not flip the
+	// task to in_review / done — the next step is about to run.
+	// processCompletion's inline 'completed' path has the same
+	// guard at run.go:435.
+	if run.ChainRunID != "" {
+		return
+	}
 	task, err := s.tasks.GetSystem(ctx, orgID, run.TaskID)
 	if err != nil || task == nil {
 		return

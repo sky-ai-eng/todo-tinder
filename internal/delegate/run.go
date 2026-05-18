@@ -447,11 +447,26 @@ func (s *Spawner) processCompletion(
 				}
 				if setErr != nil {
 					log.Printf("[delegate] warning: failed to update task %s to done: %v", task.ID, setErr)
+				} else {
+					// SKY-330: peer Board sessions need a task_updated
+					// nudge to move the card to the Done column. The
+					// inline 'done' SetStatus above is the canonical
+					// completed-run task-close path (chain + race
+					// guarded), so it owns the broadcast here.
+					s.broadcastTaskUpdate(orgID, task.ID)
 				}
 			}
 		}
 	}
 	s.broadcastRunUpdate(orgID, runID, status)
+	// SKY-330: mirror the run's terminal status onto the task. The
+	// inline 'completed' path above already set task.status='done'
+	// (so advanceTaskFromRunStatus's idempotent check skips it);
+	// this call handles the pending_approval branch (the run's
+	// status was flipped at line 415 above) by setting
+	// task.status='in_review' and broadcasting task_updated. Failed
+	// / cancelled / task_unsolvable map to no target → no-op.
+	s.advanceTaskFromRunStatus(orgID, runID, status)
 
 	// Toast the terminal state. Success cases auto-hide; failed/unsolvable
 	// show as an error toast so the user notices even if they've clicked
