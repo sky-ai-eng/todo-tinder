@@ -53,17 +53,23 @@ const COLUMN_TITLES: Record<ColumnId, string> = {
   done: 'Done',
 }
 
-// Filter persistence: per-user, per-column. localStorage key prefix
-// is global so a re-login (different user) doesn't see the prior
-// user's filters — we don't have the userID at module-load time so
-// this is a "best effort" partition, refined per-mount.
-const FILTER_STORAGE_KEY = 'sky330.board.filters.v1'
+// Filter persistence: per-user, per-column. Storage key is namespaced
+// by the user's id so a re-login (different user on the same browser)
+// loads their own filters and doesn't overwrite the prior user's. The
+// pre-load default ("anon") is only used briefly during the /api/me
+// roundtrip; once currentUserID resolves the effect below re-loads
+// against the per-user key.
+const FILTER_STORAGE_PREFIX = 'sky330.board.filters.v1'
+
+function filterStorageKey(userID: string): string {
+  return `${FILTER_STORAGE_PREFIX}.${userID || 'anon'}`
+}
 
 type FilterMap = Record<ColumnId, ColumnFilterState>
 
-function loadFilters(): FilterMap {
+function loadFilters(userID: string): FilterMap {
   try {
-    const raw = localStorage.getItem(FILTER_STORAGE_KEY)
+    const raw = localStorage.getItem(filterStorageKey(userID))
     if (!raw) return defaultFilters()
     const parsed = JSON.parse(raw) as Partial<FilterMap>
     const out = defaultFilters()
@@ -114,15 +120,24 @@ export default function Board() {
   const [bot, setBot] = useState<TeamBot | null>(null)
   const [currentUserID, setCurrentUserID] = useState<string>('')
 
-  // Per-column filter state. Persisted to localStorage.
-  const [filters, setFilters] = useState<FilterMap>(() => loadFilters())
+  // Per-column filter state. Persisted to localStorage under a key
+  // namespaced by the current user's id so a re-login (different user
+  // on the same browser) loads that user's filters instead of the
+  // previous user's. We initialise from the anon key for the brief
+  // pre-/api/me window; once currentUserID resolves, the effect below
+  // re-loads from the per-user key.
+  const [filters, setFilters] = useState<FilterMap>(() => loadFilters(''))
+  useEffect(() => {
+    if (!currentUserID) return
+    setFilters(loadFilters(currentUserID))
+  }, [currentUserID])
   useEffect(() => {
     try {
-      localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filters))
+      localStorage.setItem(filterStorageKey(currentUserID), JSON.stringify(filters))
     } catch {
       // Quota / disabled storage — silently skip; filters work in-memory.
     }
-  }, [filters])
+  }, [filters, currentUserID])
 
   // Snoozed visibility toggle for the Queued column. Off by default;
   // snoozed tasks are intentionally deferred and don't need to clutter

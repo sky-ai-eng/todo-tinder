@@ -22,9 +22,13 @@ import type { Task, TeamMember, TeamBot } from '../../types'
 //   - claimed by bot + click Bot     → no-op (already there; would just
 //                                      prompt for a duplicate run)
 //
-// Errors are surfaced via the parent's onError callback rather than
-// inline — the picker collapses on action and the Board's toast
-// surface owns visible failure reporting.
+// Errors: the onClaim / onUnclaim / onDelegate callbacks own
+// failure handling. The picker collapses immediately on action
+// without waiting for the promise to resolve — if the caller
+// surfaces failures via toasts or refetch reconciliation, that's
+// where the user sees them. (Pre-merge the docstring referenced
+// an `onError` callback that doesn't exist; that wording predated
+// the wire-up.)
 interface Props {
   task: Task
   currentUserID: string
@@ -150,15 +154,54 @@ export default function AssigneePicker({
             />
           )}
 
-          {/* Teammates: display-only in v1. Show the holding teammate
-              if a cross-user claim landed somehow (shouldn't normally
-              happen since v1 doesn't allow cross-user assign, but the
-              data model permits it via SetClaimedByUser primitives). */}
-          {claimedByOtherUser && (
+          {/* Teammates: display-only in v1. The full roster is
+              rendered (matching the design's "me, bot, teammates..."
+              order) so users can see who else is on the team without
+              the picker actually permitting cross-user assignment.
+              The current claimant (if it's a teammate) is marked
+              selected; non-claimant teammates render with a "(v1)
+              reassignment not supported" sublabel to set expectations.
+              Skip the current user — already rendered as "Me". */}
+          {(() => {
+            const teammates = members.filter(
+              (m) => !m.is_current_user && m.user_id !== currentUserID,
+            )
+            if (teammates.length === 0) return null
+            return (
+              <>
+                <div className="my-1 border-t border-border-subtle" />
+                {teammates.map((m) => {
+                  const label = m.display_name || m.github_username || m.user_id
+                  const isClaimant = task.claimed_by_user_id === m.user_id
+                  return (
+                    <PickerRow
+                      key={m.user_id}
+                      avatar={<AvatarCircle initials={initialsFor(label)} tone="user" />}
+                      label={label}
+                      sublabel={
+                        isClaimant
+                          ? 'Currently claimed (reassignment not supported in v1)'
+                          : 'Reassignment not supported in v1'
+                      }
+                      selected={isClaimant}
+                      disabled
+                    />
+                  )
+                })}
+              </>
+            )
+          })()}
+          {/* Cross-user claim by someone NOT in the loaded roster
+              (stale members list, or a cross-team claim that slipped
+              through SetClaimedByUser): still surface that the task
+              is held so the picker doesn't lie about being unclaimed.
+              Skipped when claimedByOtherUser resolves to a teammate
+              row above (the selected indicator covers it). */}
+          {claimedByOtherUser && !members.some((m) => m.user_id === task.claimed_by_user_id) && (
             <PickerRow
               avatar={<AvatarCircle initials={initialsFor(currentAssignee.label)} tone="user" />}
               label={currentAssignee.label}
-              sublabel="Currently claimed (reassignment not supported in v1)"
+              sublabel="Claimed by a user outside this team's roster"
               selected
               disabled
             />

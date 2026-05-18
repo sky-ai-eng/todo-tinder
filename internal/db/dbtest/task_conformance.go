@@ -497,6 +497,180 @@ func RunTaskStoreConformance(t *testing.T, mk TaskStoreFactory) {
 		}
 	})
 
+	// SKY-330: AdvanceStatusForUser — the manual user board transition.
+
+	t.Run("AdvanceStatusForUser_lands_for_user_claim", func(t *testing.T) {
+		s, orgID, _, _, userID, seed, _ := mk(t)
+		_, _, taskID := seed(t, "adv-happy")
+		if ok, err := s.ClaimQueuedForUser(ctx, orgID, taskID, userID); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		ok, err := s.AdvanceStatusForUser(ctx, orgID, taskID, userID, "in_progress")
+		if err != nil {
+			t.Fatalf("AdvanceStatusForUser: %v", err)
+		}
+		if !ok {
+			t.Fatal("AdvanceStatusForUser returned false on a valid transition")
+		}
+		got, _ := s.Get(ctx, orgID, taskID)
+		if got.Status != "in_progress" {
+			t.Errorf("status=%q, want in_progress", got.Status)
+		}
+		// Backward transition (in_progress → in_review then back to
+		// in_progress) is also allowed — the guard only checks the
+		// current status is in the active set, not that newStatus is
+		// strictly forward.
+		if ok2, err := s.AdvanceStatusForUser(ctx, orgID, taskID, userID, "in_review"); err != nil || !ok2 {
+			t.Fatalf("Advance → in_review: ok=%v err=%v", ok2, err)
+		}
+		if ok2, err := s.AdvanceStatusForUser(ctx, orgID, taskID, userID, "in_progress"); err != nil || !ok2 {
+			t.Fatalf("Advance back → in_progress: ok=%v err=%v", ok2, err)
+		}
+	})
+
+	t.Run("AdvanceStatusForUser_refuses_bot_claim", func(t *testing.T) {
+		s, orgID, _, agentID, userID, seed, _ := mk(t)
+		_, _, taskID := seed(t, "adv-bot")
+		if _, err := s.StampAgentClaimIfUnclaimed(ctx, orgID, taskID, agentID); err != nil {
+			t.Fatalf("stamp agent: %v", err)
+		}
+		ok, err := s.AdvanceStatusForUser(ctx, orgID, taskID, userID, "in_progress")
+		if err != nil {
+			t.Fatalf("AdvanceStatusForUser: %v", err)
+		}
+		if ok {
+			t.Error("AdvanceStatusForUser landed on bot-claimed task; should refuse (status owned by run lifecycle)")
+		}
+		got, _ := s.Get(ctx, orgID, taskID)
+		if got.Status != "queued" {
+			t.Errorf("status=%q, want queued (refusal must not transition)", got.Status)
+		}
+	})
+
+	t.Run("AdvanceStatusForUser_refuses_different_user", func(t *testing.T) {
+		s, orgID, _, _, userID, seed, _ := mk(t)
+		_, _, taskID := seed(t, "adv-other")
+		if ok, err := s.ClaimQueuedForUser(ctx, orgID, taskID, userID); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		// A different user's id — must not be able to advance someone
+		// else's task. Use a syntactic-only mismatch so the FK-shape
+		// constant the seeder uses for userID still distinguishes.
+		otherUserID := "00000000-0000-0000-0000-0000000000ff"
+		ok, err := s.AdvanceStatusForUser(ctx, orgID, taskID, otherUserID, "in_progress")
+		if err != nil {
+			t.Fatalf("AdvanceStatusForUser: %v", err)
+		}
+		if ok {
+			t.Error("AdvanceStatusForUser landed on someone else's task; should refuse")
+		}
+	})
+
+	t.Run("AdvanceStatusForUser_refuses_terminal_task", func(t *testing.T) {
+		s, orgID, _, _, userID, seed, _ := mk(t)
+		_, _, taskID := seed(t, "adv-term")
+		if ok, err := s.ClaimQueuedForUser(ctx, orgID, taskID, userID); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if err := s.Close(ctx, orgID, taskID, "test_close", ""); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		ok, err := s.AdvanceStatusForUser(ctx, orgID, taskID, userID, "in_progress")
+		if err != nil {
+			t.Fatalf("AdvanceStatusForUser: %v", err)
+		}
+		if ok {
+			t.Error("AdvanceStatusForUser landed on terminal task; should refuse")
+		}
+	})
+
+	t.Run("AdvanceStatusForUser_rejects_invalid_target", func(t *testing.T) {
+		s, orgID, _, _, userID, seed, _ := mk(t)
+		_, _, taskID := seed(t, "adv-bad")
+		if ok, err := s.ClaimQueuedForUser(ctx, orgID, taskID, userID); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		for _, bad := range []string{"done", "dismissed", "queued", "snoozed", "wat"} {
+			ok, err := s.AdvanceStatusForUser(ctx, orgID, taskID, userID, bad)
+			if err != nil {
+				t.Errorf("to=%q: unexpected err: %v", bad, err)
+			}
+			if ok {
+				t.Errorf("to=%q: AdvanceStatusForUser returned ok=true; should only accept in_progress/in_review", bad)
+			}
+		}
+	})
+
+	// SKY-330: QueuedIncludingSnoozed — surfaces future-snoozed entries
+	// for the board's "show snoozed" toggle while keeping the canonical
+	// Queued() projection unchanged.
+
+	t.Run("QueuedIncludingSnoozed_includes_snoozed_while_Queued_excludes", func(t *testing.T) {
+		s, orgID, _, _, _, seed, _ := mk(t)
+		_, _, liveID := seed(t, "qsnz-live")
+		_, _, snoozedID := seed(t, "qsnz-snoozed")
+		if err := s.SetStatus(ctx, orgID, snoozedID, "snoozed"); err != nil {
+			t.Fatalf("SetStatus snoozed: %v", err)
+		}
+
+		live, err := s.Queued(ctx, orgID)
+		if err != nil {
+			t.Fatalf("Queued: %v", err)
+		}
+		var sawLive, sawSnoozedInLive bool
+		for _, x := range live {
+			if x.ID == liveID {
+				sawLive = true
+			}
+			if x.ID == snoozedID {
+				sawSnoozedInLive = true
+			}
+		}
+		if !sawLive {
+			t.Error("Queued() missing the unsnoozed task")
+		}
+		if sawSnoozedInLive {
+			t.Error("Queued() returned a snoozed task; should exclude")
+		}
+
+		all, err := s.QueuedIncludingSnoozed(ctx, orgID)
+		if err != nil {
+			t.Fatalf("QueuedIncludingSnoozed: %v", err)
+		}
+		var sawLiveAll, sawSnoozedAll bool
+		for _, x := range all {
+			if x.ID == liveID {
+				sawLiveAll = true
+			}
+			if x.ID == snoozedID {
+				sawSnoozedAll = true
+			}
+		}
+		if !sawLiveAll {
+			t.Error("QueuedIncludingSnoozed() missing the live task")
+		}
+		if !sawSnoozedAll {
+			t.Error("QueuedIncludingSnoozed() missing the snoozed task")
+		}
+	})
+
+	t.Run("QueuedIncludingSnoozed_excludes_claimed", func(t *testing.T) {
+		s, orgID, _, _, userID, seed, _ := mk(t)
+		_, _, taskID := seed(t, "qsnz-claimed")
+		if ok, err := s.ClaimQueuedForUser(ctx, orgID, taskID, userID); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		out, err := s.QueuedIncludingSnoozed(ctx, orgID)
+		if err != nil {
+			t.Fatalf("QueuedIncludingSnoozed: %v", err)
+		}
+		for _, x := range out {
+			if x.ID == taskID {
+				t.Error("QueuedIncludingSnoozed surfaced a user-claimed task; SKY-261 invariant says only unclaimed rows belong in the queue projection")
+			}
+		}
+	})
+
 	// --- Empty-arg / ctx-cancel quick guards ---
 
 	t.Run("CtxCancellation_fails_fast", func(t *testing.T) {
