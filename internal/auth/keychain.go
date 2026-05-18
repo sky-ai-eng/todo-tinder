@@ -40,127 +40,6 @@ type Credentials struct {
 	JiraPAT   string
 }
 
-// Store saves all credentials to the OS keychain.
-// If the keychain backend is unavailable and env vars supply at least one PAT,
-// the error is logged and suppressed; otherwise it is returned so the caller
-// knows credentials were not persisted.
-func Store(creds Credentials) error {
-	if !probeKeychain() {
-		if len(EnvProvided()) > 0 {
-			return nil
-		}
-		return fmt.Errorf("keychain backend unavailable and no TRIAGE_FACTORY_*_PAT env vars set")
-	}
-	pairs := []struct{ key, val string }{
-		{keyGitHubURL, creds.GitHubURL},
-		{keyGitHubPAT, creds.GitHubPAT},
-		{keyJiraURL, creds.JiraURL},
-		{keyJiraPAT, creds.JiraPAT},
-	}
-	for _, p := range pairs {
-		if p.val == "" {
-			continue
-		}
-		if err := keyring.Set(service, p.key, p.val); err != nil {
-			return fmt.Errorf("keychain store %s: %w", p.key, err)
-		}
-	}
-	return nil
-}
-
-// Load retrieves credentials from the OS keychain, then overlays any
-// TRIAGE_FACTORY_* environment variables on top (env wins if set).
-// If the keychain is unavailable but env vars supply at least one PAT,
-// the keychain error is suppressed.
-func Load() (Credentials, error) {
-	creds, keychainErr := loadFromKeychain()
-
-	anyEnv := false
-	overlay := func(key string, dst *string) {
-		if v := os.Getenv(envKeys[key]); v != "" {
-			*dst = v
-			anyEnv = true
-		}
-	}
-	overlay(keyGitHubURL, &creds.GitHubURL)
-	overlay(keyGitHubPAT, &creds.GitHubPAT)
-	overlay(keyJiraURL, &creds.JiraURL)
-	overlay(keyJiraPAT, &creds.JiraPAT)
-
-	if anyEnv {
-		logEnvOnce()
-	}
-
-	if keychainErr != nil && (creds.GitHubPAT != "" || creds.JiraPAT != "") {
-		return creds, nil
-	}
-	return creds, keychainErr
-}
-
-func loadFromKeychain() (Credentials, error) {
-	var creds Credentials
-	var err error
-
-	creds.GitHubURL, err = get(keyGitHubURL)
-	if err != nil {
-		return creds, err
-	}
-	creds.GitHubPAT, err = get(keyGitHubPAT)
-	if err != nil {
-		return creds, err
-	}
-	creds.JiraURL, err = get(keyJiraURL)
-	if err != nil {
-		return creds, err
-	}
-	creds.JiraPAT, err = get(keyJiraPAT)
-	if err != nil {
-		return creds, err
-	}
-
-	return creds, nil
-}
-
-func deleteKeys(keys ...string) error {
-	if !probeKeychain() {
-		return nil
-	}
-	for _, key := range keys {
-		if err := keyring.Delete(service, key); err != nil && err != keyring.ErrNotFound {
-			return fmt.Errorf("keychain delete %s: %w", key, err)
-		}
-	}
-	return nil
-}
-
-// Clear removes all credentials from the OS keychain. Also sweeps the
-// legacy jira_display_name key (retired in SKY-270 when Jira identity
-// moved to users.jira_display_name / jira_account_id) so upgrades from
-// pre-SKY-270 keychains leave no orphan entries.
-func Clear() error {
-	return deleteKeys(keyGitHubURL, keyGitHubPAT, keyJiraURL, keyJiraPAT, "jira_display_name")
-}
-
-// ClearGitHub removes GitHub credentials from the OS keychain.
-func ClearGitHub() error {
-	return deleteKeys(keyGitHubURL, keyGitHubPAT)
-}
-
-// ClearJira removes Jira credentials from the OS keychain. Sweeps the
-// legacy jira_display_name key too — see Clear().
-func ClearJira() error {
-	return deleteKeys(keyJiraURL, keyJiraPAT, "jira_display_name")
-}
-
-// IsConfigured returns true if at least one PAT is available (from keychain or env vars).
-func IsConfigured() bool {
-	creds, err := Load()
-	if err != nil {
-		return false
-	}
-	return creds.GitHubPAT != "" || creds.JiraPAT != ""
-}
-
 // EnvProvided returns which credential groups have values supplied by
 // environment variables: "github" if URL+PAT are set, "jira" likewise.
 func EnvProvided() []string {
@@ -186,14 +65,13 @@ func get(key string) (string, error) {
 // GetSecret reads a single keychain entry by key, returning "" (not an
 // error) when no entry exists. For the four well-known credential keys
 // (github_url, github_pat, jira_url, jira_pat) any matching
-// TRIAGE_FACTORY_* env var overrides the keychain value — same overlay
-// rule as Load. Unknown keys read straight from keychain.
+// TRIAGE_FACTORY_* env var overrides the keychain value. Unknown keys
+// read straight from keychain.
 //
 // This is the read-path entry point for the local-mode SecretStore
 // (internal/db/sqlite). The keyed shape lets multi-mode consumers
 // (vault-backed SecretStore) and local-mode consumers share one
-// interface in package db so callers like the per-org Anthropic
-// credential resolver don't have to branch on runmode.
+// interface in package db so callers don't have to branch on runmode.
 func GetSecret(key string) (string, error) {
 	if envName, ok := envKeys[key]; ok {
 		if v := os.Getenv(envName); v != "" {
@@ -204,12 +82,11 @@ func GetSecret(key string) (string, error) {
 	return get(key)
 }
 
-// PutSecret writes value under key in the keychain. Mirrors the
-// keychain-unavailable handling of Store: if the keychain probe fails
-// and the four well-known keys have env-var coverage, treat the write
-// as a silent no-op (the env is the source of truth and the keychain
-// write would just fail). For unknown keys there's no env fallback, so
-// a keychain-unavailable error propagates.
+// PutSecret writes value under key in the keychain. If the keychain
+// probe fails and the four well-known keys have env-var coverage,
+// treat the write as a silent no-op (the env is the source of truth
+// and the keychain write would just fail). For unknown keys there's
+// no env fallback, so a keychain-unavailable error propagates.
 //
 // # Asymmetry with GetSecret
 //
@@ -217,11 +94,10 @@ func GetSecret(key string) (string, error) {
 // but PutSecret always writes to the keychain. That means a rotation
 // (Put new_value) is invisible to subsequent Get calls when a
 // TRIAGE_FACTORY_* env var is set for the same key: Get continues to
-// return the env value. This matches the existing Store/Load
-// asymmetry rather than introducing new behavior, but the absence of
-// a self-contained read-back is a real footgun for callers — surface
-// the env-overlay state to the user when rotating a known key
-// (Settings UI does this today via EnvProvided).
+// return the env value. The absence of a self-contained read-back is
+// a real footgun for callers — surface the env-overlay state to the
+// user when rotating a known key (Settings UI does this today via
+// EnvProvided).
 func PutSecret(key, value string) error {
 	if !probeKeychain() {
 		if _, known := envKeys[key]; known && len(EnvProvided()) > 0 {
@@ -255,9 +131,7 @@ func HasKeychainEntry(key string) bool {
 }
 
 // DeleteSecret removes a single keychain entry. Missing entries are
-// not an error (matches the behavior of Clear / ClearJira). When the
-// keychain is unavailable the call is a no-op — same shape as
-// deleteKeys.
+// not an error. When the keychain is unavailable the call is a no-op.
 func DeleteSecret(key string) error {
 	if !probeKeychain() {
 		return nil

@@ -71,7 +71,7 @@ func Handle(args []string) {
 			os.Exit(1)
 		}
 
-		if err := auth.Clear(); err != nil {
+		if err := clearAllSecrets(); err != nil {
 			fmt.Fprintf(os.Stderr, "  warn: clear keychain: %v\n", err)
 			fmt.Println()
 			fmt.Println("triagefactory uninstall: completed with warnings (see above).")
@@ -149,7 +149,7 @@ func Handle(args []string) {
 		}
 	}
 
-	if err := auth.Clear(); err != nil {
+	if err := clearAllSecrets(); err != nil {
 		fmt.Fprintf(os.Stderr, "  warn: clear keychain: %v\n", err)
 		failed = true
 	} else {
@@ -445,6 +445,21 @@ func plural(n int, singular, plural string) string {
 		return singular
 	}
 	return plural
+}
+
+// clearAllSecrets removes the four well-known integration credentials
+// plus the legacy jira_display_name key from the OS keychain.
+// Uninstall is single-process, local-only, with no DB context, so it
+// bypasses the SecretStore seam and calls the low-level keychain
+// helpers directly.
+func clearAllSecrets() error {
+	keys := []string{"github_url", "github_pat", "jira_url", "jira_pat", "jira_display_name"}
+	for _, k := range keys {
+		if err := auth.DeleteSecret(k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func fail(format string, args ...any) {

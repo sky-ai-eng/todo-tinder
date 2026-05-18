@@ -45,6 +45,7 @@ type Server struct {
 	projects      db.ProjectStore     // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
 	events        db.EventStore       // SKY-305: events audit log Record/Latest for stock carry-over + factory drag-to-delegate
 	taskMemory    db.TaskMemoryStore  // run_memory writes (human verdict capture on review/PR submit, swipe-discard cleanup)
+	secrets       db.SecretStore      // canonical credential read/write path — local-mode keychain, multi-mode vault
 	// tx runs handler-cleanup write batches under the request user's
 	// claims even when the cleanup needs to outlive the request
 	// context. Each cleanup wraps in `s.tx.WithTx(cleanupCtx, orgID,
@@ -58,8 +59,13 @@ type Server struct {
 	curator         *curator.Curator
 	ghClient        *ghclient.Client
 	jiraClient      *jira.Client
-	onGitHubChanged func() // GitHub creds/repos changed — full restart + re-profile
-	onJiraChanged   func() // Jira config changed — restart Jira poller only
+	// Change callbacks accept the orgID of the tenant whose integration
+	// creds just rotated, so the closure can re-resolve via SecretStore.
+	// Local mode always passes runmode.LocalDefaultOrgID; multi-mode
+	// handlers thread the request's orgID through so the callback
+	// can't fire one org's poller restart with another org's PAT.
+	onGitHubChanged func(orgID string) // GitHub creds/repos changed — full restart + re-profile
+	onJiraChanged   func(orgID string) // Jira config changed — restart Jira poller only
 	scorerTrigger   func() // invoked after non-poll task creation (e.g. carry-over) to kick scoring immediately
 	lifetimeCounter *db.LifetimeDistinctCounter
 
@@ -196,7 +202,7 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 // argument list grows one store at a time as their callers migrate;
 // raw *sql.DB stays available for handlers that haven't been ported
 // to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, tx db.TxRunner) *Server {
+func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, tx db.TxRunner) *Server {
 	s := &Server{
 		db:            database,
 		prompts:       prompts,
@@ -217,6 +223,7 @@ func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboa
 		projects:      projects,
 		events:        events,
 		taskMemory:    taskMemory,
+		secrets:       secrets,
 		tx:            tx,
 		mux:           http.NewServeMux(),
 		ws:            websocket.NewHub(),
@@ -504,13 +511,14 @@ func (s *Server) SetCurator(c *curator.Curator) {
 
 // SetOnGitHubChanged registers a callback for GitHub config changes (creds, URL, repos).
 // This triggers a full restart: invalidate profiles → stop all pollers → re-profile → restart.
-func (s *Server) SetOnGitHubChanged(fn func()) {
+// The orgID is the tenant whose creds changed — closure re-resolves via SecretStore.
+func (s *Server) SetOnGitHubChanged(fn func(orgID string)) {
 	s.onGitHubChanged = fn
 }
 
 // SetOnJiraChanged registers a callback for Jira config changes.
-// This restarts only the Jira poller.
-func (s *Server) SetOnJiraChanged(fn func()) {
+// This restarts only the Jira poller. See SetOnGitHubChanged for orgID semantics.
+func (s *Server) SetOnJiraChanged(fn func(orgID string)) {
 	s.onJiraChanged = fn
 }
 

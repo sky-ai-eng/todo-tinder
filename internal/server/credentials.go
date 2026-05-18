@@ -10,6 +10,8 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -98,9 +100,10 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 		resp.Jira = jiraUser
 	}
 
-	// Store credentials in keychain (PATs only — github_username lives on
-	// the users row per SKY-264, written separately below).
-	if err := auth.Store(auth.Credentials{
+	// Store credentials via SecretStore (PATs only — github_username lives on
+	// the users row per SKY-264, written separately below). Local mode hits
+	// the keychain; multi mode hits the Postgres vault wrapper.
+	if err := integrations.Save(r.Context(), s.secrets, orgID, auth.Credentials{
 		GitHubURL: req.GitHubURL,
 		GitHubPAT: req.GitHubPAT,
 		JiraURL:   req.JiraURL,
@@ -143,7 +146,7 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 	// starts, closing a race where carry-over reads stale snapshots.
 	if s.onGitHubChanged != nil {
 		s.MarkJiraRestarted()
-		go s.onGitHubChanged()
+		go s.onGitHubChanged(orgID)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -155,7 +158,7 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, err := auth.Load()
+	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"configured": false,
@@ -191,22 +194,38 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 }
 
 // DELETE /api/integrations — clears all integration credentials (GitHub
-// + Jira) from the keychain. Used by the Settings "Clear All Tokens"
+// + Jira) via SecretStore. Used by the Settings "Clear All Tokens"
 // flow when the user wants a fresh slate. Granular per-integration
 // clears live on subpaths (e.g. DELETE /api/integrations/jira).
+//
+// Env-overlay UX: if any of the four well-known integration secrets
+// are supplied by TRIAGE_FACTORY_* env vars (local mode only —
+// multi-mode has no env overlay), SecretStore.Delete returns ok=false
+// and the value continues to surface on the next Get. Surface that to
+// the user instead of silently lying that the clear succeeded.
 func (s *Server) handleIntegrationsClear(w http.ResponseWriter, r *http.Request) {
-	if err := auth.Clear(); err != nil {
+	orgID := OrgIDFrom(r.Context())
+	if err := integrations.Clear(r.Context(), s.secrets, orgID); err != nil {
 		internalError(w, "auth", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+	resp := map[string]any{"status": "cleared"}
+	if runmode.Current() == runmode.ModeLocal {
+		if envs := auth.EnvProvided(); len(envs) > 0 {
+			resp["warning"] = fmt.Sprintf("env vars (%v) still supply credentials — unset them in your shell to fully clear", envs)
+			resp["env_provided"] = envs
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // DELETE /api/integrations/jira — clears Jira credentials only,
 // preserving GitHub. Counterpart to the collection-level clear at
-// DELETE /api/integrations.
+// DELETE /api/integrations. See the env-overlay note on
+// handleIntegrationsClear for the warning shape.
 func (s *Server) handleIntegrationsDeleteJira(w http.ResponseWriter, r *http.Request) {
-	if err := auth.ClearJira(); err != nil {
+	orgID := OrgIDFrom(r.Context())
+	if err := integrations.ClearJira(r.Context(), s.secrets, orgID); err != nil {
 		internalError(w, "auth", err)
 		return
 	}
@@ -214,7 +233,18 @@ func (s *Server) handleIntegrationsDeleteJira(w http.ResponseWriter, r *http.Req
 	// keep polling with stale credentials.
 	if s.onJiraChanged != nil {
 		s.MarkJiraRestarted()
-		go s.onJiraChanged()
+		go s.onJiraChanged(orgID)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+	resp := map[string]any{"status": "cleared"}
+	if runmode.Current() == runmode.ModeLocal {
+		envs := auth.EnvProvided()
+		for _, e := range envs {
+			if e == "jira" {
+				resp["warning"] = "env vars (TRIAGE_FACTORY_JIRA_URL/PAT) still supply this credential — unset them in your shell to fully clear"
+				resp["env_provided"] = []string{"jira"}
+				break
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
