@@ -93,7 +93,7 @@ func TestHandleCuratorSend_AcceptedReturnsRequestID(t *testing.T) {
 	// CancelProject blocks on the goroutine's exit (curator's
 	// shutdown contract) so by the time it returns no further
 	// status writes can land on the row.
-	c.CancelProject(projectID)
+	c.CancelProject(runmode.LocalDefaultOrgID, projectID)
 
 	got, err := db.GetCuratorRequest(srv.db, resp.RequestID)
 	if err != nil {

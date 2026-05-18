@@ -169,7 +169,7 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 		cancel()
 		return ErrYieldNotResumable
 	}
-	s.broadcastRunUpdate(runID, "running")
+	s.broadcastRunUpdate(orgID, runID, "running")
 
 	go func() {
 		defer func() {
@@ -197,7 +197,7 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 				return mErr
 			})
 			if ok {
-				s.broadcastRunUpdate(runID, "cancelled")
+				s.broadcastRunUpdate(orgID, runID, "cancelled")
 			}
 		}
 

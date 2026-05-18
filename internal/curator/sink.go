@@ -126,7 +126,7 @@ func (s *requestSink) OnMessage(msg *domain.AgentMessage) error {
 		return fmt.Errorf("insert curator message: %w", err)
 	}
 	curatorMsg.ID = int(id)
-	s.curator.broadcastMessage(s.projectID, curatorMsg)
+	s.curator.broadcastMessage(s.orgID, s.projectID, curatorMsg)
 	return nil
 }
 
@@ -136,12 +136,17 @@ var _ agentproc.Sink = (*requestSink)(nil)
 
 // broadcastMessage pushes a CuratorMessage onto the websocket. Empty
 // hub is tolerated (test harnesses construct curators without a hub).
-func (c *Curator) broadcastMessage(projectID string, msg *domain.CuratorMessage) {
+// orgID scopes the event to the owning tenant so the hub's per-
+// connection filter routes it only to clients authed against that
+// org — leaks of curator transcripts across tenants would surface
+// another team's prompts and responses.
+func (c *Curator) broadcastMessage(orgID, projectID string, msg *domain.CuratorMessage) {
 	if c.wsHub == nil {
 		return
 	}
 	c.wsHub.Broadcast(websocket.Event{
 		Type:      "curator_message",
+		OrgID:     orgID,
 		ProjectID: projectID,
 		Data:      msg,
 	})
@@ -150,12 +155,13 @@ func (c *Curator) broadcastMessage(projectID string, msg *domain.CuratorMessage)
 // broadcastRequestUpdate pushes a status transition for a request.
 // Frontend uses this to flip the UI from "queued" → "running" →
 // terminal without re-fetching the request row.
-func (c *Curator) broadcastRequestUpdate(projectID, requestID, status string) {
+func (c *Curator) broadcastRequestUpdate(orgID, projectID, requestID, status string) {
 	if c.wsHub == nil {
 		return
 	}
 	c.wsHub.Broadcast(websocket.Event{
 		Type:      "curator_request_update",
+		OrgID:     orgID,
 		ProjectID: projectID,
 		Data: map[string]string{
 			"request_id": requestID,

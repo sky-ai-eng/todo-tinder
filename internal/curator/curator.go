@@ -117,7 +117,7 @@ func (c *Curator) SendMessage(ctx context.Context, projectID, orgID, creatorUser
 		return "", fmt.Errorf("create curator request: %w", err)
 	}
 
-	session := c.getOrStartSession(projectID)
+	session := c.getOrStartSession(orgID, projectID)
 	if session == nil {
 		// Best-effort cancel on the package-level helper — the
 		// "curator is shut down" path runs from the handler goroutine
@@ -130,14 +130,14 @@ func (c *Curator) SendMessage(ctx context.Context, projectID, orgID, creatorUser
 	item := queueItem{requestID: requestID, orgID: orgID, creatorUserID: creatorUserID}
 	select {
 	case session.queue <- item:
-		c.broadcastRequestUpdate(projectID, requestID, "queued")
+		c.broadcastRequestUpdate(orgID, projectID, requestID, "queued")
 		return requestID, nil
 	default:
 		// Queue is full — should not happen at the per-project depth
 		// we configure, but if it ever does, fail the row up-front
 		// rather than blocking the HTTP handler.
 		_, _ = db.CompleteCuratorRequest(c.database, requestID, "failed", "curator queue full", 0, 0, 0)
-		c.broadcastRequestUpdate(projectID, requestID, "failed")
+		c.broadcastRequestUpdate(orgID, projectID, requestID, "failed")
 		return "", errors.New("curator queue is full")
 	}
 }
@@ -168,7 +168,11 @@ func (c *Curator) Cancel(projectID string) {
 // race a still-running goroutine. The DB cascade (curator_requests
 // → curator_messages) takes care of the row removal once the
 // project row is dropped.
-func (c *Curator) CancelProject(projectID string) {
+//
+// orgID is the project's owning tenant, threaded through to
+// broadcast events so the cancellation toast/update only reaches
+// connections authed against that org.
+func (c *Curator) CancelProject(orgID, projectID string) {
 	c.mu.Lock()
 	session, ok := c.sessions[projectID]
 	if ok {
@@ -182,11 +186,11 @@ func (c *Curator) CancelProject(projectID string) {
 		// a chance to drain. Cancel them at the DB level so the
 		// FK cascade on project delete doesn't leave behind status
 		// confusion.
-		c.cancelQueuedRows(projectID, "project deleted")
+		c.cancelQueuedRows(orgID, projectID, "project deleted")
 		return
 	}
 	session.shutdown("project deleted")
-	c.cancelQueuedRows(projectID, "project deleted")
+	c.cancelQueuedRows(orgID, projectID, "project deleted")
 }
 
 // Shutdown stops every per-project goroutine and rejects further
@@ -221,7 +225,7 @@ func (c *Curator) Shutdown() {
 // ships. Identity-per-row is recoverable from curator_requests.creator_user_id;
 // the harder question is which pool (admin vs. per-user) attribution
 // belongs to for system-driven cancels.
-func (c *Curator) cancelQueuedRows(projectID, reason string) {
+func (c *Curator) cancelQueuedRows(orgID, projectID, reason string) {
 	queued, err := db.QueuedCuratorRequestsForProject(c.database, projectID)
 	if err != nil {
 		log.Printf("[curator] warning: failed to list queued requests for project %s: %v", projectID, err)
@@ -234,7 +238,7 @@ func (c *Curator) cancelQueuedRows(projectID, reason string) {
 			continue
 		}
 		if flipped {
-			c.broadcastRequestUpdate(projectID, req.ID, "cancelled")
+			c.broadcastRequestUpdate(orgID, projectID, req.ID, "cancelled")
 		}
 	}
 }
@@ -247,7 +251,7 @@ func (c *Curator) cancelQueuedRows(projectID, reason string) {
 // "no sessions to stop" snapshot while a fresh session is being
 // inserted. Returns nil iff the curator has been shut down — caller
 // flips the persisted row to cancelled so it doesn't dangle.
-func (c *Curator) getOrStartSession(projectID string) *projectSession {
+func (c *Curator) getOrStartSession(orgID, projectID string) *projectSession {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -260,6 +264,7 @@ func (c *Curator) getOrStartSession(projectID string) *projectSession {
 	session := &projectSession{
 		curator:   c,
 		projectID: projectID,
+		orgID:     orgID,
 		queue:     make(chan queueItem, sessionQueueDepth),
 		ctx:       ctx,
 		stopAll:   cancel,

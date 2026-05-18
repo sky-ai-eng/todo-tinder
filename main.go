@@ -473,8 +473,14 @@ func main() {
 			if err := stores.Repos.UpdateCloneStatusSystem(context.Background(), runmode.LocalDefaultOrgID, owner, repo, "ok", "", ""); err != nil {
 				log.Printf("[clone-status] update %s/%s ok: %v", owner, repo, err)
 			}
+			// Scoped to the local sentinel org — the upstream UpdateCloneStatusSystem
+			// call above stamps the same org id, so the broadcast surface matches
+			// the row's owning tenant. Multi-mode clone-status fan-out is a
+			// separate concern (the callback today only fires from local-mode
+			// paths).
 			wsHub.Broadcast(websocket.Event{
-				Type: "repo_profile_updated",
+				Type:  "repo_profile_updated",
+				OrgID: runmode.LocalDefaultOrgID,
 				Data: map[string]any{
 					"id":           owner + "/" + repo,
 					"clone_status": "ok",
@@ -508,7 +514,8 @@ func main() {
 			log.Printf("[clone-status] update %s/%s failed: %v", owner, repo, err)
 		}
 		wsHub.Broadcast(websocket.Event{
-			Type: "repo_profile_updated",
+			Type:  "repo_profile_updated",
+			OrgID: runmode.LocalDefaultOrgID,
 			Data: map[string]any{
 				"id":               owner + "/" + repo,
 				"clone_status":     "failed",
@@ -544,15 +551,22 @@ func main() {
 	bus.Subscribe(eventbus.Subscriber{
 		Name: "ws-broadcast",
 		Handle: func(evt domain.Event) {
+			// Forward the bus's per-event OrgID so the WS hub's
+			// per-connection filter scopes the fanout to the right
+			// tenant. System events (evt.OrgID == "") propagate as
+			// system-wide broadcasts that deliver everywhere.
 			wsHub.Broadcast(websocket.Event{
-				Type: "event",
-				Data: evt,
+				Type:  "event",
+				OrgID: evt.OrgID,
+				Data:  evt,
 			})
-			// Also send the legacy "tasks_updated" for backward compat
+			// Also send the legacy "tasks_updated" for backward compat,
+			// scoped to the same tenant as the originating event.
 			if evt.EventType == domain.EventSystemPollCompleted {
 				wsHub.Broadcast(websocket.Event{
-					Type: "tasks_updated",
-					Data: map[string]any{},
+					Type:  "tasks_updated",
+					OrgID: evt.OrgID,
+					Data:  map[string]any{},
 				})
 			}
 		},
@@ -567,16 +581,18 @@ func main() {
 	var eventRouter *routing.Router
 
 	scorer := ai.NewRunner(database, stores.Scores, stores.Entities, runmode.LocalDefaultOrg, ai.RunnerCallbacks{
-		OnScoringStarted: func(taskIDs []string) {
+		OnScoringStarted: func(orgID string, taskIDs []string) {
 			wsHub.Broadcast(websocket.Event{
-				Type: "scoring_started",
-				Data: map[string]any{"task_ids": taskIDs},
+				Type:  "scoring_started",
+				OrgID: orgID,
+				Data:  map[string]any{"task_ids": taskIDs},
 			})
 		},
 		OnScoringCompleted: func(orgID string, taskIDs []string) {
 			wsHub.Broadcast(websocket.Event{
-				Type: "scoring_completed",
-				Data: map[string]any{"task_ids": taskIDs},
+				Type:  "scoring_completed",
+				OrgID: orgID,
+				Data:  map[string]any{"task_ids": taskIDs},
 			})
 			// Post-scoring re-derive: check deferred triggers whose
 			// min_autonomy_suitability threshold the scored tasks now meet.
@@ -586,11 +602,11 @@ func main() {
 				go eventRouter.ReDeriveAfterScoring(orgID, taskIDs)
 			}
 		},
-		OnTasksSkipped: func(skipped, total int) {
-			toast.Warning(wsHub, fmt.Sprintf("AI scoring: %d of %d tasks skipped this cycle", skipped, total))
+		OnTasksSkipped: func(orgID string, skipped, total int) {
+			toast.Warning(wsHub, orgID, fmt.Sprintf("AI scoring: %d of %d tasks skipped this cycle", skipped, total))
 		},
-		OnError: func(err error) {
-			toast.Error(wsHub, fmt.Sprintf("AI scoring cycle aborted: %v", err))
+		OnError: func(orgID string, err error) {
+			toast.Error(wsHub, orgID, fmt.Sprintf("AI scoring cycle aborted: %v", err))
 		},
 	})
 	scorer.SetProfileGate(profileGate.Ready)
@@ -641,20 +657,26 @@ func main() {
 		lastErrorToast  = map[string]time.Time{}
 	)
 	pollerMgr := poller.NewManager(database, bus, stores.Users, stores.Tasks, stores.Entities, stores.Repos, stores.Orgs)
-	pollerMgr.OnError = func(source string, err error) {
+	pollerMgr.OnError = func(source, orgID string, err error) {
+		// Throttle key includes orgID so a chronic failure on one tenant
+		// doesn't suppress a fresh failure on another. Process-level
+		// errors (ListActiveSystem) pass orgID="" and throttle together
+		// per source — that's still the right behavior for "Jira API
+		// is down" style spam.
+		throttleKey := source + ":" + orgID
 		errorThrottleMu.Lock()
-		if last, ok := lastErrorToast[source]; ok && time.Since(last) < errorToastMinInterval {
+		if last, ok := lastErrorToast[throttleKey]; ok && time.Since(last) < errorToastMinInterval {
 			errorThrottleMu.Unlock()
 			return
 		}
-		lastErrorToast[source] = time.Now()
+		lastErrorToast[throttleKey] = time.Now()
 		errorThrottleMu.Unlock()
 
 		label := "Jira"
 		if source == "github" {
 			label = "GitHub"
 		}
-		toast.ErrorTitled(wsHub, label, fmt.Sprintf("Poll failed: %v", err))
+		toast.ErrorTitled(wsHub, orgID, label, fmt.Sprintf("Poll failed: %v", err))
 	}
 
 	// Create spawner once — credentials are hot-swapped in place
@@ -694,9 +716,34 @@ func main() {
 	// frontend Knowledge panel listens and refetches, so files appear
 	// in the UI as the agent writes them mid-turn. Failure here is
 	// non-fatal — the panel still works, just without live updates.
+	//
+	// resolveOrgForProject lets the watcher stamp each broadcast with
+	// the project's owning org so the hub's per-connection filter
+	// keeps the event scoped to that tenant. Uses the admin-pool
+	// ResolveOrgSystem variant — the watcher fires from a fs-events
+	// goroutine with no claims context.
+	//
+	// Returning "" tells the watcher to drop the broadcast rather
+	// than fall back to a system-wide fanout (which the hub would
+	// deliver to every connected tenant, leaking the update cross-
+	// tenancy). Both branches below — lookup error and no-row — log
+	// on this side so the failure is visible without the watcher
+	// having to know why.
+	resolveOrgForProject := func(projectID string) string {
+		orgID, err := stores.Projects.ResolveOrgSystem(context.Background(), projectID)
+		if err != nil {
+			log.Printf("[kbwatcher] resolve org for project %s: %v (dropping live update)", projectID, err)
+			return ""
+		}
+		if orgID == "" {
+			log.Printf("[kbwatcher] no org for project %s — stale dir or unresolved row (dropping live update)", projectID)
+			return ""
+		}
+		return orgID
+	}
 	if root, err := curator.ProjectsRoot(); err != nil {
 		log.Printf("[kbwatcher] resolve projects root: %v (live KB updates disabled)", err)
-	} else if _, err := curator.NewKnowledgeWatcher(wsHub, root); err != nil {
+	} else if _, err := curator.NewKnowledgeWatcher(wsHub, root, resolveOrgForProject); err != nil {
 		log.Printf("[kbwatcher] start: %v (live KB updates disabled)", err)
 	}
 
@@ -861,7 +908,7 @@ func main() {
 				if meta.Source == "jira" {
 					label = "Jira"
 				}
-				toast.Info(wsHub, fmt.Sprintf(
+				toast.Info(wsHub, evt.OrgID, fmt.Sprintf(
 					"First %s poll complete — %d %s tracked",
 					label, meta.Entities, pluralize(meta.Entities, "entity", "entities"),
 				))

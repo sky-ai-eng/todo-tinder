@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -120,6 +121,34 @@ func (s *projectStore) List(ctx context.Context, orgID string) ([]domain.Project
 
 func (s *projectStore) ListSystem(ctx context.Context, orgID string) ([]domain.Project, error) {
 	return listProjects(ctx, s.admin, orgID)
+}
+
+// ResolveOrgSystem returns the project's owning org id via the admin
+// pool — RLS would hide the row from a JWT-claims-free caller, and
+// the consumer (kbwatcher's broadcast scoping) has no identity
+// context. Returns ("", nil) when no row matches so callers can drop
+// the broadcast cleanly (see kbwatcher's ProjectOrgResolver docs —
+// the watcher treats empty as "drop", not "fan out system-wide").
+//
+// projectID comes from a filesystem directory name (the kb watcher
+// reads /<projects-root>/<id>/knowledge-base/...), which can be any
+// string the operator put on disk. A non-UUID string would otherwise
+// surface as SQLSTATE 22P02 from the UUID-typed projects.id column
+// rather than the clean no-row shape this method documents. Short-
+// circuit invalid UUIDs to ("", nil) per the convention in uuid.go.
+func (s *projectStore) ResolveOrgSystem(ctx context.Context, projectID string) (string, error) {
+	if !isValidUUID(projectID) {
+		return "", nil
+	}
+	var orgID string
+	err := s.admin.QueryRowContext(ctx, `SELECT org_id::text FROM projects WHERE id = $1`, projectID).Scan(&orgID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return orgID, nil
 }
 
 func listProjects(ctx context.Context, q queryer, orgID string) ([]domain.Project, error) {

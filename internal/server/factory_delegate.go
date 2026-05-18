@@ -216,7 +216,8 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		return
 	case result == db.HandoffChanged:
 		s.ws.Broadcast(websocket.Event{
-			Type: "task_claimed",
+			Type:  "task_claimed",
+			OrgID: orgID,
 			Data: map[string]any{
 				"task_id":             task.ID,
 				"claimed_by_agent_id": a.ID,

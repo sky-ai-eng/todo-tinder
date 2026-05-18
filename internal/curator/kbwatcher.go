@@ -46,10 +46,33 @@ type Broadcaster interface {
 	Broadcast(websocket.Event)
 }
 
+// ProjectOrgResolver maps a project id to its owning org id. The
+// kbwatcher uses this to stamp the per-connection routing org on
+// each project_knowledge_updated event so the hub's fanout filter
+// keeps cross-tenant noise off.
+//
+// Return value semantics:
+//
+//   - non-empty orgID: normal case, broadcast with that scope.
+//   - empty string: project couldn't be resolved (stale dir, lookup
+//     error). The watcher DROPS the broadcast rather than falling
+//     back to system-wide — an empty OrgID on the wire would reach
+//     every connected tenant's clients, leaking the update across
+//     the tenancy boundary. Resolver implementations should log on
+//     their side and return ""; the watcher does not log on drop
+//     (the resolver is closer to the failure).
+//
+// A nil ProjectOrgResolver is still tolerated for tests and pre-
+// wiring; in that case the watcher broadcasts with OrgID="" and the
+// hub delivers system-wide — that's fine for tests but not for
+// production, which always wires a real resolver.
+type ProjectOrgResolver func(projectID string) string
+
 type KnowledgeWatcher struct {
-	watcher *fsnotify.Watcher
-	hub     Broadcaster
-	root    string
+	watcher       *fsnotify.Watcher
+	hub           Broadcaster
+	root          string
+	resolveOrgFor ProjectOrgResolver
 
 	mu       sync.Mutex
 	debounce map[string]*time.Timer
@@ -59,7 +82,13 @@ type KnowledgeWatcher struct {
 // starts the event loop. The root is created if missing — fresh
 // installs haven't run a curator turn yet, so the dir genuinely may
 // not exist.
-func NewKnowledgeWatcher(hub Broadcaster, projectsRoot string) (*KnowledgeWatcher, error) {
+//
+// resolveOrgFor maps a project id (the directory name under the
+// watcher's root) to its owning org so the broadcast can be scoped
+// to that tenant's clients. Nil resolver is tolerated (tests, pre-
+// wiring) and falls back to empty-org broadcasts that the hub
+// delivers to every client.
+func NewKnowledgeWatcher(hub Broadcaster, projectsRoot string, resolveOrgFor ProjectOrgResolver) (*KnowledgeWatcher, error) {
 	if err := os.MkdirAll(projectsRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("ensure projects root: %w", err)
 	}
@@ -68,10 +97,11 @@ func NewKnowledgeWatcher(hub Broadcaster, projectsRoot string) (*KnowledgeWatche
 		return nil, fmt.Errorf("fsnotify: %w", err)
 	}
 	kw := &KnowledgeWatcher{
-		watcher:  w,
-		hub:      hub,
-		root:     projectsRoot,
-		debounce: make(map[string]*time.Timer),
+		watcher:       w,
+		hub:           hub,
+		root:          projectsRoot,
+		resolveOrgFor: resolveOrgFor,
+		debounce:      make(map[string]*time.Timer),
 	}
 	if err := w.Add(projectsRoot); err != nil {
 		_ = w.Close()
@@ -213,8 +243,20 @@ func (kw *KnowledgeWatcher) fire(projectID string) {
 		if kw.hub == nil {
 			return
 		}
+		var orgID string
+		if kw.resolveOrgFor != nil {
+			orgID = kw.resolveOrgFor(projectID)
+			if orgID == "" {
+				// Resolver couldn't map this project (stale dir,
+				// lookup error). Drop rather than broadcast with
+				// OrgID="" which the hub would fan out to every
+				// tenant, leaking the update cross-tenancy.
+				return
+			}
+		}
 		kw.hub.Broadcast(websocket.Event{
 			Type:      "project_knowledge_updated",
+			OrgID:     orgID,
 			ProjectID: projectID,
 		})
 	})

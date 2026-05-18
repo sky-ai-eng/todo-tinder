@@ -119,7 +119,7 @@ func (s *Spawner) Cancel(orgID, runID, userID string) error {
 	if !flipped {
 		return fmt.Errorf("no active run %s", runID)
 	}
-	s.broadcastRunUpdate(runID, "cancelled")
+	s.broadcastRunUpdate(orgID, runID, "cancelled")
 	if entityID != "" {
 		s.notifyDrainer(orgID, triggerType, entityID)
 	}
@@ -154,7 +154,7 @@ func (s *Spawner) handleCancelled(orgID, runID string, startTime time.Time, wtPa
 	if completeErr != nil {
 		log.Printf("[delegate] warning: failed to record cancellation for run %s: %v", runID, completeErr)
 	}
-	s.broadcastRunUpdate(runID, "cancelled")
+	s.broadcastRunUpdate(orgID, runID, "cancelled")
 	if wtPath != "" {
 		// Best-effort cleanup; same rationale as the defer in runAgent.
 		_ = worktree.RemoveAt(wtPath, runID)
@@ -210,12 +210,12 @@ func (s *Spawner) failRun(orgID, runID, taskID, triggerType, creatorUserID, errM
 	}
 
 	s.updateBreakerCounter(taskID, triggerType, "failed")
-	s.broadcastRunUpdate(runID, "failed")
+	s.broadcastRunUpdate(orgID, runID, "failed")
 
 	// Surface as a sticky error toast so the user sees the failure even when
 	// they're not watching the runs page. Truncate the message — full stderr
 	// dumps don't fit in a toast card.
-	toast.Error(s.wsHub, fmt.Sprintf("Run %s failed: %s", shortRunID(runID), truncateToastMsg(errMsg, 160)))
+	toast.Error(s.wsHub, orgID, fmt.Sprintf("Run %s failed: %s", shortRunID(runID), truncateToastMsg(errMsg, 160)))
 }
 
 // truncateToastMsg caps an error message at maxLen runes with an ellipsis.

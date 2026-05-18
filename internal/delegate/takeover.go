@@ -267,7 +267,8 @@ func (s *Spawner) Takeover(orgID, runID, baseDir, userID string) (*TakeoverResul
 	// not task responsibility. The two channels stay split (SKY-261 B+).
 	if s.wsHub != nil {
 		s.wsHub.Broadcast(websocket.Event{
-			Type: "task_claimed",
+			Type:  "task_claimed",
+			OrgID: orgID,
 			Data: map[string]any{
 				"task_id":             run.TaskID,
 				"claimed_by_agent_id": "",
@@ -276,8 +277,8 @@ func (s *Spawner) Takeover(orgID, runID, baseDir, userID string) (*TakeoverResul
 		})
 	}
 
-	s.broadcastRunUpdate(runID, "taken_over")
-	toast.Info(s.wsHub, fmt.Sprintf("Taken over: run %s — resume in your terminal", shortRunID(runID)))
+	s.broadcastRunUpdate(orgID, runID, "taken_over")
+	toast.Info(s.wsHub, orgID, fmt.Sprintf("Taken over: run %s — resume in your terminal", shortRunID(runID)))
 
 	return &TakeoverResult{TakeoverPath: destPath, SessionID: run.SessionID}, nil
 }
@@ -358,7 +359,7 @@ func (s *Spawner) abortTakeover(orgID, runID, claudeCwd, destPath, userID string
 		return
 	}
 	if ok {
-		s.broadcastRunUpdate(runID, "cancelled")
+		s.broadcastRunUpdate(orgID, runID, "cancelled")
 	}
 }
 
@@ -577,8 +578,8 @@ func (s *Spawner) Release(orgID, runID, userID string) error {
 		return fmt.Errorf("%w: run %s (DB row no longer matches release preconditions)", ErrReleaseNothingHeld, runID)
 	}
 
-	s.broadcastRunUpdate(runID, "taken_over")
-	toast.Info(s.wsHub, fmt.Sprintf("Released takeover: run %s", shortRunID(runID)))
+	s.broadcastRunUpdate(orgID, runID, "taken_over")
+	toast.Info(s.wsHub, orgID, fmt.Sprintf("Released takeover: run %s", shortRunID(runID)))
 
 	return nil
 }

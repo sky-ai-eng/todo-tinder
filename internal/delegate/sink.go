@@ -74,7 +74,7 @@ func (k *runSink) OnSession(sessionID string) error {
 	} else if err := k.spawner.agentRuns.SetSessionSystem(bgCtx, k.orgID, k.runID, sessionID); err != nil {
 		return fmt.Errorf("persist session_id: %w", err)
 	}
-	k.spawner.broadcastRunUpdate(k.runID, "running")
+	k.spawner.broadcastRunUpdate(k.orgID, k.runID, "running")
 	return nil
 }
 
@@ -104,7 +104,7 @@ func (k *runSink) OnMessage(msg *domain.AgentMessage) error {
 		id = i
 	}
 	msg.ID = int(id)
-	k.spawner.broadcastMessage(k.runID, msg)
+	k.spawner.broadcastMessage(k.orgID, k.runID, msg)
 	return nil
 }
 

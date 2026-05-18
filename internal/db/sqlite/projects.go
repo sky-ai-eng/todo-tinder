@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -158,6 +159,23 @@ func (s *projectStore) Update(ctx context.Context, orgID string, p domain.Projec
 // gate.
 func (s *projectStore) ListSystem(ctx context.Context, orgID string) ([]domain.Project, error) {
 	return s.List(ctx, orgID)
+}
+
+// ResolveOrgSystem returns the local sentinel org for any known
+// project id. SQLite has a single tenant per database file so the
+// only valid org_id for any row is runmode.LocalDefaultOrgID; we
+// still gate on the row's existence so a stale projectID surfaces as
+// ("", nil) rather than confidently claiming the sentinel org.
+func (s *projectStore) ResolveOrgSystem(ctx context.Context, projectID string) (string, error) {
+	var orgID string
+	err := s.q.QueryRowContext(ctx, `SELECT org_id FROM projects WHERE id = ?`, projectID).Scan(&orgID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return orgID, nil
 }
 
 func (s *projectStore) Delete(ctx context.Context, orgID, id string) error {

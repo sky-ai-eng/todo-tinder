@@ -346,9 +346,12 @@ func (s *Server) routes() {
 	s.apiMutating("POST /api/projects/{id}/curator/reset", s.handleCuratorReset)
 
 	// Websocket: wrapped via s.api so the handshake sees claims in
-	// r.Context() for the WS-connection scoping that D9b will read.
+	// r.Context() (sentinel in local mode, real values in multi).
+	// handleWS pulls (userID, orgID) out and threads them into the
+	// hub's HandleWS so the per-connection scoping in pkg/websocket
+	// can filter Broadcast fanout without importing internal/server.
 	// Treated as GET-equivalent — no CSRF wrap.
-	s.api("GET /api/ws", s.ws.HandleWS)
+	s.api("GET /api/ws", s.handleWS)
 
 	s.api("GET /api/dashboard/stats", s.handleDashboardStats)
 	s.api("GET /api/dashboard/prs", s.handleDashboardPRs)

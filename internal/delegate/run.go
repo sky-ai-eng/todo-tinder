@@ -451,18 +451,18 @@ func (s *Spawner) processCompletion(
 			}
 		}
 	}
-	s.broadcastRunUpdate(runID, status)
+	s.broadcastRunUpdate(orgID, runID, status)
 
 	// Toast the terminal state. Success cases auto-hide; failed/unsolvable
 	// show as an error toast so the user notices even if they've clicked
 	// away from the runs page.
 	switch status {
 	case "completed", "pending_approval":
-		toast.Success(s.wsHub, fmt.Sprintf("Run %s completed", shortRunID(runID)))
+		toast.Success(s.wsHub, orgID, fmt.Sprintf("Run %s completed", shortRunID(runID)))
 	case "failed":
-		toast.Error(s.wsHub, fmt.Sprintf("Run %s failed: %s", shortRunID(runID), truncateToastMsg(resultSummary, 160)))
+		toast.Error(s.wsHub, orgID, fmt.Sprintf("Run %s failed: %s", shortRunID(runID), truncateToastMsg(resultSummary, 160)))
 	case "task_unsolvable":
-		toast.Warning(s.wsHub, fmt.Sprintf("Run %s — task unsolvable: %s", shortRunID(runID), truncateToastMsg(resultSummary, 140)))
+		toast.Warning(s.wsHub, orgID, fmt.Sprintf("Run %s — task unsolvable: %s", shortRunID(runID), truncateToastMsg(resultSummary, 140)))
 	}
 }
 
@@ -513,7 +513,7 @@ func (s *Spawner) persistYield(orgID, runID string, req *domain.YieldRequest, co
 		}
 		msg = m
 	}
-	s.broadcastMessage(runID, msg)
+	s.broadcastMessage(orgID, runID, msg)
 
 	var flipped bool
 	if triggerType == "manual" {
@@ -542,7 +542,7 @@ func (s *Spawner) persistYield(orgID, runID string, req *domain.YieldRequest, co
 		// broadcast needed (the racing path already broadcast).
 		return nil
 	}
-	s.broadcastRunUpdate(runID, "awaiting_input")
-	toast.Info(s.wsHub, fmt.Sprintf("Run %s waiting for response", shortRunID(runID)))
+	s.broadcastRunUpdate(orgID, runID, "awaiting_input")
+	toast.Info(s.wsHub, orgID, fmt.Sprintf("Run %s waiting for response", shortRunID(runID)))
 	return nil
 }

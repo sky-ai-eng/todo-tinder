@@ -229,7 +229,7 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 	if createErr != nil {
 		return "", fmt.Errorf("create agent run: %w", createErr)
 	}
-	s.broadcastRunUpdate(runID, "initializing")
+	s.broadcastRunUpdate(orgID, runID, "initializing")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.mu.Lock()
@@ -291,7 +291,7 @@ func (s *Spawner) Delegate(task domain.Task, opts DelegateOpts) (string, error) 
 		if triggerType == "event" {
 			verb = "Auto-fired"
 		}
-		toast.Info(s.wsHub, fmt.Sprintf("%s: %s (%s)", verb, truncateToastMsg(task.Title, 80), shortRunID(runID)))
+		toast.Info(s.wsHub, orgID, fmt.Sprintf("%s: %s (%s)", verb, truncateToastMsg(task.Title, 80), shortRunID(runID)))
 		s.runAgent(ctx, runID, task, mission, cfg, startTime, model, triggerType, creatorUserID)
 	}()
 

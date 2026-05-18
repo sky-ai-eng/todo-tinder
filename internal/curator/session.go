@@ -21,7 +21,13 @@ import (
 type projectSession struct {
 	curator   *Curator
 	projectID string
-	queue     chan queueItem
+	// orgID is the project's owning tenant. Captured at session start
+	// so shutdown() and any other code path that fires without an
+	// in-scope queueItem can still scope broadcast events to the right
+	// org. A project belongs to exactly one org for its lifetime, so
+	// this is stable across the session.
+	orgID string
+	queue chan queueItem
 
 	// ctx + stopAll bound the lifetime of the whole goroutine. Closed
 	// during Curator.Shutdown or CancelProject; the goroutine drops
@@ -145,7 +151,7 @@ func (s *projectSession) dispatch(item queueItem) {
 		s.failRequest(item, "request not found")
 		return
 	}
-	s.curator.broadcastRequestUpdate(s.projectID, requestID, "running")
+	s.curator.broadcastRequestUpdate(item.orgID, s.projectID, requestID, "running")
 
 	// Cancel could have fired during MarkRunning's DB call. Check
 	// before doing any further work so we don't pointlessly load
@@ -407,7 +413,7 @@ func (s *projectSession) dispatch(item queueItem) {
 		// purposes — user retry should re-see the deltas.
 		s.revertPendingFor(item)
 	}
-	s.curator.broadcastRequestUpdate(s.projectID, requestID, status)
+	s.curator.broadcastRequestUpdate(item.orgID, s.projectID, requestID, status)
 }
 
 // finalizePendingFor purges every pending-context row consumed by this
@@ -496,7 +502,7 @@ func (s *projectSession) shutdown(reason string) {
 	// a future `MarkRequestCancelledIfActiveSystem` variant.
 	if inFlightID != "" {
 		if flipped, err := db.MarkCuratorRequestCancelledIfActive(s.curator.database, inFlightID, reason); err == nil && flipped {
-			s.curator.broadcastRequestUpdate(s.projectID, inFlightID, "cancelled")
+			s.curator.broadcastRequestUpdate(s.orgID, s.projectID, inFlightID, "cancelled")
 		}
 	}
 
@@ -519,7 +525,7 @@ func (s *projectSession) markCancelled(item queueItem, reason string) {
 		return
 	}
 	if flipped {
-		s.curator.broadcastRequestUpdate(s.projectID, item.requestID, "cancelled")
+		s.curator.broadcastRequestUpdate(item.orgID, s.projectID, item.requestID, "cancelled")
 	}
 }
 
@@ -543,5 +549,5 @@ func (s *projectSession) failRequest(item queueItem, errMsg string) {
 		// the handler already broadcast that.
 		return
 	}
-	s.curator.broadcastRequestUpdate(s.projectID, item.requestID, "failed")
+	s.curator.broadcastRequestUpdate(item.orgID, s.projectID, item.requestID, "failed")
 }

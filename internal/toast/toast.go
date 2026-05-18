@@ -47,21 +47,29 @@ type Broadcaster interface {
 	Broadcast(websocket.Event)
 }
 
-// Fire publishes a toast with the given level/title/body. No-op when hub
-// is nil or body is empty — empty-body toasts would render as confusing
-// blank cards, so we drop them silently.
+// Fire publishes a toast scoped to orgID with the given level/title/body.
+// No-op when hub is nil or body is empty — empty-body toasts would render
+// as confusing blank cards, so we drop them silently.
+//
+// orgID is the tenant the toast belongs to and gates per-connection
+// fanout via the hub's Broadcast filter. Pass empty to fire a
+// system-wide toast that reaches every connected client (used for
+// process-level events in main.go like startup config-change
+// notifications); per-tenant call sites must always provide a real
+// orgID so a toast for org A doesn't pop on org B's UI.
 //
 // Handles both untyped-nil (`hub == nil`) and typed-nil interface values
 // (e.g. `var h *websocket.Hub; toast.Fire(h, ...)`). A typed-nil passes
 // the naive `== nil` check because the interface's type descriptor is
 // non-nil, but calling Broadcast on it would panic. Reflection closes
 // that hole so every caller gets a consistent "nil hub = no-op" contract.
-func Fire(hub Broadcaster, level Level, title, body string) {
+func Fire(hub Broadcaster, orgID string, level Level, title, body string) {
 	if isNilBroadcaster(hub) || body == "" {
 		return
 	}
 	hub.Broadcast(websocket.Event{
-		Type: "toast",
+		Type:  "toast",
+		OrgID: orgID,
 		Data: Payload{
 			ID:    uuid.New().String(),
 			Level: level,
@@ -83,25 +91,36 @@ func isNilBroadcaster(hub Broadcaster) bool {
 
 // Convenience helpers — the common case has no title.
 
-func Info(hub Broadcaster, body string)    { Fire(hub, LevelInfo, "", body) }
-func Success(hub Broadcaster, body string) { Fire(hub, LevelSuccess, "", body) }
-func Warning(hub Broadcaster, body string) { Fire(hub, LevelWarning, "", body) }
-func Error(hub Broadcaster, body string)   { Fire(hub, LevelError, "", body) }
+func Info(hub Broadcaster, orgID, body string) {
+	Fire(hub, orgID, LevelInfo, "", body)
+}
+
+func Success(hub Broadcaster, orgID, body string) {
+	Fire(hub, orgID, LevelSuccess, "", body)
+}
+
+func Warning(hub Broadcaster, orgID, body string) {
+	Fire(hub, orgID, LevelWarning, "", body)
+}
+
+func Error(hub Broadcaster, orgID, body string) {
+	Fire(hub, orgID, LevelError, "", body)
+}
 
 // Titled variants for when you want a short category label + a longer body.
 
-func InfoTitled(hub Broadcaster, title, body string) {
-	Fire(hub, LevelInfo, title, body)
+func InfoTitled(hub Broadcaster, orgID, title, body string) {
+	Fire(hub, orgID, LevelInfo, title, body)
 }
 
-func SuccessTitled(hub Broadcaster, title, body string) {
-	Fire(hub, LevelSuccess, title, body)
+func SuccessTitled(hub Broadcaster, orgID, title, body string) {
+	Fire(hub, orgID, LevelSuccess, title, body)
 }
 
-func WarningTitled(hub Broadcaster, title, body string) {
-	Fire(hub, LevelWarning, title, body)
+func WarningTitled(hub Broadcaster, orgID, title, body string) {
+	Fire(hub, orgID, LevelWarning, title, body)
 }
 
-func ErrorTitled(hub Broadcaster, title, body string) {
-	Fire(hub, LevelError, title, body)
+func ErrorTitled(hub Broadcaster, orgID, title, body string) {
+	Fire(hub, orgID, LevelError, title, body)
 }

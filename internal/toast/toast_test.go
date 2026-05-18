@@ -15,10 +15,12 @@ func (f *fakeHub) Broadcast(evt websocket.Event) {
 	f.events = append(f.events, evt)
 }
 
+const testOrgID = "00000000-0000-0000-0000-00000000aaaa"
+
 func TestFire_PublishesExpectedShape(t *testing.T) {
 	hub := &fakeHub{}
 
-	Error(hub, "Jira poll failed: auth error")
+	Error(hub, testOrgID, "Jira poll failed: auth error")
 
 	if len(hub.events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(hub.events))
@@ -26,6 +28,9 @@ func TestFire_PublishesExpectedShape(t *testing.T) {
 	evt := hub.events[0]
 	if evt.Type != "toast" {
 		t.Errorf("expected type 'toast', got %q", evt.Type)
+	}
+	if evt.OrgID != testOrgID {
+		t.Errorf("expected OrgID %q stamped on the event, got %q", testOrgID, evt.OrgID)
 	}
 	payload, ok := evt.Data.(Payload)
 	if !ok {
@@ -48,7 +53,7 @@ func TestFire_PublishesExpectedShape(t *testing.T) {
 func TestFire_EmptyBody_NoOp(t *testing.T) {
 	// Empty body should be dropped — a blank toast card is worse than no toast.
 	hub := &fakeHub{}
-	Info(hub, "")
+	Info(hub, testOrgID, "")
 	if len(hub.events) != 0 {
 		t.Errorf("expected 0 events for empty body, got %d", len(hub.events))
 	}
@@ -57,7 +62,7 @@ func TestFire_EmptyBody_NoOp(t *testing.T) {
 func TestFire_NilHub_NoOp(t *testing.T) {
 	// Untyped nil must not panic — simplifies test setup and makes toast-fires
 	// safe in code paths where WS setup was skipped.
-	Error(nil, "anything")
+	Error(nil, testOrgID, "anything")
 	// no panic = pass
 }
 
@@ -68,13 +73,13 @@ func TestFire_TypedNilHub_NoOp(t *testing.T) {
 	// because the interface's type descriptor is non-nil; only the wrapped
 	// pointer is nil. Without the reflect guard, Broadcast would panic.
 	var hub *websocket.Hub // nil pointer, assignable to Broadcaster
-	Error(hub, "anything")
+	Error(hub, testOrgID, "anything")
 	// no panic = pass
 }
 
 func TestFire_TitledHelper(t *testing.T) {
 	hub := &fakeHub{}
-	WarningTitled(hub, "Scorer", "batch failed — 3 tasks skipped")
+	WarningTitled(hub, testOrgID, "Scorer", "batch failed — 3 tasks skipped")
 
 	if len(hub.events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(hub.events))
@@ -93,10 +98,10 @@ func TestFire_LevelsDistinct(t *testing.T) {
 	// in the helper definitions where a future maintainer might accidentally
 	// have Success() fire LevelInfo.
 	hub := &fakeHub{}
-	Info(hub, "a")
-	Success(hub, "b")
-	Warning(hub, "c")
-	Error(hub, "d")
+	Info(hub, testOrgID, "a")
+	Success(hub, testOrgID, "b")
+	Warning(hub, testOrgID, "c")
+	Error(hub, testOrgID, "d")
 
 	want := []Level{LevelInfo, LevelSuccess, LevelWarning, LevelError}
 	if len(hub.events) != len(want) {
@@ -107,5 +112,20 @@ func TestFire_LevelsDistinct(t *testing.T) {
 		if got != want[i] {
 			t.Errorf("event %d: expected level %q, got %q", i, want[i], got)
 		}
+	}
+}
+
+// TestFire_EmptyOrg_Passthrough — the empty-OrgID case is the system-wide
+// broadcast contract. The Fire helper accepts it without complaint; the
+// hub's per-connection filter delivers empty-OrgID events to every client.
+// Toasts fired from main.go startup paths legitimately use this shape.
+func TestFire_EmptyOrg_Passthrough(t *testing.T) {
+	hub := &fakeHub{}
+	Info(hub, "", "system-wide announcement")
+	if len(hub.events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(hub.events))
+	}
+	if hub.events[0].OrgID != "" {
+		t.Errorf("expected empty OrgID, got %q", hub.events[0].OrgID)
 	}
 }
