@@ -4,6 +4,9 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // projectEntity is the per-row payload returned by
@@ -35,22 +38,28 @@ func (s *Server) handleProjectEntities(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, projectID)
-	if err != nil {
-		log.Printf("[entities] get project %s: %v", projectID, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
+	var project *domain.Project
+	var entities []domain.ProjectPanelEntity
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, projectID)
+		if e != nil {
+			return e
+		}
+		if project == nil {
+			return nil
+		}
+		entities, e = tx.Entities.ListProjectPanel(r.Context(), orgID, projectID)
+		return e
+	}); err != nil {
+		log.Printf("[entities] project %s: %v", projectID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project entities"})
 		return
 	}
 	if project == nil {
 		notFound(w, "project")
-		return
-	}
-
-	entities, err := s.entities.ListProjectPanel(r.Context(), orgID, projectID)
-	if err != nil {
-		log.Printf("[entities] list for project %s: %v", projectID, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load entities"})
 		return
 	}
 
