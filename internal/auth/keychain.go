@@ -183,6 +183,91 @@ func get(key string) (string, error) {
 	return val, err
 }
 
+// GetSecret reads a single keychain entry by key, returning "" (not an
+// error) when no entry exists. For the four well-known credential keys
+// (github_url, github_pat, jira_url, jira_pat) any matching
+// TRIAGE_FACTORY_* env var overrides the keychain value — same overlay
+// rule as Load. Unknown keys read straight from keychain.
+//
+// This is the read-path entry point for the local-mode SecretStore
+// (internal/db/sqlite). The keyed shape lets multi-mode consumers
+// (vault-backed SecretStore) and local-mode consumers share one
+// interface in package db so callers like the per-org Anthropic
+// credential resolver don't have to branch on runmode.
+func GetSecret(key string) (string, error) {
+	if envName, ok := envKeys[key]; ok {
+		if v := os.Getenv(envName); v != "" {
+			logEnvOnce()
+			return v, nil
+		}
+	}
+	return get(key)
+}
+
+// PutSecret writes value under key in the keychain. Mirrors the
+// keychain-unavailable handling of Store: if the keychain probe fails
+// and the four well-known keys have env-var coverage, treat the write
+// as a silent no-op (the env is the source of truth and the keychain
+// write would just fail). For unknown keys there's no env fallback, so
+// a keychain-unavailable error propagates.
+//
+// # Asymmetry with GetSecret
+//
+// Env vars are read-only — GetSecret returns the env value when set,
+// but PutSecret always writes to the keychain. That means a rotation
+// (Put new_value) is invisible to subsequent Get calls when a
+// TRIAGE_FACTORY_* env var is set for the same key: Get continues to
+// return the env value. This matches the existing Store/Load
+// asymmetry rather than introducing new behavior, but the absence of
+// a self-contained read-back is a real footgun for callers — surface
+// the env-overlay state to the user when rotating a known key
+// (Settings UI does this today via EnvProvided).
+func PutSecret(key, value string) error {
+	if !probeKeychain() {
+		if _, known := envKeys[key]; known && len(EnvProvided()) > 0 {
+			return nil
+		}
+		return fmt.Errorf("keychain backend unavailable")
+	}
+	return keyring.Set(service, key, value)
+}
+
+// HasKeychainEntry reports whether the keychain currently has a value
+// stored under key, bypassing the TRIAGE_FACTORY_* env overlay
+// GetSecret applies. Use this when you need to know about the
+// keychain row specifically — e.g. the SecretStore.Delete contract,
+// which must report ok=false when only an env-supplied value exists
+// (DeleteSecret can't remove env vars, so claiming "removed" would be
+// a lie).
+//
+// Returns false on any keychain error, including unavailability —
+// callers treating absence the same as inaccessibility is the right
+// posture here.
+func HasKeychainEntry(key string) bool {
+	if !probeKeychain() {
+		return false
+	}
+	val, err := keyring.Get(service, key)
+	if err != nil {
+		return false
+	}
+	return val != ""
+}
+
+// DeleteSecret removes a single keychain entry. Missing entries are
+// not an error (matches the behavior of Clear / ClearJira). When the
+// keychain is unavailable the call is a no-op — same shape as
+// deleteKeys.
+func DeleteSecret(key string) error {
+	if !probeKeychain() {
+		return nil
+	}
+	if err := keyring.Delete(service, key); err != nil && err != keyring.ErrNotFound {
+		return fmt.Errorf("keychain delete %s: %w", key, err)
+	}
+	return nil
+}
+
 // --- env var helpers ---
 
 var envLogOnce sync.Once
