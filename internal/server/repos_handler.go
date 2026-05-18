@@ -7,6 +7,8 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 )
 
@@ -40,8 +42,13 @@ func (s *Server) handleRepoProfiles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	profiles, err := s.repos.List(r.Context(), orgID)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var profiles []domain.RepoProfile
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		profiles, e = tx.Repos.List(r.Context(), orgID)
+		return e
+	}); err != nil {
 		internalError(w, "repos", err)
 		return
 	}
@@ -95,6 +102,7 @@ func (s *Server) handleRepoUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	owner := r.PathValue("owner")
 	repo := r.PathValue("repo")
 	if owner == "" || repo == "" {
@@ -120,7 +128,9 @@ func (s *Server) handleRepoUpdate(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid base_branch value"})
 			return
 		}
-		if err := s.repos.UpdateBaseBranch(r.Context(), orgID, repoID, branch); err != nil {
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			return tx.Repos.UpdateBaseBranch(r.Context(), orgID, repoID, branch)
+		}); err != nil {
 			internalError(w, "repos", err)
 			return
 		}
@@ -175,7 +185,10 @@ func (s *Server) handleReposSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.repos.SetConfigured(r.Context(), orgID, req.Repos); err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.Repos.SetConfigured(r.Context(), orgID, req.Repos)
+	}); err != nil {
 		internalError(w, "repos", err)
 		return
 	}

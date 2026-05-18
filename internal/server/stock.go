@@ -75,8 +75,12 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 	// synthesized event metadata reads correctly. Both come from the same
 	// auth.ValidateJira response at PAT setup; missing either means the
 	// bootstrap hasn't run yet or Jira isn't connected.
-	localAccountID, localDisplayName, err := s.users.GetJiraIdentity(r.Context(), userID)
-	if err != nil {
+	var localAccountID, localDisplayName string
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
 		return
 	}
@@ -95,18 +99,21 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entities, err := s.entities.ListActive(r.Context(), orgID, "jira")
-	if err != nil {
+	var entities []domain.Entity
+	var taskedEntityIDs map[string]struct{}
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		entities, e = tx.Entities.ListActive(r.Context(), orgID, "jira")
+		if e != nil {
+			return e
+		}
+		// Batch-fetch the set of Jira entity IDs that already have an active task
+		// so we don't run N queries inside the loop. If this fails we can't tell
+		// which entities are safe to show, so fail the request outright.
+		taskedEntityIDs, e = tx.Tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list entities: " + err.Error()})
-		return
-	}
-
-	// Batch-fetch the set of Jira entity IDs that already have an active task
-	// so we don't run N queries inside the loop. If this fails we can't tell
-	// which entities are safe to show, so fail the request outright.
-	taskedEntityIDs, err := s.tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check active tasks: " + err.Error()})
 		return
 	}
 
@@ -308,8 +315,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	creds, _ := auth.Load()
-	localAccountID, localDisplayName, err := s.users.GetJiraIdentity(r.Context(), userID)
-	if err != nil {
+	var localAccountID, localDisplayName string
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
 		return
 	}
@@ -322,8 +333,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	// eligibility checks run in O(1) per action. Fail the request if this
 	// fails — otherwise we'd act on tickets without knowing whether they're
 	// already being tracked.
-	taskedEntityIDs, err := s.tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
-	if err != nil {
+	var taskedEntityIDs map[string]struct{}
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		taskedEntityIDs, e = tx.Tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check active tasks: " + err.Error()})
 		return
 	}
@@ -348,8 +363,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		entity, err := s.entities.GetBySource(r.Context(), orgID, "jira", issueKey)
-		if err != nil {
+		var entity *domain.Entity
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			entity, e = tx.Entities.GetBySource(r.Context(), orgID, "jira", issueKey)
+			return e
+		}); err != nil {
 			failed = append(failed, stockFailure{issueKey, a.Action, "failed to load entity"})
 			continue
 		}
@@ -430,18 +449,21 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			// lie). Assigned tickets use jira:issue:assigned as before.
 			var eventType string
 			var eventID string
-			if isAvailable {
-				eventType = domain.EventJiraIssueAvailable
-				eventID, err = recordCarryOverAvailableEvent(r.Context(), s.events, orgID, entity.ID, snap)
-			} else {
-				eventType = domain.EventJiraIssueAssigned
-				eventID, err = recordCarryOverAssignedEvent(r.Context(), s.events, orgID, entity.ID, snap)
-			}
-			if err != nil {
-				failed = append(failed, stockFailure{a.IssueKey, a.Action, "record event: " + err.Error()})
-				continue
-			}
-			if _, _, err := s.tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, eventType, "", eventID, 0.5); err != nil {
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				var e error
+				if isAvailable {
+					eventType = domain.EventJiraIssueAvailable
+					eventID, e = recordCarryOverAvailableEvent(r.Context(), tx.Events, orgID, entity.ID, snap)
+				} else {
+					eventType = domain.EventJiraIssueAssigned
+					eventID, e = recordCarryOverAssignedEvent(r.Context(), tx.Events, orgID, entity.ID, snap)
+				}
+				if e != nil {
+					return e
+				}
+				_, _, e = tx.Tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, eventType, "", eventID, 0.5)
+				return e
+			}); err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
 			}
@@ -490,27 +512,29 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			// jira:issue:assigned event — after the AssignToSelf call, the
 			// user is the assignee in Jira too, so the event metadata is
 			// accurate for either starting state.
-			eventID, err := recordCarryOverAssignedEvent(r.Context(), s.events, orgID, entity.ID, snap)
-			if err != nil {
-				failed = append(failed, stockFailure{a.IssueKey, a.Action, "record event: " + err.Error()})
-				continue
-			}
-			task, _, err := s.tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5)
-			if err != nil {
+			var task *domain.Task
+			var claimOK bool
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				eventID, e := recordCarryOverAssignedEvent(r.Context(), tx.Events, orgID, entity.ID, snap)
+				if e != nil {
+					return fmt.Errorf("record event: %w", e)
+				}
+				task, _, e = tx.Tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5)
+				if e != nil {
+					return e
+				}
+				// SKY-261 B+: claim is on the responsibility axis now,
+				// not status. status='claimed' was dropped along with
+				// status='delegated' once the claim cols took over the
+				// "who's responsible" answer. Stamp the user claim
+				// optimistically — if the task pre-existed in some
+				// non-queued state or was already claimed by someone
+				// else, surface that as a failed action rather than
+				// stealing.
+				claimOK, e = tx.Tasks.ClaimQueuedForUser(r.Context(), orgID, task.ID, userID)
+				return e
+			}); err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
-				continue
-			}
-			// SKY-261 B+: claim is on the responsibility axis now,
-			// not status. status='claimed' was dropped along with
-			// status='delegated' once the claim cols took over the
-			// "who's responsible" answer. Stamp the user claim
-			// optimistically — if the task pre-existed in some
-			// non-queued state or was already claimed by someone
-			// else, surface that as a failed action rather than
-			// stealing.
-			claimOK, err := s.tasks.ClaimQueuedForUser(r.Context(), orgID, task.ID, userID)
-			if err != nil {
-				failed = append(failed, stockFailure{a.IssueKey, a.Action, "claim stamp: " + err.Error()})
 				continue
 			}
 			if !claimOK {
@@ -536,7 +560,9 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			if err := s.entities.MarkClosed(r.Context(), orgID, entity.ID); err != nil {
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				return tx.Entities.MarkClosed(r.Context(), orgID, entity.ID)
+			}); err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
 				continue
 			}

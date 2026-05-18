@@ -64,6 +64,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	var req createProjectRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -73,9 +74,17 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 		return
 	}
-	pinned, errMsg := validatePinnedRepos(r.Context(), s.repos, orgID, req.PinnedRepos)
-	if errMsg != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+	var pinned []string
+	var pinnedErrMsg string
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		pinned, pinnedErrMsg = validatePinnedRepos(r.Context(), tx.Repos, orgID, req.PinnedRepos)
+		return nil
+	}); err != nil {
+		internalError(w, "projects", err)
+		return
+	}
+	if pinnedErrMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pinnedErrMsg})
 		return
 	}
 	jiraKey := strings.TrimSpace(req.JiraProjectKey)
@@ -97,6 +106,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		cfg = loaded
 	}
 	if jiraKey != "" || linearKey != "" {
+		var errMsg string
 		jiraKey, linearKey, errMsg = validateTrackerKeys(cfg, jiraKey, linearKey)
 		if errMsg != "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
@@ -110,29 +120,31 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	// — tests that don't seed prompts get NULL on insert and the curator
 	// runtime falls back to the same default at dispatch time anyway.
 	specPromptID := ""
-	def, defErr := s.prompts.Get(r.Context(), orgID, domain.SystemTicketSpecPromptID)
-	if defErr != nil {
-		log.Printf("handleProjectCreate: failed to load default spec-authorship prompt %q: %v", domain.SystemTicketSpecPromptID, defErr)
-	} else if def != nil {
-		specPromptID = domain.SystemTicketSpecPromptID
-	}
-
-	id, err := s.projects.Create(r.Context(), orgID, runmode.LocalDefaultTeamID, domain.Project{
-		Name:                   name,
-		Description:            req.Description,
-		PinnedRepos:            pinned,
-		JiraProjectKey:         jiraKey,
-		LinearProjectKey:       linearKey,
-		CuratorSessionID:       req.CuratorSessionID,
-		SpecAuthorshipPromptID: specPromptID,
-	})
-	if err != nil {
+	var created *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		def, defErr := tx.Prompts.Get(r.Context(), orgID, domain.SystemTicketSpecPromptID)
+		if defErr != nil {
+			log.Printf("handleProjectCreate: failed to load default spec-authorship prompt %q: %v", domain.SystemTicketSpecPromptID, defErr)
+		} else if def != nil {
+			specPromptID = domain.SystemTicketSpecPromptID
+		}
+		id, createErr := tx.Projects.Create(r.Context(), orgID, runmode.LocalDefaultTeamID, domain.Project{
+			Name:                   name,
+			Description:            req.Description,
+			PinnedRepos:            pinned,
+			JiraProjectKey:         jiraKey,
+			LinearProjectKey:       linearKey,
+			CuratorSessionID:       req.CuratorSessionID,
+			SpecAuthorshipPromptID: specPromptID,
+		})
+		if createErr != nil {
+			return createErr
+		}
+		var getErr error
+		created, getErr = tx.Projects.Get(r.Context(), orgID, id)
+		return getErr
+	}); err != nil {
 		internalError(w, "projects", err)
-		return
-	}
-	created, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "created but read-back failed: " + err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusCreated, created)
@@ -143,8 +155,13 @@ func (s *Server) handleProjectList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	projects, err := s.projects.List(r.Context(), orgID)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var projects []domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		projects, e = tx.Projects.List(r.Context(), orgID)
+		return e
+	}); err != nil {
 		internalError(w, "projects", err)
 		return
 	}
@@ -156,9 +173,14 @@ func (s *Server) handleProjectGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "projects", err)
 		return
 	}
@@ -214,9 +236,14 @@ func (s *Server) handleProjectExport(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "projects", err)
 		return
 	}
@@ -343,6 +370,7 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 	var req patchProjectRequest
 	if !decodeJSON(w, r, &req, "") {
@@ -361,8 +389,12 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	existing, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	var existing *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		existing, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "projects", err)
 		return
 	}
@@ -384,7 +416,15 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		updated.Description = *req.Description
 	}
 	if req.PinnedRepos != nil {
-		pinned, errMsg := validatePinnedRepos(r.Context(), s.repos, orgID, *req.PinnedRepos)
+		var pinned []string
+		var errMsg string
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			pinned, errMsg = validatePinnedRepos(r.Context(), tx.Repos, orgID, *req.PinnedRepos)
+			return nil
+		}); err != nil {
+			internalError(w, "projects", err)
+			return
+		}
 		if errMsg != "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 			return
@@ -451,8 +491,12 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		// up front keeps the contract crisp.
 		trimmed := strings.TrimSpace(*req.SpecAuthorshipPromptID)
 		if trimmed != "" {
-			prompt, err := s.prompts.Get(r.Context(), orgID, trimmed)
-			if err != nil {
+			var prompt *domain.Prompt
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				var e error
+				prompt, e = tx.Prompts.Get(r.Context(), orgID, trimmed)
+				return e
+			}); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "load prompt: " + err.Error()})
 				return
 			}
@@ -464,7 +508,9 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		updated.SpecAuthorshipPromptID = trimmed
 	}
 
-	if err := s.projects.Update(r.Context(), orgID, updated); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.Projects.Update(r.Context(), orgID, updated)
+	}); err != nil {
 		internalError(w, "projects", err)
 		return
 	}
@@ -488,8 +534,12 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 	if existing.CuratorSessionID != "" {
 		queuePendingContextChanges(s.db, *existing, updated)
 	}
-	fresh, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	var fresh *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		fresh, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "updated but read-back failed: " + err.Error()})
 		return
 	}
@@ -501,6 +551,7 @@ func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	// Take the same per-project lock that PATCH uses. Without this,
@@ -522,9 +573,13 @@ func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	// project's worktree. A read failure here is non-fatal: skip the
 	// prune step, the on-disk cleanup still happens.
 	var pinned []string
-	if existing, err := s.projects.Get(r.Context(), orgID, id); err == nil && existing != nil {
-		pinned = existing.PinnedRepos
-	}
+	_ = s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		existing, e := tx.Projects.Get(r.Context(), orgID, id)
+		if e == nil && existing != nil {
+			pinned = existing.PinnedRepos
+		}
+		return nil
+	})
 
 	// Stop any in-flight Curator chat for this project BEFORE the DB
 	// delete: the goroutine writes terminal cancelled status into
@@ -538,7 +593,9 @@ func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 		s.curator.CancelProject(orgID, id)
 	}
 
-	if err := s.projects.Delete(r.Context(), orgID, id); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.Projects.Delete(r.Context(), orgID, id)
+	}); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			notFound(w, "project")
 			return
@@ -856,9 +913,14 @@ func (s *Server) handleProjectKnowledge(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		log.Printf("[projects] knowledge list: db get %s: %v", id, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
@@ -1138,9 +1200,14 @@ func (s *Server) handleProjectKnowledgeFile(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		log.Printf("[projects] knowledge fetch: db get %s: %v", id, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
@@ -1244,8 +1311,13 @@ func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Req
 	mu.Lock()
 	defer mu.Unlock()
 
-	project, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		log.Printf("[projects] knowledge upload: db get %s: %v", id, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
@@ -1329,7 +1401,9 @@ func (s *Server) handleProjectKnowledgeUpload(w http.ResponseWriter, r *http.Req
 		}
 	}
 	if wroteAny {
-		if err := s.projects.BumpUpdatedAt(r.Context(), orgID, id); err != nil {
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			return tx.Projects.BumpUpdatedAt(r.Context(), orgID, id)
+		}); err != nil {
 			// Log but don't fail the upload — the files are on disk
 			// and the user expects the response to reflect that.
 			// The activity timestamp is a hint for follow-on display,
@@ -1453,8 +1527,13 @@ func (s *Server) handleProjectKnowledgeDelete(w http.ResponseWriter, r *http.Req
 	mu.Lock()
 	defer mu.Unlock()
 
-	project, err := s.projects.Get(r.Context(), orgID, id)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		log.Printf("[projects] knowledge delete: db get %s: %v", id, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
@@ -1477,7 +1556,9 @@ func (s *Server) handleProjectKnowledgeDelete(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to remove file"})
 		return
 	}
-	if err := s.projects.BumpUpdatedAt(r.Context(), orgID, id); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.Projects.BumpUpdatedAt(r.Context(), orgID, id)
+	}); err != nil {
 		log.Printf("[projects] knowledge delete: bump updated_at for %s: %v", id, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update project state"})
 		return

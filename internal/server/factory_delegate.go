@@ -69,8 +69,12 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// clean it up — it'd run to completion against a closed PR).
 	// Mirrors the router's "task creation requires active entity"
 	// contract at routing/router.go.
-	entity, err := s.entities.Get(r.Context(), orgID, req.EntityID)
-	if err != nil {
+	var entity *domain.Entity
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		entity, e = tx.Entities.Get(r.Context(), orgID, req.EntityID)
+		return e
+	}); err != nil {
 		internalError(w, "factory", err)
 		return
 	}
@@ -92,8 +96,12 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// (label_added "bug"). If no matching event exists the entity
 	// isn't actually at this station; refuse rather than fabricate
 	// an anchor.
-	primaryEvent, err := s.events.LatestForEntityTypeAndDedupKey(r.Context(), orgID, req.EntityID, req.EventType, req.DedupKey)
-	if err != nil {
+	var primaryEvent *domain.Event
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		primaryEvent, e = tx.Events.LatestForEntityTypeAndDedupKey(r.Context(), orgID, req.EntityID, req.EventType, req.DedupKey)
+		return e
+	}); err != nil {
 		internalError(w, "factory", err)
 		return
 	}
@@ -124,8 +132,12 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// the events package contract.
 	defaultPriority := 0.5
 	schema, schemaOK := events.Get(req.EventType)
-	handlers, err := s.eventHandlers.GetEnabledForEvent(r.Context(), orgID, req.EventType)
-	if err != nil {
+	var handlers []domain.EventHandler
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		handlers, e = tx.EventHandlers.GetEnabledForEvent(r.Context(), orgID, req.EventType)
+		return e
+	}); err != nil {
 		internalError(w, "factory", err)
 		return
 	}
@@ -154,28 +166,35 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	task, created, err := s.tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, req.EntityID, req.EventType, req.DedupKey, primaryEvent.ID, defaultPriority)
-	if err != nil {
+	var task *domain.Task
+	var created bool
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		task, created, e = tx.Tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, req.EntityID, req.EventType, req.DedupKey, primaryEvent.ID, defaultPriority)
+		if e != nil {
+			return e
+		}
+		// Mirror the router's audit linkage: when a brand-new task is
+		// synthesized, record a task_events row linking it to the event
+		// it was anchored on. Same kind="spawned" the router uses at
+		// internal/routing/router.go:223-227, so a future timeline UI
+		// reading task_events sees a uniform shape regardless of which
+		// path created the task. Non-fatal — audit gap is preferable to
+		// failing the delegate after the row is already in tasks.
+		//
+		// We don't record kind="bumped" on the find branch: the drag is
+		// the user's gesture (already captured in swipe_events via
+		// RecordSwipe), not a fresh event landing — there's nothing new
+		// to link the existing task to.
+		if created {
+			if recErr := tx.Tasks.RecordEvent(r.Context(), orgID, task.ID, primaryEvent.ID, "spawned"); recErr != nil {
+				log.Printf("[factory] failed to record spawned task_event for %s: %v", task.ID, recErr)
+			}
+		}
+		return nil
+	}); err != nil {
 		internalError(w, "factory", err)
 		return
-	}
-
-	// Mirror the router's audit linkage: when a brand-new task is
-	// synthesized, record a task_events row linking it to the event
-	// it was anchored on. Same kind="spawned" the router uses at
-	// internal/routing/router.go:223-227, so a future timeline UI
-	// reading task_events sees a uniform shape regardless of which
-	// path created the task. Non-fatal — audit gap is preferable to
-	// failing the delegate after the row is already in tasks.
-	//
-	// We don't record kind="bumped" on the find branch: the drag is
-	// the user's gesture (already captured in swipe_events via
-	// RecordSwipe), not a fresh event landing — there's nothing new
-	// to link the existing task to.
-	if created {
-		if err := s.tasks.RecordEvent(r.Context(), orgID, task.ID, primaryEvent.ID, "spawned"); err != nil {
-			log.Printf("[factory] failed to record spawned task_event for %s: %v", task.ID, err)
-		}
 	}
 
 	// SKY-261 B+ alignment with swipe-delegate: the user's gesture is
@@ -194,7 +213,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// time. Factory drag-to-bot is the same semantic as swipe-up
 	// "delegate to bot" — both refuse with 409 when the bot is off
 	// for this team.
-	a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID)
+	a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID, userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
 		return
@@ -210,11 +229,17 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// (a chip the user previously claimed via the Board), and the
 	// idempotent same-agent no-op. Refuses on a different-user
 	// claim — the factory drop shouldn't steal.
-	switch result, err := s.tasks.HandoffAgentClaim(r.Context(), orgID, task.ID, a.ID, userID); {
-	case err != nil:
+	var handoffResult db.HandoffResult
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		handoffResult, e = tx.Tasks.HandoffAgentClaim(r.Context(), orgID, task.ID, a.ID, userID)
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
 		return
-	case result == db.HandoffChanged:
+	}
+	switch handoffResult {
+	case db.HandoffChanged:
 		s.ws.Broadcast(websocket.Event{
 			Type:  "task_claimed",
 			OrgID: orgID,
@@ -224,12 +249,12 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 				"claimed_by_user_id":  "",
 			},
 		})
-	case result == db.HandoffNoOp:
+	case db.HandoffNoOp:
 		// Bot already owns it (e.g., a sibling factory drop landed
 		// first). Skip the broadcast and continue to the spawn so
 		// the user's gesture still gets a run if one isn't already
 		// underway.
-	case result == db.HandoffRefused:
+	case db.HandoffRefused:
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "task is claimed by another user; refusing to steal",
 		})
@@ -247,7 +272,10 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// failure stays non-fatal because the claim col + WS broadcast
 	// already captured the state-level effect; the audit is best-
 	// effort.
-	if _, err := s.swipes.RecordSwipe(r.Context(), orgID, task.ID, "delegate", 0); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		_, e := tx.Swipes.RecordSwipe(r.Context(), orgID, task.ID, "delegate", 0)
+		return e
+	}); err != nil {
 		log.Printf("[factory] failed to record delegate swipe for task %s: %v", task.ID, err)
 	}
 

@@ -9,6 +9,8 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -110,7 +112,9 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 	// later. userID is extracted from the request context — sentinel in
 	// local mode (via the shim), real user UUID in multi mode.
 	if resp.GitHub != nil && resp.GitHub.Login != "" {
-		if err := s.users.SetGitHubUsername(r.Context(), userID, resp.GitHub.Login); err != nil {
+		if err := s.tx.WithTx(r.Context(), runmode.LocalDefaultOrg, userID, func(tx db.TxStores) error {
+			return tx.Users.SetGitHubUsername(r.Context(), userID, resp.GitHub.Login)
+		}); err != nil {
 			log.Printf("[setup] failed to persist users.github_username: %v", err)
 		}
 	}
@@ -146,6 +150,7 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	creds, err := auth.Load()
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -155,7 +160,12 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	repoCount, _ := s.repos.CountConfigured(r.Context(), orgID)
+	var repoCount int
+	_ = s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		repoCount, e = tx.Repos.CountConfigured(r.Context(), orgID)
+		return e
+	})
 
 	// GitHub is mandatory — configured requires GitHub creds + at least one repo
 	result := map[string]any{

@@ -28,8 +28,13 @@ func (s *Server) handlePromptsList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	prompts, err := s.prompts.List(r.Context(), orgID)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var prompts []domain.Prompt
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		prompts, e = tx.Prompts.List(r.Context(), orgID)
+		return e
+	}); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
@@ -44,9 +49,14 @@ func (s *Server) handlePromptGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
-	prompt, err := s.prompts.Get(r.Context(), orgID, id)
-	if err != nil {
+	var prompt *domain.Prompt
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		prompt, e = tx.Prompts.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
@@ -123,12 +133,19 @@ func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
 		Model:  req.Model,
 	}
 
-	if err := s.prompts.Create(r.Context(), orgID, prompt); err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var created *domain.Prompt
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		if e := tx.Prompts.Create(r.Context(), orgID, prompt); e != nil {
+			return e
+		}
+		var ge error
+		created, ge = tx.Prompts.Get(r.Context(), orgID, id)
+		return ge
+	}); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
-
-	created, _ := s.prompts.Get(r.Context(), orgID, id)
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -144,6 +161,7 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	var req updatePromptRequest
@@ -164,8 +182,55 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := s.prompts.Get(r.Context(), orgID, id)
-	if err != nil {
+	var existing *domain.Prompt
+	var conflictErr string
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		existing, e = tx.Prompts.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if existing == nil {
+			return nil
+		}
+		if existing.Kind == kind {
+			return nil
+		}
+		if existing.Kind == domain.PromptKindChain {
+			// Reject chain→leaf if any chain steps exist.
+			steps, e := tx.Chains.ListSteps(r.Context(), orgID, id)
+			if e != nil {
+				return e
+			}
+			if len(steps) > 0 {
+				conflictErr = fmt.Sprintf("cannot change kind: prompt has %d chain step(s)", len(steps))
+				return nil
+			}
+			return nil
+		}
+		// Reject leaf→chain if triggers, runs, or *other* chains
+		// reference this prompt. The chain-step check matters because
+		// existing chains that embed this prompt as a step would
+		// suddenly point at a chain-kind prompt; the chain-step API
+		// explicitly rejects nested chains, so the chain would fail
+		// at delegate time instead of definition time.
+		triggers, e := tx.EventHandlers.ListForPrompt(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		runCount, e := tx.Prompts.CountRunReferences(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		stepRefs, e := tx.Chains.CountStepReferences(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if len(triggers) > 0 || runCount > 0 || stepRefs > 0 {
+			conflictErr = fmt.Sprintf("cannot change kind: prompt is referenced by %d trigger(s), %d run(s), and %d chain step(s)", len(triggers), runCount, stepRefs)
+		}
+		return nil
+	}); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
@@ -173,58 +238,23 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "prompt")
 		return
 	}
-
-	if existing.Kind != kind {
-		if existing.Kind == domain.PromptKindChain {
-			// Reject chain→leaf if any chain steps exist.
-			steps, err := s.chains.ListSteps(r.Context(), orgID, id)
-			if err != nil {
-				internalError(w, "prompts", err)
-				return
-			}
-			if len(steps) > 0 {
-				writeJSON(w, http.StatusConflict, map[string]string{
-					"error": fmt.Sprintf("cannot change kind: prompt has %d chain step(s)", len(steps)),
-				})
-				return
-			}
-		} else {
-			// Reject leaf→chain if triggers, runs, or *other* chains
-			// reference this prompt. The chain-step check matters because
-			// existing chains that embed this prompt as a step would
-			// suddenly point at a chain-kind prompt; the chain-step API
-			// explicitly rejects nested chains, so the chain would fail
-			// at delegate time instead of definition time.
-			triggers, err := s.eventHandlers.ListForPrompt(r.Context(), orgID, id)
-			if err != nil {
-				internalError(w, "prompts", err)
-				return
-			}
-			runCount, err := s.prompts.CountRunReferences(r.Context(), orgID, id)
-			if err != nil {
-				internalError(w, "prompts", err)
-				return
-			}
-			stepRefs, err := s.chains.CountStepReferences(r.Context(), orgID, id)
-			if err != nil {
-				internalError(w, "prompts", err)
-				return
-			}
-			if len(triggers) > 0 || runCount > 0 || stepRefs > 0 {
-				writeJSON(w, http.StatusConflict, map[string]string{
-					"error": fmt.Sprintf("cannot change kind: prompt is referenced by %d trigger(s), %d run(s), and %d chain step(s)", len(triggers), runCount, stepRefs),
-				})
-				return
-			}
-		}
-	}
-
-	if err := s.prompts.Update(r.Context(), orgID, id, req.Name, req.Body, string(kind), req.Model); err != nil {
-		internalError(w, "prompts", err)
+	if conflictErr != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": conflictErr})
 		return
 	}
 
-	updated, _ := s.prompts.Get(r.Context(), orgID, id)
+	var updated *domain.Prompt
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		if e := tx.Prompts.Update(r.Context(), orgID, id, req.Name, req.Body, string(kind), req.Model); e != nil {
+			return e
+		}
+		var ge error
+		updated, ge = tx.Prompts.Get(r.Context(), orgID, id)
+		return ge
+	}); err != nil {
+		internalError(w, "prompts", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -244,10 +274,61 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	prompt, err := s.prompts.Get(r.Context(), orgID, id)
-	if err != nil {
+	var prompt *domain.Prompt
+	var status string
+	var conflictErr string
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		prompt, e = tx.Prompts.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if prompt == nil {
+			return nil
+		}
+
+		// Block deletion if the prompt is referenced by any auto-triggers.
+		// Post-SKY-259 triggers live in event_handlers with kind='trigger';
+		// ListForPrompt returns only those.
+		triggers, e := tx.EventHandlers.ListForPrompt(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if len(triggers) > 0 {
+			conflictErr = "This prompt is used by an auto-delegation trigger. Remove the trigger first."
+			return nil
+		}
+
+		// Block deletion if this prompt is a step inside any chain. The FK
+		// is ON DELETE RESTRICT so the underlying constraint would fire
+		// anyway; we surface a friendlier message and the count of chains.
+		chainRefs, e := tx.Chains.CountStepReferences(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if chainRefs > 0 {
+			conflictErr = "This prompt is used as a step in one or more chains. Remove it from those chains first."
+			return nil
+		}
+
+		// System and imported prompts are soft-deleted (hidden), user prompts are hard-deleted
+		if prompt.Source == "system" || prompt.Source == "imported" {
+			if e := tx.Prompts.Hide(r.Context(), orgID, id); e != nil {
+				return e
+			}
+			status = "hidden"
+			return nil
+		}
+
+		if e := tx.Prompts.Delete(r.Context(), orgID, id); e != nil {
+			return e
+		}
+		status = "deleted"
+		return nil
+	}); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}
@@ -255,52 +336,11 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "prompt")
 		return
 	}
-
-	// Block deletion if the prompt is referenced by any auto-triggers.
-	// Post-SKY-259 triggers live in event_handlers with kind='trigger';
-	// ListForPrompt returns only those.
-	triggers, err := s.eventHandlers.ListForPrompt(r.Context(), orgID, id)
-	if err != nil {
-		internalError(w, "prompts", err)
+	if conflictErr != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": conflictErr})
 		return
 	}
-	if len(triggers) > 0 {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "This prompt is used by an auto-delegation trigger. Remove the trigger first.",
-		})
-		return
-	}
-
-	// Block deletion if this prompt is a step inside any chain. The FK
-	// is ON DELETE RESTRICT so the underlying constraint would fire
-	// anyway; we surface a friendlier message and the count of chains.
-	chainRefs, err := s.chains.CountStepReferences(r.Context(), orgID, id)
-	if err != nil {
-		internalError(w, "prompts", err)
-		return
-	}
-	if chainRefs > 0 {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "This prompt is used as a step in one or more chains. Remove it from those chains first.",
-		})
-		return
-	}
-
-	// System and imported prompts are soft-deleted (hidden), user prompts are hard-deleted
-	if prompt.Source == "system" || prompt.Source == "imported" {
-		if err := s.prompts.Hide(r.Context(), orgID, id); err != nil {
-			internalError(w, "prompts", err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "hidden"})
-		return
-	}
-
-	if err := s.prompts.Delete(r.Context(), orgID, id); err != nil {
-		internalError(w, "prompts", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
 }
 
 func (s *Server) handlePromptStats(w http.ResponseWriter, r *http.Request) {
@@ -308,9 +348,14 @@ func (s *Server) handlePromptStats(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
-	stats, err := s.prompts.Stats(r.Context(), orgID, id)
-	if err != nil {
+	var stats *domain.PromptStats
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		stats, e = tx.Prompts.Stats(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "prompts", err)
 		return
 	}

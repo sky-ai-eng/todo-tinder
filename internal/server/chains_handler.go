@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
@@ -17,21 +18,28 @@ func (s *Server) handleChainStepsGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	prompt, err := s.prompts.Get(r.Context(), orgID, id)
-	if err != nil {
+	var prompt *domain.Prompt
+	var steps []domain.ChainStep
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		prompt, e = tx.Prompts.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if prompt == nil {
+			return nil
+		}
+		steps, e = tx.Chains.ListSteps(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "chains", err)
 		return
 	}
 	if prompt == nil {
 		notFound(w, "prompt")
-		return
-	}
-
-	steps, err := s.chains.ListSteps(r.Context(), orgID, id)
-	if err != nil {
-		internalError(w, "chains", err)
 		return
 	}
 	if steps == nil {
@@ -57,10 +65,15 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	prompt, err := s.prompts.Get(r.Context(), orgID, id)
-	if err != nil {
+	var prompt *domain.Prompt
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		prompt, e = tx.Prompts.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "chains", err)
 		return
 	}
@@ -89,30 +102,10 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 
 	stepIDs := make([]string, 0, len(req.Steps))
 	briefs := make([]string, 0, len(req.Steps))
-	for i, step := range req.Steps {
+	for _, step := range req.Steps {
 		if step.StepPromptID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "step_prompt_id is required for every step",
-			})
-			return
-		}
-		stepPrompt, err := s.prompts.Get(r.Context(), orgID, step.StepPromptID)
-		if err != nil {
-			internalError(w, "chains", err)
-			return
-		}
-		if stepPrompt == nil {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error": "step " + strconv.Itoa(i) + " references a non-existent prompt",
-			})
-			return
-		}
-		// Recursion guard: a chain step must point at a leaf prompt.
-		// Nested chains aren't supported in v1 and would also create
-		// cycles if a chain referenced itself transitively.
-		if stepPrompt.Kind == domain.PromptKindChain {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error": "step " + strconv.Itoa(i) + " references another chain prompt; nested chains aren't supported",
 			})
 			return
 		}
@@ -126,8 +119,40 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 		briefs = append(briefs, step.Brief)
 	}
 
-	if err := s.chains.ReplaceSteps(r.Context(), orgID, id, stepIDs, briefs); err != nil {
+	// Validate each step's prompt exists + is a leaf, then replace
+	// in one tx so all lookups and the final write share claims.
+	var validationErr string
+	var validationStatus int
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		for i, sid := range stepIDs {
+			stepPrompt, e := tx.Prompts.Get(r.Context(), orgID, sid)
+			if e != nil {
+				return e
+			}
+			if stepPrompt == nil {
+				validationErr = "step " + strconv.Itoa(i) + " references a non-existent prompt"
+				validationStatus = http.StatusUnprocessableEntity
+				return nil
+			}
+			// Recursion guard: a chain step must point at a leaf prompt.
+			// Nested chains aren't supported in v1 and would also create
+			// cycles if a chain referenced itself transitively.
+			if stepPrompt.Kind == domain.PromptKindChain {
+				validationErr = "step " + strconv.Itoa(i) + " references another chain prompt; nested chains aren't supported"
+				validationStatus = http.StatusUnprocessableEntity
+				return nil
+			}
+		}
+		if validationErr != "" {
+			return nil
+		}
+		return tx.Chains.ReplaceSteps(r.Context(), orgID, id, stepIDs, briefs)
+	}); err != nil {
 		internalError(w, "chains", err)
+		return
+	}
+	if validationErr != "" {
+		writeJSON(w, validationStatus, map[string]string{"error": validationErr})
 		return
 	}
 
@@ -153,10 +178,39 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	cr, err := s.chains.GetRun(r.Context(), orgID, id)
-	if err != nil {
+	var cr *domain.ChainRun
+	var steps []domain.ChainStep
+	var stepRuns []domain.AgentRun
+	var verdictsByRun map[string]*domain.ChainVerdict
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		cr, e = tx.Chains.GetRun(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if cr == nil {
+			return nil
+		}
+		steps, e = tx.Chains.ListSteps(r.Context(), orgID, cr.ChainPromptID)
+		if e != nil {
+			return e
+		}
+		stepRuns, e = tx.Chains.RunsForChain(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		runIDs := make([]string, 0, len(stepRuns))
+		for i := range stepRuns {
+			if stepRuns[i].ChainStepIndex != nil {
+				runIDs = append(runIDs, stepRuns[i].ID)
+			}
+		}
+		verdictsByRun, e = tx.Chains.LatestVerdictsForRuns(r.Context(), orgID, runIDs)
+		return e
+	}); err != nil {
 		internalError(w, "chains", err)
 		return
 	}
@@ -164,31 +218,11 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "chain run")
 		return
 	}
-
-	steps, err := s.chains.ListSteps(r.Context(), orgID, cr.ChainPromptID)
-	if err != nil {
-		internalError(w, "chains", err)
-		return
-	}
-
-	stepRuns, err := s.chains.RunsForChain(r.Context(), orgID, id)
-	if err != nil {
-		internalError(w, "chains", err)
-		return
-	}
 	runByStep := map[int]*domain.AgentRun{}
-	runIDs := make([]string, 0, len(stepRuns))
 	for i := range stepRuns {
 		if stepRuns[i].ChainStepIndex != nil {
 			runByStep[*stepRuns[i].ChainStepIndex] = &stepRuns[i]
-			runIDs = append(runIDs, stepRuns[i].ID)
 		}
-	}
-
-	verdictsByRun, err := s.chains.LatestVerdictsForRuns(r.Context(), orgID, runIDs)
-	if err != nil {
-		internalError(w, "chains", err)
-		return
 	}
 
 	views := make([]chainRunStepView, 0, len(steps))
@@ -216,8 +250,12 @@ func (s *Server) handleChainRunCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 
-	cr, err := s.chains.GetRun(r.Context(), orgID, id)
-	if err != nil {
+	var cr *domain.ChainRun
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		cr, e = tx.Chains.GetRun(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "chains", err)
 		return
 	}

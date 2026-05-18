@@ -37,10 +37,15 @@ func (s *Server) handlePendingPRGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
-	if err != nil {
+	var pr *domain.PendingPR
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		pr, e = tx.PendingPRs.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "pending-prs", err)
 		return
 	}
@@ -59,10 +64,15 @@ func (s *Server) handleRunPendingPR(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 
-	pr, err := s.pendingPRs.ByRunID(r.Context(), orgID, runID)
-	if err != nil {
+	var pr *domain.PendingPR
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		pr, e = tx.PendingPRs.ByRunID(r.Context(), orgID, runID)
+		return e
+	}); err != nil {
 		internalError(w, "pending-prs", err)
 		return
 	}
@@ -83,6 +93,7 @@ func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	var req struct {
@@ -93,8 +104,12 @@ func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
-	if err != nil {
+	var pr *domain.PendingPR
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		pr, e = tx.PendingPRs.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "pending-prs", err)
 		return
 	}
@@ -122,7 +137,9 @@ func (s *Server) handlePendingPRUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.pendingPRs.UpdateTitleBody(r.Context(), orgID, id, title, body); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.PendingPRs.UpdateTitleBody(r.Context(), orgID, id, title, body)
+	}); err != nil {
 		if errors.Is(err, db.ErrPendingPRSubmitted) {
 			// 409 Conflict so the overlay can show the user a clean
 			// "submission in flight, your edit was dropped" message
@@ -147,10 +164,15 @@ func (s *Server) handlePendingPRDiff(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
-	if err != nil {
+	var pr *domain.PendingPR
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		pr, e = tx.PendingPRs.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "pending-prs", err)
 		return
 	}
@@ -220,8 +242,12 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	pr, err := s.pendingPRs.Get(r.Context(), orgID, id)
-	if err != nil {
+	var pr *domain.PendingPR
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		pr, e = tx.PendingPRs.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "pending-prs", err)
 		return
 	}
@@ -234,7 +260,9 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 	// on to call GitHub; the loser sees 409 and can retry once the
 	// winner finishes (which will release the guard on failure or
 	// delete the row on success).
-	if err := s.pendingPRs.MarkSubmitted(r.Context(), orgID, id); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.PendingPRs.MarkSubmitted(r.Context(), orgID, id)
+	}); err != nil {
 		if errors.Is(err, db.ErrPendingPRSubmitInFlight) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "another submit is in flight or has already completed"})
 			return
