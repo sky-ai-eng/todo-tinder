@@ -602,11 +602,11 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 // first, then configure projects and statuses.
 func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — Jira connect is a
-	// user-scoped write to users.jira_account_id that runs before a
-	// multi-mode user has picked an active org. Empty orgID is
-	// acceptable: the users-table RLS policies don't gate on
-	// tf.current_org_id().
+	// orgID via OrgIDFrom (not requireOrg) — Jira connect runs before a
+	// multi-mode user has picked an active org. That's safe here because
+	// this handler only updates the authenticated caller's own users row
+	// (via userID), rather than relying on a broader invariant that all
+	// users-table access is independent of tf.current_org_id().
 	orgID := OrgIDFrom(r.Context())
 	var req struct {
 		URL string `json:"url"`
