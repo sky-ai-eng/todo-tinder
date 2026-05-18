@@ -135,6 +135,19 @@ type TaskStore interface {
 	// every other lifecycle write routes through a guarded helper.
 	SetStatus(ctx context.Context, orgID, taskID, status string) error
 
+	// AdvanceStatusForUser flips a user-claimed task's lifecycle
+	// status forward (SKY-330 board manual transitions). Guards:
+	//   - task must be claimed by userID
+	//   - current status must be one of {queued, in_progress, in_review}
+	//   - newStatus must be one of {in_progress, in_review}
+	// Refuses all other shapes — terminal transitions (done /
+	// dismissed) go through Close + handleSwipe, requeue clears the
+	// claim entirely, and bot-claimed tasks transition via
+	// SetStatusSystem from the router. Returns ok=true when the
+	// update actually changed a row; false means a guard tripped
+	// (caller surfaces 409).
+	AdvanceStatusForUser(ctx context.Context, orgID, taskID, userID, newStatus string) (bool, error)
+
 	// RecordEvent inserts into the task_events junction (task_id,
 	// event_id, kind). Idempotent on (task_id, event_id).
 	RecordEvent(ctx context.Context, orgID, taskID, eventID, kind string) error

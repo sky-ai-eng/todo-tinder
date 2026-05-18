@@ -57,6 +57,15 @@ func TestHandleTeamMembers_LocalSingleEntry(t *testing.T) {
 	if m.GitHubUsername == nil || *m.GitHubUsername != "AidanAllchin" {
 		t.Errorf("github_username: got %v want AidanAllchin", m.GitHubUsername)
 	}
+	// SKY-330: bot presence depends on agent bootstrap + team_agents.enabled.
+	// The test server bootstraps a default-enabled agent (see newTestServer),
+	// so bot should be non-nil with the bootstrapped agent's display name.
+	if resp.Bot == nil {
+		t.Fatal("bot: expected non-nil (test server bootstraps a default-enabled agent)")
+	}
+	if resp.Bot.AgentID == "" {
+		t.Error("bot.agent_id: expected non-empty")
+	}
 }
 
 // TestHandleTeamMembers_NoIdentityCaptured handles the pre-GitHub-config

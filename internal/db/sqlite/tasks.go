@@ -102,6 +102,20 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 				AND t.status NOT IN ('done', 'dismissed')
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`)
+	case "done", "dismissed":
+		// SKY-330: cap the Done column at the last 7 days so the
+		// board doesn't accumulate an unbounded history. closed_at
+		// is set by Close/CloseAllForEntity; rows missing it (legacy
+		// or future-modified) fall through the filter so they still
+		// surface — preferred over silent disappearance.
+		return queryTasksCtx(ctx, s.q, `
+			SELECT `+sqliteTaskColumnsWithEntity+`
+			FROM tasks t
+			JOIN entities e ON t.entity_id = e.id
+			WHERE t.status = ?
+				AND (t.closed_at IS NULL OR t.closed_at >= datetime('now', '-7 days'))
+			ORDER BY t.closed_at DESC, COALESCE(t.priority_score, 0.5) DESC
+		`, status)
 	}
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+sqliteTaskColumnsWithEntity+`
@@ -393,6 +407,30 @@ func (s *taskStore) SetStatus(ctx context.Context, orgID, taskID, status string)
 	}
 	_, err := s.q.ExecContext(ctx, `UPDATE tasks SET status = ? WHERE id = ?`, status, taskID)
 	return err
+}
+
+func (s *taskStore) AdvanceStatusForUser(ctx context.Context, orgID, taskID, userID, newStatus string) (bool, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return false, err
+	}
+	if newStatus != "in_progress" && newStatus != "in_review" {
+		return false, nil
+	}
+	res, err := s.q.ExecContext(ctx, `
+		UPDATE tasks
+		   SET status = ?
+		 WHERE id = ?
+		   AND claimed_by_user_id = ?
+		   AND status IN ('queued', 'in_progress', 'in_review')
+	`, newStatus, taskID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *taskStore) RecordEvent(ctx context.Context, orgID, taskID, eventID, kind string) error {

@@ -770,6 +770,63 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }
 
+// handleTaskAdvance is the SKY-330 board's manual user transition —
+// "I'm working on this now" (in_progress) and "I've submitted this for
+// review" (in_review). Refuses if the caller doesn't hold the user
+// claim, if the task is bot-claimed (those transition automatically
+// via the spawner), or if the requested status is anything other
+// than in_progress / in_review. Done / dismissed go through swipe;
+// requeue goes through /requeue.
+//
+// Body: {"to": "in_progress" | "in_review"}
+func (s *Server) handleTaskAdvance(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+	id := r.PathValue("id")
+
+	var body struct {
+		To string `json:"to"`
+	}
+	if !decodeJSON(w, r, &body, "invalid request body") {
+		return
+	}
+	if body.To != "in_progress" && body.To != "in_review" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to must be one of: in_progress, in_review"})
+		return
+	}
+
+	var advanced bool
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		advanced, e = tx.Tasks.AdvanceStatusForUser(r.Context(), orgID, id, userID, body.To)
+		return e
+	}); err != nil {
+		internalError(w, "tasks", err)
+		return
+	}
+	if !advanced {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "task not advancable — must be claimed by you and currently in queued/in_progress/in_review",
+		})
+		return
+	}
+
+	// Broadcast on the status axis so peer Board sessions move the
+	// card to the new column without polling.
+	if s.ws != nil {
+		s.ws.Broadcast(websocket.Event{
+			Type:  "task_updated",
+			OrgID: orgID,
+			Data:  map[string]any{"task_id": id, "status": body.To},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": body.To})
+}
+
 // discardOutcome describes how the task ended up after the user
 // rejected the agent's prepared review. The DB cleanup path is the
 // same across all four values, but the human_content note baked
@@ -850,6 +907,19 @@ func (s *Server) finalizeRequeue(r *http.Request, orgID, userID, taskID string, 
 	cleanupCtx := context.WithoutCancel(r.Context())
 	s.cleanupPendingApprovalRun(cleanupCtx, orgID, userID, taskID, discardOutcomeRequeued)
 	s.revertJiraStateIfApplicable(task)
+	// SKY-330: requeue clears both claim cols and flips status to
+	// 'queued'. Peer Board sessions need a task_updated event to
+	// pull the card back into the Queued column; without this they
+	// keep showing the stale claim/status until the next refresh.
+	// The cleanupPendingApprovalRun broadcast only fires for tasks
+	// with a pending_approval run — most requeues don't.
+	if s.ws != nil {
+		s.ws.Broadcast(websocket.Event{
+			Type:  "task_updated",
+			OrgID: orgID,
+			Data:  map[string]any{"task_id": taskID, "status": "queued"},
+		})
+	}
 }
 
 // cleanupPendingApprovalRun handles the SKY-206 case: the user
