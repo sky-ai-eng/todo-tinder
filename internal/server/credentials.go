@@ -10,7 +10,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -33,6 +32,11 @@ type setupResponse struct {
 
 func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
+	// orgID via OrgIDFrom (not requireOrg) — integrations setup updates
+	// the authenticated user's own users row and can run before a
+	// multi-mode user has picked an active org. For these current-user
+	// row operations, an empty orgID is acceptable.
+	orgID := OrgIDFrom(r.Context())
 	var req setupRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -112,7 +116,7 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 	// later. userID is extracted from the request context — sentinel in
 	// local mode (via the shim), real user UUID in multi mode.
 	if resp.GitHub != nil && resp.GitHub.Login != "" {
-		if err := s.tx.WithTx(r.Context(), runmode.LocalDefaultOrg, userID, func(tx db.TxStores) error {
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 			return tx.Users.SetGitHubUsername(r.Context(), userID, resp.GitHub.Login)
 		}); err != nil {
 			log.Printf("[setup] failed to persist users.github_username: %v", err)
