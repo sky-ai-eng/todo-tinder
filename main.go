@@ -21,6 +21,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/eventbus"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
 	"github.com/sky-ai-eng/triage-factory/internal/poller"
 	"github.com/sky-ai-eng/triage-factory/internal/projectclassify"
@@ -108,13 +109,13 @@ func bootstrapBareClones(database *sql.DB, repos db.RepoStore) {
 // absent (Settings UI capture is the alternate write path), or
 // (c) ValidateGitHub fails (PAT invalid / GitHub down — the user
 // can recapture via Settings, or the next boot retries).
-func bootstrapLocalGitHubIdentity(users db.UsersStore) error {
+func bootstrapLocalGitHubIdentity(users db.UsersStore, secrets db.SecretStore) error {
 	if runmode.Current() != runmode.ModeLocal {
 		return nil
 	}
 	ctx := context.Background()
 
-	creds, _ := auth.Load() // auth errors are non-fatal — degrade to no-op
+	creds, _ := integrations.Load(ctx, secrets, runmode.LocalDefaultOrgID) // secret-store errors are non-fatal — degrade to no-op
 	if creds.GitHubPAT == "" || creds.GitHubURL == "" {
 		return nil
 	}
@@ -152,13 +153,13 @@ func bootstrapLocalGitHubIdentity(users db.UsersStore) error {
 // No-op when (a) the row already has both columns populated,
 // (b) credentials are absent, or (c) ValidateJira fails. The Settings
 // handler covers the alternate write path on Jira reconnect.
-func bootstrapLocalJiraIdentity(users db.UsersStore) error {
+func bootstrapLocalJiraIdentity(users db.UsersStore, secrets db.SecretStore) error {
 	if runmode.Current() != runmode.ModeLocal {
 		return nil
 	}
 	ctx := context.Background()
 
-	creds, _ := auth.Load()
+	creds, _ := integrations.Load(ctx, secrets, runmode.LocalDefaultOrgID)
 	if creds.JiraPAT == "" || creds.JiraURL == "" {
 		return nil
 	}
@@ -377,7 +378,7 @@ func main() {
 		openBrowser(browserURL)
 	}
 
-	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Tx)
+	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Tx)
 
 	distFS, err := frontendDist()
 	if err != nil {
@@ -416,10 +417,10 @@ func main() {
 	// Populate users.github_username before seeding event handlers so the
 	// SQLite Seed substitution sees the local user's login when it wires
 	// allowlist placeholders on shipped predicates.
-	if err := bootstrapLocalGitHubIdentity(stores.Users); err != nil {
+	if err := bootstrapLocalGitHubIdentity(stores.Users, stores.Secrets); err != nil {
 		log.Printf("[bootstrap] users.github_username: %v (continuing — Settings will capture on next save)", err)
 	}
-	if err := bootstrapLocalJiraIdentity(stores.Users); err != nil {
+	if err := bootstrapLocalJiraIdentity(stores.Users, stores.Secrets); err != nil {
 		log.Printf("[bootstrap] users.jira_identity: %v (continuing — Settings will capture on next save)", err)
 	}
 	seedDefaultPrompts(stores.Prompts, stores.EventHandlers)
@@ -496,7 +497,7 @@ func main() {
 			// Use the configured GitHub host so GHE installs probe
 			// the right SSH endpoint, not github.com. Falls back to
 			// git@github.com when the URL is empty/unparseable.
-			creds, _ := auth.Load()
+			creds, _ := integrations.Load(context.Background(), stores.Secrets, runmode.LocalDefaultOrgID)
 			sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			if perr := worktree.CachedPreflightSSH(ctx, sshHost); perr != nil {
@@ -656,7 +657,7 @@ func main() {
 		errorThrottleMu sync.Mutex
 		lastErrorToast  = map[string]time.Time{}
 	)
-	pollerMgr := poller.NewManager(database, bus, stores.Users, stores.Tasks, stores.Entities, stores.Repos, stores.Orgs)
+	pollerMgr := poller.NewManager(database, bus, stores.Users, stores.Tasks, stores.Entities, stores.Repos, stores.Orgs, stores.Secrets)
 	pollerMgr.OnError = func(source, orgID string, err error) {
 		// Throttle key includes orgID so a chronic failure on one tenant
 		// doesn't suppress a fresh failure on another. Process-level
@@ -801,7 +802,7 @@ func main() {
 	}
 
 	// GitHub changed: invalidate profiles → stop all → re-profile → restart all
-	srv.SetOnGitHubChanged(func() {
+	srv.SetOnGitHubChanged(func(orgID string) {
 		log.Println("[server] GitHub config changed, full restart...")
 		setAnnouncePending("github")
 		setAnnouncePending("jira")
@@ -813,8 +814,9 @@ func main() {
 		// Signal again — would silently freeze scoring forever.
 		pollerMgr.StopAll()
 
+		ctx := context.Background()
 		cfg, _ := config.Load()
-		creds, _ := auth.Load()
+		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
 
 		if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) {
 			ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
@@ -829,7 +831,7 @@ func main() {
 					log.Printf("[repoprofile] profiling failed: %v", err)
 				}
 				profileGate.Signal()
-				pollerMgr.RestartAll()
+				pollerMgr.RestartAll(context.Background(), orgID)
 				scorer.Trigger()
 				bootstrapBareClones(database, stores.Repos)
 			}()
@@ -837,7 +839,7 @@ func main() {
 			spawner.UpdateCredentials(nil, "")
 			curatorRuntime.UpdateCredentials("")
 			srv.SetGitHubClient(nil)
-			pollerMgr.RestartAll()
+			pollerMgr.RestartAll(ctx, orgID)
 		}
 
 		// Also refresh Jira client in case it's configured
@@ -849,13 +851,14 @@ func main() {
 	})
 
 	// Jira changed: restart only the Jira poller
-	srv.SetOnJiraChanged(func() {
+	srv.SetOnJiraChanged(func(orgID string) {
 		log.Println("[server] Jira config changed, restarting Jira poller...")
 		setAnnouncePending("jira")
 
-		creds, _ := auth.Load()
+		ctx := context.Background()
+		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
 
-		pollerMgr.RestartJira()
+		pollerMgr.RestartJira(ctx, orgID)
 
 		if creds.JiraPAT != "" && creds.JiraURL != "" {
 			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT))
@@ -916,10 +919,15 @@ func main() {
 		},
 	})
 
-	// Initial start with current credentials
+	// Initial start with current credentials. Local mode by design — multi-mode
+	// users get GitHub identity per-org via the D14 admin UI, not via this
+	// keychain-driven boot path. Hard-gating on the runmode lets us keep using
+	// the local sentinel here without it leaking into multi-mode startup.
 	cfg, _ := config.Load()
-	creds, _ := auth.Load()
-	repoCount, _ := stores.Repos.CountConfiguredSystem(context.Background(), runmode.LocalDefaultOrgID)
+	ctx := context.Background()
+	orgID := runmode.LocalDefaultOrgID
+	creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
+	repoCount, _ := stores.Repos.CountConfiguredSystem(ctx, orgID)
 
 	if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) && repoCount > 0 {
 		ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
@@ -935,13 +943,13 @@ func main() {
 				log.Printf("[repoprofile] initial profiling failed: %v", err)
 			}
 			profileGate.Signal()
-			pollerMgr.RestartAll()
+			pollerMgr.RestartAll(context.Background(), orgID)
 			scorer.Trigger()
 			bootstrapBareClones(database, stores.Repos)
 		}()
 	} else {
 		// Not fully configured — start pollers immediately (may be empty)
-		pollerMgr.RestartAll()
+		pollerMgr.RestartAll(ctx, orgID)
 	}
 
 	if creds.JiraPAT != "" && creds.JiraURL != "" {

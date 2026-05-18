@@ -32,9 +32,12 @@ type Stores struct {
 	// snapshot_json blobs. Owns no table.
 	Dashboard DashboardStore
 
-	// Secrets is the per-org secret bag. Multi-only — SQLite impl
-	// returns ErrNotApplicableInLocal for every method (local-mode
-	// credentials live in the OS keychain, not the DB).
+	// Secrets is the per-org secret bag. Postgres impl wraps the
+	// public.vault_* SECURITY DEFINER functions (RLS-gated per org);
+	// SQLite impl delegates to internal/auth's keychain helpers so
+	// callers see the same Put/Get/Delete shape in either mode.
+	// orgID is required and enforced — vault wrapper rejects on a
+	// claim/arg mismatch in multi, sqlite asserts LocalDefaultOrg.
 	Secrets SecretStore
 
 	// EventHandlers owns the unified event_handlers table (post-SKY-259):

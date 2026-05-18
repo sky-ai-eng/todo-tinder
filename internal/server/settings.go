@@ -14,7 +14,9 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -198,7 +200,8 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
 	}
-	creds, _ := auth.Load() // auth errors are non-fatal (keychain may be empty)
+	orgID := OrgIDFrom(r.Context())
+	creds, _ := integrations.Load(r.Context(), s.secrets, orgID) // store errors are non-fatal (keychain may be empty)
 
 	resp := settingsResponse{
 		GitHub: githubSettings{
@@ -285,13 +288,18 @@ type settingsUpdateRequest struct {
 
 func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — settings POST performs
-	// current-user-scoped reads/writes (for example, the caller's own
-	// users row) and may run before a multi-mode user has picked an
-	// active org. Empty orgID is acceptable for this handler's
-	// current-user operations; do not generalize that to all
-	// users-table RLS policies.
-	orgID := OrgIDFrom(r.Context())
+	// Settings POST mutates org-scoped credentials via the SecretStore.
+	// Multi-mode requires an active org because the Postgres impl
+	// refuses a vault write with an empty org_id claim; local mode
+	// always has the sentinel orgID via the withSession shim so this
+	// 409 only ever fires for a freshly-signed-in multi-mode user
+	// with no membership/active-org row yet. The post-SKY-242 split
+	// (user/team/org settings on distinct surfaces) will let the
+	// user-scoped fields move to their own handler without this gate.
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	var req settingsUpdateRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -303,7 +311,14 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
 	}
-	creds, _ := auth.Load() // auth errors are non-fatal
+	creds, _ := integrations.Load(r.Context(), s.secrets, orgID) // store errors are non-fatal
+
+	// Track which disconnects hit the env-overlay no-op so we can surface
+	// a single user-facing warning in the success response. The FE renders
+	// this as a toast/banner — telling the user "Disconnect succeeded but
+	// env vars still supply the credential" is the load-bearing UX from
+	// the SecretStore sweep.
+	envOverlayWarn := []string{}
 
 	// Snapshot pre-change values for diffing
 	prevGHURL := creds.GitHubURL
@@ -392,8 +407,21 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		creds.GitHubURL = ""
 		creds.GitHubPAT = ""
 		cfg.GitHub.BaseURL = ""
-		if err := auth.ClearGitHub(); err != nil {
+		if err := integrations.ClearGitHub(r.Context(), s.secrets, orgID); err != nil {
 			log.Printf("[settings] failed to clear GitHub keychain entry: %v", err)
+		}
+		// Env-overlay note: when a TRIAGE_FACTORY_GITHUB_* env var supplies
+		// the credential, the SecretStore Delete is a no-op and the value
+		// will still surface on the next Get — record it so the response
+		// can warn the user. Local-mode only; multi-mode has no env overlay.
+		if runmode.Current() == runmode.ModeLocal {
+			for _, e := range auth.EnvProvided() {
+				if e == "github" {
+					envOverlayWarn = append(envOverlayWarn, "github")
+					log.Printf("[settings] note: TRIAGE_FACTORY_GITHUB_URL/PAT env vars still supply GitHub credentials — unset them in your shell to fully disconnect")
+					break
+				}
+			}
 		}
 		// Also clear the captured login on the users row so a downstream
 		// "are we connected to GitHub" check via DB stays in sync with the
@@ -443,8 +471,17 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		creds.JiraURL = ""
 		creds.JiraPAT = ""
 		cfg.Jira.BaseURL = ""
-		if err := auth.ClearJira(); err != nil {
+		if err := integrations.ClearJira(r.Context(), s.secrets, orgID); err != nil {
 			log.Printf("[settings] failed to clear Jira keychain entry: %v", err)
+		}
+		if runmode.Current() == runmode.ModeLocal {
+			for _, e := range auth.EnvProvided() {
+				if e == "jira" {
+					envOverlayWarn = append(envOverlayWarn, "jira")
+					log.Printf("[settings] note: TRIAGE_FACTORY_JIRA_URL/PAT env vars still supply Jira credentials — unset them in your shell to fully disconnect")
+					break
+				}
+			}
 		}
 		// Clear the captured identity on the users row so downstream
 		// "are we connected to Jira" checks stay in sync with the
@@ -557,7 +594,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Persist
-	if err := auth.Store(creds); err != nil {
+	if err := integrations.Save(r.Context(), s.secrets, orgID, creds); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
 		return
 	}
@@ -588,27 +625,33 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	if ghChanged && s.onGitHubChanged != nil {
 		// GitHub change triggers full restart (includes Jira poller restart)
 		s.MarkJiraRestarted()
-		go s.onGitHubChanged()
+		go s.onGitHubChanged(orgID)
 	} else if jiraChanged && s.onJiraChanged != nil {
 		// Jira-only change — just restart Jira poller
 		s.MarkJiraRestarted()
-		go s.onJiraChanged()
+		go s.onJiraChanged(orgID)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+	resp := map[string]any{"status": "saved"}
+	if len(envOverlayWarn) > 0 {
+		resp["warning"] = "env vars still supply credentials for the disconnected integration(s) — unset them in your shell to fully disconnect"
+		resp["env_overlay_blocks_disconnect"] = envOverlayWarn
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleJiraConnect validates and stores Jira credentials without saving
 // the rest of the settings. This powers the two-stage settings flow: connect
 // first, then configure projects and statuses.
+//
+// Requires an active org because credentials write through the SecretStore
+// — see handleSettingsPost for the multi-mode rationale.
 func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — Jira connect runs before a
-	// multi-mode user has picked an active org. That's safe here because
-	// this handler only updates the authenticated caller's own users row
-	// (via userID), rather than relying on a broader invariant that all
-	// users-table access is independent of tf.current_org_id().
-	orgID := OrgIDFrom(r.Context())
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		URL string `json:"url"`
 		PAT string `json:"pat"`
@@ -628,7 +671,7 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load existing state before writing anything (fail early)
-	creds, err := auth.Load()
+	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load credentials: " + err.Error()})
 		return
@@ -644,15 +687,16 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 	creds.JiraPAT = req.PAT
 	cfg.Jira.BaseURL = req.URL
 
-	if err := auth.Store(creds); err != nil {
+	if err := integrations.Save(r.Context(), s.secrets, orgID, creds); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
 		return
 	}
 	if err := config.Save(cfg); err != nil {
-		// Roll back keychain to avoid creds/config desync
-		creds.JiraURL = ""
-		creds.JiraPAT = ""
-		auth.Store(creds) //nolint:errcheck
+		// Roll back keychain to avoid creds/config desync. Use Delete
+		// rather than rewriting with empty strings — integrations.Save
+		// skips empty values, so the rollback has to issue an explicit
+		// clear.
+		_ = integrations.ClearJira(r.Context(), s.secrets, orgID)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save config: " + err.Error()})
 		return
 	}
@@ -675,7 +719,8 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 // handleJiraStatuses returns available statuses for given Jira projects.
 // Query params: ?project=PROJ1&project=PROJ2 (or uses configured projects if omitted).
 func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
-	creds, _ := auth.Load()
+	orgID := OrgIDFrom(r.Context())
+	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
 	if creds.JiraPAT == "" || creds.JiraURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Jira not configured"})
 		return
@@ -748,8 +793,8 @@ func (s *Server) handleGitHubPreflightSSH(w http.ResponseWriter, r *http.Request
 	// SSH button on the Settings page works for GHE deployments. We
 	// load creds (not config) because creds.GitHubURL is the URL the
 	// user actually authenticates against; cfg.GitHub.BaseURL mirrors
-	// it but the keychain copy is the source of truth.
-	creds, _ := auth.Load()
+	// it but the SecretStore copy is the source of truth.
+	creds, _ := integrations.Load(r.Context(), s.secrets, OrgIDFrom(r.Context()))
 	sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)

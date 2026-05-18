@@ -8,13 +8,15 @@ import (
 
 // SecretStore is the per-org secret bag — GitHub PATs, Jira tokens,
 // any other long-lived credential the hosted product needs scoped to
-// one tenant. Multi-only by design:
+// one tenant. Two production-grade implementations:
 //
 //   - Local mode: secrets live in the OS keychain (internal/auth),
-//     keyed on the install — there's only one user. The DB has no
-//     org-secrets table. All three methods on the SQLite impl
-//     return ErrNotApplicableInLocal so a misconfigured caller
-//     fails loudly instead of silently writing nowhere.
+//     keyed on the install — there's only one user. The SQLite impl
+//     delegates Put/Get/Delete to auth.PutSecret/GetSecret/DeleteSecret
+//     so callers that want one credential interface across modes
+//     (local-equals-multi-at-N=1) get the same shape they'd get in
+//     multi. orgID must equal runmode.LocalDefaultOrg; anything else
+//     is a caller bug and rejected with an error.
 //
 //   - Multi mode: secrets are persisted via the public.vault_*
 //     wrapper functions defined in the D3 baseline. Those functions
@@ -24,7 +26,7 @@ import (
 //     The Postgres impl is a thin wrapper over those SQL functions.
 //
 // D5 owns the consumer side (wiring real handlers + secret-name
-// catalog); D2 just provides the interface + working impls.
+// catalog); D2 provides the interface and both impls.
 type SecretStore interface {
 	// Put writes (or rotates) a secret. description is optional —
 	// the wrapper coalesces NULL → "". Vault stores by name

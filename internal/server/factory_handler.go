@@ -391,10 +391,10 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 					ej.Assignee = snap.Assignee
 				}
 			}
-			// Jira "mine" = assigned to the session user. We don't store the
-			// Jira display name next to github username, but the keychain's
-			// JiraDisplayName is available via auth.Load() — keep this empty
-			// for v1 and let the UI fall back to the other tint.
+			// Jira "mine" = assigned to the session user. The session user's
+			// Jira display name lives on users.jira_display_name (read via
+			// UsersStore.GetJiraIdentity); keep this empty for v1 and let
+			// the UI fall back to the other tint.
 		}
 		entities = append(entities, ej)
 	}
