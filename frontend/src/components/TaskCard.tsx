@@ -16,10 +16,18 @@ interface Props {
   // execution; this prop is how the Board reflects that divergence.
   delegateFailed?: { message: string }
   onRetry?: () => void
+  // SKY-330: caller-supplied assignee picker. Rendered inline at the
+  // top-right of the badge row so it doesn't overlap the bottom-row
+  // affordances (Requeue / Open) or the badges themselves. Optional
+  // — null on Cards-view triage where the picker isn't shown.
+  assigneeSlot?: React.ReactNode
 }
 
 const TaskCard = forwardRef<HTMLDivElement, Props & React.HTMLAttributes<HTMLDivElement>>(
-  ({ task, style, isDragging, onRequeue, delegateFailed, onRetry, ...props }, ref) => {
+  (
+    { task, style, isDragging, onRequeue, delegateFailed, onRetry, assigneeSlot, ...props },
+    ref,
+  ) => {
     const age = formatAge(task.created_at)
     // Normalize once so the condition and the prop share the same non-nullable
     // value — avoids the non-null assertion on a field typed as optional.
@@ -48,12 +56,15 @@ const TaskCard = forwardRef<HTMLDivElement, Props & React.HTMLAttributes<HTMLDiv
         }`}
         {...props}
       >
-        <div className="flex items-center gap-2 mb-2">
-          <SourceBadge task={task} />
-          <EventBadge eventType={task.event_type} compact />
-          {subtaskCount > 0 && <SubtaskHint count={subtaskCount} />}
-          {isSnoozed && <SnoozedBadge until={snoozedUntil} />}
-          {delegateFailed && <DelegateFailedBadge message={delegateFailed.message} />}
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <SourceBadge task={task} />
+            <EventBadge eventType={task.event_type} compact />
+            {subtaskCount > 0 && <SubtaskHint count={subtaskCount} />}
+            {isSnoozed && <SnoozedBadge until={snoozedUntil} />}
+            {delegateFailed && <DelegateFailedBadge message={delegateFailed.message} />}
+          </div>
+          {assigneeSlot && <div className="shrink-0">{assigneeSlot}</div>}
         </div>
 
         <h3 className="text-[13px] font-semibold text-text-primary leading-snug line-clamp-2 mb-1">

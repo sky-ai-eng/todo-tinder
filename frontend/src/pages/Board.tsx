@@ -978,29 +978,24 @@ function SortableTaskCard({
     transition,
     opacity: isDragging ? 0.3 : 1,
   }
+  // SKY-330: assigneeSlot is forwarded into TaskCard's header instead
+  // of overlaid via absolute positioning — the prior approach
+  // collided with the bottom-row affordances on tall cards and with
+  // AgentCard's elapsed-time / expand cluster after a run completes.
+  // Card owns its own layout; we just hand it the slot to render.
   return (
-    <div style={{ position: 'relative' }}>
-      <TaskCard
-        ref={setNodeRef}
-        task={task}
-        style={style}
-        isDragging={false}
-        onRequeue={onRequeue}
-        delegateFailed={delegateFailed}
-        onRetry={onRetry}
-        {...attributes}
-        {...listeners}
-      />
-      {assigneeSlot && (
-        <div
-          className="absolute top-3 right-3 z-10"
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {assigneeSlot}
-        </div>
-      )}
-    </div>
+    <TaskCard
+      ref={setNodeRef}
+      task={task}
+      style={style}
+      isDragging={false}
+      onRequeue={onRequeue}
+      delegateFailed={delegateFailed}
+      onRetry={onRetry}
+      assigneeSlot={assigneeSlot}
+      {...attributes}
+      {...listeners}
+    />
   )
 }
 
@@ -1044,8 +1039,11 @@ function SortableAgentCard({
     transition,
     opacity: isDragging ? 0.3 : 1,
     cursor: draggable ? 'grab' : undefined,
-    position: 'relative',
   }
+  // SKY-330: assigneeSlot forwarded into AgentCard's header cluster
+  // so it shares the gap-2 spacing with elapsed/expand/takeover
+  // instead of overlapping them via absolute positioning. Same
+  // reasoning as the TaskCard wrapper above.
   return (
     <div
       ref={setNodeRef}
@@ -1060,16 +1058,8 @@ function SortableAgentCard({
         messages={messages}
         onRequeue={onRequeue}
         onReview={onReview}
+        assigneeSlot={assigneeSlot}
       />
-      {assigneeSlot && (
-        <div
-          className="absolute top-3 right-3 z-10"
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {assigneeSlot}
-        </div>
-      )}
     </div>
   )
 }
