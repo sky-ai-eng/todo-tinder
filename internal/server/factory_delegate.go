@@ -194,7 +194,7 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 	// time. Factory drag-to-bot is the same semantic as swipe-up
 	// "delegate to bot" — both refuse with 409 when the bot is off
 	// for this team.
-	a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID)
+	a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID, userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
 		return

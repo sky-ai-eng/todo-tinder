@@ -140,34 +140,55 @@ func (s *Server) projectMutex(id string) *sync.Mutex {
 // Team-agent lookup keeps the local team sentinel — multi-mode team
 // semantics are a separate (post-D9) ticket; this helper sweeps the
 // org dimension only.
-func (s *Server) agentEnabledForOrg(ctx context.Context, orgID string) (*domain.Agent, bool, error) {
+func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (*domain.Agent, bool, error) {
 	if s.agents == nil {
 		return nil, false, fmt.Errorf("agent store not configured")
 	}
-	a, err := s.agents.GetForOrg(ctx, orgID)
-	if err != nil {
-		return nil, false, fmt.Errorf("agent lookup: %w", err)
+	var (
+		a       *domain.Agent
+		enabled bool
+		// teamMissing distinguishes "no agent bootstrapped"
+		// (fatal err) from "team_agents row missing → treat as
+		// disabled" inside the closure where we can't return the
+		// three-tuple directly.
+		teamMissing bool
+	)
+	if err := s.tx.WithTx(ctx, orgID, userID, func(tx db.TxStores) error {
+		var e error
+		a, e = tx.Agents.GetForOrg(ctx, orgID)
+		if e != nil {
+			return fmt.Errorf("agent lookup: %w", e)
+		}
+		if a == nil {
+			return fmt.Errorf("no agent bootstrapped — set up the bot first")
+		}
+		if s.teamAgents == nil {
+			// Pre-D-Claims wiring (tests). Treat as enabled to preserve
+			// the pre-flag behavior for any test path that hasn't wired
+			// teamAgents yet.
+			enabled = true
+			return nil
+		}
+		ta, e := tx.TeamAgents.GetForTeam(ctx, orgID, runmode.LocalDefaultTeamID, a.ID)
+		if e != nil {
+			return fmt.Errorf("team_agents lookup: %w", e)
+		}
+		if ta == nil {
+			// team_agents row missing — treat as disabled. Production
+			// installs always have the row via BootstrapLocalAgent; a
+			// missing row at runtime means something went sideways.
+			teamMissing = true
+			return nil
+		}
+		enabled = ta.Enabled
+		return nil
+	}); err != nil {
+		return a, false, err
 	}
-	if a == nil {
-		return nil, false, fmt.Errorf("no agent bootstrapped — set up the bot first")
-	}
-	if s.teamAgents == nil {
-		// Pre-D-Claims wiring (tests). Treat as enabled to preserve
-		// the pre-flag behavior for any test path that hasn't wired
-		// teamAgents yet.
-		return a, true, nil
-	}
-	ta, err := s.teamAgents.GetForTeam(ctx, orgID, runmode.LocalDefaultTeamID, a.ID)
-	if err != nil {
-		return a, false, fmt.Errorf("team_agents lookup: %w", err)
-	}
-	if ta == nil {
-		// team_agents row missing — treat as disabled. Production
-		// installs always have the row via BootstrapLocalAgent; a
-		// missing row at runtime means something went sideways.
+	if teamMissing {
 		return a, false, nil
 	}
-	return a, ta.Enabled, nil
+	return a, enabled, nil
 }
 
 // New creates a new server with the given database + the per-resource

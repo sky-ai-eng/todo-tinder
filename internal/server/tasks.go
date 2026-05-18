@@ -287,7 +287,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// can't manually delegate to a disabled bot either.
 		// Refuse with 409 — clear error the FE can surface as
 		// "bot is off; enable it in team settings."
-		a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID)
+		a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID, userID)
 		if err != nil {
 			log.Printf("[swipe] delegate aborted on task %s: %v", id, err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
