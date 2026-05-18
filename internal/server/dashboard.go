@@ -28,15 +28,22 @@ func (s *Server) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
-	username, _ := s.users.GetGitHubUsername(r.Context(), userID)
-	if username == "" {
-		writeJSON(w, http.StatusOK, map[string]any{})
+	var username string
+	var stats *domain.DashboardStats
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		username, _ = tx.Users.GetGitHubUsername(r.Context(), userID)
+		if username == "" {
+			return nil
+		}
+		var e error
+		stats, e = tx.Dashboard.Stats(r.Context(), orgID, username, 30)
+		return e
+	}); err != nil {
+		internalError(w, "dashboard", err)
 		return
 	}
-
-	stats, err := s.dashboard.Stats(r.Context(), orgID, username, 30)
-	if err != nil {
-		internalError(w, "dashboard", err)
+	if username == "" {
+		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
 
@@ -55,15 +62,22 @@ func (s *Server) handleDashboardPRs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []domain.PRSummaryRow{})
 		return
 	}
-	username, _ := s.users.GetGitHubUsername(r.Context(), userID)
-	if username == "" {
-		writeJSON(w, http.StatusOK, []domain.PRSummaryRow{})
+	var username string
+	var prs []domain.PRSummaryRow
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		username, _ = tx.Users.GetGitHubUsername(r.Context(), userID)
+		if username == "" {
+			return nil
+		}
+		var e error
+		prs, e = tx.Dashboard.PRs(r.Context(), orgID, username)
+		return e
+	}); err != nil {
+		internalError(w, "dashboard", err)
 		return
 	}
-
-	prs, err := s.dashboard.PRs(r.Context(), orgID, username)
-	if err != nil {
-		internalError(w, "dashboard", err)
+	if username == "" {
+		writeJSON(w, http.StatusOK, []domain.PRSummaryRow{})
 		return
 	}
 	if prs == nil {
@@ -145,6 +159,7 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 
 	creds, _ := auth.Load()
 	cfg, _ := config.Load()
@@ -175,7 +190,9 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	// the audit trail. Revisit if a user reports "my trigger didn't fire
 	// when I dragged the card."
 	sourceID := fmt.Sprintf("%s/%s#%d", parts[0], parts[1], number)
-	if patchErr := patchPRSnapshotDraft(r.Context(), s.entities, orgID, sourceID, body.Draft); patchErr != nil {
+	if patchErr := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return patchPRSnapshotDraft(r.Context(), tx.Entities, orgID, sourceID, body.Draft)
+	}); patchErr != nil {
 		log.Printf("[dashboard] warning: failed to patch snapshot for %s after draft toggle: %v", sourceID, patchErr)
 	}
 
