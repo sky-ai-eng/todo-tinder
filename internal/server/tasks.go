@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -612,6 +613,12 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 	// involved.
 	var task *domain.Task
 	var snoozed bool
+	// errSnoozeRefusedSentinel is used to roll the outer tx back when
+	// SnoozeTask returns (false, nil) — the swipes store relies on a
+	// tx-level rollback to discard the audit row it inserted before
+	// the claim-guard UPDATE refused, and a flat (no-error) return
+	// here would commit that audit row.
+	errSnoozeRefusedSentinel := errors.New("snooze refused")
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
 		task, e = tx.Tasks.Get(r.Context(), orgID, id)
@@ -622,8 +629,14 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		snoozed, e = tx.Swipes.SnoozeTask(r.Context(), orgID, id, until, req.HesitationMs)
-		return e
-	}); err != nil {
+		if e != nil {
+			return e
+		}
+		if !snoozed {
+			return errSnoozeRefusedSentinel
+		}
+		return nil
+	}); err != nil && !errors.Is(err, errSnoozeRefusedSentinel) {
 		internalError(w, "tasks", err)
 		return
 	}
