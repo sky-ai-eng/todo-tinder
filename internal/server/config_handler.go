@@ -59,8 +59,14 @@ func (s *Server) handleTeamMembers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := ClaimsFrom(r.Context()).Subject
+	// orgID via OrgIDFrom — the 501 gate above means this only runs
+	// in local mode today, where OrgIDFrom returns the local sentinel.
+	// Reading via the accessor (rather than referencing the sentinel
+	// directly) keeps this consistent with the rest of the handler
+	// surface for when the multi-mode path lands.
+	orgID := OrgIDFrom(r.Context())
 	var username, displayName, jiraAccount string
-	_ = s.tx.WithTx(r.Context(), runmode.LocalDefaultOrg, userID, func(tx db.TxStores) error {
+	_ = s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		username, _ = tx.Users.GetGitHubUsername(r.Context(), userID)
 		displayName, _ = tx.Users.GetDisplayName(r.Context(), userID)
 		jiraAccount, _, _ = tx.Users.GetJiraIdentity(r.Context(), userID)
