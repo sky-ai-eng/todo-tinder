@@ -721,13 +721,22 @@ func main() {
 	// the project's owning org so the hub's per-connection filter
 	// keeps the event scoped to that tenant. Uses the admin-pool
 	// ResolveOrgSystem variant — the watcher fires from a fs-events
-	// goroutine with no claims context. Lookup failure returns empty,
-	// which the hub treats as a system-wide event (matches pre-D9b
-	// behavior — no worse than leaving the field unset).
+	// goroutine with no claims context.
+	//
+	// Returning "" tells the watcher to drop the broadcast rather
+	// than fall back to a system-wide fanout (which the hub would
+	// deliver to every connected tenant, leaking the update cross-
+	// tenancy). Both branches below — lookup error and no-row — log
+	// on this side so the failure is visible without the watcher
+	// having to know why.
 	resolveOrgForProject := func(projectID string) string {
 		orgID, err := stores.Projects.ResolveOrgSystem(context.Background(), projectID)
 		if err != nil {
-			log.Printf("[kbwatcher] resolve org for project %s: %v (falling back to system-wide broadcast)", projectID, err)
+			log.Printf("[kbwatcher] resolve org for project %s: %v (dropping live update)", projectID, err)
+			return ""
+		}
+		if orgID == "" {
+			log.Printf("[kbwatcher] no org for project %s — stale dir or unresolved row (dropping live update)", projectID)
 			return ""
 		}
 		return orgID

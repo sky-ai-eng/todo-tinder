@@ -132,6 +132,15 @@ export function reconnectWebSocket() {
   const existing = globalWs
   globalWs = null
   if (existing && existing.readyState !== WebSocket.CLOSED) {
+    // Detach the close handler BEFORE close(). The old socket's
+    // onclose runs later (after the TCP close completes) and would
+    // otherwise null out globalWs — but by then globalWs points at
+    // the NEW socket from ensureConnected() below, dropping its
+    // reference and triggering a second reconnect that opens a
+    // duplicate /api/ws connection. The 'org switch' close is
+    // intentional, so we don't need the auto-reconnect path that
+    // onclose triggers anyway.
+    existing.onclose = null
     // Use a normal close (1000) so the server doesn't log this as an
     // abnormal disconnect. The new socket spins up below regardless
     // of close-time.
