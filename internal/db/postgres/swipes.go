@@ -61,10 +61,10 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 		if err := insertSwipeEvent(ctx, tx, orgID, taskID, action, &hesitationMs); err != nil {
 			return err
 		}
-		// Inline UPDATE rather than routing through updateTaskStatus
-		// because the helper doesn't take close-metadata params and
-		// growing it to four-axis-aware would proliferate booleans
-		// across every callsite for one path's needs.
+		// Inline UPDATE — the four axes (status, snooze_until,
+		// closed_at, close_reason) all move together for each swipe
+		// action so threading a helper signature with that many
+		// nullable params would obscure more than it shares.
 		var closedAt any
 		var reason any
 		if newStatus == "done" || newStatus == "dismissed" {
@@ -96,11 +96,8 @@ func (s *swipeStore) SnoozeTask(ctx context.Context, orgID string, taskID string
 			return err
 		}
 		// Claim guard: snooze is queue-only post-invariant ("snoozed
-		// ↔ both claim cols NULL"). updateTaskStatus only handles
-		// the (status, snooze_until) axis pair, so we inline the
-		// UPDATE here to add the claim guard; growing the helper to
-		// take claim flags would proliferate booleans across every
-		// callsite for one path's needs.
+		// ↔ both claim cols NULL"). Inline UPDATE so the WHERE
+		// clause's claim-column guards live with the snooze write.
 		res, err := tx.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'snoozed', snooze_until = $1
@@ -179,11 +176,7 @@ func (s *swipeStore) UndoLastSwipe(ctx context.Context, orgID string, taskID str
 		// claim col; leaving it on the row would keep the task in
 		// the owner's lane even after status returns to 'queued'.
 		// Clear both cols so the task lands back in the team's
-		// unclaimed triage queue, matching RequeueTask's shape. The
-		// inline UPDATE bypasses updateTaskStatus because that
-		// helper only handles the (status, snooze_until) axis pair —
-		// growing it to take claim cols too would proliferate
-		// boolean flags across every callsite for one path's needs.
+		// unclaimed triage queue, matching RequeueTask's shape.
 		// SKY-330: clear close metadata too — undoing a dismiss /
 		// complete swipe means the task isn't terminal anymore.
 		_, err := tx.ExecContext(ctx,
@@ -244,33 +237,4 @@ func insertSwipeEvent(ctx context.Context, tx *sql.Tx, orgID, taskID, action str
 		return fmt.Errorf("insert swipe_events: %w", err)
 	}
 	return nil
-}
-
-// updateTaskStatus is the shared tasks-row update for every swipe
-// method. clearSnooze=true clears snooze_until; clearSnooze=false
-// leaves it alone (RecordSwipe's path) or replaces it with the
-// passed value (SnoozeTask's path). The two-flag shape lets one
-// helper serve all three callsites without a separate UPDATE per
-// permutation.
-func updateTaskStatus(ctx context.Context, tx *sql.Tx, orgID, taskID, status string, snoozeUntil *time.Time, clearSnooze bool) error {
-	switch {
-	case clearSnooze:
-		_, err := tx.ExecContext(ctx,
-			`UPDATE tasks SET status = $1, snooze_until = NULL WHERE org_id = $2 AND id = $3`,
-			status, orgID, taskID,
-		)
-		return err
-	case snoozeUntil != nil:
-		_, err := tx.ExecContext(ctx,
-			`UPDATE tasks SET status = $1, snooze_until = $2 WHERE org_id = $3 AND id = $4`,
-			status, *snoozeUntil, orgID, taskID,
-		)
-		return err
-	default:
-		_, err := tx.ExecContext(ctx,
-			`UPDATE tasks SET status = $1 WHERE org_id = $2 AND id = $3`,
-			status, orgID, taskID,
-		)
-		return err
-	}
 }
