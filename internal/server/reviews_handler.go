@@ -40,21 +40,28 @@ func (s *Server) handleReviewGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	reviewID := r.PathValue("id")
 
-	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
-	if err != nil {
+	var review *domain.PendingReview
+	var comments []domain.PendingReviewComment
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		review, e = tx.Reviews.Get(r.Context(), orgID, reviewID)
+		if e != nil {
+			return e
+		}
+		if review == nil {
+			return nil
+		}
+		comments, e = tx.Reviews.ListComments(r.Context(), orgID, reviewID)
+		return e
+	}); err != nil {
 		internalError(w, "reviews", err)
 		return
 	}
 	if review == nil {
 		notFound(w, "review")
-		return
-	}
-
-	comments, err := s.reviews.ListComments(r.Context(), orgID, reviewID)
-	if err != nil {
-		internalError(w, "reviews", err)
 		return
 	}
 
@@ -97,8 +104,24 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
-	if err != nil {
+	var review *domain.PendingReview
+	var comments []domain.PendingReviewComment
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		review, e = tx.Reviews.Get(r.Context(), orgID, reviewID)
+		if e != nil {
+			return e
+		}
+		if review == nil {
+			return nil
+		}
+		if review.ReviewEvent == "" {
+			return nil
+		}
+		// Load comments (potentially edited by the user)
+		comments, e = tx.Reviews.ListComments(r.Context(), orgID, reviewID)
+		return e
+	}); err != nil {
 		internalError(w, "reviews", err)
 		return
 	}
@@ -108,13 +131,6 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if review.ReviewEvent == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "review has not been submitted by the agent yet"})
-		return
-	}
-
-	// Load comments (potentially edited by the user)
-	comments, err := s.reviews.ListComments(r.Context(), orgID, reviewID)
-	if err != nil {
-		internalError(w, "reviews", err)
 		return
 	}
 
@@ -150,7 +166,9 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 	// surface as a 5xx and confuse the user about what landed.
 	if review.RunID != "" {
 		humanContent := FormatHumanFeedback(buildHumanFeedbackInput(review, comments, actualEvent))
-		if err := s.taskMemory.UpdateRunMemoryHumanContent(r.Context(), orgID, review.RunID, humanContent); err != nil {
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			return tx.TaskMemory.UpdateRunMemoryHumanContent(r.Context(), orgID, review.RunID, humanContent)
+		}); err != nil {
 			log.Printf("[reviews] warning: failed to record human verdict for run %s: %v", review.RunID, err)
 		}
 	}
@@ -236,22 +254,29 @@ func (s *Server) handleRunReview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	runID := r.PathValue("runID")
 
-	review, err := s.reviews.ByRunID(r.Context(), orgID, runID)
-	if err != nil {
+	var review *domain.PendingReview
+	var comments []domain.PendingReviewComment
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		review, e = tx.Reviews.ByRunID(r.Context(), orgID, runID)
+		if e != nil {
+			return e
+		}
+		if review == nil {
+			return nil
+		}
+		// Delegate to the full review GET which includes comments
+		comments, e = tx.Reviews.ListComments(r.Context(), orgID, review.ID)
+		return e
+	}); err != nil {
 		internalError(w, "reviews", err)
 		return
 	}
 	if review == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no pending review for this run"})
-		return
-	}
-
-	// Delegate to the full review GET which includes comments
-	comments, err := s.reviews.ListComments(r.Context(), orgID, review.ID)
-	if err != nil {
-		internalError(w, "reviews", err)
 		return
 	}
 
@@ -286,6 +311,7 @@ func (s *Server) handleReviewUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	reviewID := r.PathValue("id")
 
 	var req struct {
@@ -296,27 +322,31 @@ func (s *Server) handleReviewUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
-	if err != nil {
+	var review *domain.PendingReview
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		review, e = tx.Reviews.Get(r.Context(), orgID, reviewID)
+		if e != nil {
+			return e
+		}
+		if review == nil {
+			return nil
+		}
+		body := review.ReviewBody
+		event := review.ReviewEvent
+		if req.ReviewBody != nil {
+			body = *req.ReviewBody
+		}
+		if req.ReviewEvent != nil {
+			event = *req.ReviewEvent
+		}
+		return tx.Reviews.SetSubmission(r.Context(), orgID, reviewID, body, event)
+	}); err != nil {
 		internalError(w, "reviews", err)
 		return
 	}
 	if review == nil {
 		notFound(w, "review")
-		return
-	}
-
-	body := review.ReviewBody
-	event := review.ReviewEvent
-	if req.ReviewBody != nil {
-		body = *req.ReviewBody
-	}
-	if req.ReviewEvent != nil {
-		event = *req.ReviewEvent
-	}
-
-	if err := s.reviews.SetSubmission(r.Context(), orgID, reviewID, body, event); err != nil {
-		internalError(w, "reviews", err)
 		return
 	}
 
@@ -329,6 +359,7 @@ func (s *Server) handleReviewCommentUpdate(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	commentID := r.PathValue("commentId")
 
 	var req struct {
@@ -342,7 +373,9 @@ func (s *Server) handleReviewCommentUpdate(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := s.reviews.UpdateComment(r.Context(), orgID, commentID, req.Body); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.Reviews.UpdateComment(r.Context(), orgID, commentID, req.Body)
+	}); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -356,9 +389,12 @@ func (s *Server) handleReviewCommentDelete(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	commentID := r.PathValue("commentId")
 
-	if err := s.reviews.DeleteComment(r.Context(), orgID, commentID); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.Reviews.DeleteComment(r.Context(), orgID, commentID)
+	}); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -372,6 +408,7 @@ func (s *Server) handleReviewDiff(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	reviewID := r.PathValue("id")
 
 	if s.ghClient == nil {
@@ -379,8 +416,12 @@ func (s *Server) handleReviewDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	review, err := s.reviews.Get(r.Context(), orgID, reviewID)
-	if err != nil {
+	var review *domain.PendingReview
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		review, e = tx.Reviews.Get(r.Context(), orgID, reviewID)
+		return e
+	}); err != nil {
 		internalError(w, "reviews", err)
 		return
 	}
