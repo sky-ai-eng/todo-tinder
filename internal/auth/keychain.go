@@ -183,6 +183,57 @@ func get(key string) (string, error) {
 	return val, err
 }
 
+// GetSecret reads a single keychain entry by key, returning "" (not an
+// error) when no entry exists. For the four well-known credential keys
+// (github_url, github_pat, jira_url, jira_pat) any matching
+// TRIAGE_FACTORY_* env var overrides the keychain value — same overlay
+// rule as Load. Unknown keys read straight from keychain.
+//
+// This is the read-path entry point for the local-mode SecretStore
+// (internal/db/sqlite). The keyed shape lets multi-mode consumers
+// (vault-backed SecretStore) and local-mode consumers share one
+// interface in package db so callers like the per-org Anthropic
+// credential resolver don't have to branch on runmode.
+func GetSecret(key string) (string, error) {
+	if envName, ok := envKeys[key]; ok {
+		if v := os.Getenv(envName); v != "" {
+			logEnvOnce()
+			return v, nil
+		}
+	}
+	return get(key)
+}
+
+// PutSecret writes value under key in the keychain. Mirrors the
+// keychain-unavailable handling of Store: if the keychain probe fails
+// and the four well-known keys have env-var coverage, treat the write
+// as a silent no-op (the env is the source of truth and the keychain
+// write would just fail). For unknown keys there's no env fallback, so
+// a keychain-unavailable error propagates.
+func PutSecret(key, value string) error {
+	if !probeKeychain() {
+		if _, known := envKeys[key]; known && len(EnvProvided()) > 0 {
+			return nil
+		}
+		return fmt.Errorf("keychain backend unavailable")
+	}
+	return keyring.Set(service, key, value)
+}
+
+// DeleteSecret removes a single keychain entry. Missing entries are
+// not an error (matches the behavior of Clear / ClearJira). When the
+// keychain is unavailable the call is a no-op — same shape as
+// deleteKeys.
+func DeleteSecret(key string) error {
+	if !probeKeychain() {
+		return nil
+	}
+	if err := keyring.Delete(service, key); err != nil && err != keyring.ErrNotFound {
+		return fmt.Errorf("keychain delete %s: %w", key, err)
+	}
+	return nil
+}
+
 // --- env var helpers ---
 
 var envLogOnce sync.Once
