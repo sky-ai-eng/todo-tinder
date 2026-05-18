@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 
+	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
@@ -58,9 +59,13 @@ func (s *Server) handleTeamMembers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := ClaimsFrom(r.Context()).Subject
-	username, _ := s.users.GetGitHubUsername(r.Context(), userID)
-	displayName, _ := s.users.GetDisplayName(r.Context(), userID)
-	jiraAccount, _, _ := s.users.GetJiraIdentity(r.Context(), userID)
+	var username, displayName, jiraAccount string
+	_ = s.tx.WithTx(r.Context(), runmode.LocalDefaultOrg, userID, func(tx db.TxStores) error {
+		username, _ = tx.Users.GetGitHubUsername(r.Context(), userID)
+		displayName, _ = tx.Users.GetDisplayName(r.Context(), userID)
+		jiraAccount, _, _ = tx.Users.GetJiraIdentity(r.Context(), userID)
+		return nil
+	})
 	var login, jiraID *string
 	if username != "" {
 		login = &username
