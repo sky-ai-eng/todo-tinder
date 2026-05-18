@@ -437,21 +437,42 @@ func (s *Spawner) processCompletion(
 		} else {
 			hasOtherActiveRun, _ := s.agentRuns.HasOtherActiveRunForTaskSystem(bgCtx, orgID, task.ID, runID)
 			if !hasOtherActiveRun {
+				// SKY-330: route through Close/CloseSystem (not the
+				// raw SetStatus primitive) so close_reason and
+				// closed_at land alongside the status flip. Pre-330
+				// this wrote status='done' with NULL close_reason —
+				// the Done column's 7-day cap (closed_at >= now-7d)
+				// would silently exclude these otherwise. Sister fix
+				// to advanceTaskFromRunStatus's CloseSystem path; the
+				// idempotent skip there means this is the only call
+				// site that writes the close_reason here.
 				var setErr error
 				if triggerType == "manual" {
 					setErr = s.tx.SyntheticClaimsWithTx(bgCtx, orgID, creatorUserID, func(ts db.TxStores) error {
-						return ts.Tasks.SetStatus(bgCtx, orgID, task.ID, "done")
+						return ts.Tasks.Close(bgCtx, orgID, task.ID, "run_completed", "")
 					})
 				} else {
-					setErr = s.tasks.SetStatusSystem(bgCtx, orgID, task.ID, "done")
+					setErr = s.tasks.CloseSystem(bgCtx, orgID, task.ID, "run_completed", "")
 				}
 				if setErr != nil {
-					log.Printf("[delegate] warning: failed to update task %s to done: %v", task.ID, setErr)
+					log.Printf("[delegate] warning: failed to close task %s: %v", task.ID, setErr)
+				} else {
+					// Peer Board sessions need a task_updated nudge
+					// to move the card to the Done column.
+					s.broadcastTaskUpdate(orgID, task.ID, "done")
 				}
 			}
 		}
 	}
 	s.broadcastRunUpdate(orgID, runID, status)
+	// SKY-330: mirror the run's terminal status onto the task. The
+	// inline 'completed' path above already set task.status='done'
+	// (so advanceTaskFromRunStatus's idempotent check skips it);
+	// this call handles the pending_approval branch (the run's
+	// status was flipped at line 415 above) by setting
+	// task.status='in_review' and broadcasting task_updated. Failed
+	// / cancelled / task_unsolvable map to no target → no-op.
+	s.advanceTaskFromRunStatus(orgID, runID, status)
 
 	// Toast the terminal state. Success cases auto-hide; failed/unsolvable
 	// show as an error toast so the user notices even if they've clicked

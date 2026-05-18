@@ -398,7 +398,8 @@ CREATE TABLE tasks (
     event_type           TEXT NOT NULL REFERENCES events_catalog(id) ON DELETE RESTRICT,
     dedup_key            TEXT NOT NULL DEFAULT '',
     primary_event_id     TEXT NOT NULL REFERENCES events(id),
-    status               TEXT NOT NULL DEFAULT 'queued',
+    status               TEXT NOT NULL DEFAULT 'queued'
+                            CHECK (status IN ('queued','in_progress','in_review','done','dismissed','snoozed')),
     priority_score       REAL,
     ai_summary           TEXT,
     autonomy_suitability REAL,

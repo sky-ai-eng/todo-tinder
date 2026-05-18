@@ -370,8 +370,8 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[pending-prs] warning: read run %s for task closure: %v", pr.RunID, runErr)
 				return nil
 			}
-			if err := tx.Tasks.SetStatus(cleanupCtx, orgID, run.TaskID, "done"); err != nil {
-				log.Printf("[pending-prs] warning: failed to update task status for run %s: %v", pr.RunID, err)
+			if err := tx.Tasks.Close(cleanupCtx, orgID, run.TaskID, "run_completed", ""); err != nil {
+				log.Printf("[pending-prs] warning: failed to close task for run %s: %v", pr.RunID, err)
 			}
 			return nil
 		}); err != nil {

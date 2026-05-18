@@ -266,12 +266,17 @@ func seedPgRunForTaskMemory(t *testing.T, h *pgtest.Harness, orgID, userID, prom
 	}
 
 	taskID := uuid.New().String()
+	// 'done' is the terminal task status. Pre-SKY-330 this seed wrote
+	// 'completed' — never a valid task value (completed is run-level)
+	// but silently accepted because the column had no CHECK. SKY-330's
+	// CHECK constraint surfaces the latent fixture bug; same fix as
+	// the SQLite mirror.
 	if _, err := conn.Exec(`
 		INSERT INTO tasks (id, org_id, creator_user_id, team_id, visibility, entity_id, event_type, dedup_key, primary_event_id,
 		                   status, scoring_status, priority_score, created_at)
 		VALUES ($1, $2, $3,
 		        (SELECT id FROM teams WHERE org_id = $2 ORDER BY created_at ASC LIMIT 1),
-		        'team', $4, $5, '', $6, 'completed', 'pending', 0.5, $7)
+		        'team', $4, $5, '', $6, 'done', 'pending', 0.5, $7)
 	`, taskID, orgID, userID, entityID, eventType, eventID, now); err != nil {
 		t.Fatalf("seed task: %v", err)
 	}

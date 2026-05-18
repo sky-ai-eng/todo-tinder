@@ -222,8 +222,8 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[reviews] warning: read run %s for task closure: %v", review.RunID, runErr)
 				return nil
 			}
-			if err := tx.Tasks.SetStatus(cleanupCtx, orgID, run.TaskID, "done"); err != nil {
-				log.Printf("[reviews] warning: failed to update task status for run %s: %v", review.RunID, err)
+			if err := tx.Tasks.Close(cleanupCtx, orgID, run.TaskID, "run_completed", ""); err != nil {
+				log.Printf("[reviews] warning: failed to close task for run %s: %v", review.RunID, err)
 			}
 			return nil
 		}); err != nil {

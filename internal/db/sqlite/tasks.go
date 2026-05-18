@@ -77,20 +77,61 @@ func (s *taskStore) Queued(ctx context.Context, orgID string) ([]domain.Task, er
 	`)
 }
 
+func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return nil, err
+	}
+	// SKY-330: drops the snooze-window filter so the Board's "show
+	// snoozed" toggle surfaces deferred entries. Status='queued' +
+	// status='snoozed' both qualify; SKY-261 enforces snoozed↔unclaimed
+	// so the claim guards are still safe to apply.
+	//
+	// Ordering puts snoozed rows at the tail (the "wakes Mar 5"
+	// badge cluster) regardless of priority so a high-priority but
+	// deferred entry doesn't jump above live queued work. SQLite
+	// treats the boolean expression as 0/1 — false (live) sorts
+	// before true (snoozed).
+	return queryTasksCtx(ctx, s.q, `
+		SELECT `+sqliteTaskColumnsWithEntity+`
+		FROM tasks t
+		JOIN entities e ON t.entity_id = e.id
+		LEFT JOIN (
+			SELECT org_id, event_type, MIN(sort_order) AS sort_order
+			FROM event_handlers
+			WHERE enabled = 1 AND kind = 'rule'
+			GROUP BY org_id, event_type
+		) tr ON t.event_type = tr.event_type AND t.org_id = tr.org_id
+		WHERE t.status IN ('queued', 'snoozed')
+			AND t.claimed_by_agent_id IS NULL
+			AND t.claimed_by_user_id  IS NULL
+		ORDER BY (t.status = 'snoozed') ASC,
+		         COALESCE(tr.sort_order, 999) ASC,
+		         COALESCE(t.priority_score, 0.5) DESC
+	`)
+}
+
 func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error) {
 	if err := assertLocalOrg(orgID); err != nil {
 		return nil, err
 	}
 	// SKY-261 B+: 'claimed' and 'delegated' aren't real lifecycle
 	// values — they're derived filters on the claim columns.
+	// SKY-330 added in_progress + in_review as first-class statuses,
+	// so the "claimed" derivation now means specifically "any claim
+	// (user or bot) at status='queued'." Status='queued' avoids
+	// double-rendering once a task advances to in_progress / in_review
+	// (those have their own columns). Including bot claims here
+	// surfaces the brief window between delegate-stamp and the run's
+	// first non-initializing status — plus delegate-spawn-failure
+	// rows that stay claimed-queued indefinitely until retry.
 	switch status {
 	case "claimed":
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+sqliteTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id
-			WHERE t.claimed_by_user_id IS NOT NULL
-				AND t.status NOT IN ('done', 'dismissed')
+			WHERE (t.claimed_by_user_id IS NOT NULL OR t.claimed_by_agent_id IS NOT NULL)
+				AND t.status = 'queued'
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`)
 	case "delegated":
@@ -102,6 +143,24 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 				AND t.status NOT IN ('done', 'dismissed')
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`)
+	case "done", "dismissed":
+		// SKY-330: cap the Done column at the last 7 days so the
+		// board doesn't accumulate an unbounded history. closed_at
+		// is now populated by every close path — Close(),
+		// RecordSwipe (complete/dismiss), spawner auto-close — so
+		// requiring it here means rows that bypass those paths
+		// surface as bugs (column empty) rather than accumulating
+		// silently. Legacy pre-330 rows with NULL closed_at fall
+		// out of the cap; they're old enough to be excluded anyway.
+		return queryTasksCtx(ctx, s.q, `
+			SELECT `+sqliteTaskColumnsWithEntity+`
+			FROM tasks t
+			JOIN entities e ON t.entity_id = e.id
+			WHERE t.status = ?
+				AND t.closed_at IS NOT NULL
+				AND t.closed_at >= datetime('now', '-7 days')
+			ORDER BY t.closed_at DESC, COALESCE(t.priority_score, 0.5) DESC
+		`, status)
 	}
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+sqliteTaskColumnsWithEntity+`
@@ -393,6 +452,30 @@ func (s *taskStore) SetStatus(ctx context.Context, orgID, taskID, status string)
 	}
 	_, err := s.q.ExecContext(ctx, `UPDATE tasks SET status = ? WHERE id = ?`, status, taskID)
 	return err
+}
+
+func (s *taskStore) AdvanceStatusForUser(ctx context.Context, orgID, taskID, userID, newStatus string) (bool, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return false, err
+	}
+	if newStatus != "in_progress" && newStatus != "in_review" {
+		return false, nil
+	}
+	res, err := s.q.ExecContext(ctx, `
+		UPDATE tasks
+		   SET status = ?
+		 WHERE id = ?
+		   AND claimed_by_user_id = ?
+		   AND status IN ('queued', 'in_progress', 'in_review')
+	`, newStatus, taskID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *taskStore) RecordEvent(ctx context.Context, orgID, taskID, eventID, kind string) error {

@@ -205,6 +205,131 @@ func (s *Spawner) updateStatus(orgID, runID, status string) {
 		log.Printf("[delegate] warning: failed to update status for run %s: %v", runID, err)
 	}
 	s.broadcastRunUpdate(orgID, runID, status)
+	s.advanceTaskFromRunStatus(orgID, runID, status)
+}
+
+// advanceTaskFromRunStatus is SKY-330's bot-side auto-progression:
+// when a bot-claimed task's run transitions through lifecycle
+// stages, mirror the change onto the task's status so the board
+// column placement follows the work. User-claimed tasks transition
+// manually — this helper short-circuits on non-bot claims.
+//
+// Mapping:
+//   - any active stage (initializing/cloning/fetching/.../running) → in_progress
+//   - pending_approval                                              → in_review
+//   - completed                                                     → done (close_reason=run_completed)
+//   - failed / cancelled / task_unsolvable / taken_over             → no transition (user decides)
+//
+// All failures here are logged-not-fatal — the run state has already
+// been persisted and broadcast; failing the task transition would
+// leave the system in a recoverable state (next poll / next event
+// reconciles).
+func (s *Spawner) advanceTaskFromRunStatus(orgID, runID, runStatus string) {
+	if s.tasks == nil {
+		return
+	}
+	if s.isChainRunID(runID) {
+		return
+	}
+	target, isClose := targetTaskStatusForRunStatus(runStatus)
+	if target == "" {
+		return
+	}
+	ctx := context.Background()
+	run, err := s.agentRuns.GetSystem(ctx, orgID, runID)
+	if err != nil || run == nil || run.TaskID == "" {
+		return
+	}
+	// Chain step: the chain orchestrator owns task lifecycle (it
+	// closes the task only when the chain itself terminates). A
+	// pending_approval / completed mid-chain step must not flip the
+	// task to in_review / done — the next step is about to run.
+	// processCompletion's inline 'completed' path has the same
+	// guard at run.go:435.
+	if run.ChainRunID != "" {
+		return
+	}
+	task, err := s.tasks.GetSystem(ctx, orgID, run.TaskID)
+	if err != nil || task == nil {
+		return
+	}
+	// Only mirror onto bot-claimed tasks. A user takeover may have
+	// flipped the claim while this run was in flight; in that case
+	// the user owns the lifecycle and we leave their card alone.
+	if task.ClaimedByAgentID == "" {
+		return
+	}
+	// Idempotent: skip the write (and the WS broadcast) when the
+	// task is already at the target state. Prevents repeat updateStatus
+	// calls for the same run state from flooding the bus.
+	if task.Status == target {
+		return
+	}
+	// Terminal-already check: a closed task should never re-open
+	// based on a late run event. Run completions that arrive after
+	// a user-driven close are silently ignored.
+	if task.Status == "done" || task.Status == "dismissed" {
+		return
+	}
+	// Re-delegation guard: if a newer active run exists for the
+	// same task (the user re-delegated while this run was in flight),
+	// an older run reaching pending_approval / completed must not
+	// flip the task — the newer run is still working. processCompletion's
+	// inline 'completed' path at run.go:438 has the same check; the
+	// helper mirrors it so the two paths don't drift. Active-stage
+	// targets (in_progress) are idempotent against the newer run's
+	// own writes so the guard is harmless there too.
+	hasOtherActive, _ := s.agentRuns.HasOtherActiveRunForTaskSystem(ctx, orgID, task.ID, runID)
+	if hasOtherActive {
+		return
+	}
+	if isClose {
+		if err := s.tasks.CloseSystem(ctx, orgID, task.ID, "run_completed", ""); err != nil {
+			log.Printf("[delegate] warning: failed to close task %s for completed run %s: %v", task.ID, runID, err)
+			return
+		}
+	} else {
+		if err := s.tasks.SetStatusSystem(ctx, orgID, task.ID, target); err != nil {
+			log.Printf("[delegate] warning: failed to advance task %s to %q for run %s: %v", task.ID, target, runID, err)
+			return
+		}
+	}
+	s.broadcastTaskUpdate(orgID, task.ID, target)
+}
+
+// targetTaskStatusForRunStatus returns the task status a given run
+// status should produce, plus whether the transition is a close
+// (callers route to Close for the close_reason metadata). Empty
+// target means no transition (e.g. failed, cancelled — user picks
+// next step).
+func targetTaskStatusForRunStatus(runStatus string) (target string, isClose bool) {
+	switch runStatus {
+	case "initializing", "cloning", "fetching", "worktree_created", "agent_starting", "running":
+		return "in_progress", false
+	case "pending_approval":
+		return "in_review", false
+	case "completed":
+		return "done", true
+	default:
+		return "", false
+	}
+}
+
+// broadcastTaskUpdate emits a SKY-330 task_updated WS event so the
+// board can refetch / patch the card without polling. Payload
+// matches the shared event shape (task_id + status) the other
+// emitters use (handleSwipe, handleSnooze, handleTaskAdvance,
+// finalizeRequeue), so the FE's typed WSEvent ('task_updated':
+// {task_id, status}) holds across producers.
+func (s *Spawner) broadcastTaskUpdate(orgID, taskID, status string) {
+	if s.wsHub == nil {
+		return
+	}
+	s.wsHub.Broadcast(websocket.Event{
+		Type:  "task_updated",
+		OrgID: orgID,
+		Data:  map[string]string{"task_id": taskID, "status": status},
+	})
 }
 
 // updateBreakerCounter is a no-op stub. The breaker is now query-based

@@ -31,20 +31,31 @@ func newSwipeStore(q queryer) db.SwipeStore { return &swipeStore{q: q} }
 var _ db.SwipeStore = (*swipeStore)(nil)
 
 func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, action string, hesitationMs int) (string, error) {
-	// SKY-261 B+ split the responsibility axis off the lifecycle axis.
-	// claim + delegate are responsibility-only — the handler stamps
-	// claim columns; this UPDATE leaves status at 'queued'. Only
-	// dismiss/snooze/complete are genuine lifecycle moves.
-	var newStatus string
+	// See sqlite/swipes.go for the full rationale. Summary: claim +
+	// delegate are responsibility-only and MUST NOT touch the
+	// lifecycle status (or in_progress / in_review tasks lose their
+	// stage during takeover/delegate via the assignee picker).
+	// Terminal swipes (dismiss / complete) write status + closed_at
+	// + close_reason. Snooze flows through SnoozeTask.
+	terminal := action == "dismiss" || action == "complete"
+	var newStatus, closeReason string
 	switch action {
 	case "claim", "delegate":
-		newStatus = "queued"
+		// Audit-only path.
 	case "dismiss":
 		newStatus = "dismissed"
-	case "snooze":
-		newStatus = "snoozed"
+		closeReason = "user_dismissed"
 	case "complete":
 		newStatus = "done"
+		closeReason = "user_completed"
+	case "snooze":
+		// Defensive: handleSwipe accepts action='snooze' and routes
+		// it here; the production FE uses /snooze + SnoozeTask
+		// instead, but a stray /swipe action=snooze should at least
+		// produce a consistent status='snoozed' rather than falling
+		// through to the 'queued' default. See SQLite mirror for the
+		// full rationale.
+		newStatus = "snoozed"
 	default:
 		newStatus = "queued"
 	}
@@ -52,13 +63,43 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 		if err := insertSwipeEvent(ctx, tx, orgID, taskID, action, &hesitationMs); err != nil {
 			return err
 		}
-		// clearSnooze=true on every action this method handles —
-		// dismiss/complete are terminal lifecycle moves; claim/delegate's
-		// snooze_until clear is redundant with the claim helpers'
-		// atomic snooze-wake under the v0.7 "snoozed ↔ unclaimed"
-		// invariant but harmless. SnoozeTask is the only method that
-		// SETS snooze_until; every other path clears it.
-		return updateTaskStatus(ctx, tx, orgID, taskID, newStatus, nil, true)
+		if newStatus == "" {
+			// claim / delegate: preserve in_progress / in_review
+			// across takeover, but flip 'snoozed' → 'queued' so the
+			// SKY-261 "snoozed ↔ unclaimed" invariant holds when a
+			// path bypasses the claim helpers. See SQLite mirror for
+			// the full rationale.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE tasks
+				    SET status = CASE WHEN status = 'snoozed' THEN 'queued' ELSE status END,
+				        snooze_until = NULL
+				  WHERE org_id = $1 AND id = $2`,
+				orgID, taskID,
+			); err != nil {
+				return err
+			}
+			row := tx.QueryRowContext(ctx,
+				`SELECT status FROM tasks WHERE org_id = $1 AND id = $2`,
+				orgID, taskID,
+			)
+			return row.Scan(&newStatus)
+		}
+		var closedAt any
+		var reason any
+		if terminal {
+			closedAt = time.Now()
+			reason = closeReason
+		}
+		_, err := tx.ExecContext(ctx,
+			`UPDATE tasks
+			    SET status = $1,
+			        snooze_until = NULL,
+			        closed_at = $2,
+			        close_reason = $3
+			  WHERE org_id = $4 AND id = $5`,
+			newStatus, closedAt, reason, orgID, taskID,
+		)
+		return err
 	}); err != nil {
 		return "", err
 	}
@@ -74,11 +115,8 @@ func (s *swipeStore) SnoozeTask(ctx context.Context, orgID string, taskID string
 			return err
 		}
 		// Claim guard: snooze is queue-only post-invariant ("snoozed
-		// ↔ both claim cols NULL"). updateTaskStatus only handles
-		// the (status, snooze_until) axis pair, so we inline the
-		// UPDATE here to add the claim guard; growing the helper to
-		// take claim flags would proliferate booleans across every
-		// callsite for one path's needs.
+		// ↔ both claim cols NULL"). Inline UPDATE so the WHERE
+		// clause's claim-column guards live with the snooze write.
 		res, err := tx.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'snoozed', snooze_until = $1
@@ -121,12 +159,16 @@ func (s *swipeStore) RequeueTask(ctx context.Context, orgID string, taskID strin
 		// filter (claim cols all NULL + status 'queued') picks the
 		// row up immediately. Status reset to 'queued' covers the
 		// snoozed-back-to-queue path too.
+		// SKY-330: also clear close metadata — re-queueing a
+		// previously-terminal task means it isn't terminal anymore.
 		res, err := tx.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'queued',
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE org_id = $1 AND id = $2`,
 			orgID, taskID,
 		)
@@ -153,17 +195,17 @@ func (s *swipeStore) UndoLastSwipe(ctx context.Context, orgID string, taskID str
 		// claim col; leaving it on the row would keep the task in
 		// the owner's lane even after status returns to 'queued'.
 		// Clear both cols so the task lands back in the team's
-		// unclaimed triage queue, matching RequeueTask's shape. The
-		// inline UPDATE bypasses updateTaskStatus because that
-		// helper only handles the (status, snooze_until) axis pair —
-		// growing it to take claim cols too would proliferate
-		// boolean flags across every callsite for one path's needs.
+		// unclaimed triage queue, matching RequeueTask's shape.
+		// SKY-330: clear close metadata too — undoing a dismiss /
+		// complete swipe means the task isn't terminal anymore.
 		_, err := tx.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = $1,
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE org_id = $2 AND id = $3`,
 			"queued", orgID, taskID,
 		)
@@ -214,33 +256,4 @@ func insertSwipeEvent(ctx context.Context, tx *sql.Tx, orgID, taskID, action str
 		return fmt.Errorf("insert swipe_events: %w", err)
 	}
 	return nil
-}
-
-// updateTaskStatus is the shared tasks-row update for every swipe
-// method. clearSnooze=true clears snooze_until; clearSnooze=false
-// leaves it alone (RecordSwipe's path) or replaces it with the
-// passed value (SnoozeTask's path). The two-flag shape lets one
-// helper serve all three callsites without a separate UPDATE per
-// permutation.
-func updateTaskStatus(ctx context.Context, tx *sql.Tx, orgID, taskID, status string, snoozeUntil *time.Time, clearSnooze bool) error {
-	switch {
-	case clearSnooze:
-		_, err := tx.ExecContext(ctx,
-			`UPDATE tasks SET status = $1, snooze_until = NULL WHERE org_id = $2 AND id = $3`,
-			status, orgID, taskID,
-		)
-		return err
-	case snoozeUntil != nil:
-		_, err := tx.ExecContext(ctx,
-			`UPDATE tasks SET status = $1, snooze_until = $2 WHERE org_id = $3 AND id = $4`,
-			status, *snoozeUntil, orgID, taskID,
-		)
-		return err
-	default:
-		_, err := tx.ExecContext(ctx,
-			`UPDATE tasks SET status = $1 WHERE org_id = $2 AND id = $3`,
-			status, orgID, taskID,
-		)
-		return err
-	}
 }

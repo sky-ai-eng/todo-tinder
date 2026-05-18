@@ -26,24 +26,50 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 	if err := assertLocalOrg(orgID); err != nil {
 		return "", err
 	}
-	// Action → status mapping. SKY-261 B+ split the responsibility axis
+	// Action → effect mapping. SKY-261 B+ split the responsibility axis
 	// (who owns this) off the lifecycle axis (where in its life the
-	// task is). claim + delegate are responsibility-only now — the
-	// handler stamps claim columns; the status stays 'queued' here.
-	// Only dismiss/snooze/complete (genuine lifecycle moves) transition
-	// status. Unknown action defaults to 'queued' so a typo doesn't
-	// strand the task; same fallback as pre-SKY-261.
-	var newStatus string
+	// task is). claim + delegate are responsibility-only — the handler
+	// stamps claim columns and may already have moved the lifecycle
+	// status (e.g. snooze-wake inside ClaimQueuedForUser). This audit
+	// path MUST NOT write status for those actions or it would clobber
+	// the lifecycle status of an in_progress / in_review task during a
+	// takeover/delegate (SKY-330's assignee picker exercises both).
+	// Only dismiss + complete are genuine lifecycle moves recorded
+	// here; snooze flows through SnoozeTask separately.
+	//
+	// SKY-330: closed_at + close_reason are written on terminal swipes
+	// so the Board's Done-column 7-day cap actually applies. They're
+	// NOT cleared on claim/delegate because the swipe handler refuses
+	// claim transitions on terminal tasks at the entry — so a row
+	// reaching this path with stale close metadata isn't a state the
+	// handler permits. Re-open paths (RequeueTask / UndoLastSwipe)
+	// clear the close columns explicitly.
+	terminal := action == "dismiss" || action == "complete"
+	var newStatus, closeReason string
 	switch action {
 	case "claim", "delegate":
-		newStatus = "queued"
+		// Audit-only path — read the current status to return so the
+		// caller's WS broadcast carries the right value.
 	case "dismiss":
 		newStatus = "dismissed"
-	case "snooze":
-		newStatus = "snoozed"
+		closeReason = "user_dismissed"
 	case "complete":
 		newStatus = "done"
+		closeReason = "user_completed"
+	case "snooze":
+		// Defensive: the FE routes snoozing through
+		// /api/tasks/{id}/snooze → SnoozeTask, but handleSwipe still
+		// accepts action='snooze' and falls into the dismiss/snooze/
+		// complete branch that calls RecordSwipe. If a request ever
+		// lands here, write status='snoozed' so the audit row at least
+		// matches the lifecycle write — without this, the default arm
+		// below would silently write 'queued' and the snooze "would
+		// have happened" without happening. snooze_until stays NULL
+		// (handler doesn't pass it through this path), which the FE
+		// doesn't produce in practice.
+		newStatus = "snoozed"
 	default:
+		// Unknown action — same fallback as pre-SKY-261, write 'queued'.
 		newStatus = "queued"
 	}
 	err := inTx(ctx, s.q, func(q queryer) error {
@@ -53,18 +79,43 @@ func (s *swipeStore) RecordSwipe(ctx context.Context, orgID string, taskID, acti
 		); err != nil {
 			return err
 		}
-		// snooze_until is cleared on every transition this method
-		// handles — dismiss/complete (genuine lifecycle moves) are
-		// terminal so a leftover deferral makes no sense, and
-		// claim/delegate's snooze_until clear is redundant with the
-		// claim helpers (Stamp/Handoff/Takeover/ClaimQueued all do
-		// their own atomic snooze wake under the v0.7 "snoozed ↔
-		// unclaimed" invariant) but harmless. SnoozeTask is the
-		// only method that should SET snooze_until; everything
-		// else clears it.
+		if newStatus == "" {
+			// claim / delegate: preserve in_progress / in_review across
+			// takeover, but flip 'snoozed' → 'queued' so the SKY-261
+			// "snoozed ↔ unclaimed" invariant holds even when a code
+			// path bypasses the claim helpers (which do the wake
+			// atomically under normal operation). The CASE expression
+			// keeps every non-snoozed status intact — load-bearing for
+			// the assignee picker's take-over-from-bot path, which
+			// hits an in_progress / in_review row.
+			if _, err := q.ExecContext(ctx,
+				`UPDATE tasks
+				   SET status = CASE WHEN status = 'snoozed' THEN 'queued' ELSE status END,
+				       snooze_until = NULL
+				 WHERE id = ?`,
+				taskID,
+			); err != nil {
+				return err
+			}
+			// Read-back so the caller's WS broadcast carries the
+			// actual post-mutation status.
+			row := q.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, taskID)
+			return row.Scan(&newStatus)
+		}
+		var closedAt any
+		var reason any
+		if terminal {
+			closedAt = time.Now()
+			reason = closeReason
+		}
 		_, err := q.ExecContext(ctx,
-			`UPDATE tasks SET status = ?, snooze_until = NULL WHERE id = ?`,
-			newStatus, taskID,
+			`UPDATE tasks
+			   SET status = ?,
+			       snooze_until = NULL,
+			       closed_at = ?,
+			       close_reason = ?
+			 WHERE id = ?`,
+			newStatus, closedAt, reason, taskID,
 		)
 		return err
 	})
@@ -141,12 +192,18 @@ func (s *swipeStore) RequeueTask(ctx context.Context, orgID string, taskID strin
 		// task back in the team's triage queue means it's no longer
 		// claimed by anyone (the derived queue filter requires both
 		// claim cols NULL).
+		// SKY-330: also clear close metadata — re-queueing a
+		// previously-terminal task means it isn't terminal anymore,
+		// and the Board's Done-column 7-day cap reads closed_at to
+		// gate visibility.
 		res, err := q.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'queued',
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE id = ?`,
 			taskID,
 		)
@@ -183,12 +240,16 @@ func (s *swipeStore) UndoLastSwipe(ctx context.Context, orgID string, taskID str
 		// owner's lane even after status returns to 'queued'. Clear
 		// both cols so the task lands back in the team's unclaimed
 		// triage queue, the same shape /requeue produces.
+		// SKY-330: clear close metadata too — undoing a dismiss /
+		// complete swipe means the task isn't terminal anymore.
 		_, err := q.ExecContext(ctx,
 			`UPDATE tasks
 			    SET status = 'queued',
 			        snooze_until = NULL,
 			        claimed_by_agent_id = NULL,
-			        claimed_by_user_id  = NULL
+			        claimed_by_user_id  = NULL,
+			        closed_at = NULL,
+			        close_reason = NULL
 			  WHERE id = ?`,
 			taskID,
 		)

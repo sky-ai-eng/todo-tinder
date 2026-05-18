@@ -17,9 +17,23 @@ interface Props {
   messages: AgentMessage[]
   onRequeue?: () => void
   onReview?: () => void
+  // SKY-330: caller-supplied assignee picker. Rendered inline at the
+  // start of the header's right-side cluster (assignee | elapsed |
+  // expand | takeover) so it shares the cluster's gap-2 spacing
+  // instead of overlapping it via absolute positioning. Optional —
+  // call sites outside the Board (factory views, etc.) omit it.
+  assigneeSlot?: React.ReactNode
 }
 
-export default function AgentCard({ task, run, chainSteps, messages, onRequeue, onReview }: Props) {
+export default function AgentCard({
+  task,
+  run,
+  chainSteps,
+  messages,
+  onRequeue,
+  onReview,
+  assigneeSlot,
+}: Props) {
   const orgHref = useOrgHref()
   const scrollRef = useRef<HTMLDivElement>(null)
   const [now, setNow] = useState(() => Date.now())
@@ -132,6 +146,7 @@ export default function AgentCard({ task, run, chainSteps, messages, onRequeue, 
             )}
           </div>
           <div className="flex items-center gap-2">
+            {assigneeSlot && <div className="shrink-0">{assigneeSlot}</div>}
             <span className="text-[11px] text-text-tertiary">{elapsed}</span>
             <Link
               to={orgHref(`/board/runs/${run.ID}`)}

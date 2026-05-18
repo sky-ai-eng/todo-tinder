@@ -95,16 +95,46 @@ func (s *taskStore) Queued(ctx context.Context, orgID string) ([]domain.Task, er
 	`, orgID)
 }
 
+func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error) {
+	// SKY-330: snoozed rows render at the tail regardless of
+	// priority so deferred entries don't jump above live queued
+	// work. Postgres sorts false before true on the boolean
+	// expression (matches the SQLite mirror's 0/1 ordering).
+	return queryTasksCtx(ctx, s.q, `
+		SELECT `+pgTaskColumnsWithEntity+`
+		FROM tasks t
+		JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
+		LEFT JOIN (
+			SELECT org_id, event_type, MIN(sort_order) AS sort_order
+			FROM event_handlers
+			WHERE enabled = true AND kind = 'rule'
+			GROUP BY org_id, event_type
+		) tr ON t.event_type = tr.event_type AND t.org_id = tr.org_id
+		WHERE t.org_id = $1
+			AND t.status IN ('queued', 'snoozed')
+			AND t.claimed_by_agent_id IS NULL
+			AND t.claimed_by_user_id  IS NULL
+		ORDER BY (t.status = 'snoozed') ASC,
+		         COALESCE(tr.sort_order, 999) ASC,
+		         COALESCE(t.priority_score, 0.5) DESC
+	`, orgID)
+}
+
 func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error) {
 	switch status {
 	case "claimed":
+		// SKY-330: "claimed" = any claim (user or bot) at
+		// status='queued'. Mirrors the SQLite branch — see that
+		// file's comment for the full rationale around the
+		// status='queued' filter and including bot claims to
+		// surface the delegate-spawn-failure retry case.
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+pgTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
 			WHERE t.org_id = $1
-				AND t.claimed_by_user_id IS NOT NULL
-				AND t.status NOT IN ('done', 'dismissed')
+				AND (t.claimed_by_user_id IS NOT NULL OR t.claimed_by_agent_id IS NOT NULL)
+				AND t.status = 'queued'
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`, orgID)
 	case "delegated":
@@ -117,6 +147,21 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 				AND t.status NOT IN ('done', 'dismissed')
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`, orgID)
+	case "done", "dismissed":
+		// SKY-330: cap the Done column at the last 7 days. Mirrors
+		// the SQLite branch — every close path now populates
+		// closed_at, so the NOT NULL guard turns missing values into
+		// surfacable bugs rather than letting them accumulate.
+		return queryTasksCtx(ctx, s.q, `
+			SELECT `+pgTaskColumnsWithEntity+`
+			FROM tasks t
+			JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
+			WHERE t.org_id = $1
+				AND t.status = $2
+				AND t.closed_at IS NOT NULL
+				AND t.closed_at >= NOW() - INTERVAL '7 days'
+			ORDER BY t.closed_at DESC, COALESCE(t.priority_score, 0.5) DESC
+		`, orgID, status)
 	}
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+pgTaskColumnsWithEntity+`
@@ -393,6 +438,28 @@ func setTaskStatus(ctx context.Context, q queryer, orgID, taskID, status string)
 		UPDATE tasks SET status = $1 WHERE org_id = $2 AND id = $3
 	`, status, orgID, taskID)
 	return err
+}
+
+func (s *taskStore) AdvanceStatusForUser(ctx context.Context, orgID, taskID, userID, newStatus string) (bool, error) {
+	if newStatus != "in_progress" && newStatus != "in_review" {
+		return false, nil
+	}
+	res, err := s.q.ExecContext(ctx, `
+		UPDATE tasks
+		   SET status = $1
+		 WHERE org_id = $2
+		   AND id = $3
+		   AND claimed_by_user_id = $4
+		   AND status IN ('queued', 'in_progress', 'in_review')
+	`, newStatus, orgID, taskID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *taskStore) RecordEvent(ctx context.Context, orgID, taskID, eventID, kind string) error {

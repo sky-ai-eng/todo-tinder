@@ -31,11 +31,25 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 // teamMembersResponse is the roster shown to Variant B (multi-person team)
-// of the predicate editor. Each row carries display_name + github_username
-// + is_current_user so the FE can pre-rank the dropdown and highlight
-// "you" among teammates.
+// of the predicate editor AND to SKY-330's per-card assignee picker.
+// Each row carries display_name + github_username + is_current_user so
+// the FE can pre-rank the dropdown and highlight "you" among teammates.
+//
+// Bot is a sibling field rather than a member row because the bot is
+// not a user — it occupies the agent claim slot, not the user claim
+// slot. Frontend renders it as a distinct entry (right under "Me" per
+// SKY-330) when non-null. Null when the agent isn't bootstrapped or
+// team_agents.enabled is false for the caller's team — same gate the
+// delegate handlers enforce, surfaced to the picker so disabled bots
+// don't appear as a (would-409) option.
 type teamMembersResponse struct {
 	Members []teamMemberRow `json:"members"`
+	Bot     *teamBotRow     `json:"bot"`
+}
+
+type teamBotRow struct {
+	AgentID     string `json:"agent_id"`
+	DisplayName string `json:"display_name"`
 }
 
 type teamMemberRow struct {
@@ -79,6 +93,19 @@ func (s *Server) handleTeamMembers(w http.ResponseWriter, r *http.Request) {
 	if jiraAccount != "" {
 		jiraID = &jiraAccount
 	}
+
+	// Bot resolution mirrors the swipe-delegate / factory-delegate
+	// gate so the picker shows exactly the options the delegate
+	// handlers would accept. Errors here are non-fatal — the picker
+	// degrades to "no bot" rather than failing the roster fetch.
+	var bot *teamBotRow
+	if agent, enabled, err := s.agentEnabledForOrg(r.Context(), orgID, userID); err == nil && enabled && agent != nil {
+		bot = &teamBotRow{
+			AgentID:     agent.ID,
+			DisplayName: agent.DisplayName,
+		}
+	}
+
 	writeJSON(w, http.StatusOK, teamMembersResponse{
 		Members: []teamMemberRow{
 			{
@@ -89,5 +116,6 @@ func (s *Server) handleTeamMembers(w http.ResponseWriter, r *http.Request) {
 				IsCurrentUser:  true,
 			},
 		},
+		Bot: bot,
 	})
 }

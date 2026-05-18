@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
@@ -51,6 +53,12 @@ type taskJSON struct {
 	// subtasks — the "consider decomposing" signal (SKY-173). Zero for
 	// GitHub tasks and Jira tickets without subtasks.
 	OpenSubtaskCount int `json:"open_subtask_count"`
+	// Claim cols (SKY-330): exposed so the per-card assignee picker
+	// can render the current assignee without a second round-trip.
+	// Exactly one is set when claimed; both empty when unclaimed.
+	// omitempty keeps the wire shape clean for the unclaimed-queue case.
+	ClaimedByAgentID string `json:"claimed_by_agent_id,omitempty"`
+	ClaimedByUserID  string `json:"claimed_by_user_id,omitempty"`
 }
 
 func taskToJSON(t domain.Task) taskJSON {
@@ -80,6 +88,8 @@ func taskToJSON(t domain.Task) taskJSON {
 		CloseReason:         t.CloseReason,
 		SnoozeUntil:         snoozeUntil,
 		OpenSubtaskCount:    t.OpenSubtaskCount,
+		ClaimedByAgentID:    t.ClaimedByAgentID,
+		ClaimedByUserID:     t.ClaimedByUserID,
 	}
 }
 
@@ -89,10 +99,20 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
+	// SKY-330: ?include_snoozed=true keeps future-snoozed rows in the
+	// response so the Board's "show snoozed" toggle can render them
+	// at the tail of the Queued column. Default = false so /api/queue
+	// stays the canonical "pickable right now" projection for the
+	// Cards triage view.
+	includeSnoozed := r.URL.Query().Get("include_snoozed") == "true"
 	var tasks []domain.Task
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
-		tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+		if includeSnoozed {
+			tasks, e = tx.Tasks.QueuedIncludingSnoozed(r.Context(), orgID)
+		} else {
+			tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+		}
 		return e
 	}); err != nil {
 		internalError(w, "tasks", err)
@@ -469,13 +489,25 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	// resolved it themselves" (complete) from "human took over and
 	// will handle it manually" (claim) — three distinct
 	// recalibration signals.
-	if req.Action == "dismiss" || req.Action == "complete" || req.Action == "claim" {
+	if req.Action == "dismiss" || req.Action == "complete" || req.Action == "claim" || req.Action == "delegate" {
 		outcome := discardOutcomeDismissed
 		switch req.Action {
 		case "complete":
 			outcome = discardOutcomeCompleted
 		case "claim":
 			outcome = discardOutcomeClaimed
+		case "delegate":
+			// SKY-330: re-delegate cancels the prior in-flight run
+			// before spawning the new one. Pre-330 the prior run was
+			// allowed to keep running in parallel — the guards in
+			// processCompletion + advanceTaskFromRunStatus prevent
+			// its stale terminal events from corrupting state, but
+			// the parallel work itself was wasteful (two cloned
+			// worktrees, two API budgets). The assignee picker makes
+			// re-delegate a routine gesture (clicking the bot row on
+			// an already-bot-claimed task), so cancel-first is now
+			// load-bearing for cost control rather than an edge case.
+			outcome = discardOutcomeRedelegated
 		}
 		// Cleanup runs detached from r.Context() so a client
 		// disconnect after the swipe response doesn't strand the
@@ -770,6 +802,90 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }
 
+// handleTaskAdvance is the SKY-330 board's manual user transition —
+// "I'm working on this now" (in_progress) and "I've submitted this for
+// review" (in_review). Refuses if the caller doesn't hold the user
+// claim, if the task is bot-claimed (those transition automatically
+// via the spawner), or if the requested status is anything other
+// than in_progress / in_review. Done / dismissed go through swipe;
+// requeue goes through /requeue.
+//
+// Body: {"to": "in_progress" | "in_review"}
+func (s *Server) handleTaskAdvance(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+	id := r.PathValue("id")
+
+	var body struct {
+		To string `json:"to"`
+	}
+	if !decodeJSON(w, r, &body, "invalid request body") {
+		return
+	}
+	if body.To != "in_progress" && body.To != "in_review" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to must be one of: in_progress, in_review"})
+		return
+	}
+
+	// SKY-330: validate the path id as a UUID up front. On Postgres
+	// tasks.id is the uuid column type, so a malformed id surfaces as
+	// SQLSTATE 22P02 from the store call → 500. Treating malformed
+	// ids as "task not found" keeps the API portable across SQLite
+	// (id TEXT, no parse error) and Postgres.
+	if _, err := uuid.Parse(id); err != nil {
+		notFound(w, "task")
+		return
+	}
+
+	// Pre-load mirrors the /requeue + /undo shape: gives us a clean
+	// 404 for genuinely missing rows. 409 on the store's ok=false
+	// means "guard tripped" (task exists but isn't claimed by you,
+	// or is terminal) — distinct from "task not found" rather than
+	// merged like the pre-fix shape.
+	var task *domain.Task
+	var advanced bool
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		task, e = tx.Tasks.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if task == nil {
+			return nil
+		}
+		advanced, e = tx.Tasks.AdvanceStatusForUser(r.Context(), orgID, id, userID, body.To)
+		return e
+	}); err != nil {
+		internalError(w, "tasks", err)
+		return
+	}
+	if task == nil {
+		notFound(w, "task")
+		return
+	}
+	if !advanced {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "task not advanceable — must be claimed by you and currently in queued/in_progress/in_review",
+		})
+		return
+	}
+
+	// Broadcast on the status axis so peer Board sessions move the
+	// card to the new column without polling.
+	if s.ws != nil {
+		s.ws.Broadcast(websocket.Event{
+			Type:  "task_updated",
+			OrgID: orgID,
+			Data:  map[string]any{"task_id": id, "status": body.To},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": body.To})
+}
+
 // discardOutcome describes how the task ended up after the user
 // rejected the agent's prepared review. The DB cleanup path is the
 // same across all four values, but the human_content note baked
@@ -806,6 +922,16 @@ const (
 	// cleanup; the swipe handler now runs the cleanup on every
 	// claim regardless of frontend state.
 	discardOutcomeClaimed
+	// discardOutcomeRedelegated: user re-delegated the task while
+	// the prior run was still in flight (or had landed a pending
+	// review). The bot is still on the task — the prior run's
+	// artifacts are thrown away in favor of a fresh run with
+	// (typically) different instructions. Distinct from
+	// Requeued/Dismissed/Completed/Claimed: the agent still owns
+	// the task, but the verdict it just produced is no longer the
+	// right answer. Future agents reading prior memory should
+	// reconsider the framing rather than the conclusion.
+	discardOutcomeRedelegated
 )
 
 // finalizeRequeue runs the side-effect cleanup that both /undo and
@@ -850,6 +976,19 @@ func (s *Server) finalizeRequeue(r *http.Request, orgID, userID, taskID string, 
 	cleanupCtx := context.WithoutCancel(r.Context())
 	s.cleanupPendingApprovalRun(cleanupCtx, orgID, userID, taskID, discardOutcomeRequeued)
 	s.revertJiraStateIfApplicable(task)
+	// SKY-330: requeue clears both claim cols and flips status to
+	// 'queued'. Peer Board sessions need a task_updated event to
+	// pull the card back into the Queued column; without this they
+	// keep showing the stale claim/status until the next refresh.
+	// The cleanupPendingApprovalRun broadcast only fires for tasks
+	// with a pending_approval run — most requeues don't.
+	if s.ws != nil {
+		s.ws.Broadcast(websocket.Event{
+			Type:  "task_updated",
+			OrgID: orgID,
+			Data:  map[string]any{"task_id": taskID, "status": "queued"},
+		})
+	}
 }
 
 // cleanupPendingApprovalRun handles the SKY-206 case: the user
@@ -1018,6 +1157,11 @@ func buildDiscardHumanContent(outcome discardOutcome, kind string) string {
 		return fmt.Sprintf(
 			"**Outcome:** Human discarded the prepared %s and claimed the task to handle it themselves.\n"+
 				"**Implication:** The %s you proposed was not accepted. The human took over to work the entity manually rather than apply your %s or re-queue it for another agent attempt — a sign that automation wasn't the right fit for this case.",
+			artifact, verdictNoun, artifact)
+	case discardOutcomeRedelegated:
+		return fmt.Sprintf(
+			"**Outcome:** Human re-delegated the task to the bot while this run was in flight; the prior %s was discarded in favor of a fresh attempt.\n"+
+				"**Implication:** The human kept the agent on the task but didn't accept the %s you produced — likely a prompt-fit issue or a missing-context issue rather than an automation-fit issue. Reconsider the framing or scope before producing a new %s.",
 			artifact, verdictNoun, artifact)
 	default: // discardOutcomeRequeued
 		return fmt.Sprintf(

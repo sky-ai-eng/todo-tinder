@@ -334,6 +334,7 @@ func (s *Server) routes() {
 	s.apiMutating("POST /api/tasks/{id}/snooze", s.handleSnooze)
 	s.apiMutating("POST /api/tasks/{id}/undo", s.handleUndo)
 	s.apiMutating("POST /api/tasks/{id}/requeue", s.handleRequeue)
+	s.apiMutating("POST /api/tasks/{id}/advance", s.handleTaskAdvance)
 
 	s.api("GET /api/agent/runs/{runID}", s.handleAgentStatus)
 	s.api("GET /api/agent/runs/{runID}/messages", s.handleAgentMessages)
