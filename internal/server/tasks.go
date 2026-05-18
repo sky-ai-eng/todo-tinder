@@ -87,8 +87,13 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tasks, err := s.tasks.Queued(r.Context(), orgID)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	var tasks []domain.Task
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+		return e
+	}); err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
@@ -104,15 +109,18 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	status := r.URL.Query().Get("status")
 	var tasks []domain.Task
-	var err error
-	if status != "" {
-		tasks, err = s.tasks.ByStatus(r.Context(), orgID, status)
-	} else {
-		tasks, err = s.tasks.Queued(r.Context(), orgID)
-	}
-	if err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		if status != "" {
+			tasks, e = tx.Tasks.ByStatus(r.Context(), orgID, status)
+		} else {
+			tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+		}
+		return e
+	}); err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
@@ -128,9 +136,14 @@ func (s *Server) handleTaskGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
-	task, err := s.tasks.Get(r.Context(), orgID, id)
-	if err != nil {
+	var task *domain.Task
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		task, e = tx.Tasks.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
@@ -192,9 +205,13 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// (idempotent same-user, takeover from bot, claim from
 		// unclaimed) and one refuse path (different user owns it).
 		// Refused → 409 with NO state mutation and NO audit row.
-		task, lerr := s.tasks.Get(r.Context(), orgID, id)
-		if lerr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": lerr.Error()})
+		var task *domain.Task
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			task, e = tx.Tasks.Get(r.Context(), orgID, id)
+			return e
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
 		if task == nil {
@@ -224,13 +241,17 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		case task.ClaimedByAgentID != "":
-			ok, err := s.tasks.TakeoverClaimFromAgent(r.Context(), orgID, id, userID)
-			if err != nil {
+			var claimOK bool
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				var e error
+				claimOK, e = tx.Tasks.TakeoverClaimFromAgent(r.Context(), orgID, id, userID)
+				return e
+			}); err != nil {
 				log.Printf("[swipe] takeover claim flip failed on task %s: %v", id, err)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
 				return
 			}
-			if !ok {
+			if !claimOK {
 				writeJSON(w, http.StatusConflict, map[string]string{
 					"error": "claim race lost; refetch task and retry",
 				})
@@ -238,13 +259,17 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			}
 			claimChanged = true
 		default:
-			ok, err := s.tasks.ClaimQueuedForUser(r.Context(), orgID, id, userID)
-			if err != nil {
+			var claimOK bool
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				var e error
+				claimOK, e = tx.Tasks.ClaimQueuedForUser(r.Context(), orgID, id, userID)
+				return e
+			}); err != nil {
 				log.Printf("[swipe] user claim stamp failed on task %s: %v", id, err)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
 				return
 			}
-			if !ok {
+			if !claimOK {
 				writeJSON(w, http.StatusConflict, map[string]string{
 					"error": "claim race lost; refetch task and retry",
 				})
@@ -261,7 +286,12 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// row. Best-effort: if the insert fails, the claim still
 		// landed; log and continue rather than 500-ing on a
 		// committed state change.
-		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
+		var ns string
+		swipeErr := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			ns, e = tx.Swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
+			return e
+		})
 		if swipeErr != nil {
 			log.Printf("[swipe] audit write failed for task %s claim: %v (claim mutation already landed)", id, swipeErr)
 			newStatus = "queued"
@@ -308,9 +338,13 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// for the response — 404 for missing, 409 + closed-task
 		// message for terminal, 409 + theft message for different
 		// user. Matches the claim path's load-and-branch shape.
-		task, lerr := s.tasks.Get(r.Context(), orgID, id)
-		if lerr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": lerr.Error()})
+		var task *domain.Task
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			task, e = tx.Tasks.Get(r.Context(), orgID, id)
+			return e
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
 		if task == nil {
@@ -323,8 +357,12 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		result, err := s.tasks.HandoffAgentClaim(r.Context(), orgID, id, a.ID, userID)
-		if err != nil {
+		var result db.HandoffResult
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			result, e = tx.Tasks.HandoffAgentClaim(r.Context(), orgID, id, a.ID, userID)
+			return e
+		}); err != nil {
 			log.Printf("[swipe] failed to stamp agent claim on task %s: %v", id, err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "claim stamp failed: " + err.Error()})
 			return
@@ -344,7 +382,12 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		}
 		// Accepted path (Changed or NoOp). Audit post-mutation,
 		// best-effort.
-		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
+		var ns string
+		swipeErr := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			ns, e = tx.Swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
+			return e
+		})
 		if swipeErr != nil {
 			log.Printf("[swipe] audit write failed for task %s delegate: %v (claim mutation already landed)", id, swipeErr)
 			newStatus = "queued"
@@ -370,9 +413,13 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// the status would flip to 'snoozed' without snooze_until,
 		// which the FE doesn't produce and we don't bother
 		// guarding against beyond defaulting newStatus.)
-		ns, swipeErr := s.swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
-		if swipeErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": swipeErr.Error()})
+		var ns string
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			ns, e = tx.Swipes.RecordSwipe(r.Context(), orgID, id, req.Action, req.HesitationMs)
+			return e
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
 		newStatus = ns
@@ -436,8 +483,12 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		cleanupCtx := context.WithoutCancel(r.Context())
 		s.cleanupPendingApprovalRun(cleanupCtx, orgID, userID, id, outcome)
 		if s.spawner != nil {
-			ids, err := s.agentRuns.ActiveIDsForTask(r.Context(), orgID, id)
-			if err != nil {
+			var ids []string
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				var e error
+				ids, e = tx.AgentRuns.ActiveIDsForTask(r.Context(), orgID, id)
+				return e
+			}); err != nil {
 				log.Printf("[swipe] active-run lookup for task %s failed: %v", id, err)
 			} else {
 				for _, runID := range ids {
@@ -459,7 +510,12 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	// "In Review" while canonical is "In Progress", transitioning back to the
 	// canonical would be a spurious status change that would confuse watchers.
 	if req.Action == "claim" && s.jiraClient != nil {
-		task, err := s.tasks.Get(r.Context(), orgID, id)
+		var task *domain.Task
+		err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			task, e = tx.Tasks.Get(r.Context(), orgID, id)
+			return e
+		})
 		if err == nil && task != nil && task.EntitySource == "jira" {
 			// config.Load() on the swipe hot path: bounded by O(projects)
 			// settings rows, paced by human swipe rate — sub-millisecond
@@ -500,7 +556,12 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 
 	// Trigger delegation on swipe-up
 	if req.Action == "delegate" && s.spawner != nil {
-		task, err := s.tasks.Get(r.Context(), orgID, id)
+		var task *domain.Task
+		err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			task, e = tx.Tasks.Get(r.Context(), orgID, id)
+			return e
+		})
 		if err == nil && task != nil {
 			runID, err := s.spawner.Delegate(*task, delegate.DelegateOpts{
 				OrgID:            orgID,
@@ -529,6 +590,7 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	var req snoozeRequest
@@ -548,19 +610,25 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 	// leaking implementation detail and confusing legitimate 404
 	// callers. The pre-check fails fast before the store gets
 	// involved.
-	task, err := s.tasks.Get(r.Context(), orgID, id)
-	if err != nil {
+	var task *domain.Task
+	var snoozed bool
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		task, e = tx.Tasks.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if task == nil {
+			return nil
+		}
+		snoozed, e = tx.Swipes.SnoozeTask(r.Context(), orgID, id, until, req.HesitationMs)
+		return e
+	}); err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
 	if task == nil {
 		notFound(w, "task")
-		return
-	}
-
-	snoozed, err := s.swipes.SnoozeTask(r.Context(), orgID, id, until, req.HesitationMs)
-	if err != nil {
-		internalError(w, "tasks", err)
 		return
 	}
 	if !snoozed {
@@ -602,6 +670,7 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	// GetTask up front does double duty: existence check for the
@@ -610,8 +679,18 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 	// UndoLastSwipe would still fail on the swipe_events FK, but
 	// we'd surface the SQLite error string as a 500 — leaking
 	// implementation detail and confusing legitimate 404 callers.
-	task, err := s.tasks.Get(r.Context(), orgID, id)
-	if err != nil {
+	var task *domain.Task
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		task, e = tx.Tasks.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if task == nil {
+			return nil
+		}
+		return tx.Swipes.UndoLastSwipe(r.Context(), orgID, id)
+	}); err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
@@ -620,12 +699,7 @@ func (s *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.swipes.UndoLastSwipe(r.Context(), orgID, id); err != nil {
-		internalError(w, "tasks", err)
-		return
-	}
-
-	s.finalizeRequeue(r, orgID, ClaimsFrom(r.Context()).Subject, id, task)
+	s.finalizeRequeue(r, orgID, userID, id, task)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }
@@ -649,10 +723,23 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	task, err := s.tasks.Get(r.Context(), orgID, id)
-	if err != nil {
+	var task *domain.Task
+	var requeued bool
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		task, e = tx.Tasks.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if task == nil {
+			return nil
+		}
+		requeued, e = tx.Swipes.RequeueTask(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "tasks", err)
 		return
 	}
@@ -660,18 +747,12 @@ func (s *Server) handleRequeue(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "task")
 		return
 	}
-
-	requeued, err := s.swipes.RequeueTask(r.Context(), orgID, id)
-	if err != nil {
-		internalError(w, "tasks", err)
-		return
-	}
 	if !requeued {
 		notFound(w, "task")
 		return
 	}
 
-	s.finalizeRequeue(r, orgID, ClaimsFrom(r.Context()).Subject, id, task)
+	s.finalizeRequeue(r, orgID, userID, id, task)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }
