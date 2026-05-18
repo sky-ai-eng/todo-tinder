@@ -40,6 +40,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 )
 
 // Handle dispatches the uninstall subcommand.
@@ -447,14 +448,14 @@ func plural(n int, singular, plural string) string {
 	return plural
 }
 
-// clearAllSecrets removes the four well-known integration credentials
-// plus the legacy jira_display_name key from the OS keychain.
-// Uninstall is single-process, local-only, with no DB context, so it
-// bypasses the SecretStore seam and calls the low-level keychain
-// helpers directly.
+// clearAllSecrets removes every credential key the SecretStore
+// manages plus any legacy keys still swept on Clear. Uninstall is
+// single-process, local-only, with no DB context, so it bypasses the
+// SecretStore seam and calls the low-level keychain helpers directly
+// — but the key list comes from integrations.AllKeys() so this stays
+// in sync as new keys land.
 func clearAllSecrets() error {
-	keys := []string{"github_url", "github_pat", "jira_url", "jira_pat", "jira_display_name"}
-	for _, k := range keys {
+	for _, k := range integrations.AllKeys() {
 		if err := auth.DeleteSecret(k); err != nil {
 			return err
 		}

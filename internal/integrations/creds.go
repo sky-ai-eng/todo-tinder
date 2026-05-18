@@ -35,6 +35,16 @@ const (
 // install leaves no orphan keychain row.
 const legacyJiraDisplayName = "jira_display_name"
 
+// AllKeys returns every credential key the SecretStore manages for an
+// integration tenant — the four well-known keys plus any legacy keys
+// still swept on Clear. Exposed so callers without a SecretStore /
+// DB context (e.g. cmd/uninstall) can wipe the same key set
+// integrations.Clear would clear, without duplicating the literal
+// list and risking drift as new keys land.
+func AllKeys() []string {
+	return []string{KeyGitHubURL, KeyGitHubPAT, KeyJiraURL, KeyJiraPAT, legacyJiraDisplayName}
+}
+
 // Load reads the four well-known integration secrets for orgID via
 // the SecretStore and returns them in the auth.Credentials transport
 // shape. The bundle exists because every downstream consumer
@@ -104,7 +114,7 @@ func ClearJira(ctx context.Context, secrets db.SecretStore, orgID string) error 
 // Clear removes both GitHub and Jira credentials for orgID. Includes
 // the legacy jira_display_name sweep — see ClearJira.
 func Clear(ctx context.Context, secrets db.SecretStore, orgID string) error {
-	return clearKeys(ctx, secrets, orgID, KeyGitHubURL, KeyGitHubPAT, KeyJiraURL, KeyJiraPAT, legacyJiraDisplayName)
+	return clearKeys(ctx, secrets, orgID, AllKeys()...)
 }
 
 func clearKeys(ctx context.Context, secrets db.SecretStore, orgID string, keys ...string) error {

@@ -34,11 +34,12 @@ type setupResponse struct {
 
 func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — integrations setup updates
-	// the authenticated user's own users row and can run before a
-	// multi-mode user has picked an active org. For these current-user
-	// row operations, an empty orgID is acceptable.
-	orgID := OrgIDFrom(r.Context())
+	// Setup writes credentials through the SecretStore, which is
+	// org-scoped — see handleSettingsPost for the multi-mode rationale.
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	var req setupRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -204,7 +205,10 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 // and the value continues to surface on the next Get. Surface that to
 // the user instead of silently lying that the clear succeeded.
 func (s *Server) handleIntegrationsClear(w http.ResponseWriter, r *http.Request) {
-	orgID := OrgIDFrom(r.Context())
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	if err := integrations.Clear(r.Context(), s.secrets, orgID); err != nil {
 		internalError(w, "auth", err)
 		return
@@ -224,7 +228,10 @@ func (s *Server) handleIntegrationsClear(w http.ResponseWriter, r *http.Request)
 // DELETE /api/integrations. See the env-overlay note on
 // handleIntegrationsClear for the warning shape.
 func (s *Server) handleIntegrationsDeleteJira(w http.ResponseWriter, r *http.Request) {
-	orgID := OrgIDFrom(r.Context())
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	if err := integrations.ClearJira(r.Context(), s.secrets, orgID); err != nil {
 		internalError(w, "auth", err)
 		return

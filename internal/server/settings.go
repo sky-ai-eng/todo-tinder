@@ -288,13 +288,18 @@ type settingsUpdateRequest struct {
 
 func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — settings POST performs
-	// current-user-scoped reads/writes (for example, the caller's own
-	// users row) and may run before a multi-mode user has picked an
-	// active org. Empty orgID is acceptable for this handler's
-	// current-user operations; do not generalize that to all
-	// users-table RLS policies.
-	orgID := OrgIDFrom(r.Context())
+	// Settings POST mutates org-scoped credentials via the SecretStore.
+	// Multi-mode requires an active org because the Postgres impl
+	// refuses a vault write with an empty org_id claim; local mode
+	// always has the sentinel orgID via the withSession shim so this
+	// 409 only ever fires for a freshly-signed-in multi-mode user
+	// with no membership/active-org row yet. The post-SKY-242 split
+	// (user/team/org settings on distinct surfaces) will let the
+	// user-scoped fields move to their own handler without this gate.
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	var req settingsUpdateRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -638,14 +643,15 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 // handleJiraConnect validates and stores Jira credentials without saving
 // the rest of the settings. This powers the two-stage settings flow: connect
 // first, then configure projects and statuses.
+//
+// Requires an active org because credentials write through the SecretStore
+// — see handleSettingsPost for the multi-mode rationale.
 func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — Jira connect runs before a
-	// multi-mode user has picked an active org. That's safe here because
-	// this handler only updates the authenticated caller's own users row
-	// (via userID), rather than relying on a broader invariant that all
-	// users-table access is independent of tf.current_org_id().
-	orgID := OrgIDFrom(r.Context())
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		URL string `json:"url"`
 		PAT string `json:"pat"`
