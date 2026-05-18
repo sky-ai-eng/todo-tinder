@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
@@ -199,19 +200,76 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	// GitHub configured) degrades to everyone-is-other rather than failing
 	// the whole endpoint — the factory should still render for a user who's
 	// only set up Jira.
-	ghUsername, _ := s.users.GetGitHubUsername(r.Context(), userID)
+	var ghUsername string
+	var eventCounts, taskCounts map[string]int
+	var activeRuns []domain.FactoryActiveRun
+	var entityRows []domain.FactoryEntityRow
+	var recentByEntity map[string][]domain.FactoryRecentEvent
+	var pendingTasks []domain.PendingTaskRef
+	var awaitingByEntity map[string]struct{}
+	runAuthors := map[string]string{}
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		ghUsername, _ = tx.Users.GetGitHubUsername(r.Context(), userID)
 
-	// --- Throughput counters ------------------------------------------------
-	eventCounts, err := s.factory.EventCountsSince(r.Context(), orgID, since)
-	if err != nil {
+		// --- Throughput counters --------------------------------------
+		var e error
+		eventCounts, e = tx.Factory.EventCountsSince(r.Context(), orgID, since)
+		if e != nil {
+			return e
+		}
+		taskCounts, e = tx.Factory.TaskCountsSince(r.Context(), orgID, since)
+		if e != nil {
+			return e
+		}
+
+		// --- Active runs ----------------------------------------------
+		activeRuns, e = tx.Factory.ActiveRuns(r.Context(), orgID)
+		if e != nil {
+			return e
+		}
+
+		// Join active runs onto stations. Each active run also needs to
+		// know the entity's author so "mine" tint is accurate — pre-fetch
+		// those entities.
+		for _, ar := range activeRuns {
+			if _, seen := runAuthors[ar.Task.EntityID]; seen {
+				continue
+			}
+			ent, getErr := tx.Entities.Get(r.Context(), orgID, ar.Task.EntityID)
+			if getErr != nil || ent == nil {
+				runAuthors[ar.Task.EntityID] = ""
+				continue
+			}
+			runAuthors[ar.Task.EntityID] = extractEntityAuthor(ent)
+		}
+
+		// --- Active entities ------------------------------------------
+		entityRows, e = tx.Factory.Entities(r.Context(), orgID, factoryEntityLimit)
+		if e != nil {
+			return e
+		}
+
+		entityIDs := make([]string, 0, len(entityRows))
+		for _, row := range entityRows {
+			entityIDs = append(entityIDs, row.Entity.ID)
+		}
+		recentByEntity, e = tx.Factory.RecentEventsByEntity(r.Context(), orgID, entityIDs, factoryRecentEventsPerEntity)
+		if e != nil {
+			return e
+		}
+
+		pendingTasks, e = tx.Tasks.ListActiveRefsForEntities(r.Context(), orgID, entityIDs)
+		if e != nil {
+			return e
+		}
+
+		awaitingByEntity, e = tx.AgentRuns.EntitiesWithAwaitingInput(r.Context(), orgID, entityIDs)
+		return e
+	}); err != nil {
 		internalError(w, "factory", err)
 		return
 	}
-	taskCounts, err := s.factory.TaskCountsSince(r.Context(), orgID, since)
-	if err != nil {
-		internalError(w, "factory", err)
-		return
-	}
+
 	// Lifetime distinct-entity counts come from the in-memory aggregate
 	// (hydrated once at startup, kept warm by the SetOnEventRecorded
 	// hook inside RecordEvent itself) so this path stays O(1) regardless
@@ -219,13 +277,6 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	var lifetimeCounts map[string]int
 	if s.lifetimeCounter != nil {
 		lifetimeCounts = s.lifetimeCounter.Snapshot()
-	}
-
-	// --- Active runs --------------------------------------------------------
-	activeRuns, err := s.factory.ActiveRuns(r.Context(), orgID)
-	if err != nil {
-		internalError(w, "factory", err)
-		return
 	}
 
 	stations := map[string]factoryStationJSON{}
@@ -255,21 +306,6 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 		stations[eventType] = st
 	}
 
-	// Join active runs onto stations. Each active run also needs to know the
-	// entity's author so "mine" tint is accurate — pre-fetch those entities.
-	runAuthors := map[string]string{}
-	for _, ar := range activeRuns {
-		if _, seen := runAuthors[ar.Task.EntityID]; seen {
-			continue
-		}
-		ent, err := s.entities.Get(r.Context(), orgID, ar.Task.EntityID)
-		if err != nil || ent == nil {
-			runAuthors[ar.Task.EntityID] = ""
-			continue
-		}
-		runAuthors[ar.Task.EntityID] = extractEntityAuthor(ent)
-	}
-
 	for _, ar := range activeRuns {
 		st := ensureStation(ar.Task.EventType)
 		st.ActiveRuns++
@@ -282,33 +318,12 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Active entities ----------------------------------------------------
-	entityRows, err := s.factory.Entities(r.Context(), orgID, factoryEntityLimit)
-	if err != nil {
-		internalError(w, "factory", err)
-		return
-	}
-
-	entityIDs := make([]string, 0, len(entityRows))
-	for _, row := range entityRows {
-		entityIDs = append(entityIDs, row.Entity.ID)
-	}
-	recentByEntity, err := s.factory.RecentEventsByEntity(r.Context(), orgID, entityIDs, factoryRecentEventsPerEntity)
-	if err != nil {
-		internalError(w, "factory", err)
-		return
-	}
-
 	// Pending tasks per entity, grouped by event_type. Drives the
 	// drawer's drag-to-delegate flow. Uses the minimal
 	// ListActiveTaskRefsForEntities projection (id + entity_id +
 	// event_type + dedup_key) rather than the full Task struct so
 	// /api/factory/snapshot doesn't pay for the entity JOIN and the
 	// snapshot_json json_extract on every poll.
-	pendingTasks, err := s.tasks.ListActiveRefsForEntities(r.Context(), orgID, entityIDs)
-	if err != nil {
-		internalError(w, "factory", err)
-		return
-	}
 	pendingByEntity := map[string]map[string][]pendingTaskRef{}
 	for _, t := range pendingTasks {
 		byType, ok := pendingByEntity[t.EntityID]
@@ -320,12 +335,6 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 			TaskID:   t.ID,
 			DedupKey: t.DedupKey,
 		})
-	}
-
-	awaitingByEntity, err := s.agentRuns.EntitiesWithAwaitingInput(r.Context(), orgID, entityIDs)
-	if err != nil {
-		internalError(w, "factory", err)
-		return
 	}
 
 	entities := make([]factoryEntityJSON, 0, len(entityRows))
