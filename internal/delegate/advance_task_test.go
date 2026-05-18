@@ -184,6 +184,45 @@ func TestAdvanceTaskFromRunStatus_AlreadyTerminalIgnored(t *testing.T) {
 	}
 }
 
+// Re-delegation race: an older run reaches pending_approval or
+// completed AFTER a newer run is already active on the same task.
+// processCompletion's inline 'completed' path has a
+// HasOtherActiveRunForTaskSystem guard so the older run doesn't
+// clobber the newer one's lifecycle; this mirror has to share that
+// guard or the same stale-run problem walks the task to in_review/
+// done while the newer run is still working.
+func TestAdvanceTaskFromRunStatus_StaleRunNoOpWhenNewerActive(t *testing.T) {
+	s, database, runID, taskID := setupAdvanceFixture(t, "stale-completed")
+	stampBotClaim(t, database, taskID)
+	// Park the task in in_progress (the newer run's state).
+	if _, err := database.Exec(`UPDATE tasks SET status = 'in_progress' WHERE id = ?`, taskID); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	// Seed a second active run on the same task. Use a unique run id
+	// + session id to avoid colliding with the original fixture.
+	if _, err := database.Exec(`
+		INSERT INTO runs (id, task_id, prompt_id, status, trigger_type, session_id, worktree_path)
+		VALUES (?, ?, 'test-prompt', 'running', 'manual', 'sess-newer', '/tmp/wt-newer')
+	`, "r-newer", taskID); err != nil {
+		t.Fatalf("seed newer run: %v", err)
+	}
+
+	// The OLDER run (runID from the fixture) reaches completed.
+	s.advanceTaskFromRunStatus(runmode.LocalDefaultOrg, runID, "completed")
+
+	if got := readTaskStatus(t, database, taskID); got != "in_progress" {
+		t.Errorf("status = %q, want in_progress (stale completed run must not close a task with a newer active run)", got)
+	}
+
+	// Same scenario for pending_approval: older run produces a
+	// review while the newer run keeps working. The task must not
+	// jump to in_review.
+	s.advanceTaskFromRunStatus(runmode.LocalDefaultOrg, runID, "pending_approval")
+	if got := readTaskStatus(t, database, taskID); got != "in_progress" {
+		t.Errorf("status = %q, want in_progress (stale pending_approval must not move task to in_review)", got)
+	}
+}
+
 // Chain steps: the chain orchestrator owns task lifecycle for the
 // whole chain. Mid-chain step terminals must not flip the task —
 // terminateChain handles closure when the chain itself terminates.

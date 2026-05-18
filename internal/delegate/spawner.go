@@ -271,6 +271,18 @@ func (s *Spawner) advanceTaskFromRunStatus(orgID, runID, runStatus string) {
 	if task.Status == "done" || task.Status == "dismissed" {
 		return
 	}
+	// Re-delegation guard: if a newer active run exists for the
+	// same task (the user re-delegated while this run was in flight),
+	// an older run reaching pending_approval / completed must not
+	// flip the task — the newer run is still working. processCompletion's
+	// inline 'completed' path at run.go:438 has the same check; the
+	// helper mirrors it so the two paths don't drift. Active-stage
+	// targets (in_progress) are idempotent against the newer run's
+	// own writes so the guard is harmless there too.
+	hasOtherActive, _ := s.agentRuns.HasOtherActiveRunForTaskSystem(ctx, orgID, task.ID, runID)
+	if hasOtherActive {
+		return
+	}
 	if isClose {
 		if err := s.tasks.CloseSystem(ctx, orgID, task.ID, "run_completed", ""); err != nil {
 			log.Printf("[delegate] warning: failed to close task %s for completed run %s: %v", task.ID, runID, err)
