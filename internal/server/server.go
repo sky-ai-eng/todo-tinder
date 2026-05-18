@@ -51,14 +51,14 @@ type Server struct {
 	// context. Each cleanup wraps in `s.tx.WithTx(cleanupCtx, orgID,
 	// userID, fn)` so multi-mode RLS sees the user's identity. Local
 	// mode SQLite ignores userID.
-	tx              db.TxRunner
-	mux             *http.ServeMux
-	static          fs.FS
-	ws              *websocket.Hub
-	spawner         *delegate.Spawner
-	curator         *curator.Curator
-	ghClient        *ghclient.Client
-	jiraClient      *jira.Client
+	tx         db.TxRunner
+	mux        *http.ServeMux
+	static     fs.FS
+	ws         *websocket.Hub
+	spawner    *delegate.Spawner
+	curator    *curator.Curator
+	ghClient   *ghclient.Client
+	jiraClient *jira.Client
 	// Change callbacks accept the orgID of the tenant whose integration
 	// creds just rotated, so the closure can re-resolve via SecretStore.
 	// Local mode always passes runmode.LocalDefaultOrgID; multi-mode
@@ -66,7 +66,7 @@ type Server struct {
 	// can't fire one org's poller restart with another org's PAT.
 	onGitHubChanged func(orgID string) // GitHub creds/repos changed — full restart + re-profile
 	onJiraChanged   func(orgID string) // Jira config changed — restart Jira poller only
-	scorerTrigger   func() // invoked after non-poll task creation (e.g. carry-over) to kick scoring immediately
+	scorerTrigger   func()             // invoked after non-poll task creation (e.g. carry-over) to kick scoring immediately
 	lifetimeCounter *db.LifetimeDistinctCounter
 
 	// authDeps groups the multi-mode-only auth stack (JWKS verifier +

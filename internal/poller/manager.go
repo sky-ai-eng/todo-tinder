@@ -36,10 +36,10 @@ type Manager struct {
 	// argument. See the per-org loops in runGitHubCycle / runJiraCycle.
 	tasks    db.TaskStore
 	entities db.EntityStore
-	users    db.UsersStore    // source of the session user's github_username
-	repos    db.RepoStore     // configured-repo names for GitHub poller startup
-	orgs     db.OrgsStore     // enumerate active orgs at each poll tick
-	secrets  db.SecretStore   // integration creds via SecretStore (keychain in local, vault in multi)
+	users    db.UsersStore  // source of the session user's github_username
+	repos    db.RepoStore   // configured-repo names for GitHub poller startup
+	orgs     db.OrgsStore   // enumerate active orgs at each poll tick
+	secrets  db.SecretStore // integration creds via SecretStore (keychain in local, vault in multi)
 
 	// OnError fires when a poll cycle returns an error. Source is "github"
 	// or "jira"; orgID identifies the tenant whose cycle errored (empty
