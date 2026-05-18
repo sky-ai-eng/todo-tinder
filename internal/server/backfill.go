@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
@@ -49,76 +50,84 @@ func (s *Server) handleBackfillCandidates(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, projectID)
-	if err != nil {
-		log.Printf("[backfill] candidates: get project %s: %v", projectID, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
+	var project *domain.Project
+	var out []backfillCandidate
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, projectID)
+		if e != nil {
+			return e
+		}
+		if project == nil {
+			return nil
+		}
+
+		var collected []domain.Entity
+
+		github, e := tx.Entities.ListActive(r.Context(), orgID, "github")
+		if e != nil {
+			return e
+		}
+		for _, ent := range github {
+			if !entityInProjectScope(&ent, project) {
+				continue
+			}
+			collected = append(collected, ent)
+		}
+
+		jira, e := tx.Entities.ListActive(r.Context(), orgID, "jira")
+		if e != nil {
+			return e
+		}
+		for _, ent := range jira {
+			if !entityInProjectScope(&ent, project) {
+				continue
+			}
+			collected = append(collected, ent)
+		}
+
+		// Resolve current_project_name once per distinct project_id rather
+		// than per row — the same other-project may sponsor many candidates.
+		nameCache := map[string]string{}
+		out = make([]backfillCandidate, 0, len(collected))
+		for _, ent := range collected {
+			// Already in this project — no work to do; skip from candidates.
+			if ent.ProjectID != nil && *ent.ProjectID == projectID {
+				continue
+			}
+			c := backfillCandidate{
+				ID:       ent.ID,
+				Source:   ent.Source,
+				SourceID: ent.SourceID,
+				Kind:     ent.Kind,
+				Title:    ent.Title,
+				URL:      ent.URL,
+				State:    ent.State,
+			}
+			if ent.ProjectID != nil && *ent.ProjectID != "" {
+				c.CurrentProjectID = *ent.ProjectID
+				name, ok := nameCache[*ent.ProjectID]
+				if !ok {
+					if p, perr := tx.Projects.Get(r.Context(), orgID, *ent.ProjectID); perr == nil && p != nil {
+						name = p.Name
+					}
+					nameCache[*ent.ProjectID] = name
+				}
+				c.CurrentProjectName = name
+			}
+			out = append(out, c)
+		}
+		return nil
+	}); err != nil {
+		log.Printf("[backfill] candidates: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load backfill candidates"})
 		return
 	}
 	if project == nil {
 		notFound(w, "project")
 		return
-	}
-
-	var collected []domain.Entity
-
-	github, err := s.entities.ListActive(r.Context(), orgID, "github")
-	if err != nil {
-		log.Printf("[backfill] candidates: list github entities: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load github entities"})
-		return
-	}
-	for _, e := range github {
-		if !entityInProjectScope(&e, project) {
-			continue
-		}
-		collected = append(collected, e)
-	}
-
-	jira, err := s.entities.ListActive(r.Context(), orgID, "jira")
-	if err != nil {
-		log.Printf("[backfill] candidates: list jira entities: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load jira entities"})
-		return
-	}
-	for _, e := range jira {
-		if !entityInProjectScope(&e, project) {
-			continue
-		}
-		collected = append(collected, e)
-	}
-
-	// Resolve current_project_name once per distinct project_id rather
-	// than per row — the same other-project may sponsor many candidates.
-	nameCache := map[string]string{}
-	out := make([]backfillCandidate, 0, len(collected))
-	for _, e := range collected {
-		// Already in this project — no work to do; skip from candidates.
-		if e.ProjectID != nil && *e.ProjectID == projectID {
-			continue
-		}
-		c := backfillCandidate{
-			ID:       e.ID,
-			Source:   e.Source,
-			SourceID: e.SourceID,
-			Kind:     e.Kind,
-			Title:    e.Title,
-			URL:      e.URL,
-			State:    e.State,
-		}
-		if e.ProjectID != nil && *e.ProjectID != "" {
-			c.CurrentProjectID = *e.ProjectID
-			name, ok := nameCache[*e.ProjectID]
-			if !ok {
-				if p, err := s.projects.Get(r.Context(), orgID, *e.ProjectID); err == nil && p != nil {
-					name = p.Name
-				}
-				nameCache[*e.ProjectID] = name
-			}
-			c.CurrentProjectName = name
-		}
-		out = append(out, c)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"candidates": out})
@@ -152,9 +161,14 @@ func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	projectID := r.PathValue("id")
-	project, err := s.projects.Get(r.Context(), orgID, projectID)
-	if err != nil {
+	var project *domain.Project
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		project, e = tx.Projects.Get(r.Context(), orgID, projectID)
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load project"})
 		return
 	}
@@ -193,36 +207,47 @@ func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
 		// Without this gate, a malicious client could reassign any
 		// entity row by id, and a stale UI could quietly stamp
 		// classified_at on closed work.
-		entity, lookupErr := s.entities.Get(r.Context(), orgID, eid)
-		if lookupErr != nil {
-			failures = append(failures, backfillFailure{EntityID: eid, Error: "lookup failed: " + lookupErr.Error()})
-			continue
-		}
-		if entity == nil {
-			failures = append(failures, backfillFailure{EntityID: eid, Error: "entity not found"})
-			continue
-		}
-		if entity.State != "active" {
-			failures = append(failures, backfillFailure{EntityID: eid, Error: "entity is not active"})
-			continue
-		}
-		if !entityInProjectScope(entity, project) {
-			failures = append(failures, backfillFailure{EntityID: eid, Error: "entity is outside this project's scope"})
-			continue
-		}
-		// Stamp manual-assignment display copy so the entities-panel
-		// UI (SKY-238) renders "Manually assigned by user." instead
-		// of the empty-rationale fallback. Overwrites any prior
-		// model-driven rationale on reclaim — the human's pick
-		// supersedes the classifier's vote, and showing the stale
-		// model rationale next to a human-claimed assignment would
-		// be misleading.
-		if assignErr := s.entities.AssignProject(r.Context(), orgID, eid, &projectID, manualAssignmentMessage); assignErr != nil {
-			if errors.Is(assignErr, sql.ErrNoRows) {
-				failures = append(failures, backfillFailure{EntityID: eid, Error: "entity not found"})
-			} else {
-				failures = append(failures, backfillFailure{EntityID: eid, Error: assignErr.Error()})
+		var failure *backfillFailure
+		txErr := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			entity, lookupErr := tx.Entities.Get(r.Context(), orgID, eid)
+			if lookupErr != nil {
+				failure = &backfillFailure{EntityID: eid, Error: "lookup failed: " + lookupErr.Error()}
+				return nil
 			}
+			if entity == nil {
+				failure = &backfillFailure{EntityID: eid, Error: "entity not found"}
+				return nil
+			}
+			if entity.State != "active" {
+				failure = &backfillFailure{EntityID: eid, Error: "entity is not active"}
+				return nil
+			}
+			if !entityInProjectScope(entity, project) {
+				failure = &backfillFailure{EntityID: eid, Error: "entity is outside this project's scope"}
+				return nil
+			}
+			// Stamp manual-assignment display copy so the entities-panel
+			// UI (SKY-238) renders "Manually assigned by user." instead
+			// of the empty-rationale fallback. Overwrites any prior
+			// model-driven rationale on reclaim — the human's pick
+			// supersedes the classifier's vote, and showing the stale
+			// model rationale next to a human-claimed assignment would
+			// be misleading.
+			if assignErr := tx.Entities.AssignProject(r.Context(), orgID, eid, &projectID, manualAssignmentMessage); assignErr != nil {
+				if errors.Is(assignErr, sql.ErrNoRows) {
+					failure = &backfillFailure{EntityID: eid, Error: "entity not found"}
+					return nil
+				}
+				return assignErr
+			}
+			return nil
+		})
+		if txErr != nil {
+			failures = append(failures, backfillFailure{EntityID: eid, Error: txErr.Error()})
+			continue
+		}
+		if failure != nil {
+			failures = append(failures, *failure)
 			continue
 		}
 		applied++
