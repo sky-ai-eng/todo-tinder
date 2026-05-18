@@ -210,6 +210,18 @@ func GetSecret(key string) (string, error) {
 // as a silent no-op (the env is the source of truth and the keychain
 // write would just fail). For unknown keys there's no env fallback, so
 // a keychain-unavailable error propagates.
+//
+// # Asymmetry with GetSecret
+//
+// Env vars are read-only — GetSecret returns the env value when set,
+// but PutSecret always writes to the keychain. That means a rotation
+// (Put new_value) is invisible to subsequent Get calls when a
+// TRIAGE_FACTORY_* env var is set for the same key: Get continues to
+// return the env value. This matches the existing Store/Load
+// asymmetry rather than introducing new behavior, but the absence of
+// a self-contained read-back is a real footgun for callers — surface
+// the env-overlay state to the user when rotating a known key
+// (Settings UI does this today via EnvProvided).
 func PutSecret(key, value string) error {
 	if !probeKeychain() {
 		if _, known := envKeys[key]; known && len(EnvProvided()) > 0 {
@@ -218,6 +230,28 @@ func PutSecret(key, value string) error {
 		return fmt.Errorf("keychain backend unavailable")
 	}
 	return keyring.Set(service, key, value)
+}
+
+// HasKeychainEntry reports whether the keychain currently has a value
+// stored under key, bypassing the TRIAGE_FACTORY_* env overlay
+// GetSecret applies. Use this when you need to know about the
+// keychain row specifically — e.g. the SecretStore.Delete contract,
+// which must report ok=false when only an env-supplied value exists
+// (DeleteSecret can't remove env vars, so claiming "removed" would be
+// a lie).
+//
+// Returns false on any keychain error, including unavailability —
+// callers treating absence the same as inaccessibility is the right
+// posture here.
+func HasKeychainEntry(key string) bool {
+	if !probeKeychain() {
+		return false
+	}
+	val, err := keyring.Get(service, key)
+	if err != nil {
+		return false
+	}
+	return val != ""
 }
 
 // DeleteSecret removes a single keychain entry. Missing entries are

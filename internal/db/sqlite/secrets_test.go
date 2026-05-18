@@ -89,6 +89,53 @@ func TestSecretStore_SQLite_KeychainRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSecretStore_SQLite_DeleteWithOnlyEnvOverlay pins the Delete
+// contract under the TRIAGE_FACTORY_* env overlay. auth.GetSecret
+// returns the env value even when the keychain row doesn't exist, so
+// probing with GetSecret would lie ("yes, I removed it") when in
+// truth DeleteSecret can't touch env vars. The implementation uses
+// auth.HasKeychainEntry to bypass the overlay — this test pins that
+// behavior so a regression to the GetSecret probe surfaces.
+func TestSecretStore_SQLite_DeleteWithOnlyEnvOverlay(t *testing.T) {
+	keyring.MockInit()
+	conn := openSQLiteForTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+	org := runmode.LocalDefaultOrg
+
+	// Set the env overlay but write nothing to the keychain.
+	t.Setenv("TRIAGE_FACTORY_GITHUB_PAT", "env-only-token")
+
+	// Get reflects the env value (existing behavior — env wins).
+	got, err := stores.Secrets.Get(ctx, org, "github_pat")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got != "env-only-token" {
+		t.Fatalf("Get got=%q want env-only-token", got)
+	}
+
+	// Delete must return ok=false: there's no keychain row, and
+	// reporting "removed" while the env var continues to surface the
+	// value on the next Get would lie to the caller.
+	ok, err := stores.Secrets.Delete(ctx, org, "github_pat")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if ok {
+		t.Errorf("Delete on env-only value ok=true; want false — env overlay can't be removed")
+	}
+
+	// Subsequent Get still returns the env value (unchanged by Delete).
+	got, err = stores.Secrets.Get(ctx, org, "github_pat")
+	if err != nil {
+		t.Fatalf("Get after delete: %v", err)
+	}
+	if got != "env-only-token" {
+		t.Errorf("Get after delete got=%q want env-only-token (env survives Delete)", got)
+	}
+}
+
 // TestSecretStore_SQLite_RejectsNonLocalOrg pins the safety net for
 // callers that forgot to extract the request orgID via the SKY-316
 // accessor. Passing a real UUID into the local-mode store would

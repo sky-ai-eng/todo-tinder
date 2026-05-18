@@ -53,15 +53,15 @@ func (*secretStore) Delete(_ context.Context, orgID, key string) (bool, error) {
 		return false, err
 	}
 	// The keychain helper doesn't report whether a row was actually
-	// removed, so probe with a Get first to give callers the
-	// (ok bool) contract the interface promises. The probe is cheap
-	// — one keychain read — and matches the Postgres impl's behavior
-	// of returning ok=false for an already-absent key.
-	existing, err := auth.GetSecret(key)
-	if err != nil {
-		return false, err
-	}
-	if existing == "" {
+	// removed, so probe before deleting to give callers the (ok bool)
+	// contract the interface promises. Use HasKeychainEntry rather
+	// than GetSecret so the probe bypasses the TRIAGE_FACTORY_* env
+	// overlay — DeleteSecret can't remove env vars, so reporting
+	// ok=true based on an env-supplied value would lie to the caller
+	// (subsequent Get would still return the env value). Matches the
+	// Postgres impl's behavior of returning ok=false when no row was
+	// removed.
+	if !auth.HasKeychainEntry(key) {
 		return false, nil
 	}
 	if err := auth.DeleteSecret(key); err != nil {
