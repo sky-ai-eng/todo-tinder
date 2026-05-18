@@ -489,13 +489,25 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	// resolved it themselves" (complete) from "human took over and
 	// will handle it manually" (claim) — three distinct
 	// recalibration signals.
-	if req.Action == "dismiss" || req.Action == "complete" || req.Action == "claim" {
+	if req.Action == "dismiss" || req.Action == "complete" || req.Action == "claim" || req.Action == "delegate" {
 		outcome := discardOutcomeDismissed
 		switch req.Action {
 		case "complete":
 			outcome = discardOutcomeCompleted
 		case "claim":
 			outcome = discardOutcomeClaimed
+		case "delegate":
+			// SKY-330: re-delegate cancels the prior in-flight run
+			// before spawning the new one. Pre-330 the prior run was
+			// allowed to keep running in parallel — the guards in
+			// processCompletion + advanceTaskFromRunStatus prevent
+			// its stale terminal events from corrupting state, but
+			// the parallel work itself was wasteful (two cloned
+			// worktrees, two API budgets). The assignee picker makes
+			// re-delegate a routine gesture (clicking the bot row on
+			// an already-bot-claimed task), so cancel-first is now
+			// load-bearing for cost control rather than an edge case.
+			outcome = discardOutcomeRedelegated
 		}
 		// Cleanup runs detached from r.Context() so a client
 		// disconnect after the swipe response doesn't strand the
@@ -910,6 +922,16 @@ const (
 	// cleanup; the swipe handler now runs the cleanup on every
 	// claim regardless of frontend state.
 	discardOutcomeClaimed
+	// discardOutcomeRedelegated: user re-delegated the task while
+	// the prior run was still in flight (or had landed a pending
+	// review). The bot is still on the task — the prior run's
+	// artifacts are thrown away in favor of a fresh run with
+	// (typically) different instructions. Distinct from
+	// Requeued/Dismissed/Completed/Claimed: the agent still owns
+	// the task, but the verdict it just produced is no longer the
+	// right answer. Future agents reading prior memory should
+	// reconsider the framing rather than the conclusion.
+	discardOutcomeRedelegated
 )
 
 // finalizeRequeue runs the side-effect cleanup that both /undo and
@@ -1135,6 +1157,11 @@ func buildDiscardHumanContent(outcome discardOutcome, kind string) string {
 		return fmt.Sprintf(
 			"**Outcome:** Human discarded the prepared %s and claimed the task to handle it themselves.\n"+
 				"**Implication:** The %s you proposed was not accepted. The human took over to work the entity manually rather than apply your %s or re-queue it for another agent attempt — a sign that automation wasn't the right fit for this case.",
+			artifact, verdictNoun, artifact)
+	case discardOutcomeRedelegated:
+		return fmt.Sprintf(
+			"**Outcome:** Human re-delegated the task to the bot while this run was in flight; the prior %s was discarded in favor of a fresh attempt.\n"+
+				"**Implication:** The human kept the agent on the task but didn't accept the %s you produced — likely a prompt-fit issue or a missing-context issue rather than an automation-fit issue. Reconsider the framing or scope before producing a new %s.",
 			artifact, verdictNoun, artifact)
 	default: // discardOutcomeRequeued
 		return fmt.Sprintf(
