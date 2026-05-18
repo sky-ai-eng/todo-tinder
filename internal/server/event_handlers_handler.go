@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
 )
@@ -38,6 +39,7 @@ func (s *Server) handleEventHandlersList(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
 	if kind != "" && kind != domain.EventHandlerKindRule && kind != domain.EventHandlerKindTrigger {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -45,8 +47,12 @@ func (s *Server) handleEventHandlersList(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	handlers, err := s.eventHandlers.List(r.Context(), orgID, kind)
-	if err != nil {
+	var handlers []domain.EventHandler
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		handlers, e = tx.EventHandlers.List(r.Context(), orgID, kind)
+		return e
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
@@ -92,6 +98,7 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	var req createEventHandlerRequest
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -159,8 +166,12 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 		}
 		// Verify the prompt exists for clearer 404 than the downstream FK
 		// integrity error.
-		prompt, err := s.prompts.Get(r.Context(), orgID, req.PromptID)
-		if err != nil {
+		var prompt *domain.Prompt
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			prompt, e = tx.Prompts.Get(r.Context(), orgID, req.PromptID)
+			return e
+		}); err != nil {
 			internalError(w, "event_handlers", err)
 			return
 		}
@@ -196,7 +207,15 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	if err := s.eventHandlers.Create(r.Context(), orgID, h); err != nil {
+	var fresh *domain.EventHandler
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		if e := tx.EventHandlers.Create(r.Context(), orgID, h); e != nil {
+			return e
+		}
+		var ge error
+		fresh, ge = tx.EventHandlers.Get(r.Context(), orgID, h.ID)
+		return ge
+	}); err != nil {
 		// Driver-specific error strings ("UNIQUE constraint failed: ..." on
 		// SQLite, "duplicate key value violates unique constraint ..." on
 		// Postgres) leak schema names + index identifiers to clients.
@@ -215,7 +234,6 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 		})
 		return
 	}
-	fresh, _ := s.eventHandlers.Get(r.Context(), orgID, h.ID)
 	if fresh != nil {
 		writeJSON(w, http.StatusCreated, fresh)
 		return
@@ -248,6 +266,7 @@ func (s *Server) handleEventHandlerUpdate(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	var req patchEventHandlerRequest
@@ -255,8 +274,12 @@ func (s *Server) handleEventHandlerUpdate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	existing, err := s.eventHandlers.Get(r.Context(), orgID, id)
-	if err != nil {
+	var existing *domain.EventHandler
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		existing, e = tx.EventHandlers.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
@@ -339,11 +362,18 @@ func (s *Server) handleEventHandlerUpdate(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	if err := s.eventHandlers.Update(r.Context(), orgID, updated); err != nil {
+	var fresh *domain.EventHandler
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		if e := tx.EventHandlers.Update(r.Context(), orgID, updated); e != nil {
+			return e
+		}
+		var ge error
+		fresh, ge = tx.EventHandlers.Get(r.Context(), orgID, id)
+		return ge
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
-	fresh, _ := s.eventHandlers.Get(r.Context(), orgID, id)
 	if fresh != nil {
 		writeJSON(w, http.StatusOK, fresh)
 		return
@@ -361,10 +391,29 @@ func (s *Server) handleEventHandlerDelete(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
-	existing, err := s.eventHandlers.Get(r.Context(), orgID, id)
-	if err != nil {
+	var existing *domain.EventHandler
+	var disabled bool
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		existing, e = tx.EventHandlers.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if existing == nil {
+			return nil
+		}
+		if existing.Source == domain.EventHandlerSourceSystem {
+			if e := tx.EventHandlers.SetEnabled(r.Context(), orgID, id, false); e != nil {
+				return e
+			}
+			disabled = true
+			return nil
+		}
+		return tx.EventHandlers.Delete(r.Context(), orgID, id)
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
@@ -372,21 +421,11 @@ func (s *Server) handleEventHandlerDelete(w http.ResponseWriter, r *http.Request
 		notFound(w, "event handler")
 		return
 	}
-
-	if existing.Source == domain.EventHandlerSourceSystem {
-		if err := s.eventHandlers.SetEnabled(r.Context(), orgID, id, false); err != nil {
-			internalError(w, "event_handlers", err)
-			return
-		}
+	if disabled {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "disabled",
 			"reason": "system handlers cannot be deleted (they would be resurrected on next boot); disabled instead",
 		})
-		return
-	}
-
-	if err := s.eventHandlers.Delete(r.Context(), orgID, id); err != nil {
-		internalError(w, "event_handlers", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -398,6 +437,7 @@ func (s *Server) handleEventHandlerToggle(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 	var req struct {
 		Enabled bool `json:"enabled"`
@@ -405,17 +445,23 @@ func (s *Server) handleEventHandlerToggle(w http.ResponseWriter, r *http.Request
 	if !decodeJSON(w, r, &req, "") {
 		return
 	}
-	existing, err := s.eventHandlers.Get(r.Context(), orgID, id)
-	if err != nil {
+	var existing *domain.EventHandler
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		existing, e = tx.EventHandlers.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if existing == nil {
+			return nil
+		}
+		return tx.EventHandlers.SetEnabled(r.Context(), orgID, id, req.Enabled)
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
 	if existing == nil {
 		notFound(w, "event handler")
-		return
-	}
-	if err := s.eventHandlers.SetEnabled(r.Context(), orgID, id, req.Enabled); err != nil {
-		internalError(w, "event_handlers", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "enabled": req.Enabled})
@@ -439,6 +485,7 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
 
 	var req promoteEventHandlerRequest
@@ -454,8 +501,23 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	existing, err := s.eventHandlers.Get(r.Context(), orgID, id)
-	if err != nil {
+	var existing *domain.EventHandler
+	var prompt *domain.Prompt
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		existing, e = tx.EventHandlers.Get(r.Context(), orgID, id)
+		if e != nil {
+			return e
+		}
+		if existing == nil {
+			return nil
+		}
+		if existing.Kind != domain.EventHandlerKindRule {
+			return nil
+		}
+		prompt, e = tx.Prompts.Get(r.Context(), orgID, req.PromptID)
+		return e
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
@@ -465,12 +527,6 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 	}
 	if existing.Kind != domain.EventHandlerKindRule {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "only rules can be promoted"})
-		return
-	}
-
-	prompt, err := s.prompts.Get(r.Context(), orgID, req.PromptID)
-	if err != nil {
-		internalError(w, "event_handlers", err)
 		return
 	}
 	if prompt == nil {
@@ -499,11 +555,18 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 		MinAutonomySuitability: req.MinAutonomySuitability,
 		ScopePredicateJSON:     predicate,
 	}
-	if err := s.eventHandlers.Promote(r.Context(), orgID, id, target); err != nil {
+	var fresh *domain.EventHandler
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		if e := tx.EventHandlers.Promote(r.Context(), orgID, id, target); e != nil {
+			return e
+		}
+		var ge error
+		fresh, ge = tx.EventHandlers.Get(r.Context(), orgID, id)
+		return ge
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
-	fresh, _ := s.eventHandlers.Get(r.Context(), orgID, id)
 	writeJSON(w, http.StatusOK, fresh)
 }
 
@@ -516,6 +579,7 @@ func (s *Server) handleEventHandlerReorder(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 	var ids []string
 	if !decodeJSON(w, r, &ids, "expected array of handler IDs") {
 		return
@@ -524,7 +588,9 @@ func (s *Server) handleEventHandlerReorder(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty ID list"})
 		return
 	}
-	if err := s.eventHandlers.Reorder(r.Context(), orgID, ids); err != nil {
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return tx.EventHandlers.Reorder(r.Context(), orgID, ids)
+	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
 	}
