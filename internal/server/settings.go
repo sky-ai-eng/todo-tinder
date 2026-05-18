@@ -285,11 +285,12 @@ type settingsUpdateRequest struct {
 
 func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
-	// orgID via OrgIDFrom (not requireOrg) — settings POST is a
-	// user-scoped write to users.github_username etc. and runs even
-	// before a multi-mode user has picked an active org. Empty orgID
-	// is acceptable: the users-table RLS policies don't gate on
-	// tf.current_org_id().
+	// orgID via OrgIDFrom (not requireOrg) — settings POST performs
+	// current-user-scoped reads/writes (for example, the caller's own
+	// users row) and may run before a multi-mode user has picked an
+	// active org. Empty orgID is acceptable for this handler's
+	// current-user operations; do not generalize that to all
+	// users-table RLS policies.
 	orgID := OrgIDFrom(r.Context())
 	var req settingsUpdateRequest
 	if !decodeJSON(w, r, &req, "") {
