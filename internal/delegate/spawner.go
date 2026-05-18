@@ -282,7 +282,7 @@ func (s *Spawner) advanceTaskFromRunStatus(orgID, runID, runStatus string) {
 			return
 		}
 	}
-	s.broadcastTaskUpdate(orgID, task.ID)
+	s.broadcastTaskUpdate(orgID, task.ID, target)
 }
 
 // targetTaskStatusForRunStatus returns the task status a given run
@@ -304,17 +304,19 @@ func targetTaskStatusForRunStatus(runStatus string) (target string, isClose bool
 }
 
 // broadcastTaskUpdate emits a SKY-330 task_updated WS event so the
-// board can refetch / patch the card without polling. Payload is
-// just the taskID — the FE refetches the task to get the full row,
-// matching the agent_run_update pattern.
-func (s *Spawner) broadcastTaskUpdate(orgID, taskID string) {
+// board can refetch / patch the card without polling. Payload
+// matches the shared event shape (task_id + status) the other
+// emitters use (handleSwipe, handleSnooze, handleTaskAdvance,
+// finalizeRequeue), so the FE's typed WSEvent ('task_updated':
+// {task_id, status}) holds across producers.
+func (s *Spawner) broadcastTaskUpdate(orgID, taskID, status string) {
 	if s.wsHub == nil {
 		return
 	}
 	s.wsHub.Broadcast(websocket.Event{
 		Type:  "task_updated",
 		OrgID: orgID,
-		Data:  map[string]string{"task_id": taskID},
+		Data:  map[string]string{"task_id": taskID, "status": status},
 	})
 }
 

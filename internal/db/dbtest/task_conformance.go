@@ -141,6 +141,50 @@ func RunTaskStoreConformance(t *testing.T, mk TaskStoreFactory) {
 		}
 	})
 
+	// SKY-330: the "claimed" derived branch in ByStatus filters
+	// status='queued' so the Board's Claimed column doesn't
+	// double-render a user-claimed task that's also in In Progress
+	// or In Review. Distinct from the broader "any non-terminal
+	// user-claimed task" set the pre-330 derivation produced.
+	t.Run("ByStatus_claimed_excludes_in_progress_and_in_review", func(t *testing.T) {
+		s, orgID, _, _, userID, seed, _ := mk(t)
+		_, _, queuedID := seed(t, "bs-claimed-q")
+		_, _, ipID := seed(t, "bs-claimed-ip")
+		_, _, irID := seed(t, "bs-claimed-ir")
+
+		// Claim all three.
+		for _, id := range []string{queuedID, ipID, irID} {
+			if ok, err := s.ClaimQueuedForUser(ctx, orgID, id, userID); err != nil || !ok {
+				t.Fatalf("claim %s: ok=%v err=%v", id, ok, err)
+			}
+		}
+		// Advance two of them.
+		if ok, err := s.AdvanceStatusForUser(ctx, orgID, ipID, userID, "in_progress"); err != nil || !ok {
+			t.Fatalf("advance ip: ok=%v err=%v", ok, err)
+		}
+		if ok, err := s.AdvanceStatusForUser(ctx, orgID, irID, userID, "in_review"); err != nil || !ok {
+			t.Fatalf("advance ir: ok=%v err=%v", ok, err)
+		}
+
+		claimed, err := s.ByStatus(ctx, orgID, "claimed")
+		if err != nil {
+			t.Fatalf("ByStatus claimed: %v", err)
+		}
+		seen := map[string]bool{}
+		for _, x := range claimed {
+			seen[x.ID] = true
+		}
+		if !seen[queuedID] {
+			t.Errorf("Claimed projection missing the queued+claim task %s", queuedID)
+		}
+		if seen[ipID] {
+			t.Errorf("Claimed projection contained an in_progress task %s; would double-render with In Progress column", ipID)
+		}
+		if seen[irID] {
+			t.Errorf("Claimed projection contained an in_review task %s; would double-render with In Review column", irID)
+		}
+	})
+
 	t.Run("FindOrCreate_idempotent_on_dedup_key", func(t *testing.T) {
 		s, orgID, teamID, _, _, seed, _ := mk(t)
 		entityID, eventID, _ := seed(t, "foc-dedup")

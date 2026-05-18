@@ -340,6 +340,20 @@ export default function Board() {
             })
             .catch(() => {})
 
+          // SKY-330: a few server paths still mutate task state but
+          // only emit agent_run_update (review/PR approval flips
+          // task='done', then broadcasts the run completion). Without
+          // a refetch here the card stays in its old column until a
+          // manual refresh. Cheap to re-pull all five buckets — the
+          // queries are indexed and short.
+          if (
+            ['completed', 'failed', 'cancelled', 'task_unsolvable', 'pending_approval'].includes(
+              event.data.status,
+            )
+          ) {
+            fetchTasks()
+          }
+
           if (!matched) {
             // Chain step run that isn't the active step: a new step
             // started or a prior one changed. Otherwise seed agentRuns
@@ -393,7 +407,14 @@ export default function Board() {
           // a single indexed query) and this avoids the per-column
           // patch logic getting out of sync with backend rules.
           fetchTasks()
-        } else if (event.type === 'tasks_updated') {
+        } else if (event.type === 'tasks_updated' || event.type === 'scoring_completed') {
+          // scoring_completed: the scorer just landed priority_score
+          // and ai_summary on a batch. Without this refetch the board
+          // keeps stale ordering and missing summaries until another
+          // unrelated event triggers fetchTasks. Cards.tsx has the
+          // mirror — refetches on both scoring_started and
+          // scoring_completed; we only need completed since the
+          // priority_score it writes is what drives ordering here.
           fetchTasks()
         }
       },

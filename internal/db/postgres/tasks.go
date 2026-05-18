@@ -96,6 +96,10 @@ func (s *taskStore) Queued(ctx context.Context, orgID string) ([]domain.Task, er
 }
 
 func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error) {
+	// SKY-330: snoozed rows render at the tail regardless of
+	// priority so deferred entries don't jump above live queued
+	// work. Postgres sorts false before true on the boolean
+	// expression (matches the SQLite mirror's 0/1 ordering).
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+pgTaskColumnsWithEntity+`
 		FROM tasks t
@@ -110,20 +114,27 @@ func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([
 			AND t.status IN ('queued', 'snoozed')
 			AND t.claimed_by_agent_id IS NULL
 			AND t.claimed_by_user_id  IS NULL
-		ORDER BY COALESCE(tr.sort_order, 999) ASC, COALESCE(t.priority_score, 0.5) DESC
+		ORDER BY (t.status = 'snoozed') ASC,
+		         COALESCE(tr.sort_order, 999) ASC,
+		         COALESCE(t.priority_score, 0.5) DESC
 	`, orgID)
 }
 
 func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error) {
 	switch status {
 	case "claimed":
+		// SKY-330: "claimed" now means specifically "user has claimed
+		// but hasn't advanced" (status='queued' + user claim). The
+		// pre-330 derivation included in_progress / in_review tasks,
+		// which double-renders on the board now that those have their
+		// own columns. Mirrors the SQLite branch.
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+pgTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
 			WHERE t.org_id = $1
 				AND t.claimed_by_user_id IS NOT NULL
-				AND t.status NOT IN ('done', 'dismissed')
+				AND t.status = 'queued'
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`, orgID)
 	case "delegated":

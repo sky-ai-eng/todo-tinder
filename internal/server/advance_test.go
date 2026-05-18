@@ -100,8 +100,11 @@ func TestHandleAdvance_RejectsInvalidTarget(t *testing.T) {
 
 // TestHandleAdvance_HappyPath_QueuedToInProgress is the canonical
 // flow: a user-claimed task in 'queued' moves to 'in_progress'.
-// Verifies the status flip lands and the task_updated WS broadcast
-// fires (peer Board sessions need it to re-bucket the card).
+// Verifies the status flip lands at the DB level. The handler also
+// emits a task_updated WS broadcast on success, but the test server
+// doesn't currently expose a recording hub so we don't assert on
+// the event here — the BoardColumn refetch behavior is covered at
+// the integration / manual smoke level.
 func TestHandleAdvance_HappyPath_QueuedToInProgress(t *testing.T) {
 	s := newTestServer(t)
 	taskID := seedAdvanceTask(t, s.db, "happy-ip", advanceTaskOpts{
@@ -147,12 +150,12 @@ func TestHandleAdvance_HappyPath_InProgressToInReview(t *testing.T) {
 	}
 }
 
-// TestHandleAdvance_404OnUnknownTask covers the not-found case.
+// TestHandleAdvance_409OnUnknownTask covers the not-found case.
 // AdvanceStatusForUser returns ok=false for any missing-row query,
 // so the handler can't distinguish "task not found" from "guard
-// tripped" — both surface as 409. Documented here so future
-// readers don't expect a separate 404 path.
-func TestHandleAdvance_404OnUnknownTask(t *testing.T) {
+// tripped" — both surface as 409. Test name reflects the actual
+// expected status code so `go test -run` output isn't misleading.
+func TestHandleAdvance_409OnUnknownTask(t *testing.T) {
 	s := newTestServer(t)
 	rec := doJSON(t, s, http.MethodPost,
 		"/api/tasks/00000000-0000-0000-0000-000000000bad/advance",

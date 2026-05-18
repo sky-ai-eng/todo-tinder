@@ -85,6 +85,12 @@ func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([
 	// snoozed" toggle surfaces deferred entries. Status='queued' +
 	// status='snoozed' both qualify; SKY-261 enforces snoozed↔unclaimed
 	// so the claim guards are still safe to apply.
+	//
+	// Ordering puts snoozed rows at the tail (the "wakes Mar 5"
+	// badge cluster) regardless of priority so a high-priority but
+	// deferred entry doesn't jump above live queued work. SQLite
+	// treats the boolean expression as 0/1 — false (live) sorts
+	// before true (snoozed).
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+sqliteTaskColumnsWithEntity+`
 		FROM tasks t
@@ -98,7 +104,9 @@ func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([
 		WHERE t.status IN ('queued', 'snoozed')
 			AND t.claimed_by_agent_id IS NULL
 			AND t.claimed_by_user_id  IS NULL
-		ORDER BY COALESCE(tr.sort_order, 999) ASC, COALESCE(t.priority_score, 0.5) DESC
+		ORDER BY (t.status = 'snoozed') ASC,
+		         COALESCE(tr.sort_order, 999) ASC,
+		         COALESCE(t.priority_score, 0.5) DESC
 	`)
 }
 
@@ -108,6 +116,12 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 	}
 	// SKY-261 B+: 'claimed' and 'delegated' aren't real lifecycle
 	// values — they're derived filters on the claim columns.
+	// SKY-330 added in_progress + in_review as first-class statuses,
+	// so the "claimed" derivation now means specifically "user has
+	// claimed but hasn't advanced yet" (status='queued' + user
+	// claim). Without the status='queued' filter, a user-claimed
+	// task in in_progress would render in BOTH the Claimed and
+	// In Progress columns on the board.
 	switch status {
 	case "claimed":
 		return queryTasksCtx(ctx, s.q, `
@@ -115,7 +129,7 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id
 			WHERE t.claimed_by_user_id IS NOT NULL
-				AND t.status NOT IN ('done', 'dismissed')
+				AND t.status = 'queued'
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
 		`)
 	case "delegated":
