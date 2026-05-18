@@ -535,7 +535,7 @@ func (s *Server) handleProjectDelete(w http.ResponseWriter, r *http.Request) {
 	// rows. No-op when the curator runtime hasn't been wired (test
 	// harnesses, fresh-install before first message).
 	if s.curator != nil {
-		s.curator.CancelProject(id)
+		s.curator.CancelProject(orgID, id)
 	}
 
 	if err := s.projects.Delete(r.Context(), orgID, id); err != nil {

@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import { ChevronDown, Check } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useOrgContext } from '../contexts/OrgContext'
+import { reconnectWebSocket } from '../hooks/useWebSocket'
 
 /**
  * Topbar dropdown for switching between orgs the user belongs to.
@@ -41,10 +42,43 @@ export default function OrgPicker() {
 
   const active = auth.orgs.find((o) => o.id === activeOrgId) ?? auth.orgs[0]
 
-  const handlePick = (newOrgId: string) => {
+  const handlePick = async (newOrgId: string) => {
     setOpen(false)
     if (newOrgId === activeOrgId) return
     setActiveOrgId(newOrgId)
+
+    // Persist the choice on the session row so the server's
+    // withSession picks up the new active org for every subsequent
+    // request (and so cross-tab /api/me reads agree). Fire-and-log
+    // failures: the local pick already updated OrgContext, and the
+    // next /api/me will reconcile a transient persistence failure on
+    // the user's next interaction.
+    try {
+      const resp = await fetch('/api/me/active-org', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ org_id: newOrgId }),
+      })
+      if (resp.ok) {
+        // Force the WS to re-handshake so the hub's per-(user, org)
+        // Broadcast filter routes events for the just-switched
+        // tenant rather than the previous one. Without this the
+        // user keeps receiving the old org's events until the next
+        // unrelated disconnect.
+        reconnectWebSocket()
+      } else {
+        // 404/409 here means the server refused the switch (revoked
+        // membership, etc.). The picker rolling back the local
+        // selection would conflict with whatever URL navigation is
+        // about to happen below; for now log and let the AuthGate /
+        // /api/me reconciliation correct it on the next page render.
+        console.warn('[org-picker] active-org POST failed:', resp.status)
+      }
+    } catch (err) {
+      console.warn('[org-picker] active-org POST error:', err)
+    }
+
     // Rewrite the URL: swap the org_id segment, preserve everything
     // after it. Routes that don't start with /orgs/<id> fall back to
     // the new org's root.

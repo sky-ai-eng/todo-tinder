@@ -270,7 +270,8 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		}
 		if claimChanged {
 			s.ws.Broadcast(websocket.Event{
-				Type: "task_claimed",
+				Type:  "task_claimed",
+				OrgID: orgID,
 				Data: map[string]any{
 					"task_id":             id,
 					"claimed_by_agent_id": "",
@@ -352,7 +353,8 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		}
 		if result == db.HandoffChanged {
 			s.ws.Broadcast(websocket.Event{
-				Type: "task_claimed",
+				Type:  "task_claimed",
+				OrgID: orgID,
 				Data: map[string]any{
 					"task_id":             id,
 					"claimed_by_agent_id": a.ID,
@@ -380,8 +382,9 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// broadcast a dismissed/completed/snoozed task would stay
 		// in its old lane on other browsers until the next refresh.
 		s.ws.Broadcast(websocket.Event{
-			Type: "task_updated",
-			Data: map[string]any{"task_id": id, "status": newStatus},
+			Type:  "task_updated",
+			OrgID: orgID,
+			Data:  map[string]any{"task_id": id, "status": newStatus},
 		})
 	}
 
@@ -576,8 +579,9 @@ func (s *Server) handleSnooze(w http.ResponseWriter, r *http.Request) {
 	// Board on a peer session keeps showing the task in its old
 	// lane until the next user-driven refresh.
 	s.ws.Broadcast(websocket.Event{
-		Type: "task_updated",
-		Data: map[string]any{"task_id": id, "status": "snoozed"},
+		Type:  "task_updated",
+		OrgID: orgID,
+		Data:  map[string]any{"task_id": id, "status": "snoozed"},
 	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "snoozed", "until": until.Format(time.RFC3339)})
@@ -873,6 +877,7 @@ func (s *Server) cleanupPendingApprovalRun(ctx context.Context, orgID, userID, t
 
 	s.ws.Broadcast(websocket.Event{
 		Type:  "agent_run_update",
+		OrgID: orgID,
 		RunID: runID,
 		Data:  map[string]string{"status": "cancelled"},
 	})

@@ -563,7 +563,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	// applied cleanly. The frontend also shows a partial-failure warning toast
 	// if there are any failures; this one only fires on at-least-one-success.
 	if applied > 0 {
-		toast.Success(s.ws, fmt.Sprintf(
+		toast.Success(s.ws, orgID, fmt.Sprintf(
 			"Carry-over applied: %d queued, %d claimed, %d closed", queued, claimed, closed,
 		))
 	}

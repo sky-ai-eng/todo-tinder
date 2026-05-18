@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -120,6 +121,23 @@ func (s *projectStore) List(ctx context.Context, orgID string) ([]domain.Project
 
 func (s *projectStore) ListSystem(ctx context.Context, orgID string) ([]domain.Project, error) {
 	return listProjects(ctx, s.admin, orgID)
+}
+
+// ResolveOrgSystem returns the project's owning org id via the admin
+// pool — RLS would hide the row from a JWT-claims-free caller, and
+// the consumer (kbwatcher's broadcast scoping) has no identity
+// context. Returns ("", nil) when no row matches so callers can fall
+// back to a system-wide broadcast cleanly.
+func (s *projectStore) ResolveOrgSystem(ctx context.Context, projectID string) (string, error) {
+	var orgID string
+	err := s.admin.QueryRowContext(ctx, `SELECT org_id::text FROM projects WHERE id = $1`, projectID).Scan(&orgID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return orgID, nil
 }
 
 func listProjects(ctx context.Context, q queryer, orgID string) ([]domain.Project, error) {

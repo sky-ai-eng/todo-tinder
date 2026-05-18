@@ -367,7 +367,7 @@ func (s *Server) handleAgentRespond(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "record response: " + err.Error()})
 		return
 	}
-	s.ws.Broadcast(websocket.Event{Type: "agent_message", RunID: runID, Data: msg})
+	s.ws.Broadcast(websocket.Event{Type: "agent_message", OrgID: orgID, RunID: runID, Data: msg})
 
 	// Hand off to the spawner. Status flip from awaiting_input to
 	// running happens INSIDE ResumeAfterYield, AFTER the cancel

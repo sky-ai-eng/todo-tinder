@@ -221,6 +221,7 @@ func (s *Server) handleCuratorReset(w http.ResponseWriter, r *http.Request) {
 	if s.ws != nil {
 		s.ws.Broadcast(websocket.Event{
 			Type:      "curator_reset",
+			OrgID:     orgID,
 			ProjectID: projectID,
 		})
 	}

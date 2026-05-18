@@ -98,6 +98,55 @@ function subscribe(handler: Handler) {
   }
 }
 
+/**
+ * Force the singleton websocket to close and re-open so the next
+ * handshake captures fresh server-side identity (cookies, session,
+ * active_org_id). Called by the org-switcher after `POST
+ * /api/me/active-org` lands a 200, so the hub re-registers the
+ * connection with the new active org and the per-(user, org) Broadcast
+ * filter routes the user to events from the just-selected tenant
+ * rather than the previous one.
+ *
+ * Implementation choices:
+ *   - We close() the existing socket explicitly. The onclose handler
+ *     already retries via setTimeout when listeners.size > 0; we
+ *     short-circuit the wait by calling ensureConnected() right after
+ *     so the new socket comes up immediately rather than after the
+ *     2s reconnect delay that's tuned for unexpected disconnects.
+ *   - cloneStatusByRepo is intentionally NOT cleared: the per-repo
+ *     state is keyed by `owner/repo` which is invariant across orgs
+ *     in our deployment shape, and re-firing the "clone failed" toast
+ *     on a switched org would be noisy.
+ *   - No retry/error handling here: a fail-to-reconnect surfaces via
+ *     the existing reconnect-on-close loop, same as any other dropped
+ *     connection.
+ *
+ * Multi-tab note (matches the SKY-313 multi-tab caveat): each tab
+ * holds its own globalWs reference, so reconnect only affects the
+ * tab that initiated the switch. Other tabs continue to receive
+ * events for their previously-selected org until the user navigates
+ * or they pick up the new active-org from the session on the next
+ * /api/me read.
+ */
+export function reconnectWebSocket() {
+  const existing = globalWs
+  globalWs = null
+  if (existing && existing.readyState !== WebSocket.CLOSED) {
+    // Use a normal close (1000) so the server doesn't log this as an
+    // abnormal disconnect. The new socket spins up below regardless
+    // of close-time.
+    try {
+      existing.close(1000, 'org switch')
+    } catch {
+      // close() can throw if the socket is in CONNECTING — harmless,
+      // ensureConnected below will pick up the slack.
+    }
+  }
+  if (listeners.size > 0) {
+    ensureConnected()
+  }
+}
+
 // --- React hook ---
 
 export function useWebSocket(handler: Handler) {

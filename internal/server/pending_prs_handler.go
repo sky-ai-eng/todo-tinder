@@ -352,6 +352,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 
 		s.ws.Broadcast(websocket.Event{
 			Type:  "agent_run_update",
+			OrgID: orgID,
 			RunID: pr.RunID,
 			Data:  map[string]string{"status": "completed"},
 		})

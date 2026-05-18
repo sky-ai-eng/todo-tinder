@@ -104,4 +104,15 @@ type ProjectStore interface {
 	// does for the sibling read on the entity side. org_id stays in
 	// the WHERE clause as defense in depth; behavior matches List.
 	ListSystem(ctx context.Context, orgID string) ([]domain.Project, error)
+
+	// ResolveOrgSystem returns the project's owning org id, or
+	// ("", nil) when no row matches the supplied id. Admin-pool by
+	// construction so it can be called from background goroutines
+	// that have a projectID but no JWT-claims context (today: the
+	// kbwatcher's broadcast scoping). Bypasses RLS on purpose — the
+	// caller is system-level and uses the result only to fan
+	// broadcasts to the right tenant. Errors other than "no row"
+	// propagate so callers can decide between "treat as system-wide"
+	// and "give up".
+	ResolveOrgSystem(ctx context.Context, projectID string) (string, error)
 }

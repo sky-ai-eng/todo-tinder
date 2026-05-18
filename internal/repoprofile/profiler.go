@@ -190,7 +190,8 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 		}
 		if p.ws != nil {
 			p.ws.Broadcast(websocket.Event{
-				Type: "repo_docs_updated",
+				Type:  "repo_docs_updated",
+				OrgID: orgID,
 				Data: map[string]any{
 					"id":            name,
 					"has_readme":    prof.HasReadme,
@@ -230,7 +231,7 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 			for j, d := range batch {
 				repoNames[j] = d.profile.ID
 			}
-			toast.Warning(p.ws, fmt.Sprintf("Profiling failed for %s — rows saved without AI summary", strings.Join(repoNames, ", ")))
+			toast.Warning(p.ws, orgID, fmt.Sprintf("Profiling failed for %s — rows saved without AI summary", strings.Join(repoNames, ", ")))
 			// Fallback: upsert without profile_text so the row at least exists.
 			for _, d := range batch {
 				if uErr := p.repos.UpsertSystem(ctx, orgID, d.profile); uErr != nil {
@@ -260,7 +261,8 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 				profiled++
 				if p.ws != nil {
 					p.ws.Broadcast(websocket.Event{
-						Type: "repo_profile_updated",
+						Type:  "repo_profile_updated",
+						OrgID: orgID,
 						Data: map[string]any{
 							"id":           prof.ID,
 							"profile_text": prof.ProfileText,

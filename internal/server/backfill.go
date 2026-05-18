@@ -232,6 +232,7 @@ func (s *Server) handleBackfill(w http.ResponseWriter, r *http.Request) {
 	if len(assigned) > 0 && s.ws != nil {
 		s.ws.Broadcast(websocket.Event{
 			Type:      "entities_assigned_to_project",
+			OrgID:     orgID,
 			ProjectID: projectID,
 			Data:      map[string]any{"entity_ids": assigned},
 		})

@@ -126,7 +126,7 @@ func (s *Spawner) delegateChain(orgID string, task domain.Task, chainPrompt *dom
 		if triggerType == "event" {
 			verb = "Auto-fired chain"
 		}
-		toast.Info(s.wsHub, fmt.Sprintf("%s: %s (%s)",
+		toast.Info(s.wsHub, orgID, fmt.Sprintf("%s: %s (%s)",
 			verb, truncateToastMsg(chainPrompt.Name, 60), shortRunID(chainRunID)))
 
 		s.runChain(ctx, orgID, chainRunID, task, chainPrompt, steps, cfg, startTime, model, triggerType, creatorUserID)
@@ -235,7 +235,7 @@ func (s *Spawner) runChain(
 				fmt.Sprintf("create step %d run: %s", i, stepCreateErr.Error()), &step.StepIndex, false)
 			return
 		}
-		s.broadcastRunUpdate(stepRunID, "initializing")
+		s.broadcastRunUpdate(orgID, stepRunID, "initializing")
 		var incErr error
 		if triggerType == "manual" {
 			incErr = s.tx.SyntheticClaimsWithTx(ctx, orgID, creatorUserID, func(ts db.TxStores) error {
@@ -270,7 +270,7 @@ func (s *Spawner) runChain(
 		}
 		mission := buildChainStepWrapperPrompt(task, step, stepPrompt, slug, len(steps), nextStepName)
 
-		toast.Info(s.wsHub, fmt.Sprintf("Chain step %d/%d: %s (%s)",
+		toast.Info(s.wsHub, orgID, fmt.Sprintf("Chain step %d/%d: %s (%s)",
 			i+1, len(steps), truncateToastMsg(stepPrompt.Name, 60), shortRunID(stepRunID)))
 
 		s.runAgent(stepCtx, stepRunID, task, mission, stepCfg, time.Now(), model, triggerType, creatorUserID)

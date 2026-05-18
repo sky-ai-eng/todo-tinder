@@ -154,7 +154,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 			log.Printf("[router] entity lifecycle error for %s: %v", *evt.EntityID, err)
 		}
 		if closed > 0 {
-			r.ws.Broadcast(websocket.Event{Type: "tasks_updated", Data: map[string]any{}})
+			r.ws.Broadcast(websocket.Event{Type: "tasks_updated", OrgID: orgID, Data: map[string]any{}})
 		}
 		return
 	}
@@ -181,7 +181,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	// triggers match the event, because close-signal events (ci_check_passed,
 	// review_submitted, review_request_removed) are not task-creating events.
 	if r.runInlineCloseChecks(orgID, evt, entityID) {
-		r.ws.Broadcast(websocket.Event{Type: "tasks_updated", Data: map[string]any{}})
+		r.ws.Broadcast(websocket.Event{Type: "tasks_updated", OrgID: orgID, Data: map[string]any{}})
 	}
 
 	// became_atomic is the belated-discovery path for parents whose
@@ -348,7 +348,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	r.scorer.Trigger()
 
 	// Broadcast task update to frontend.
-	r.ws.Broadcast(websocket.Event{Type: "tasks_updated", Data: map[string]any{}})
+	r.ws.Broadcast(websocket.Event{Type: "tasks_updated", OrgID: orgID, Data: map[string]any{}})
 
 	// Step 9: Auto-delegate for matching triggers.
 	// Gate: global kill switch — if auto-delegation is disabled, skip all triggers.
@@ -477,7 +477,7 @@ func (r *Router) tryAutoDelegate(orgID string, task *domain.Task, trigger domain
 		if promptName == "" {
 			promptName = "prompt"
 		}
-		toast.Warning(r.ws, fmt.Sprintf("Auto-delegation paused: %s tripped the breaker (%d consecutive failures on this entity)", promptName, failures))
+		toast.Warning(r.ws, orgID, fmt.Sprintf("Auto-delegation paused: %s tripped the breaker (%d consecutive failures on this entity)", promptName, failures))
 		return
 	}
 
@@ -595,7 +595,8 @@ func (r *Router) stampAgentClaim(orgID string, task *domain.Task) {
 	}
 	task.ClaimedByAgentID = a.ID
 	r.ws.Broadcast(websocket.Event{
-		Type: "task_claimed",
+		Type:  "task_claimed",
+		OrgID: orgID,
 		Data: map[string]any{
 			"task_id":             task.ID,
 			"claimed_by_agent_id": a.ID,
@@ -906,8 +907,9 @@ func (r *Router) revertTaskStatus(orgID, taskID, status string) {
 		return
 	}
 	r.ws.Broadcast(websocket.Event{
-		Type: "task_updated",
-		Data: map[string]any{"task_id": taskID, "status": status},
+		Type:  "task_updated",
+		OrgID: orgID,
+		Data:  map[string]any{"task_id": taskID, "status": status},
 	})
 }
 

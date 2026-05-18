@@ -204,7 +204,7 @@ func (s *Spawner) updateStatus(orgID, runID, status string) {
 	if err := s.agentRuns.SetStatusSystem(context.Background(), orgID, runID, status); err != nil {
 		log.Printf("[delegate] warning: failed to update status for run %s: %v", runID, err)
 	}
-	s.broadcastRunUpdate(runID, status)
+	s.broadcastRunUpdate(orgID, runID, status)
 }
 
 // updateBreakerCounter is a no-op stub. The breaker is now query-based
@@ -238,7 +238,12 @@ func (s *Spawner) isChainRunID(id string) bool {
 	return s.chainRunIDs[id]
 }
 
-func (s *Spawner) broadcastRunUpdate(runID, status string) {
+// broadcastRunUpdate stamps the run's owning org on the event so the
+// hub's per-connection scoping filter routes it only to clients
+// authed against that tenant. Every caller is inside a goroutine
+// that already has orgID in scope (the run's tenant, set at
+// Delegate() entry and threaded through every helper).
+func (s *Spawner) broadcastRunUpdate(orgID, runID, status string) {
 	if s.wsHub == nil {
 		return
 	}
@@ -247,17 +252,19 @@ func (s *Spawner) broadcastRunUpdate(runID, status string) {
 	}
 	s.wsHub.Broadcast(websocket.Event{
 		Type:  "agent_run_update",
+		OrgID: orgID,
 		RunID: runID,
 		Data:  map[string]string{"status": status},
 	})
 }
 
-func (s *Spawner) broadcastMessage(runID string, msg *domain.AgentMessage) {
+func (s *Spawner) broadcastMessage(orgID, runID string, msg *domain.AgentMessage) {
 	if s.wsHub == nil {
 		return
 	}
 	s.wsHub.Broadcast(websocket.Event{
 		Type:  "agent_message",
+		OrgID: orgID,
 		RunID: runID,
 		Data:  msg,
 	})

@@ -40,9 +40,12 @@ type Manager struct {
 	orgs     db.OrgsStore  // enumerate active orgs at each poll tick
 
 	// OnError fires when a poll cycle returns an error. Source is "github"
-	// or "jira". Wired from main to a toast helper so users see the
-	// failure without log-diving; nil-safe if caller doesn't set it.
-	OnError func(source string, err error)
+	// or "jira"; orgID identifies the tenant whose cycle errored (empty
+	// when the failure is upstream of the per-org loop, e.g. listing
+	// active orgs itself). Wired from main to a toast helper so users
+	// see the failure without log-diving; nil-safe if caller doesn't
+	// set it.
+	OnError func(source, orgID string, err error)
 
 	mu       sync.Mutex
 	ghStop   chan struct{}
@@ -72,10 +75,13 @@ func (m *Manager) trackerForOrg(orgID string) *tracker.Tracker {
 }
 
 // reportError invokes the OnError callback if set. Centralized so adding
-// behavior later (metrics, rate-limiting) has one call site.
-func (m *Manager) reportError(source string, err error) {
+// behavior later (metrics, rate-limiting) has one call site. orgID
+// scopes the failure to a tenant; pass empty when the failure is
+// process-level (e.g. the cycle's initial ListActiveSystem itself
+// errored before any per-org work began).
+func (m *Manager) reportError(source, orgID string, err error) {
 	if m.OnError != nil {
-		m.OnError(source, err)
+		m.OnError(source, orgID, err)
 	}
 }
 
@@ -216,7 +222,7 @@ func (m *Manager) runGitHubCycle(client *ghclient.Client, userTeams []string) {
 	orgIDs, err := m.orgs.ListActiveSystem(ctx)
 	if err != nil {
 		log.Printf("[github] list active orgs: %v", err)
-		m.reportError("github", err)
+		m.reportError("github", "", err)
 		return
 	}
 	for _, orgID := range orgIDs {
@@ -259,7 +265,7 @@ func (m *Manager) runGitHubCycle(client *ghclient.Client, userTeams []string) {
 		}
 		if _, err := m.trackerForOrg(orgID).RefreshGitHub(client, username, userTeams, repos); err != nil {
 			log.Printf("[github] org %s: tracker error: %v", orgID, err)
-			m.reportError("github", err)
+			m.reportError("github", orgID, err)
 		}
 	}
 }
@@ -320,13 +326,13 @@ func (m *Manager) runJiraCycle(client *jiraclient.Client, baseURL string, projec
 	orgIDs, err := m.orgs.ListActiveSystem(ctx)
 	if err != nil {
 		log.Printf("[jira] list active orgs: %v", err)
-		m.reportError("jira", err)
+		m.reportError("jira", "", err)
 		return
 	}
 	for _, orgID := range orgIDs {
 		if _, err := m.trackerForOrg(orgID).RefreshJira(client, baseURL, projects); err != nil {
 			log.Printf("[jira] org %s: tracker error: %v", orgID, err)
-			m.reportError("jira", err)
+			m.reportError("jira", orgID, err)
 		}
 	}
 }

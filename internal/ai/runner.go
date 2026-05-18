@@ -13,7 +13,11 @@ import (
 // RunnerCallbacks are optional hooks fired during the scoring lifecycle.
 // The caller wires these to WS broadcasts or other side effects.
 type RunnerCallbacks struct {
-	OnScoringStarted func(taskIDs []string)
+	// OnScoringStarted fires at the top of a scoring cycle once
+	// MarkScoring has stamped the in-progress flag on the picked tasks.
+	// orgID identifies the cycle's tenant so subscribers (the WS
+	// scoring_started broadcast) can scope per-connection fanout.
+	OnScoringStarted func(orgID string, taskIDs []string)
 	// OnScoringCompleted fires once per scoring cycle after the
 	// task_scores writes commit. orgID is the scoring context (the
 	// runner is per-org); the slice is the set of task IDs that
@@ -23,13 +27,17 @@ type RunnerCallbacks struct {
 	OnScoringCompleted func(orgID string, taskIDs []string)
 	// OnTasksSkipped fires once per scoring cycle if one or more batches
 	// errored. skipped is the exact count of tasks that weren't scored;
-	// total is len(tasks) at cycle start. Wired to a warning toast in main
-	// so the user knows tasks were skipped without log-diving. Fatal errors
-	// (DB failures) go through OnError.
-	OnTasksSkipped func(skipped, total int)
-	// OnError fires on fatal scoring errors (query, write, or scorer-returned
-	// errors that abort the cycle).
-	OnError func(err error)
+	// total is len(tasks) at cycle start. orgID is the scoring context
+	// so per-tenant subscribers (toasts in multi-mode) route to the
+	// right WS connection. Wired to a warning toast in main so the user
+	// knows tasks were skipped without log-diving. Fatal errors (DB
+	// failures) go through OnError.
+	OnTasksSkipped func(orgID string, skipped, total int)
+	// OnError fires on fatal scoring errors (query, write, or scorer-
+	// returned errors that abort the cycle). orgID identifies the
+	// tenant whose cycle failed; toast wiring in main.go scopes the
+	// user-facing notification accordingly.
+	OnError func(orgID string, err error)
 }
 
 // Runner manages AI scoring as a background process.
@@ -85,7 +93,7 @@ func (r *Runner) Trigger() {
 // reportError invokes the OnError callback if set.
 func (r *Runner) reportError(err error) {
 	if r.callbacks.OnError != nil {
-		r.callbacks.OnError(err)
+		r.callbacks.OnError(r.orgID, err)
 	}
 }
 
@@ -163,7 +171,7 @@ func (r *Runner) run(ctx context.Context) {
 	}
 
 	if r.callbacks.OnScoringStarted != nil {
-		r.callbacks.OnScoringStarted(taskIDs)
+		r.callbacks.OnScoringStarted(r.orgID, taskIDs)
 	}
 
 	scores, skippedTasks, err := ScoreTasks(ctx, r.database, r.entities, r.orgID, tasks)
@@ -201,7 +209,7 @@ func (r *Runner) run(ctx context.Context) {
 			}
 		}
 		if r.callbacks.OnTasksSkipped != nil {
-			r.callbacks.OnTasksSkipped(skippedTasks, len(tasks))
+			r.callbacks.OnTasksSkipped(r.orgID, skippedTasks, len(tasks))
 		}
 	}
 

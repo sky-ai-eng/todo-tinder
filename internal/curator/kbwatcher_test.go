@@ -65,7 +65,7 @@ func TestKnowledgeWatcher_FiresOnFileWriteInExistingKB(t *testing.T) {
 	}
 
 	rec := &recordingHub{}
-	w, err := NewKnowledgeWatcher(rec, root)
+	w, err := NewKnowledgeWatcher(rec, root, nil)
 	if err != nil {
 		t.Fatalf("new watcher: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestKnowledgeWatcher_FiresOnNewProjectAndKBCreatedAtRuntime(t *testing.T) {
 	// The watcher must add inner watches lazily and still emit.
 	root := t.TempDir()
 	rec := &recordingHub{}
-	w, err := NewKnowledgeWatcher(rec, root)
+	w, err := NewKnowledgeWatcher(rec, root, nil)
 	if err != nil {
 		t.Fatalf("new watcher: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestKnowledgeWatcher_FiresOnDelete(t *testing.T) {
 	}
 
 	rec := &recordingHub{}
-	w, err := NewKnowledgeWatcher(rec, root)
+	w, err := NewKnowledgeWatcher(rec, root, nil)
 	if err != nil {
 		t.Fatalf("new watcher: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestKnowledgeWatcher_DebouncesBurstOfWrites(t *testing.T) {
 	}
 
 	rec := &recordingHub{}
-	w, err := NewKnowledgeWatcher(rec, root)
+	w, err := NewKnowledgeWatcher(rec, root, nil)
 	if err != nil {
 		t.Fatalf("new watcher: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestKnowledgeWatcher_IgnoresChangesOutsideKnowledgeBase(t *testing.T) {
 	}
 
 	rec := &recordingHub{}
-	w, err := NewKnowledgeWatcher(rec, root)
+	w, err := NewKnowledgeWatcher(rec, root, nil)
 	if err != nil {
 		t.Fatalf("new watcher: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestKnowledgeWatcher_FiresWhenProjectAndKBImportedAtomically(t *testing.T) 
 	// content.
 	root := t.TempDir()
 	rec := &recordingHub{}
-	w, err := NewKnowledgeWatcher(rec, root)
+	w, err := NewKnowledgeWatcher(rec, root, nil)
 	if err != nil {
 		t.Fatalf("new watcher: %v", err)
 	}
