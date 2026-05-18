@@ -5,16 +5,17 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 )
 
 // handleGitHubRepos returns all repositories the authenticated user has access to.
 func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
-	creds, _ := auth.Load()
+	orgID := OrgIDFrom(r.Context())
+	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
 	if creds.GitHubPAT == "" || creds.GitHubURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GitHub not configured"})
 		return
@@ -198,7 +199,7 @@ func (s *Server) handleReposSave(w http.ResponseWriter, r *http.Request) {
 	// before the async callback starts.
 	if s.onGitHubChanged != nil {
 		s.MarkJiraRestarted()
-		go s.onGitHubChanged()
+		go s.onGitHubChanged(orgID)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "repos": len(req.Repos)})

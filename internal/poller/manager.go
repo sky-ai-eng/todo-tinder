@@ -12,6 +12,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/eventbus"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/tracker"
@@ -35,9 +36,10 @@ type Manager struct {
 	// argument. See the per-org loops in runGitHubCycle / runJiraCycle.
 	tasks    db.TaskStore
 	entities db.EntityStore
-	users    db.UsersStore // source of the session user's github_username
-	repos    db.RepoStore  // configured-repo names for GitHub poller startup
-	orgs     db.OrgsStore  // enumerate active orgs at each poll tick
+	users    db.UsersStore  // source of the session user's github_username
+	repos    db.RepoStore   // configured-repo names for GitHub poller startup
+	orgs     db.OrgsStore   // enumerate active orgs at each poll tick
+	secrets  db.SecretStore // integration creds via SecretStore (keychain in local, vault in multi)
 
 	// OnError fires when a poll cycle returns an error. Source is "github"
 	// or "jira"; orgID identifies the tenant whose cycle errored (empty
@@ -52,7 +54,7 @@ type Manager struct {
 	jiraStop chan struct{}
 }
 
-func NewManager(database *sql.DB, bus *eventbus.Bus, users db.UsersStore, tasks db.TaskStore, entities db.EntityStore, repos db.RepoStore, orgs db.OrgsStore) *Manager {
+func NewManager(database *sql.DB, bus *eventbus.Bus, users db.UsersStore, tasks db.TaskStore, entities db.EntityStore, repos db.RepoStore, orgs db.OrgsStore, secrets db.SecretStore) *Manager {
 	return &Manager{
 		database: database,
 		bus:      bus,
@@ -61,6 +63,7 @@ func NewManager(database *sql.DB, bus *eventbus.Bus, users db.UsersStore, tasks 
 		users:    users,
 		repos:    repos,
 		orgs:     orgs,
+		secrets:  secrets,
 	}
 }
 
@@ -85,19 +88,26 @@ func (m *Manager) reportError(source, orgID string, err error) {
 	}
 }
 
-// RestartAll stops all polling loops and restarts any that are fully configured.
-func (m *Manager) RestartAll() {
+// RestartAll stops all polling loops and restarts any that are fully
+// configured. orgID identifies the tenant whose credentials drive the
+// restart — in local mode that's runmode.LocalDefaultOrgID; in multi
+// mode this signature lets a future per-org Manager loop call Restart
+// per active org. The poller cycles themselves still iterate active
+// orgs internally for the per-org tracker dispatch — orgID here is
+// the credential-resolution scope (whose PAT do we boot the client
+// with), not the polling scope.
+func (m *Manager) RestartAll(ctx context.Context, orgID string) {
 	m.stopAll()
 
 	cfg, _ := config.Load()
-	creds, _ := auth.Load()
+	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 
 	m.startGitHub(cfg, creds)
 	m.startJira(cfg, creds)
 }
 
 // RestartGitHub stops and restarts only the GitHub polling loop.
-func (m *Manager) RestartGitHub() {
+func (m *Manager) RestartGitHub(ctx context.Context, orgID string) {
 	m.mu.Lock()
 	if m.ghStop != nil {
 		close(m.ghStop)
@@ -107,12 +117,12 @@ func (m *Manager) RestartGitHub() {
 	m.mu.Unlock()
 
 	cfg, _ := config.Load()
-	creds, _ := auth.Load()
+	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 	m.startGitHub(cfg, creds)
 }
 
 // RestartJira stops and restarts only the Jira polling loop.
-func (m *Manager) RestartJira() {
+func (m *Manager) RestartJira(ctx context.Context, orgID string) {
 	m.mu.Lock()
 	if m.jiraStop != nil {
 		close(m.jiraStop)
@@ -122,7 +132,7 @@ func (m *Manager) RestartJira() {
 	m.mu.Unlock()
 
 	cfg, _ := config.Load()
-	creds, _ := auth.Load()
+	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 	m.startJira(cfg, creds)
 }
 
@@ -132,8 +142,8 @@ func (m *Manager) StopAll() {
 }
 
 // Restart is a convenience alias for RestartAll.
-func (m *Manager) Restart() {
-	m.RestartAll()
+func (m *Manager) Restart(ctx context.Context, orgID string) {
+	m.RestartAll(ctx, orgID)
 }
 
 func (m *Manager) stopAll() {

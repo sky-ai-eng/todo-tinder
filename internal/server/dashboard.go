@@ -9,11 +9,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 )
 
 // handleDashboardStats returns aggregated PR statistics from entity snapshots.
@@ -23,7 +23,7 @@ func (s *Server) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, err := auth.Load()
+	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
 	if err != nil || creds.GitHubPAT == "" {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
@@ -57,7 +57,7 @@ func (s *Server) handleDashboardPRs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, err := auth.Load()
+	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
 	if err != nil || creds.GitHubPAT == "" {
 		writeJSON(w, http.StatusOK, []domain.PRSummaryRow{})
 		return
@@ -107,7 +107,11 @@ func (s *Server) handleDashboardPRStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	creds, err := auth.Load()
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
 	if err != nil || creds.GitHubPAT == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub not configured"})
 		return
@@ -161,7 +165,7 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	}
 	userID := ClaimsFrom(r.Context()).Subject
 
-	creds, _ := auth.Load()
+	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
 	cfg, _ := config.Load()
 	baseURL := cfg.GitHub.BaseURL
 	if baseURL == "" {

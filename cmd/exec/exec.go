@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -9,13 +10,15 @@ import (
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/chain"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/gh"
 	jiraexec "github.com/sky-ai-eng/triage-factory/cmd/exec/jira"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/runident"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/workspace"
-	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // Handle dispatches exec subcommands.
@@ -25,16 +28,10 @@ func Handle(args []string) {
 		return
 	}
 
-	// Load credentials for API access
-	creds, err := auth.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error loading credentials: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Open DB for local state (pending reviews, etc.). Config now lives
 	// in a settings row, so config.Load() requires an initialized DB —
-	// open + migrate before calling Init/Load.
+	// open + migrate before calling Init/Load. Credentials follow the
+	// same path — the SecretStore is wired off the DB.
 	conn, err := db.Open()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening database: %v\n", err)
@@ -70,21 +67,43 @@ func Handle(args []string) {
 	cmd := args[0]
 	cmdArgs := args[1:]
 
+	// Credentials route through the SecretStore. exec is invoked per-run
+	// with TRIAGE_FACTORY_RUN_ID; resolve the run's orgID so the
+	// SecretStore read is scoped to the right tenant. Local mode collapses
+	// to runmode.LocalDefaultOrgID, but the resolver shape stays multi-mode
+	// ready. Help paths skip the lookup so `--help` still works without a
+	// real run.
+	loadCreds := func() (string, string, string, string, error) {
+		ctx := context.Background()
+		ident, err := runident.ResolveRunIdentity(ctx, stores, os.Getenv(runident.RunIdentityEnvVar))
+		orgID := runmode.LocalDefaultOrgID
+		if err == nil {
+			orgID = ident.OrgID
+		}
+		c, lerr := integrations.Load(ctx, stores.Secrets, orgID)
+		return c.GitHubURL, c.GitHubPAT, c.JiraURL, c.JiraPAT, lerr
+	}
+
 	switch cmd {
 	case "gh":
 		if isHelp(cmdArgs) {
 			gh.Handle(nil, db.Stores{}, cmdArgs)
 			return
 		}
-		if creds.GitHubPAT == "" {
+		ghURL, ghPAT, _, _, lerr := loadCreds()
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "error loading credentials: %v\n", lerr)
+			os.Exit(1)
+		}
+		if ghPAT == "" {
 			fmt.Fprintln(os.Stderr, "GitHub not configured. Run triagefactory and complete setup first.")
 			os.Exit(1)
 		}
 		baseURL := cfg.GitHub.BaseURL
 		if baseURL == "" {
-			baseURL = creds.GitHubURL
+			baseURL = ghURL
 		}
-		client := ghclient.NewClient(baseURL, creds.GitHubPAT)
+		client := ghclient.NewClient(baseURL, ghPAT)
 		gh.Handle(client, stores, cmdArgs)
 
 	case "jira":
@@ -92,11 +111,16 @@ func Handle(args []string) {
 			jiraexec.Handle(nil, cmdArgs)
 			return
 		}
-		if creds.JiraPAT == "" || creds.JiraURL == "" {
+		_, _, jURL, jPAT, lerr := loadCreds()
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "error loading credentials: %v\n", lerr)
+			os.Exit(1)
+		}
+		if jPAT == "" || jURL == "" {
 			fmt.Fprintln(os.Stderr, "Jira not configured. Run triagefactory and complete setup first.")
 			os.Exit(1)
 		}
-		jClient := jiraclient.NewClient(creds.JiraURL, creds.JiraPAT)
+		jClient := jiraclient.NewClient(jURL, jPAT)
 		jiraexec.Handle(jClient, cmdArgs)
 
 	case "workspace":

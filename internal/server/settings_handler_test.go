@@ -135,8 +135,8 @@ func TestJiraProjectKeyRe(t *testing.T) {
 //
 // All of these bodies set *_enabled: true with empty URL/PAT so the handler
 // doesn't take the "disabled" branch (which clears credentials via
-// auth.ClearGitHub / auth.ClearJira — real keychain writes). Validation
-// short-circuits before any persistence on the rejection path.
+// integrations.ClearGitHub / integrations.ClearJira — real keychain writes).
+// Validation short-circuits before any persistence on the rejection path.
 
 // settingsPostBodyWithProject builds a request that exercises validation
 // of a single project's rules. The SKY-272 wire shape collapses Pickup,

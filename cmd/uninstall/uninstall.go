@@ -40,6 +40,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 )
 
 // Handle dispatches the uninstall subcommand.
@@ -71,7 +72,7 @@ func Handle(args []string) {
 			os.Exit(1)
 		}
 
-		if err := auth.Clear(); err != nil {
+		if err := clearAllSecrets(); err != nil {
 			fmt.Fprintf(os.Stderr, "  warn: clear keychain: %v\n", err)
 			fmt.Println()
 			fmt.Println("triagefactory uninstall: completed with warnings (see above).")
@@ -149,7 +150,7 @@ func Handle(args []string) {
 		}
 	}
 
-	if err := auth.Clear(); err != nil {
+	if err := clearAllSecrets(); err != nil {
 		fmt.Fprintf(os.Stderr, "  warn: clear keychain: %v\n", err)
 		failed = true
 	} else {
@@ -445,6 +446,21 @@ func plural(n int, singular, plural string) string {
 		return singular
 	}
 	return plural
+}
+
+// clearAllSecrets removes every credential key the SecretStore
+// manages plus any legacy keys still swept on Clear. Uninstall is
+// single-process, local-only, with no DB context, so it bypasses the
+// SecretStore seam and calls the low-level keychain helpers directly
+// — but the key list comes from integrations.AllKeys() so this stays
+// in sync as new keys land.
+func clearAllSecrets() error {
+	for _, k := range integrations.AllKeys() {
+		if err := auth.DeleteSecret(k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func fail(format string, args ...any) {
