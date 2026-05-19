@@ -582,7 +582,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	// — scoring a user-claimed task is harmless dormant work rather than
 	// the wrong-status skip the old comment described.
 	if queued > 0 && s.scorerTrigger != nil {
-		s.scorerTrigger()
+		s.scorerTrigger(orgID)
 	}
 
 	// Success toast with the per-action breakdown when at least one ticket

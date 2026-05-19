@@ -591,7 +591,7 @@ func main() {
 	// Actual initialization happens below after the spawner is created.
 	var eventRouter *routing.Router
 
-	scorer := ai.NewRunner(database, stores.Scores, stores.Entities, runmode.LocalDefaultOrg, ai.RunnerCallbacks{
+	scorer := ai.NewManager(database, stores.Scores, stores.Entities, ai.RunnerCallbacks{
 		OnScoringStarted: func(orgID string, taskIDs []string) {
 			wsHub.Broadcast(websocket.Event{
 				Type:  "scoring_started",
@@ -621,20 +621,18 @@ func main() {
 		},
 	})
 	scorer.SetProfileGate(profileGate.Ready)
-	scorer.Start()
 	srv.SetScorerTrigger(scorer.Trigger)
-	log.Println("[ai] scorer started (model: haiku)")
+	log.Println("[ai] scorer manager ready (per-org runners, model: haiku)")
 
 	// Subscriber: scorer trigger — only reacts to poll-complete sentinels.
-	// System-service profile (D9a): one scorer per process today, gets
-	// triggered by any tenant's poll completion. D9c's per-org poller
-	// loops will continue to fan poll-complete sentinels here regardless
-	// of OrgID — the scorer rotates through orgs internally.
+	// Per-org pollers emit one sentinel per (org, source); the Manager
+	// routes each to that org's Runner so a slow scoring cycle on one
+	// tenant doesn't block others' min_autonomy_suitability triggers.
 	bus.Subscribe(eventbus.Subscriber{
 		Name:   "scorer",
 		Filter: []string{"system:poll:"},
 		Handle: func(evt domain.Event) {
-			scorer.Trigger()
+			scorer.Trigger(evt.OrgID)
 		},
 	})
 
@@ -842,7 +840,7 @@ func main() {
 				}
 				profileGate.Signal()
 				pollerMgr.RestartAll(context.Background(), orgID)
-				scorer.Trigger()
+				scorer.Trigger(orgID)
 				bootstrapBareClones(database, stores.Repos)
 			}()
 		} else {
@@ -954,7 +952,7 @@ func main() {
 			}
 			profileGate.Signal()
 			pollerMgr.RestartAll(context.Background(), orgID)
-			scorer.Trigger()
+			scorer.Trigger(orgID)
 			bootstrapBareClones(database, stores.Repos)
 		}()
 	} else {

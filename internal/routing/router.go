@@ -20,8 +20,12 @@ import (
 )
 
 // Scorer is the minimal interface the router needs from the AI runner.
+// Trigger takes the event's orgID so the per-org scoring Manager kicks
+// the right tenant's Runner — a single-Trigger() across all orgs would
+// head-of-line-block min_autonomy_suitability triggers on the slowest
+// org's scoring cycle.
 type Scorer interface {
-	Trigger()
+	Trigger(orgID string)
 }
 
 // Delegator is the minimal interface the router needs from the delegate
@@ -345,7 +349,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	}
 
 	// Step 8: Enqueue AI scoring (always — produces UI metadata regardless).
-	r.scorer.Trigger()
+	r.scorer.Trigger(orgID)
 
 	// Broadcast task update to frontend.
 	r.ws.Broadcast(websocket.Event{Type: "tasks_updated", OrgID: orgID, Data: map[string]any{}})
