@@ -285,6 +285,9 @@ func (s *Server) installationToken(ctx context.Context) (Token, error) {
 	if tok.ExpiresAt.IsZero() {
 		return Token{}, errors.New("token source returned zero expires_at")
 	}
+	if !tok.ExpiresAt.After(now.Add(refreshThreshold)) {
+		return Token{}, fmt.Errorf("token source returned expired or near-expiry token (expires_at=%s)", tok.ExpiresAt.Format(time.RFC3339))
+	}
 	s.cachedToken = tok
 	s.cachedNonces.Add(1)
 	return tok, nil
