@@ -231,7 +231,10 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		if err := chownWorktreeForSandbox(workCwd); err != nil {
 			return nil, fmt.Errorf("sandbox: chown worktree: %w", err)
 		}
-		sbEnv := buildSandboxEnv(opts.ExtraEnv)
+		// Translate any host-path env values (e.g. TRIAGE_FACTORY_RUN_ROOT)
+		// to /work-relative paths before the sandbox sees them.
+		sbExtraEnv := translateEnvForSandbox(opts.ExtraEnv, workCwd)
+		sbEnv := buildSandboxEnv(sbExtraEnv)
 
 		// Translate AddDirs (host paths under workCwd) into their
 		// /work-relative equivalents inside the sandbox. Without this

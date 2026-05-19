@@ -72,6 +72,99 @@ func TestTranslateAddDirsForSandbox(t *testing.T) {
 	}
 }
 
+func TestTranslateEnvForSandbox(t *testing.T) {
+	cases := []struct {
+		name string
+		env  []string
+		cwd  string
+		want []string
+	}{
+		{
+			name: "nil_input",
+			env:  nil,
+			cwd:  "/data/worktrees/abc",
+			want: nil,
+		},
+		{
+			name: "non_path_values_passthrough",
+			env: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_REPO=owner/repo",
+				"TRIAGE_FACTORY_REVIEW_PREVIEW=1",
+			},
+			cwd: "/data/worktrees/abc",
+			want: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_REPO=owner/repo",
+				"TRIAGE_FACTORY_REVIEW_PREVIEW=1",
+			},
+		},
+		{
+			name: "abs_path_under_cwd_translates",
+			env:  []string{"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"TRIAGE_FACTORY_RUN_ROOT=/work"},
+		},
+		{
+			name: "abs_subpath_under_cwd_translates",
+			env:  []string{"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc/_scratch"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"TRIAGE_FACTORY_RUN_ROOT=/work/_scratch"},
+		},
+		{
+			name: "abs_path_outside_cwd_dropped",
+			env:  []string{"JAVA_HOME=/usr/lib/jvm/openjdk"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{},
+		},
+		{
+			name: "mixed_keep_translate_drop",
+			env: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc",
+				"JAVA_HOME=/usr/lib/jvm/openjdk",
+			},
+			cwd: "/data/worktrees/abc",
+			want: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_RUN_ROOT=/work",
+			},
+		},
+		{
+			name: "empty_cwd_drops_abs_paths_keeps_others",
+			env: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc",
+			},
+			cwd: "",
+			want: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+			},
+		},
+		{
+			name: "malformed_no_equals_passthrough",
+			env:  []string{"NOT_A_VALID_ENTRY"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"NOT_A_VALID_ENTRY"},
+		},
+		{
+			name: "empty_value_passthrough",
+			env:  []string{"TRIAGE_FACTORY_RUN_ROOT="},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"TRIAGE_FACTORY_RUN_ROOT="},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := translateEnvForSandbox(c.env, c.cwd)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("translateEnvForSandbox(%v, %q) = %v, want %v",
+					c.env, c.cwd, got, c.want)
+			}
+		})
+	}
+}
+
 // TestTranslateAddDirsForSandbox_DropsSymlinkEscapes pins the
 // defensive drop for paths that look in-tree but resolve outside.
 // Pure filepath.Rel-level check — doesn't follow symlinks (the

@@ -90,6 +90,58 @@ func chownWorktreeForSandbox(worktree string) error {
 	})
 }
 
+// translateEnvForSandbox rewrites absolute host paths embedded in env
+// var values to their /work-relative sandbox equivalents. The shape
+// matches translateAddDirsForSandbox: same workCwd, same drop-on-
+// outside-cwd policy, same pass-through for empty/non-path values.
+//
+// Why: delegate/resume callers set TRIAGE_FACTORY_RUN_ROOT to a host
+// path (e.g. /data/worktrees/<run>) so the agent's memory-gate retry
+// message can reference an absolute "$TRIAGE_FACTORY_RUN_ROOT/_scratch/
+// entity-memory/<id>.md" path. Inside the sandbox that host path
+// doesn't exist — the run root is bind-mounted at /work — so the agent
+// would write to a path that resolves to nothing. Translate before
+// passing to the sandbox so the env var points where the agent can
+// actually reach.
+//
+// Heuristic: only values matching filepath.IsAbs are candidates for
+// translation. Non-absolute values (IDs, flags, "owner/repo" strings)
+// pass through unchanged. Absolute paths outside workCwd are dropped
+// rather than left dangling — the sandbox can't reach them, and a
+// dangling host path in the env is more confusing than a missing var.
+func translateEnvForSandbox(env []string, workCwd string) []string {
+	if len(env) == 0 {
+		return env
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			// Malformed entry (no '='); pass through verbatim and
+			// let the caller's downstream env handling deal with it.
+			out = append(out, kv)
+			continue
+		}
+		key, val := kv[:eq], kv[eq+1:]
+		if val == "" || !filepath.IsAbs(val) {
+			out = append(out, kv)
+			continue
+		}
+		if workCwd == "" {
+			// No cwd to relativize against — host path can't be
+			// translated; drop to avoid leaking it into the sandbox.
+			continue
+		}
+		rel, err := filepath.Rel(workCwd, val)
+		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+			// Absolute host path outside workCwd. Drop.
+			continue
+		}
+		out = append(out, key+"="+filepath.Join("/work", rel))
+	}
+	return out
+}
+
 // translateAddDirsForSandbox rewrites the host paths in opts.AddDirs
 // into their sandbox-side equivalents under /work. The agent's tool
 // permission checks consume these via `--add-dir` flags; if we
