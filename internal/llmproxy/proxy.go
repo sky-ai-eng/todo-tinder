@@ -237,6 +237,9 @@ func (s *Server) Handler() http.Handler { return s.proxy }
 // case (binding to the host-side veth IP, e.g. 192.168.99.1) is the
 // legitimate non-loopback use case and opts in via the Config flag.
 func (s *Server) Start(addr string) (string, error) {
+	if s.httpSrv != nil {
+		return "", errors.New("llmproxy: already started; create a new Server per run")
+	}
 	if addr == "" {
 		addr = "127.0.0.1:0"
 	}

@@ -289,6 +289,32 @@ func TestProxyUpstreamWithTrailingSlash(t *testing.T) {
 	}
 }
 
+// TestProxyStartRejectsDoubleStart pins that calling Start twice on the
+// same Server returns an error rather than silently leaking the first
+// listener. Server is documented as per-run; a double-Start is a caller
+// bug that should fail loudly.
+func TestProxyStartRejectsDoubleStart(t *testing.T) {
+	srv, err := llmproxy.New(llmproxy.Config{
+		Provider: llmproxy.ProviderAnthropic,
+		APIKey:   "k",
+		Upstream: "https://api.anthropic.com",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := srv.Start(""); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	if _, err := srv.Start(""); err == nil {
+		t.Error("second Start returned nil error; want already-started error")
+	}
+}
+
 // TestProxyStartRejectsNonLoopback pins the safety default: binding
 // to anything other than loopback returns an error unless the caller
 // has explicitly set AllowNonLoopback. Without this, a caller doing
