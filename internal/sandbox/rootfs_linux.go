@@ -21,7 +21,7 @@ import (
 // the SDK depends on.
 const (
 	alpineRootfsURL    = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz"
-	alpineRootfsSHA256 = "f4f5ed83a611d3d2d27ff37d8d019e96e1c405d83e51b8d553fc36f4d0ad6c00"
+	alpineRootfsSHA256 = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
 )
 
 // rootfsCacheOnce protects single-installation of the cached rootfs.
