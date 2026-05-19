@@ -186,9 +186,12 @@ func TestLive_GitCloneThroughProxy(t *testing.T) {
 	}
 	m, installID := liveMinter(t)
 
-	// Bind on the loopback IP, opt-in non-loopback so the proxy URL
-	// is reachable from a child running under different uid/gid in
-	// future sandbox integration. For this test, 127.0.0.1 works.
+	// Bind on the default loopback address — Start("") below resolves
+	// to 127.0.0.1:0. The future sandbox-veth case (binding to the
+	// host-side veth IP) requires AllowNonLoopback=true, but that's
+	// wired up at SKY-254 integration time; for the live-test path
+	// here, loopback is sufficient and avoids needing routable
+	// interface coordination.
 	srv, err := gitproxy.New(gitproxy.Config{
 		TokenSource: liveTokenSource(m, installID),
 		Upstream:    "https://github.com",

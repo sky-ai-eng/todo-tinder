@@ -1,11 +1,13 @@
 package gitproxy_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -391,6 +393,90 @@ func TestProxyTokenSourceFailureReturns502(t *testing.T) {
 	}
 }
 
+// TestProxyRejectsCONNECT pins that CONNECT requests fail fast with
+// 501. A git client configured with http.proxy=<this> AND an https://
+// remote URL would issue CONNECT to tunnel TLS; once tunneled, the
+// traffic is opaque end-to-end TLS and the proxy can't inject the
+// installation token. Failing with a clear error surfaces the misconfig
+// instead of producing a confusing connection drop or 502.
+func TestProxyRejectsCONNECT(t *testing.T) {
+	rec := &fakeUpstreamRecord{}
+	upstream := fakeGitHub(rec)
+	defer upstream.Close()
+
+	ts := &constantTokenSource{value: "ghs_x", expiresAt: time.Now().Add(time.Hour)}
+	_, proxyURL := startProxy(t, ts.source, upstream.URL)
+
+	// Drive a CONNECT directly via a raw TCP connection to the proxy.
+	// Going through http.Client/DefaultTransport would route via the
+	// process's HTTP_PROXY env var (which CI runners often set), so
+	// the request would never reach our proxy. Raw TCP avoids all
+	// that and exercises exactly what a git client would do.
+	addr := strings.TrimPrefix(proxyURL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501 Not Implemented for CONNECT", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "CONNECT not supported") {
+		t.Errorf("body = %q; want explanation mentioning CONNECT", body)
+	}
+	// Token must not be touched on a rejected method — the mint cost is
+	// preserved for legitimate requests.
+	if rec.hits.Load() != 0 {
+		t.Errorf("upstream received %d hits on CONNECT; want 0", rec.hits.Load())
+	}
+}
+
+// TestProxyStripsProxyAuthorization pins that any Proxy-Authorization
+// header on an inbound request is dropped before forwarding to GitHub.
+// If the agent's git is misconfigured with proxy credentials (or some
+// inherited config), the header would otherwise leak those credentials
+// upstream. httputil.ReverseProxy strips hop-by-hop headers by default,
+// but we do it explicitly as defense in depth.
+func TestProxyStripsProxyAuthorization(t *testing.T) {
+	rec := &fakeUpstreamRecord{}
+	gotHeaders := http.Header{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.hits.Add(1)
+		rec.record(r)
+		gotHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	ts := &constantTokenSource{value: "ghs_x", expiresAt: time.Now().Add(time.Hour)}
+	_, proxyURL := startProxy(t, ts.source, upstream.URL)
+
+	req, _ := http.NewRequest("GET", proxyURL+"/x.git/info/refs", nil)
+	req.Header.Set("Proxy-Authorization", "Basic Y2FsbGVyOnNlY3JldA==")
+	req.Header.Set("Proxy-Connection", "keep-alive")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("roundtrip: %v", err)
+	}
+	defer resp.Body.Close()
+
+	for _, h := range []string{"Proxy-Authorization", "Proxy-Connection"} {
+		if v := gotHeaders.Get(h); v != "" {
+			t.Errorf("upstream saw %s = %q; want stripped (credential leak risk)", h, v)
+		}
+	}
+}
+
 // TestProxyForwardsHostHeader confirms the Host header sent to the
 // upstream matches the upstream's hostname, not the proxy's. GitHub's
 // edge has been observed rejecting requests where Host doesn't match
@@ -725,16 +811,17 @@ func TestPropertyB_TokenNotObservableInChildProcess(t *testing.T) {
 
 	// Run git against an http:// URL so it uses HTTP forward-proxy
 	// mode (not CONNECT-tunneled HTTPS, which a reverse-proxy listener
-	// can't terminate without a custom CA). The remote URL's host is
-	// irrelevant: in forward-proxy mode git sends the absolute URI to
-	// the proxy and our proxy rewrites the destination to Upstream
-	// (the local httptest server). Using a .invalid TLD guarantees no
-	// real DNS lookup ever succeeds, so a regression that bypassed the
-	// proxy would fail loudly rather than silently leak to the
-	// internet.
+	// can't terminate without a custom CA). The URL points at the
+	// upstream's actual host: in forward-proxy mode our proxy rewrites
+	// the destination anyway, but pointing at the local httptest host
+	// avoids any libcurl version quirk that might pre-validate the
+	// target hostname before sending the absolute URI to the proxy.
+	// The proxy is what we're testing the leak guarantees about, not
+	// the URL hostname.
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, gitBin, "ls-remote", "http://gitproxy-test.invalid/owner/repo.git")
+	cmd := exec.CommandContext(ctx, gitBin, "ls-remote", "http://"+upstreamHost+"/owner/repo.git")
 	cmd.Env = childEnv
 	cmd.Dir = tmpHome
 	// Capture combined output so we can also grep for the token in

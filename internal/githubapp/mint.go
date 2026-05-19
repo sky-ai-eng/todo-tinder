@@ -153,9 +153,12 @@ func NewMinter(cfg Config) (*Minter, error) {
 	if base == "" {
 		base = defaultAPIBase
 	}
-	// Strip a single trailing slash so callers can pass either
-	// "https://api.github.com" or "https://api.github.com/" without a
-	// resulting "//app/installations/..." in the request URL.
+	// Strip any trailing slashes so callers can pass
+	// "https://api.github.com", "https://api.github.com/", or even an
+	// accidental "https://api.github.com//" without a resulting
+	// "//app/installations/..." in the request URL. TrimRight removes
+	// all of them, which is what we want — there is no shape where a
+	// trailing slash on the API base is semantically meaningful.
 	base = strings.TrimRight(base, "/")
 	if err := validateAPIBase(base); err != nil {
 		return nil, err

@@ -232,8 +232,21 @@ func New(cfg Config) (*Server, error) {
 // to the underlying ReverseProxy: a failure to mint a token surfaces
 // as a 502 here rather than via the ReverseProxy's silent-pass-broken-
 // auth path.
+//
+// CONNECT requests are rejected explicitly with 501. Git clients
+// configured with http.proxy=<this> AND an https:// remote URL would
+// issue CONNECT to tunnel TLS through the proxy; once tunneled, the
+// traffic is opaque end-to-end TLS that we cannot inject credentials
+// into. Failing fast with a clear error here surfaces the misconfig
+// instead of producing an authenticated-looking but unauth'd request.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			http.Error(w,
+				"gitproxy: CONNECT not supported; use http:// remote URLs so the proxy can inject credentials (https:// would tunnel TLS opaquely)",
+				http.StatusNotImplemented)
+			return
+		}
 		tok, err := s.installationToken(r.Context())
 		if err != nil {
 			// 502 Bad Gateway maps cleanly: the proxy is alive but the
@@ -316,6 +329,16 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.Header.Del("X-Forwarded-Host")
 	pr.Out.Header.Del("X-Forwarded-Proto")
 	pr.Out.Header.Del("Forwarded")
+
+	// Strip proxy-auth headers explicitly. httputil.ReverseProxy
+	// already removes hop-by-hop headers (RFC 7230 §6.1 — Proxy-
+	// Authorization and Proxy-Connection are in that set) but we
+	// belt-and-braces this: if the agent's git is misconfigured with
+	// proxy credentials, or a future stdlib change ever weakened the
+	// hop-by-hop filter, forwarding Proxy-Authorization would leak
+	// those credentials to GitHub.
+	pr.Out.Header.Del("Proxy-Authorization")
+	pr.Out.Header.Del("Proxy-Connection")
 
 	tok, _ := pr.In.Context().Value(tokenCtxKey{}).(string)
 	if tok == "" {
@@ -416,9 +439,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // the proxy.
 func (s *Server) RequestCount() int64 { return s.requestCount.Load() }
 
-// MintCount returns the number of times TokenSource has been invoked.
+// MintCount returns the number of successful TokenSource invocations
+// (i.e. mints whose returned token passed validation and was cached).
+// TokenSource calls that returned an error or a stale/invalid token
+// are NOT counted — those produce a 502 and the cache is unchanged.
+//
 // Exposed so tests can verify caching behavior (first request mints;
-// subsequent requests reuse).
+// subsequent requests reuse). Tests asserting "mint was attempted at
+// all" should pin upstream hits or response status instead, since a
+// failed attempt is still observable via the 502 it produces.
 func (s *Server) MintCount() int64 { return s.cachedNonces.Load() }
 
 // timeNow returns the current time, honoring the testable now hook.
