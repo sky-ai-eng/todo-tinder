@@ -153,9 +153,13 @@ type Server struct {
 	// tokenMu serializes token cache access. The cache is a single
 	// (value, expiry) tuple; concurrent requests during refresh
 	// coalesce on the mutex rather than thundering-herd the minter.
-	tokenMu      sync.Mutex
-	cachedToken  Token
-	cachedNonces atomic.Int64 // total mint-source invocations; observable for tests
+	tokenMu     sync.Mutex
+	cachedToken Token
+	// cachedNonces counts the number of successful mint-and-cache
+	// cycles (TokenSource returned a valid token and we wrote it to
+	// cachedToken). Failed TokenSource calls produce a 502 and do
+	// NOT increment this. Observable via MintCount() for tests.
+	cachedNonces atomic.Int64
 
 	// listener is owned once Start has been called. nil until then.
 	listener net.Listener
@@ -205,11 +209,12 @@ func New(cfg Config) (*Server, error) {
 	// cross cleartext. Loopback http is permitted for httptest in unit
 	// tests; real GitHub / GHE are https.
 	if u.Scheme != "https" {
-		host, _, _ := net.SplitHostPort(u.Host)
-		if host == "" {
-			host = u.Host
-		}
-		ip := net.ParseIP(host)
+		// u.Hostname() strips the port AND the IPv6 brackets, so it
+		// works for "127.0.0.1:8080", "[::1]:8080", and "[::1]" alike.
+		// Doing this by hand with net.SplitHostPort would reject the
+		// port-less IPv6 literal because SplitHostPort returns an error
+		// and the bracket form ("[::1]") then fails net.ParseIP.
+		ip := net.ParseIP(u.Hostname())
 		if ip == nil || !ip.IsLoopback() {
 			return nil, fmt.Errorf("gitproxy: upstream %q must use https (loopback http is allowed for tests)", upstream)
 		}

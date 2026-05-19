@@ -619,6 +619,30 @@ func TestProxyUpstreamTrailingSlashAccepted(t *testing.T) {
 	}
 }
 
+// TestProxyUpstreamLoopbackHTTPVariants pins that loopback http
+// upstreams parse correctly for both IPv4 and IPv6 forms, with and
+// without an explicit port. The IPv6-no-port case is the regression
+// guard: bare "[::1]" leaves u.Host bracketed, and a naive
+// SplitHostPort + ParseIP would reject it.
+func TestProxyUpstreamLoopbackHTTPVariants(t *testing.T) {
+	ts := func(ctx context.Context) (gitproxy.Token, error) {
+		return gitproxy.Token{Value: "x", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}
+	cases := []string{
+		"http://127.0.0.1",
+		"http://127.0.0.1:8080",
+		"http://[::1]",
+		"http://[::1]:8080",
+	}
+	for _, upstream := range cases {
+		t.Run(upstream, func(t *testing.T) {
+			if _, err := gitproxy.New(gitproxy.Config{TokenSource: ts, Upstream: upstream}); err != nil {
+				t.Errorf("loopback http upstream %q should be accepted: %v", upstream, err)
+			}
+		})
+	}
+}
+
 // TestProxyStartRejectsDoubleStart pins that a second Start fails
 // rather than silently leaking the first listener.
 func TestProxyStartRejectsDoubleStart(t *testing.T) {

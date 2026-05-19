@@ -196,11 +196,12 @@ func validateAPIBase(base string) error {
 		return fmt.Errorf("githubapp: APIBase %q must not include query or fragment", base)
 	}
 	if u.Scheme != "https" {
-		host, _, _ := net.SplitHostPort(u.Host)
-		if host == "" {
-			host = u.Host
-		}
-		ip := net.ParseIP(host)
+		// u.Hostname() strips the port AND the IPv6 brackets, so it
+		// works for "127.0.0.1:8080", "[::1]:8080", and "[::1]" alike.
+		// Doing this by hand with net.SplitHostPort would reject the
+		// port-less IPv6 literal because SplitHostPort returns an error
+		// and the bracket form ("[::1]") then fails net.ParseIP.
+		ip := net.ParseIP(u.Hostname())
 		if ip == nil || !ip.IsLoopback() {
 			return fmt.Errorf("githubapp: APIBase %q must use https (loopback http is allowed for tests)", base)
 		}

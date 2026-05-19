@@ -142,7 +142,9 @@ func TestNewMinter_AcceptsValidAPIBase(t *testing.T) {
 		"https://api.github.com/",
 		"https://ghe.example.com/api/v3", // GHE — non-empty path is allowed
 		"http://127.0.0.1:8080",          // loopback http is permitted for httptest
+		"http://127.0.0.1",               // loopback http without explicit port
 		"http://[::1]:8080",              // IPv6 loopback for httptest
+		"http://[::1]",                   // IPv6 loopback without explicit port (bracket-handling regression)
 	}
 	for _, base := range cases {
 		t.Run(base, func(t *testing.T) {
@@ -427,9 +429,10 @@ func TestMintInstallationToken_RejectsMalformedResponse(t *testing.T) {
 // HTTP roundtrip. Important so a run cancellation actually propagates
 // to in-flight credential operations.
 func TestMintInstallationToken_RespectsContextCancellation(t *testing.T) {
-	// Upstream that blocks long enough for the cancel to bite.
-	block := make(chan struct{})
-	defer close(block)
+	// Upstream that blocks until the client's context is cancelled —
+	// the natural stop signal here is r.Context().Done(), which fires
+	// when the test cancels the outer context below. No separate
+	// channel is needed.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 	}))
