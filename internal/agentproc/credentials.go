@@ -199,11 +199,25 @@ func resolveCredentials(ctx context.Context, secrets SecretsReader, orgID string
 	}
 	if apiKey != "" {
 		env := map[string]string{"ANTHROPIC_API_KEY": apiKey}
-		baseURL, _ := secrets.Get(ctx, orgID, secretAnthropicBaseURL)
+		// Optional fields: a Get error here is a real backend failure
+		// (the primary key read above already succeeded, so the backend
+		// is reachable). Propagate so a transient vault hiccup surfaces
+		// at the call site instead of silently dropping the gateway URL
+		// or proxy bearer and continuing with partial config — which
+		// would manifest later as opaque SDK auth errors. Missing
+		// secrets come back as ("", nil) and are handled by the
+		// non-empty checks below.
+		baseURL, err := secrets.Get(ctx, orgID, secretAnthropicBaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("resolve anthropic_base_url: %w", err)
+		}
 		if baseURL != "" {
 			env["ANTHROPIC_BASE_URL"] = baseURL
 		}
-		authToken, _ := secrets.Get(ctx, orgID, secretAnthropicAuthMode)
+		authToken, err := secrets.Get(ctx, orgID, secretAnthropicAuthMode)
+		if err != nil {
+			return nil, fmt.Errorf("resolve anthropic_auth_token: %w", err)
+		}
 		if authToken != "" {
 			env["ANTHROPIC_AUTH_TOKEN"] = authToken
 		}
@@ -224,11 +238,17 @@ func resolveCredentials(ctx context.Context, secrets SecretsReader, orgID string
 			"AWS_BEARER_TOKEN_BEDROCK": bedrockBearer,
 			"CLAUDE_CODE_USE_BEDROCK":  "1",
 		}
-		region, _ := secrets.Get(ctx, orgID, secretAWSRegion)
+		region, err := secrets.Get(ctx, orgID, secretAWSRegion)
+		if err != nil {
+			return nil, fmt.Errorf("resolve aws_region: %w", err)
+		}
 		if region != "" {
 			env["AWS_REGION"] = region
 		}
-		modelID, _ := secrets.Get(ctx, orgID, secretBedrockModelID)
+		modelID, err := secrets.Get(ctx, orgID, secretBedrockModelID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve bedrock_model_id: %w", err)
+		}
 		if modelID != "" {
 			env["ANTHROPIC_MODEL"] = modelID
 		}
@@ -257,15 +277,24 @@ func resolveCredentials(ctx context.Context, secrets SecretsReader, orgID string
 			"AWS_SECRET_ACCESS_KEY":   secretKey,
 			"CLAUDE_CODE_USE_BEDROCK": "1",
 		}
-		sessionTok, _ := secrets.Get(ctx, orgID, secretAWSSessionToken)
+		sessionTok, err := secrets.Get(ctx, orgID, secretAWSSessionToken)
+		if err != nil {
+			return nil, fmt.Errorf("resolve aws_session_token: %w", err)
+		}
 		if sessionTok != "" {
 			env["AWS_SESSION_TOKEN"] = sessionTok
 		}
-		region, _ := secrets.Get(ctx, orgID, secretAWSRegion)
+		region, err := secrets.Get(ctx, orgID, secretAWSRegion)
+		if err != nil {
+			return nil, fmt.Errorf("resolve aws_region: %w", err)
+		}
 		if region != "" {
 			env["AWS_REGION"] = region
 		}
-		modelID, _ := secrets.Get(ctx, orgID, secretBedrockModelID)
+		modelID, err := secrets.Get(ctx, orgID, secretBedrockModelID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve bedrock_model_id: %w", err)
+		}
 		if modelID != "" {
 			env["ANTHROPIC_MODEL"] = modelID
 		}
@@ -311,8 +340,13 @@ func mergeEnv(parentEnv, extraEnv []string, creds map[string]string) []string {
 }
 
 // filterEnv returns a copy of env with any KEY=... entry whose KEY
-// is in remove dropped. Case-sensitive on the key, matching OS env
-// semantics on every platform we ship to.
+// is in remove dropped. Case-sensitive match on the key — matches
+// POSIX env semantics (the load-bearing target since multi-mode
+// + gVisor requires Linux). Windows env var names are case-
+// insensitive at the OS layer, so a parent's "Anthropic_Api_Key"
+// would slip past the leak guard there; that's acceptable because
+// Windows is only a local-mode target where the leak guard's
+// multi-tenant rationale doesn't apply.
 func filterEnv(env, remove []string) []string {
 	if len(remove) == 0 {
 		return append([]string(nil), env...)

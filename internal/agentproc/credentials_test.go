@@ -12,14 +12,25 @@ import (
 // fakeSecrets backs the resolver tests with an in-memory map. Returns
 // ("", nil) for missing keys — matches the real SecretStore.Get
 // contract.
+//
+// errOnKey lets a single key fail mid-resolution while the rest of
+// the bag stays readable. Used by the optional-field error-
+// propagation tests to simulate a transient backend hiccup that
+// the primary key read survives but a subsequent optional read
+// trips.
 type fakeSecrets struct {
-	values map[string]map[string]string // orgID → key → value
-	err    error
+	values    map[string]map[string]string // orgID → key → value
+	err       error
+	errOnKey  string
+	errForKey error
 }
 
 func (f *fakeSecrets) Get(_ context.Context, orgID, key string) (string, error) {
 	if f.err != nil {
 		return "", f.err
+	}
+	if f.errOnKey != "" && key == f.errOnKey {
+		return "", f.errForKey
 	}
 	return f.values[orgID][key], nil
 }
@@ -365,10 +376,66 @@ func containsKey(env []string, want string) bool {
 	return false
 }
 
-// TestCredentialEnvKeysSorted catches accidental duplication or
-// drift in the leak-guard list — drift here weakens the multi-mode
-// safety net silently.
-func TestCredentialEnvKeysSorted(t *testing.T) {
+// TestResolveCredentials_OptionalAnthropicFieldErrorsPropagate
+// pins that a backend hiccup mid-resolution surfaces as a real
+// error instead of being silently dropped. Without this, an
+// admin-UI write that succeeded for the primary key but failed
+// for the gateway base URL would resolve to "Anthropic configured,
+// no gateway" — and the run would route directly to api.anthropic.com
+// bypassing the org's required proxy, an exfil risk on top of the
+// obvious misconfiguration signal lost.
+func TestResolveCredentials_OptionalAnthropicFieldErrorsPropagate(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	const orgID = "99999999-9999-9999-9999-999999999999"
+	secrets := &fakeSecrets{
+		values: map[string]map[string]string{
+			orgID: {"anthropic_api_key": "sk-ant-primary-ok"},
+		},
+		errOnKey:  "anthropic_base_url",
+		errForKey: errors.New("vault transient"),
+	}
+
+	_, err := resolveCredentials(context.Background(), secrets, orgID)
+	if err == nil {
+		t.Fatal("optional field error swallowed; resolver should propagate")
+	}
+	if !strings.Contains(err.Error(), "anthropic_base_url") {
+		t.Errorf("err = %v; want it to name anthropic_base_url so debugging is obvious", err)
+	}
+}
+
+// TestResolveCredentials_OptionalBedrockFieldErrorsPropagate is the
+// Bedrock-bearer-path mirror of the Anthropic case above. Pins the
+// fix for Copilot finding 3 on PR #213.
+func TestResolveCredentials_OptionalBedrockFieldErrorsPropagate(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	const orgID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	secrets := &fakeSecrets{
+		values: map[string]map[string]string{
+			orgID: {
+				"aws_access_key_id":     "AKIA-ok",
+				"aws_secret_access_key": "secret-ok",
+			},
+		},
+		errOnKey:  "aws_session_token",
+		errForKey: errors.New("vault transient"),
+	}
+
+	_, err := resolveCredentials(context.Background(), secrets, orgID)
+	if err == nil {
+		t.Fatal("optional Bedrock field error swallowed; resolver should propagate")
+	}
+	if !strings.Contains(err.Error(), "aws_session_token") {
+		t.Errorf("err = %v; want it to name aws_session_token", err)
+	}
+}
+
+// TestCredentialEnvKeysWellFormed catches accidental duplication
+// or casing drift in the leak-guard list — drift here weakens the
+// multi-mode safety net silently. Doesn't enforce alphabetical
+// order (the list is grouped by category for readability), just
+// no-dupes + upper-case.
+func TestCredentialEnvKeysWellFormed(t *testing.T) {
 	seen := make(map[string]struct{}, len(credentialEnvKeys))
 	for _, k := range credentialEnvKeys {
 		if _, dup := seen[k]; dup {
