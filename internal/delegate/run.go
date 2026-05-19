@@ -10,13 +10,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"time"
 
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
@@ -179,17 +182,41 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 
 	s.updateStatus(orgID, runID, "running")
 
+	// StartAgentHost is invoked from inside agentproc.Run's sandbox
+	// branch; the closure brings the run identity along so the
+	// daemon's per-socket LocalClient routes writes through the right
+	// (orgID, userID) pair. Local-mode + non-sandbox calls never
+	// invoke this closure (agentproc gates on shouldSandbox).
+	stores := s.getStores()
+	var startAgentHost func() (sandbox.Mount, io.Closer, error)
+	if (db.Stores{}) != stores {
+		startAgentHost = func() (sandbox.Mount, io.Closer, error) {
+			info := agenthost.RunInfo{
+				OrgID:            orgID,
+				UserID:           creatorUserID,
+				RunID:            runID,
+				IsEventTriggered: triggerType == domain.TriggerTypeEvent,
+			}
+			hd, mount, err := agenthost.Start(stores, info)
+			if err != nil {
+				return sandbox.Mount{}, nil, err
+			}
+			return mount, hd, nil
+		}
+	}
+
 	log.Printf("[delegate] claude starting for run %s (cwd: %s)", runID, claudeCwd)
 	outcome, err := agentproc.Run(ctx, agentproc.RunOptions{
-		Cwd:          claudeCwd,
-		Model:        model,
-		Message:      prompt,
-		AllowedTools: agentproc.BuildAllowedToolsWithExtras(selfBin, cfg.extraAllowedTools),
-		MaxTurns:     100,
-		ExtraEnv:     extraEnv,
-		TraceID:      runID,
-		SystemPrompt: cfg.appendSysPrompt,
-		OrgID:        orgID,
+		Cwd:            claudeCwd,
+		Model:          model,
+		Message:        prompt,
+		AllowedTools:   agentproc.BuildAllowedToolsWithExtras(selfBin, cfg.extraAllowedTools),
+		MaxTurns:       100,
+		ExtraEnv:       extraEnv,
+		TraceID:        runID,
+		SystemPrompt:   cfg.appendSysPrompt,
+		OrgID:          orgID,
+		StartAgentHost: startAgentHost,
 	}, newRunSink(s, orgID, runID, triggerType, creatorUserID))
 
 	// If Takeover() flipped the takenOver flag while we were streaming,

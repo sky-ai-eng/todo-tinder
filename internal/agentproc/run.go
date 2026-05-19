@@ -92,6 +92,30 @@ type RunOptions struct {
 	// empty OrgID — the resolver no-ops and the subprocess inherits
 	// the host env unchanged.
 	Secrets SecretsReader
+
+	// StartAgentHost, when non-nil, starts the per-run host agenthost
+	// daemon in the sandbox branch. The daemon owns the run identity
+	// and serves the RPCs the sandboxed `triagefactory exec`
+	// subcommands send over /run/tf.sock; the callback returns the
+	// bind-mount entry agentproc adds to the sandbox spec plus a
+	// closer the deferred chain calls on Run exit (normal, error,
+	// or ctx cancellation).
+	//
+	// Callback indirection rather than an agenthost.Server-typed
+	// field because agentproc must NOT import cmd/exec/agenthost —
+	// that package transitively imports internal/agentmeta →
+	// internal/ai → internal/agentproc and the cycle would block
+	// compile. The closure shape lets the delegate spawner own all
+	// the agenthost wiring while agentproc stays library-style on
+	// the seam between sandbox setup and the agent subprocess.
+	//
+	// Local-mode + non-sandbox paths ignore this entirely. Callers
+	// whose argv never invokes `triagefactory exec` (classifier /
+	// scorer / profiler one-shot calls) leave this nil; the sandbox
+	// branch detects nil and skips the daemon setup. Skipping is safe
+	// because no agenthost client will ever try to dial in those
+	// flows.
+	StartAgentHost func() (mount sandbox.Mount, closer io.Closer, err error)
 }
 
 // NoopSink discards all stream events. Suitable for one-shot agent
@@ -265,6 +289,49 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		// translated paths without mutating the caller's struct.
 		sandboxOpts := opts
 		sandboxOpts.AddDirs = translateAddDirsForSandbox(opts.AddDirs, workCwd)
+		// Rewrite the --allowedTools selfBin pattern to point at the
+		// in-sandbox path. BuildAllowedTools embeds os.Executable() in
+		// its `Bash(<selfBin> exec *)` rule; inside the sandbox that
+		// host path doesn't exist, so the agent's per-tool path check
+		// would reject every `triagefactory exec` invocation. Re-point
+		// to the canonical /usr/local/bin/triagefactory path we
+		// bind-mount below.
+		hostSelfBin, _ := os.Executable()
+		sandboxOpts.AllowedTools = rewriteAllowedToolsForSandbox(opts.AllowedTools, hostSelfBin)
+
+		// Extra bind mounts the sandbox needs:
+		//
+		//   1. The host TF binary at /usr/local/bin/triagefactory (RO).
+		//      The agent's `triagefactory exec ...` invocations exec
+		//      this path; without the bind-mount they ENOENT because
+		//      the host path isn't visible inside the alpine rootfs.
+		//
+		//   2. The per-run agenthost unix socket at /run/tf.sock (RW).
+		//      Started below when Stores is supplied. Caller-side
+		//      hostAgentHost handles chown/chmod so the sandbox UID
+		//      can connect.
+		extraMounts := []sandbox.Mount{}
+		if hostSelfBin != "" {
+			extraMounts = append(extraMounts, sandbox.Mount{
+				Source:      hostSelfBin,
+				Destination: sandboxTFBinary,
+				Options:     []string{"ro"},
+			})
+		}
+
+		// Start the per-run agenthost daemon (when wired). The socket
+		// must exist on disk before sandbox.Wrap reads the spec, since
+		// the spec references the source path of every bind mount.
+		// Defer Close in this branch so a Wrap failure tears the
+		// daemon down cleanly.
+		if opts.StartAgentHost != nil {
+			mount, closer, ahErr := opts.StartAgentHost()
+			if ahErr != nil {
+				return nil, fmt.Errorf("sandbox: start agenthost daemon: %w", ahErr)
+			}
+			extraMounts = append(extraMounts, mount)
+			defer func() { _ = closer.Close() }()
+		}
 
 		// The sandbox's argv targets /usr/bin/node (the apk-installed
 		// nodejs in the cached alpine rootfs) + /sdk/wrapper.mjs (the
@@ -300,6 +367,7 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 			SDKDir:           sdkDir,
 			Argv:             argv,
 			Env:              sbEnv,
+			ExtraMounts:      extraMounts,
 			ConfigureProxies: configureProxies,
 		})
 		if err != nil {

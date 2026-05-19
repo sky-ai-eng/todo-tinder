@@ -2,11 +2,13 @@ package exec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/pressly/goose/v3"
 
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/chain"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/gh"
 	jiraexec "github.com/sky-ai-eng/triage-factory/cmd/exec/jira"
@@ -32,6 +34,15 @@ func Handle(args []string) {
 	// in a settings row, so config.Load() requires an initialized DB —
 	// open + migrate before calling Init/Load. Credentials follow the
 	// same path — the SecretStore is wired off the DB.
+	//
+	// The DB open is unconditional even when the sandboxed agenthost
+	// path will win below — credential loading (the loadCreds closure)
+	// still needs SecretStore access, and a future ticket
+	// will route those reads through the IPC client too. Today the
+	// production sandbox path doesn't exercise gh/jira subcommands
+	// (SKY-256 hasn't shipped the musl-static binary yet), so reading
+	// the local DB for creds is fine even when the daemon socket
+	// exists.
 	conn, err := db.Open()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening database: %v\n", err)
@@ -55,17 +66,32 @@ func Handle(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: loading config: %v (proceeding with defaults)\n", err)
 	}
-	// exec always runs in local mode against SQLite — multi-mode agents
-	// never shell out to `triagefactory exec` (SKY-303 will replace
-	// that path with an IPC client). Stores is the routing surface
-	// every subcommand uses post-SKY-302: ResolveRunIdentity reads the
-	// run via the admin pool, and the subcommand picks
-	// SyntheticClaimsWithTx (manual) or `...System` (event-triggered)
-	// based on the run's trigger_type.
 	stores := sqlite.New(conn)
 
 	cmd := args[0]
 	cmdArgs := args[1:]
+
+	// AutoDetect returns the right state-access seam for the current
+	// process: IPCClient when /run/tf.sock is bind-mounted in (the
+	// sandboxed-agent path), LocalClient otherwise (the local-mode CLI
+	// and the local-mode delegated-agent path). Help routes skip this
+	// because the help output doesn't need run identity resolution.
+	buildAgentHost := func() agenthost.Client {
+		ctx := context.Background()
+		client, derr := agenthost.AutoDetect(ctx, stores)
+		if derr != nil {
+			// runident-derived errors (env unset, unknown run) get a
+			// clean stderr message rather than the wrapping AutoDetect
+			// would otherwise apply.
+			if errors.Is(derr, runident.ErrRunIdentityMissing) || errors.Is(derr, runident.ErrRunIdentityNotFound) {
+				fmt.Fprintln(os.Stderr, derr.Error())
+			} else {
+				fmt.Fprintf(os.Stderr, "agenthost: %v\n", derr)
+			}
+			os.Exit(1)
+		}
+		return client
+	}
 
 	// Credentials route through the SecretStore. exec is invoked per-run
 	// with TRIAGE_FACTORY_RUN_ID; resolve the run's orgID so the
@@ -87,7 +113,7 @@ func Handle(args []string) {
 	switch cmd {
 	case "gh":
 		if isHelp(cmdArgs) {
-			gh.Handle(nil, db.Stores{}, cmdArgs)
+			gh.Handle(nil, nil, cmdArgs)
 			return
 		}
 		ghURL, ghPAT, _, _, lerr := loadCreds()
@@ -104,7 +130,9 @@ func Handle(args []string) {
 			baseURL = ghURL
 		}
 		client := ghclient.NewClient(baseURL, ghPAT)
-		gh.Handle(client, stores, cmdArgs)
+		host := buildAgentHost()
+		defer host.Close()
+		gh.Handle(client, host, cmdArgs)
 
 	case "jira":
 		if isHelp(cmdArgs) {
@@ -124,16 +152,18 @@ func Handle(args []string) {
 		jiraexec.Handle(jClient, cmdArgs)
 
 	case "workspace":
-		// No credentials needed — workspace acts on local DB + filesystem
-		// only. The agent's run identity flows through TRIAGE_FACTORY_RUN_ID,
-		// validated inside the subcommand.
-		workspace.Handle(stores, cmdArgs)
+		// No credentials needed — workspace acts on the agenthost client
+		// (DB + filesystem in local mode, IPC + filesystem in sandbox).
+		host := buildAgentHost()
+		defer host.Close()
+		workspace.Handle(host, cmdArgs)
 
 	case "chain":
-		// No credentials needed — chain verdict only writes a row in
-		// run_artifacts keyed by TRIAGE_FACTORY_RUN_ID. The orchestrator
-		// reads it back to decide whether to proceed.
-		chain.Handle(stores, cmdArgs)
+		// No credentials needed — chain verdict only writes a verdict
+		// row keyed by the daemon's run identity.
+		host := buildAgentHost()
+		defer host.Close()
+		chain.Handle(host, cmdArgs)
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown exec command: %s\nRun 'triagefactory exec --help' for usage.\n", cmd)

@@ -3,12 +3,10 @@ package workspace
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 
-	"github.com/sky-ai-eng/triage-factory/cmd/exec/runident"
-	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 )
 
 // listOutput is the JSON shape printed by `workspace list`. Two sections:
@@ -63,39 +61,25 @@ type listMaterialized struct {
 // would advertise a path the agent can't take and contradict the docs
 // in jira-tools.txt.
 //
-// Routing (SKY-302): every read goes through `...System` admin-pool
-// methods. List is pure introspection of the run the agent already
-// owns — wrapping in synthetic-claims just to satisfy RLS for a
-// read-only inventory would be tx-machinery overhead. The
-// ResolveRunIdentity probe still happens so an invalid
-// TRIAGE_FACTORY_RUN_ID fails with a clear "spawner bug" error.
-func listWorkspaces(stores db.Stores, runID string) (listOutput, error) {
+// All reads route through the agenthost client — in local mode the
+// LocalClient hits the SQLite store directly, in sandbox mode the
+// IPCClient round-trips to the host daemon. The TRIAGE_FACTORY_RUN_ID
+// validation happens inside host.LookupRun.
+func listWorkspaces(host agenthost.Client) (listOutput, error) {
 	ctx := context.Background()
-	ident, err := runident.ResolveRunIdentity(ctx, stores, runID)
-	switch {
-	case errors.Is(err, runident.ErrRunIdentityMissing):
-		return listOutput{}, errMissingRunID
-	case errors.Is(err, runident.ErrRunIdentityNotFound):
-		return listOutput{}, fmt.Errorf("%w: %s", errRunNotFound, runID)
-	case err != nil:
-		return listOutput{}, fmt.Errorf("workspace list: %w", err)
+	info, err := host.LookupRun(ctx)
+	if err != nil {
+		return listOutput{}, translateLookupErr(err)
 	}
 
-	// Re-read the run to get task_id. ResolveRunIdentity could
-	// return it, but every other subcommand only needs the routing
-	// triple — keeping it minimal beats threading a one-call-site
-	// field through the helper.
-	run, err := stores.AgentRuns.GetSystem(ctx, ident.OrgID, ident.RunID)
+	run, err := host.GetAgentRun(ctx)
 	if err != nil {
 		return listOutput{}, fmt.Errorf("workspace list: load run: %w", err)
 	}
 	if run == nil {
-		// Resolved a moment ago and the row vanished — surface as
-		// the same not-found shape rather than a confusing "load
-		// run" wrapped error.
-		return listOutput{}, fmt.Errorf("%w: %s", errRunNotFound, runID)
+		return listOutput{}, fmt.Errorf("%w: %s", errRunNotFound, info.RunID)
 	}
-	task, err := stores.Tasks.GetSystem(ctx, ident.OrgID, run.TaskID)
+	task, err := host.GetTask(ctx, run.TaskID)
 	if err != nil {
 		return listOutput{}, fmt.Errorf("workspace list: load task: %w", err)
 	}
@@ -106,15 +90,11 @@ func listWorkspaces(stores db.Stores, runID string) (listOutput, error) {
 		return listOutput{}, fmt.Errorf("%w (run task source is %q)", errNotJiraRun, task.EntitySource)
 	}
 
-	// ListSystem (not GetConfiguredRepoNames) so we can surface
-	// each repo's description in the JSON output. The description
-	// is the agent's cheapest disambiguation signal when the ticket
-	// text doesn't make the target repo obvious.
-	configured, err := stores.Repos.ListSystem(ctx, ident.OrgID)
+	configured, err := host.ListRepos(ctx)
 	if err != nil {
 		return listOutput{}, fmt.Errorf("workspace list: load configured repos: %w", err)
 	}
-	rows, err := stores.RunWorktrees.ListSystem(ctx, ident.OrgID, ident.RunID)
+	rows, err := host.ListRunWorktrees(ctx)
 	if err != nil {
 		return listOutput{}, fmt.Errorf("workspace list: load materialized worktrees: %w", err)
 	}
@@ -156,8 +136,8 @@ func listWorkspaces(stores db.Stores, runID string) (listOutput, error) {
 }
 
 // runList is the CLI entrypoint: env → listWorkspaces → stdout/stderr.
-func runList(stores db.Stores, args []string) {
-	out, err := listWorkspaces(stores, os.Getenv(runident.RunIdentityEnvVar))
+func runList(host agenthost.Client, _ []string) {
+	out, err := listWorkspaces(host)
 	if err != nil {
 		exitErr(err.Error())
 	}

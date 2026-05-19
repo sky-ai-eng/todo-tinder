@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/runident"
-	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
@@ -52,15 +52,17 @@ Run id is read from $TRIAGE_FACTORY_RUN_ID (set by the delegation
 spawner). The command refuses to run when invoked outside a chain
 step (the run has no chain_run_id).`
 
-// Handle dispatches chain subcommands.
-func Handle(stores db.Stores, args []string) {
+// Handle dispatches chain subcommands. host is the agenthost.Client
+// the verdict insert routes through (local SQLite or daemon IPC,
+// chosen by agenthost.AutoDetect at the top of cmd/exec/exec.go).
+func Handle(host agenthost.Client, args []string) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		printHelp()
 		return
 	}
 	switch args[0] {
 	case "verdict":
-		runVerdict(stores, args[1:])
+		runVerdict(host, args[1:])
 	default:
 		exitErr("unknown chain command: " + args[0])
 	}
@@ -70,7 +72,7 @@ func printHelp() {
 	fmt.Printf("Usage: triagefactory exec chain <command> [args]\n\n%s\n", HelpText)
 }
 
-func runVerdict(stores db.Stores, args []string) {
+func runVerdict(host agenthost.Client, args []string) {
 	fs := flag.NewFlagSet("chain verdict", flag.ContinueOnError)
 	var (
 		proceed bool
@@ -105,17 +107,20 @@ func runVerdict(stores db.Stores, args []string) {
 	}
 
 	ctx := context.Background()
-	ident, err := runident.ResolveRunIdentityFromEnv(ctx, stores)
-	switch {
-	case errors.Is(err, runident.ErrRunIdentityMissing):
-		exitErr("TRIAGE_FACTORY_RUN_ID not set; chain verdict can only be recorded inside a delegation run")
-	case err != nil:
-		exitErr("resolve run identity: " + err.Error())
+	if _, err := host.LookupRun(ctx); err != nil {
+		switch {
+		case errors.Is(err, runident.ErrRunIdentityMissing):
+			exitErr("TRIAGE_FACTORY_RUN_ID not set; chain verdict can only be recorded inside a delegation run")
+		default:
+			exitErr("resolve run identity: " + err.Error())
+		}
 	}
 
-	// Read via the admin pool — the verdict tool's role gate is the
-	// chain_run.status check below, not RLS visibility on the read.
-	chainRun, stepIdx, err := stores.Chains.GetRunForRunSystem(ctx, ident.OrgID, ident.RunID)
+	// Read the chain context for this run. The verdict tool's role
+	// gate is the chain_run.status check below, not RLS visibility on
+	// the read — both LocalClient and IPCClient route through the
+	// admin pool internally.
+	chainRun, stepIdx, err := host.GetChainRunForRun(ctx)
 	if err != nil {
 		exitErr("lookup chain run: " + err.Error())
 	}
@@ -145,19 +150,11 @@ func runVerdict(stores db.Stores, args []string) {
 		exitErr("encode verdict: " + err.Error())
 	}
 
-	// Route the verdict insert per SKY-302: manual runs wrap in
-	// synthetic-claims with the human's identity; event-triggered
-	// runs route through the admin pool. Mirrors the delegate
-	// spawner's synthetic --final verdict insert in
-	// internal/delegate/run.go.
-	if ident.IsEventTriggered {
-		err = stores.Chains.InsertVerdictSystem(ctx, ident.OrgID, ident.RunID, string(payload))
-	} else {
-		err = stores.Tx.SyntheticClaimsWithTx(ctx, ident.OrgID, ident.UserID, func(ts db.TxStores) error {
-			return ts.Chains.InsertVerdict(ctx, ident.OrgID, ident.RunID, string(payload))
-		})
-	}
-	if err != nil {
+	// Route the verdict insert through the agenthost surface: manual
+	// runs wrap in synthetic-claims with the human's identity;
+	// event-triggered runs route through the admin pool. LocalClient
+	// owns the branch; IPCClient lets the daemon decide.
+	if err := host.InsertChainVerdict(ctx, string(payload)); err != nil {
 		exitErr("record verdict: " + err.Error())
 	}
 

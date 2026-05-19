@@ -10,10 +10,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
 )
 
 // ErrYieldNotResumable is returned by ResumeAfterYield when the run
@@ -361,16 +365,39 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, orgID, runID, sessionID
 		extraEnv = append(extraEnv, "TRIAGE_FACTORY_REPO="+opts.RepoEnv)
 	}
 
+	// Resume runs follow the same sandbox-branch path as the initial
+	// invocation, so wire the same per-run agenthost daemon. The run
+	// identity is unchanged across resumes — only the prompt and the
+	// SessionID differ.
+	stores := s.getStores()
+	var startAgentHost func() (sandbox.Mount, io.Closer, error)
+	if (db.Stores{}) != stores {
+		startAgentHost = func() (sandbox.Mount, io.Closer, error) {
+			info := agenthost.RunInfo{
+				OrgID:            orgID,
+				UserID:           creatorUserID,
+				RunID:            runID,
+				IsEventTriggered: triggerType == domain.TriggerTypeEvent,
+			}
+			hd, mount, err := agenthost.Start(stores, info)
+			if err != nil {
+				return sandbox.Mount{}, nil, err
+			}
+			return mount, hd, nil
+		}
+	}
+
 	apOutcome, runErr := agentproc.Run(ctx, agentproc.RunOptions{
-		Cwd:          cwd,
-		Model:        model,
-		SessionID:    sessionID,
-		Message:      message,
-		AllowedTools: agentproc.BuildAllowedToolsWithExtras(selfBin, opts.ExtraAllowedTools),
-		MaxTurns:     100,
-		ExtraEnv:     extraEnv,
-		TraceID:      runID,
-		OrgID:        orgID,
+		Cwd:            cwd,
+		Model:          model,
+		SessionID:      sessionID,
+		Message:        message,
+		AllowedTools:   agentproc.BuildAllowedToolsWithExtras(selfBin, opts.ExtraAllowedTools),
+		MaxTurns:       100,
+		ExtraEnv:       extraEnv,
+		TraceID:        runID,
+		OrgID:          orgID,
+		StartAgentHost: startAgentHost,
 	}, newRunSink(s, orgID, runID, triggerType, creatorUserID))
 
 	outcome := &ResumeOutcome{}

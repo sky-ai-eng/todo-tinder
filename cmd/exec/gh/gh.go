@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 	"github.com/sky-ai-eng/triage-factory/internal/github"
 )
 
@@ -55,8 +55,9 @@ Repo Resolution (all gh commands):
   Priority order: --repo flag > TRIAGE_FACTORY_REPO env var > .git/config origin of cwd.
   Commands fail with a clear error if none resolve.`
 
-// Handle dispatches gh subcommands.
-func Handle(client *github.Client, stores db.Stores, args []string) {
+// Handle dispatches gh subcommands. host is the agenthost.Client the
+// PR write paths route through; it may be nil for help routes.
+func Handle(client *github.Client, host agenthost.Client, args []string) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		printHelp()
 		return
@@ -67,7 +68,7 @@ func Handle(client *github.Client, stores db.Stores, args []string) {
 
 	switch resource {
 	case "pr":
-		handlePR(client, stores, cmdArgs)
+		handlePR(client, host, cmdArgs)
 	case "actions":
 		handleActions(client, cmdArgs)
 	default:

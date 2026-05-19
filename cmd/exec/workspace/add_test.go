@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	sqlitestore "github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -19,6 +20,19 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 	_ "modernc.org/sqlite"
 )
+
+// hostFor wraps a Stores + runID into a LocalClient with the routing
+// identity tests want. Used by the materializeWorkspace cases below
+// where the test seeds a run row and then drives materialization
+// against its id. Equivalent to what agenthost.AutoDetect produces in
+// local mode.
+func hostFor(stores db.Stores, runID string) agenthost.Client {
+	return agenthost.NewLocal(stores, agenthost.RunInfo{
+		OrgID:  runmode.LocalDefaultOrgID,
+		UserID: runmode.LocalDefaultUserID,
+		RunID:  runID,
+	})
+}
 
 func TestSplitOwnerRepo(t *testing.T) {
 	cases := []struct {
@@ -242,7 +256,7 @@ func (s *stubCalls) deps() addDeps {
 func TestMaterializeWorkspace_MissingRunID(t *testing.T) {
 	stores, _ := newTestDB(t)
 	stub := &stubCalls{}
-	_, err := materializeWorkspace(stores, "" /*runID*/, "owner/repo", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, ""), "owner/repo", stub.deps())
 	if !errors.Is(err, errMissingRunID) {
 		t.Errorf("err = %v, want errMissingRunID", err)
 	}
@@ -254,7 +268,7 @@ func TestMaterializeWorkspace_MissingRunID(t *testing.T) {
 func TestMaterializeWorkspace_InvalidOwnerRepo(t *testing.T) {
 	stores, _ := newTestDB(t)
 	stub := &stubCalls{}
-	_, err := materializeWorkspace(stores, "r1", "no-slash", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "r1"), "no-slash", stub.deps())
 	if !errors.Is(err, errInvalidOwnerRepo) {
 		t.Errorf("err = %v, want errInvalidOwnerRepo", err)
 	}
@@ -266,7 +280,7 @@ func TestMaterializeWorkspace_InvalidOwnerRepo(t *testing.T) {
 func TestMaterializeWorkspace_RunNotFound(t *testing.T) {
 	stores, _ := newTestDB(t)
 	stub := &stubCalls{}
-	_, err := materializeWorkspace(stores, "missing-run", "owner/repo", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "missing-run"), "owner/repo", stub.deps())
 	if !errors.Is(err, errRunNotFound) {
 		t.Errorf("err = %v, want errRunNotFound", err)
 	}
@@ -280,7 +294,7 @@ func TestMaterializeWorkspace_RejectsGitHubPRRun(t *testing.T) {
 	seedGitHubRun(t, database, "gh-run")
 	stub := &stubCalls{}
 
-	_, err := materializeWorkspace(stores, "gh-run", "owner/repo", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "gh-run"), "owner/repo", stub.deps())
 	if !errors.Is(err, errNotJiraRun) {
 		t.Errorf("err = %v, want errNotJiraRun", err)
 	}
@@ -329,7 +343,7 @@ func TestMaterializeWorkspace_RejectsInjectionEntityKey(t *testing.T) {
 	seedRepoProfile(t, database, "sky", "core", "https://x", "main")
 	stub := &stubCalls{}
 
-	_, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if !errors.Is(err, errInvalidEntityKey) {
 		t.Errorf("err = %v, want errInvalidEntityKey", err)
 	}
@@ -343,7 +357,7 @@ func TestMaterializeWorkspace_RepoNotConfigured(t *testing.T) {
 	seedJiraRun(t, database, "r1", "SKY-1")
 	stub := &stubCalls{}
 
-	_, err := materializeWorkspace(stores, "r1", "owner/repo", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "r1"), "owner/repo", stub.deps())
 	if !errors.Is(err, errRepoNotConfigured) {
 		t.Errorf("err = %v, want errRepoNotConfigured", err)
 	}
@@ -358,7 +372,7 @@ func TestMaterializeWorkspace_RepoMissingCloneURL(t *testing.T) {
 	seedRepoProfile(t, database, "owner", "repo", "" /*cloneURL*/, "main")
 	stub := &stubCalls{}
 
-	_, err := materializeWorkspace(stores, "r1", "owner/repo", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "r1"), "owner/repo", stub.deps())
 	if !errors.Is(err, errRepoMissingCloneURL) {
 		t.Errorf("err = %v, want errRepoMissingCloneURL", err)
 	}
@@ -374,7 +388,7 @@ func TestMaterializeWorkspace_SuccessfulFirstAdd(t *testing.T) {
 	stub := &stubCalls{}
 
 	wantPath := expectedPath("r1", "sky", "core")
-	path, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	path, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("materializeWorkspace: %v", err)
 	}
@@ -424,7 +438,7 @@ func TestMaterializeWorkspace_BaseBranchFallsBackToDefault(t *testing.T) {
 	seedRepoProfile(t, database, "owner", "repo", "https://x", "develop")
 	stub := &stubCalls{}
 
-	if _, err := materializeWorkspace(stores, "r1", "owner/repo", stub.deps()); err != nil {
+	if _, err := materializeWorkspace(hostFor(stores, "r1"), "owner/repo", stub.deps()); err != nil {
 		t.Fatalf("materializeWorkspace: %v", err)
 	}
 	if stub.createArgs[0].baseBranch != "develop" {
@@ -440,7 +454,7 @@ func TestMaterializeWorkspace_IdempotentSecondAdd(t *testing.T) {
 
 	stub := &stubCalls{}
 
-	if _, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps()); err != nil {
+	if _, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps()); err != nil {
 		t.Fatalf("first add: %v", err)
 	}
 	if stub.createCalls != 1 {
@@ -449,7 +463,7 @@ func TestMaterializeWorkspace_IdempotentSecondAdd(t *testing.T) {
 
 	// Second add: GetRunWorktreeByRepo returns the row, so we
 	// short-circuit before reservation/create.
-	path2, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	path2, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("second add: %v", err)
 	}
@@ -482,7 +496,7 @@ func TestMaterializeWorkspace_RaceLossAtReservation(t *testing.T) {
 
 	stub := &stubCalls{}
 
-	path, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	path, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("materializeWorkspace: %v", err)
 	}
@@ -524,7 +538,7 @@ func TestMaterializeWorkspace_TrustsReservationEvenWhenDirMissing(t *testing.T) 
 	// must still trust the row.
 	stub := &stubCalls{}
 
-	path, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	path, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("materializeWorkspace: %v", err)
 	}
@@ -569,7 +583,7 @@ func TestMaterializeWorkspace_LiveDirShortCircuitsAgeCheck(t *testing.T) {
 		fixedNow: time.Now().Add(staleReservationAge + time.Hour),
 	}
 
-	path, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	path, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("materializeWorkspace: %v", err)
 	}
@@ -605,7 +619,7 @@ func TestMaterializeWorkspace_StaleReservationReclaimed(t *testing.T) {
 		fixedNow: time.Now().Add(staleReservationAge + time.Minute),
 	}
 
-	path, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	path, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("materializeWorkspace: %v", err)
 	}
@@ -649,7 +663,7 @@ func TestMaterializeWorkspace_FreshRowMissingDirIsInFlight(t *testing.T) {
 		fixedNow: row.CreatedAt.Add(staleReservationAge / 2),
 	}
 
-	path, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	path, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("materializeWorkspace: %v", err)
 	}
@@ -669,7 +683,7 @@ func TestMaterializeWorkspace_CreateFailureReleasesReservation(t *testing.T) {
 	// Make createWorktree fail (e.g. network error fetching the bare).
 	stub := &stubCalls{createErr: errors.New("simulated git failure")}
 
-	_, err := materializeWorkspace(stores, "r1", "sky/core", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub.deps())
 	if err == nil {
 		t.Fatal("expected error from materializeWorkspace, got nil")
 	}
@@ -701,12 +715,12 @@ func TestMaterializeWorkspace_CreateFailureRetryable(t *testing.T) {
 	wantPath := expectedPath("r1", "sky", "core")
 
 	stub1 := &stubCalls{createErr: errors.New("network blip")}
-	if _, err := materializeWorkspace(stores, "r1", "sky/core", stub1.deps()); err == nil {
+	if _, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub1.deps()); err == nil {
 		t.Fatal("expected first-attempt failure")
 	}
 
 	stub2 := &stubCalls{}
-	path, err := materializeWorkspace(stores, "r1", "sky/core", stub2.deps())
+	path, err := materializeWorkspace(hostFor(stores, "r1"), "sky/core", stub2.deps())
 	if err != nil {
 		t.Fatalf("retry: %v", err)
 	}
@@ -729,7 +743,7 @@ func TestMaterializeWorkspace_TooManySlashesRejected(t *testing.T) {
 	seedJiraRun(t, database, "r1", "SKY-1")
 	stub := &stubCalls{}
 
-	_, err := materializeWorkspace(stores, "r1", "too/many/slashes", stub.deps())
+	_, err := materializeWorkspace(hostFor(stores, "r1"), "too/many/slashes", stub.deps())
 	if !errors.Is(err, errInvalidOwnerRepo) {
 		t.Errorf("err = %v, want errInvalidOwnerRepo", err)
 	}
@@ -791,7 +805,7 @@ func TestMaterializeWorkspace_EventTriggeredRunRoutingSKY302(t *testing.T) {
 	seedRepoProfile(t, database, "sky", "core", "https://x", "main")
 	stub := &stubCalls{}
 
-	path, err := materializeWorkspace(stores, "e1", "sky/core", stub.deps())
+	path, err := materializeWorkspace(hostFor(stores, "e1"), "sky/core", stub.deps())
 	if err != nil {
 		t.Fatalf("event-triggered materializeWorkspace: %v", err)
 	}
@@ -821,7 +835,7 @@ func TestMaterializeWorkspace_EventTriggeredCreateFailureReleasesSKY302(t *testi
 	seedRepoProfile(t, database, "sky", "core", "https://x", "main")
 	stub := &stubCalls{createErr: errors.New("simulated git failure")}
 
-	if _, err := materializeWorkspace(stores, "e2", "sky/core", stub.deps()); err == nil {
+	if _, err := materializeWorkspace(hostFor(stores, "e2"), "sky/core", stub.deps()); err == nil {
 		t.Fatal("expected error from create failure, got nil")
 	}
 	// Reservation must be released so a retry can re-reserve.

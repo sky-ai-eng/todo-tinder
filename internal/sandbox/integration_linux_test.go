@@ -22,7 +22,11 @@ package sandbox
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -442,6 +446,134 @@ func TestIntegration_ConfigureProxies_ErrorAborts(t *testing.T) {
 type configureProxyError struct{ msg string }
 
 func (e *configureProxyError) Error() string { return e.msg }
+
+// TestIntegration_AgentHostIPC_RoundTrip — SKY-303 end-to-end.
+//
+// Builds cmd/exec-test-stub as a pure-Go static binary, bind-mounts
+// it into the sandbox at /usr/local/bin/triagefactory, starts a
+// listener on a temp socket the sandbox can reach via bind mount at
+// /run/tf.sock, and exec's the stub. The stub dials /run/tf.sock,
+// sends a LookupRun probe RPC, and prints the result on stdout. The
+// test asserts the round-trip succeeded and the response carries the
+// run id the host registered.
+//
+// Why not the real `triagefactory` binary: the host TF binary is
+// glibc-linked on most dev/CI systems, and the sandbox rootfs is
+// alpine (musl) — a bind-mounted glibc binary fails to exec inside
+// alpine because the dynamic loader path doesn't resolve. The
+// production fix is a static-built musl image of the real binary,
+// owned by SKY-256; this ticket proves the IPC pipe with the stub.
+func TestIntegration_AgentHostIPC_RoundTrip(t *testing.T) {
+	requireRunsc(t)
+	requireApk(t)
+
+	// Build the test stub as a pure-Go static binary so it can exec
+	// inside alpine. CGO_ENABLED=0 skips the glibc/musl linker entirely.
+	stubBin := filepath.Join(t.TempDir(), "exec-test-stub")
+	build := exec.Command("go", "build", "-o", stubBin,
+		"github.com/sky-ai-eng/triage-factory/cmd/exec-test-stub")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build test stub: %v (output: %s)", err, out)
+	}
+	// The bind-mount source path must be reachable by root inside the
+	// sandbox-launch process; t.TempDir is /tmp/<random> which works.
+	if err := os.Chmod(stubBin, 0o755); err != nil {
+		t.Fatalf("chmod stub: %v", err)
+	}
+
+	// Per-run socket on the host. Mode 0700 on the parent dir; the
+	// listener inherits from umask, then we chown + chmod to the
+	// sandbox UID exactly as the production startHostAgentHost does.
+	sockDir := t.TempDir()
+	if err := os.Chmod(sockDir, 0o700); err != nil {
+		t.Fatalf("chmod sock dir: %v", err)
+	}
+	sockPath := filepath.Join(sockDir, "test.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", sockPath, err)
+	}
+	if err := os.Chown(sockPath, WorktreeUID, WorktreeGID); err != nil {
+		t.Skipf("can't chown socket to UID %d (probably not root): %v", WorktreeUID, err)
+	}
+	if err := os.Chmod(sockPath, 0o600); err != nil {
+		t.Fatalf("chmod sock: %v", err)
+	}
+	// Parent dir must be reachable by the sandbox UID too — chown the
+	// parent so the runsc bind-mount can traverse to the socket.
+	if err := os.Chown(sockDir, WorktreeUID, WorktreeGID); err != nil {
+		t.Skipf("can't chown sock dir to UID %d: %v", WorktreeUID, err)
+	}
+
+	// Minimal echo daemon: accept one connection, read one frame,
+	// send back a synthetic LookupRun result. We don't want to drag
+	// the full agenthost.Server (and its db.Stores dep) into the
+	// sandbox-package test — the IPC pipe round-trip is what we're
+	// proving, and the frame format is identical to what the real
+	// daemon uses. Stop the goroutine via listener close at test end.
+	type req struct {
+		V uint32          `json:"v"`
+		M string          `json:"m"`
+		A json.RawMessage `json:"a,omitempty"`
+	}
+	type resp struct {
+		R json.RawMessage `json:"r,omitempty"`
+		E string          `json:"e,omitempty"`
+	}
+	sentinelRunID := "itest-agenthost-ipc"
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		var header [4]byte
+		if _, err := io.ReadFull(conn, header[:]); err != nil {
+			return
+		}
+		length := binary.BigEndian.Uint32(header[:])
+		body := make([]byte, length)
+		if _, err := io.ReadFull(conn, body); err != nil {
+			return
+		}
+		var r req
+		_ = json.Unmarshal(body, &r)
+		// Echo back a LookupRun-shaped response with our sentinel run id.
+		result := []byte(`{"info":{"org_id":"00000000-0000-0000-0000-000000000001","user_id":"","run_id":"` + sentinelRunID + `","is_event_triggered":false}}`)
+		respBody, _ := json.Marshal(resp{R: result})
+		var outHeader [4]byte
+		binary.BigEndian.PutUint32(outHeader[:], uint32(len(respBody)))
+		_, _ = conn.Write(outHeader[:])
+		_, _ = conn.Write(respBody)
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+
+	cfg := minimalConfig(t)
+	cfg.Argv = []string{"/usr/local/bin/triagefactory"}
+	cfg.ExtraMounts = []Mount{
+		{Source: stubBin, Destination: "/usr/local/bin/triagefactory", Options: []string{"ro"}},
+		{Source: sockPath, Destination: "/run/tf.sock"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd, sb, err := Wrap(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	defer sb.Close()
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("stub exec: %v (output: %s)", err, out)
+	}
+	if !strings.Contains(string(out), sentinelRunID) {
+		t.Errorf("expected stub stdout to echo run id %q, got: %s", sentinelRunID, out)
+	}
+}
 
 // Ensure filepath is used (defensive; gofmt would otherwise drop it
 // if the only reference goes away during a future edit).
