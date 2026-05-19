@@ -39,14 +39,9 @@ func alpineRootfsForArch(arch string) (url, sha string, err error) {
 				"/releases/x86_64/alpine-minirootfs-" + alpineVersion + "-x86_64.tar.gz",
 			"d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c", nil
 	case "arm64":
-		// TODO(SKY-256 follow-up): pin from
-		// https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz.sha256
-		// The Dockerfile builds for arm64 fine; this is only consulted
-		// at sandbox-launch time on an arm64 host. Until pinned, the
-		// arm64 runtime fails the sha verify with an obvious mismatch.
 		return "https://dl-cdn.alpinelinux.org/alpine/v" + majorMinor(alpineVersion) +
 				"/releases/aarch64/alpine-minirootfs-" + alpineVersion + "-aarch64.tar.gz",
-			"TODO_PIN_AARCH64_SHA256", nil
+			"041fa34a81788242df9e78fa69b97ab45b8ec47ddbf88864755610414a7bf3de", nil
 	default:
 		return "", "", fmt.Errorf("sandbox: unsupported GOARCH %q (only amd64 and arm64 are pinned; add a case to alpineRootfsForArch to support more)", arch)
 	}
