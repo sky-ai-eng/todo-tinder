@@ -95,9 +95,9 @@ func (c *IPCClient) call(ctx context.Context, method string, args any, result an
 	// fires first wins. SetDeadline on a unix socket interrupts in-flight
 	// I/O cleanly (returns *net.OpError with Timeout()==true).
 	deadline, ok := ctx.Deadline()
-	cap := time.Now().Add(callTimeout)
-	if !ok || cap.Before(deadline) {
-		deadline = cap
+	deadlineCap := time.Now().Add(callTimeout)
+	if !ok || deadlineCap.Before(deadline) {
+		deadline = deadlineCap
 	}
 	if err := c.conn.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("agenthost: set deadline: %w", err)
