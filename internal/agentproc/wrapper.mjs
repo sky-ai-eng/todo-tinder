@@ -74,6 +74,14 @@ if (!prompt) {
   process.exit(2)
 }
 
+// Forward the spawned Claude Code subprocess's stderr through our own.
+// Without this, the SDK swallows the child's stderr ("ignore" in its
+// stdio config) and a non-zero exit surfaces as the bare "Claude Code
+// process exited with code N" — no auth error / arg parse error / etc.
+// to act on. Piping it here lands the real message in agentproc.Run's
+// stderrBuf and from there into the run's error log.
+options.stderr = (chunk) => process.stderr.write(chunk)
+
 try {
   for await (const msg of query({ prompt, options })) {
     process.stdout.write(JSON.stringify(msg) + "\n")
