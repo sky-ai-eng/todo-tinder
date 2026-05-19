@@ -77,6 +77,41 @@ func applyEgressPolicy(_ context.Context, _ string, allowed []netip.Prefix) erro
 	return nil
 }
 
+// reapIptablesForSubnet removes every POSTROUTING MASQUERADE rule
+// matching the given subnet. Used by the orphan reaper at startup
+// when we know a netns was leaked (because we couldn't see its Close
+// run) and want to also clean the MASQUERADE rule it installed.
+//
+// We don't need to know the upstream interface that was used — match
+// by subnet alone. Since `10.42.0.0/16` is the sandbox's private
+// allocation pool, anything we find there is unambiguously ours.
+//
+// Best-effort: on iptables exec error, skip and move on. Returning
+// errors would just turn into log spam at startup; the operator can
+// `iptables -t nat -F POSTROUTING` if reaper falls behind.
+func reapIptablesForSubnet(ctx context.Context, subnet string) {
+	out, err := exec.CommandContext(ctx, "iptables", "-t", "nat", "-S", "POSTROUTING").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		// Match shape: `-A POSTROUTING -s 10.42.N.0/24 -o eth0 -j MASQUERADE`.
+		if !strings.HasPrefix(line, "-A POSTROUTING ") {
+			continue
+		}
+		if !strings.Contains(line, "-s "+subnet) {
+			continue
+		}
+		if !strings.Contains(line, "-j MASQUERADE") {
+			continue
+		}
+		// Swap -A for -D, exec.
+		delRule := strings.Replace(line, "-A POSTROUTING", "-D POSTROUTING", 1)
+		args := append([]string{"-t", "nat"}, strings.Fields(delRule)...)
+		_ = exec.CommandContext(ctx, "iptables", args...).Run()
+	}
+}
+
 // runIptables wraps `iptables` with context + stderr capture.
 func runIptables(ctx context.Context, args ...string) error {
 	var stderr bytes.Buffer

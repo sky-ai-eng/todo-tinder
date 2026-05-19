@@ -62,12 +62,11 @@ func reapOrphansImpl(ctx context.Context) error {
 		}
 		_ = teardownNetwork(ctx, netSt)
 
-		// Iptables MASQUERADE rules from the orphan run will remain
-		// in the host's NAT table. We can't reconstruct them without
-		// knowing the upstream interface name that was used. They'll
-		// stay until the host reboots or someone runs
-		// `iptables -t nat -F POSTROUTING`. Documented as a known
-		// limitation in the sandbox doc.
+		// Match-by-subnet cleanup of the MASQUERADE rule this orphan
+		// would have installed. Since 10.42.0.0/16 is exclusively the
+		// sandbox's allocation pool, anything matching -s <our subnet>
+		// is unambiguously ours regardless of original upstream IF.
+		reapIptablesForSubnet(ctx, subnetCIDR(idx))
 
 		defaultAllocator().Release(idx)
 	}
