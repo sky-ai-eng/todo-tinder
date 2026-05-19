@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -116,7 +115,10 @@ func TestLive_SDKViaProxy(t *testing.T) {
 	// and HOME (npm cache, claude config dir). ANTHROPIC_API_KEY is
 	// a placeholder the proxy overwrites; ANTHROPIC_BASE_URL routes
 	// the SDK at the proxy.
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
 	pathEnv := os.Getenv("PATH")
 	if pathEnv == "" {
 		t.Fatal("test process has no PATH; can't construct subprocess env")
@@ -145,8 +147,12 @@ func TestLive_SDKViaProxy(t *testing.T) {
 		"--model", "claude-haiku-4-5",
 		"--max-turns", "1")
 	cmd.Env = subprocessEnv
-	cmd.Dir, _ = os.MkdirTemp("", "llmproxy-live-")
-	defer os.RemoveAll(cmd.Dir)
+	cwd, err := os.MkdirTemp("", "llmproxy-live-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	cmd.Dir = cwd
+	defer os.RemoveAll(cwd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -186,8 +192,14 @@ func TestLive_AgentFailsWithBadProxyURL(t *testing.T) {
 		t.Fatalf("EnsureSDK: %v", err)
 	}
 
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
 	pathEnv := os.Getenv("PATH")
+	if pathEnv == "" {
+		t.Fatal("test process has no PATH; the subprocess wouldn't be able to find node and the test signal would be confounded")
+	}
 	// Port 1 is reserved and never bound — guaranteed connection
 	// refused. Using a deterministic bad address rather than a random
 	// port the kernel might briefly bind elsewhere.
@@ -206,8 +218,12 @@ func TestLive_AgentFailsWithBadProxyURL(t *testing.T) {
 		"--model", "claude-haiku-4-5",
 		"--max-turns", "1")
 	cmd.Env = subprocessEnv
-	cmd.Dir, _ = os.MkdirTemp("", "llmproxy-bad-")
-	defer os.RemoveAll(cmd.Dir)
+	cwd, err := os.MkdirTemp("", "llmproxy-bad-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	cmd.Dir = cwd
+	defer os.RemoveAll(cwd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -216,11 +232,19 @@ func TestLive_AgentFailsWithBadProxyURL(t *testing.T) {
 	runErr := cmd.Run()
 	combined := stdout.String() + stderr.String()
 
-	if runErr == nil && !strings.Contains(combined, "error") {
+	// wrapper.mjs exits non-zero on SDK errors, so the *only* valid
+	// pass condition is runErr != nil. A nil runErr means the agent
+	// completed — which against a closed port means it bypassed the
+	// proxy URL entirely, defeating the architecture. The previous
+	// version of this check also accepted "exit 0 with 'error' in
+	// output", which would have missed that regression.
+	if runErr == nil {
 		t.Errorf("agent succeeded against a non-existent proxy — base URL is NOT actually gating traffic.\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
 	}
-	// Positive signal: the failure message references the bad proxy
-	// or a connection error of some shape.
+	// Soft check on the failure mode: the error mentions the bad
+	// proxy or a connection-shape error. If neither, the SDK might
+	// be masking the connection error in a way that's harder to
+	// debug — log but don't fail.
 	hasConnectionSignal := strings.Contains(combined, "127.0.0.1:1") ||
 		strings.Contains(strings.ToLower(combined), "econnrefused") ||
 		strings.Contains(strings.ToLower(combined), "connection refused") ||
@@ -241,6 +265,3 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
-
-// ensure agentproc isn't tree-shaken when build tag isn't set
-var _ = filepath.Join

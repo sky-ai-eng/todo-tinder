@@ -93,9 +93,25 @@ type Config struct {
 
 	// Upstream is the absolute URL of the real LLM provider — e.g.
 	// "https://api.anthropic.com" or "https://bedrock-runtime.us-east-1.amazonaws.com".
-	// The path portion is preserved from each request; only scheme +
-	// host get rewritten.
+	// Only scheme + host are honored; path / query / fragment must
+	// be empty and are rejected at construction time so a caller who
+	// passes "https://api.anthropic.com/v1" by mistake fails loudly
+	// rather than silently misrouting (the incoming request path is
+	// what we forward).
 	Upstream string
+
+	// AllowNonLoopback opts into binding Start on a non-loopback
+	// address. The proxy is unauthenticated on the local hop — the
+	// security boundary is "only the agent subprocess can reach it"
+	// enforced by network isolation. An accidental "0.0.0.0:NNNN"
+	// bind would expose a credentialed proxy to the LAN; loopback-
+	// only by default prevents that footgun.
+	//
+	// Future sandbox integration (the host-side veth IP for the
+	// gVisor netns) is the legitimate non-loopback use case. Set
+	// this true when binding to the veth gateway IP so the caller
+	// has consciously acknowledged the bind is not loopback.
+	AllowNonLoopback bool
 }
 
 // Server is a single per-run proxy instance. Not safe to share
@@ -138,10 +154,22 @@ func New(cfg Config) (*Server, error) {
 	if u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("llmproxy: upstream URL missing scheme or host: %q", cfg.Upstream)
 	}
+	// Reject paths / queries / fragments on the upstream URL. The
+	// proxy preserves the incoming request path verbatim; a caller
+	// who passed "https://api.anthropic.com/v1" would silently get
+	// requests routed to "/v1/v1/messages" (path-joined) and 404
+	// at the upstream. Fail at construction so the misconfiguration
+	// surfaces at boot, not on the first request.
+	if u.Path != "" && u.Path != "/" {
+		return nil, fmt.Errorf("llmproxy: upstream URL must not include a path (got %q); the incoming request path is forwarded as-is", cfg.Upstream)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("llmproxy: upstream URL must not include query or fragment: %q", cfg.Upstream)
+	}
 
 	s := &Server{cfg: cfg, upstreamURL: u}
 	s.proxy = &httputil.ReverseProxy{
-		Director:       s.director,
+		Rewrite:        s.rewrite,
 		ModifyResponse: s.modifyResponse,
 		// Default ErrorHandler logs to stderr and 502s. That's fine
 		// for Phase 1; upgrade observability comes later.
@@ -149,40 +177,39 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// director rewrites each outbound request to point at the upstream
-// host and injects the right auth header. Called by ReverseProxy for
-// every forwarded request.
+// rewrite is the Go 1.20+ ReverseProxy hook (replacing Director). It
+// runs before the request is sent upstream and has explicit control
+// over Out — unlike Director, the stdlib does NOT add X-Forwarded-*
+// after Rewrite returns unless we call pr.SetXForwarded() ourselves.
+// That lets us suppress those proxy-chain headers, which would just
+// be noise to an LLM provider.
 //
 // The header rewrite uses Set (not Add) so any client-supplied auth
 // header is overwritten, not duplicated. That matters because the SDK
-// may send an empty or placeholder x-api-key (depending on how the
-// caller configured its env); a duplicate header could confuse some
-// HTTP/2 implementations and would absolutely confuse the upstream's
-// auth path.
-func (s *Server) director(req *http.Request) {
-	// Rewrite scheme + host + Host header. Path + query pass through
-	// unchanged — the SDK's request URL already encodes the correct
-	// API path (/v1/messages for Anthropic, /model/.../invoke for
-	// Bedrock).
-	req.URL.Scheme = s.upstreamURL.Scheme
-	req.URL.Host = s.upstreamURL.Host
-	req.Host = s.upstreamURL.Host
+// sends an empty or placeholder x-api-key depending on env shape; a
+// duplicate header could confuse some HTTP/2 implementations and
+// would absolutely confuse the upstream's auth path.
+func (s *Server) rewrite(pr *httputil.ProxyRequest) {
+	// SetURL rewrites Out.URL.Scheme, Out.URL.Host, joins paths, and
+	// sets Out.Host. Since we validated the upstream URL has no path,
+	// SetURL preserves the incoming request path verbatim.
+	pr.SetURL(s.upstreamURL)
 
-	// Strip headers ReverseProxy doesn't already strip and that
-	// confuse upstreams. X-Forwarded-* are added by ReverseProxy's
-	// default behavior; for an LLM API call those just look like
-	// proxy noise. Setting them to nothing tells ReverseProxy to skip
-	// the default add (per the stdlib docs).
-	req.Header.Del("X-Forwarded-For")
-	req.Header.Del("X-Forwarded-Host")
-	req.Header.Del("X-Forwarded-Proto")
+	// Defensive: if the incoming request happened to carry
+	// X-Forwarded-* headers (some misconfigured caller), drop them.
+	// We deliberately do not call pr.SetXForwarded() — the stdlib
+	// only adds these when explicitly invoked under the Rewrite API.
+	pr.Out.Header.Del("X-Forwarded-For")
+	pr.Out.Header.Del("X-Forwarded-Host")
+	pr.Out.Header.Del("X-Forwarded-Proto")
+	pr.Out.Header.Del("Forwarded")
 
 	switch s.cfg.Provider {
 	case ProviderAnthropic:
-		req.Header.Set("x-api-key", s.cfg.APIKey)
+		pr.Out.Header.Set("x-api-key", s.cfg.APIKey)
 		// The SDK already sets anthropic-version; we don't override.
 	case ProviderBedrockBearer:
-		req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+		pr.Out.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
 	}
 }
 
@@ -199,17 +226,24 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 // of the production Start path.
 func (s *Server) Handler() http.Handler { return s.proxy }
 
-// Start binds a localhost TCP port (random if addr is "" or ":0")
-// and serves until Shutdown is called. Returns the bound address so
-// the caller can construct the agent's BASE_URL env var.
+// Start binds a TCP port and serves until Shutdown is called. Returns
+// the bound address so the caller can construct the agent's BASE_URL
+// env var.
 //
-// Listening on 127.0.0.1 (not 0.0.0.0) so the proxy is reachable only
-// from the same host. In Phase 1 that's the TF process + the Node
-// child it spawned; in Phase 2 (sandbox case) we switch to a unix
-// socket bind-mounted into the sandbox, which is even tighter.
+// Defaults to 127.0.0.1:0 (random loopback port) when addr is "". A
+// non-loopback bind requires Config.AllowNonLoopback=true — the proxy
+// is unauthenticated on the local hop, so an accidental "0.0.0.0:NNNN"
+// would expose a credentialed proxy to the LAN. The future sandbox
+// case (binding to the host-side veth IP, e.g. 192.168.99.1) is the
+// legitimate non-loopback use case and opts in via the Config flag.
 func (s *Server) Start(addr string) (string, error) {
 	if addr == "" {
 		addr = "127.0.0.1:0"
+	}
+	if !s.cfg.AllowNonLoopback {
+		if err := assertLoopback(addr); err != nil {
+			return "", err
+		}
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -250,3 +284,41 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // has observed. Useful for tests asserting the agent actually went
 // through the proxy.
 func (s *Server) RequestCount() int64 { return s.requestCount.Load() }
+
+// assertLoopback returns nil iff addr binds to a loopback interface.
+// Hostnames resolve via the OS resolver; every resolved IP must be
+// loopback for the check to pass. The empty-host case (":NNNN" form
+// binds to all interfaces) is rejected explicitly.
+//
+// Used by Start to enforce the safety default of loopback-only when
+// AllowNonLoopback is false. The veth-IP sandbox case opts out.
+func assertLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("llmproxy: parse bind address %q: %w", addr, err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return fmt.Errorf("llmproxy: bind address %q binds to all interfaces — set AllowNonLoopback=true to confirm intent", addr)
+	}
+	// If host parses as an IP literal, check directly.
+	if ip := net.ParseIP(host); ip != nil {
+		if !ip.IsLoopback() {
+			return fmt.Errorf("llmproxy: bind address %q is not loopback — set AllowNonLoopback=true to confirm intent", addr)
+		}
+		return nil
+	}
+	// Hostname (e.g. "localhost"); resolve and require every result
+	// to be loopback. "localhost" passes; "myhost.local" pointing at
+	// a routable LAN IP does not.
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("llmproxy: resolve %q: %w", host, err)
+	}
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("llmproxy: bind host %q resolves to %s (not loopback) — set AllowNonLoopback=true to confirm intent", host, a)
+		}
+	}
+	return nil
+}

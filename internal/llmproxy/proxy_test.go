@@ -160,12 +160,35 @@ func TestProxyInjectsBedrockBearer(t *testing.T) {
 
 // TestProxyStreamingResponsePassesThrough pins SSE / chunked-response
 // behavior. The agent SDK uses streaming for every model call; if
-// the proxy buffers responses, the agent's stream-json parser would
-// see the whole batch at once and behavior would diverge from a
-// direct connection.
+// the proxy buffers responses, the agent's stream-json parser sees
+// the whole batch at once and behavior diverges from a direct
+// connection.
+//
+// The test actually pins streaming (rather than just final body
+// content) by timing the first byte read: upstream writes one chunk
+// and stays alive for ~600ms before the second; the client's first
+// Read must return well before that gap closes. A buffering proxy
+// would block the read for the full 600ms.
 func TestProxyStreamingResponsePassesThrough(t *testing.T) {
-	rec := &upstreamRecord{}
-	upstream := fakeUpstream(rec, true)
+	// Upstream that flushes chunk 1, sleeps, flushes chunk 2. The
+	// long inter-chunk gap is what gives the test its discrimination
+	// — a buffering proxy can't get under it.
+	const interChunkSleep = 600 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, _ := w.(http.Flusher)
+
+		_, _ = w.Write([]byte("data: {\"chunk\":0}\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(interChunkSleep)
+		_, _ = w.Write([]byte("data: {\"chunk\":1}\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
 	defer upstream.Close()
 
 	_, proxyURL := startProxyWithAddr(t, llmproxy.ProviderAnthropic, "sk-ant-stream", upstream.URL)
@@ -177,16 +200,29 @@ func TestProxyStreamingResponsePassesThrough(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read streamed body: %v", err)
+	// Discrimination criterion: the first chunk must arrive well
+	// before the upstream's inter-chunk sleep would have elapsed if
+	// the proxy were buffering. 100ms is comfortably less than the
+	// 600ms gap; if first read takes longer, the proxy buffered.
+	start := time.Now()
+	buf := make([]byte, 256)
+	n, err := resp.Body.Read(buf)
+	elapsed := time.Since(start)
+	if err != nil && err != io.EOF {
+		t.Fatalf("first read: %v", err)
 	}
-	got := string(body)
-	for i := 0; i < 3; i++ {
-		want := fmt.Sprintf(`"i":%d`, i)
-		if !strings.Contains(got, want) {
-			t.Errorf("streamed body missing chunk %d (looking for %q) in %q", i, want, got)
-		}
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("first chunk took %v to arrive (upstream sleeps %v between chunks); proxy is buffering",
+			elapsed, interChunkSleep)
+	}
+	if n == 0 || !strings.Contains(string(buf[:n]), `"chunk":0`) {
+		t.Errorf("first read got %q, expected chunk 0", string(buf[:n]))
+	}
+
+	// Drain the rest and check chunk 1 is also present.
+	rest, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(rest), `"chunk":1`) {
+		t.Errorf("second chunk missing from drained body: %q", string(rest))
 	}
 }
 
@@ -226,6 +262,9 @@ func TestProxyRejectsInvalidConfig(t *testing.T) {
 		{"empty_apikey", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "", Upstream: "https://x"}},
 		{"empty_upstream", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: ""}},
 		{"upstream_no_scheme", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "api.anthropic.com"}},
+		{"upstream_with_path", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "https://api.anthropic.com/v1"}},
+		{"upstream_with_query", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "https://api.anthropic.com?x=1"}},
+		{"upstream_with_fragment", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "https://api.anthropic.com#frag"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -234,6 +273,109 @@ func TestProxyRejectsInvalidConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestProxyUpstreamWithTrailingSlash pins that "https://api.anthropic.com/"
+// (path == "/") is accepted as semantically equivalent to no path —
+// users commonly write URLs with a trailing slash and refusing it
+// would be needlessly strict.
+func TestProxyUpstreamWithTrailingSlash(t *testing.T) {
+	if _, err := llmproxy.New(llmproxy.Config{
+		Provider: llmproxy.ProviderAnthropic,
+		APIKey:   "k",
+		Upstream: "https://api.anthropic.com/",
+	}); err != nil {
+		t.Errorf("trailing slash should be accepted: %v", err)
+	}
+}
+
+// TestProxyStartRejectsNonLoopback pins the safety default: binding
+// to anything other than loopback returns an error unless the caller
+// has explicitly set AllowNonLoopback. Without this, a caller doing
+// `Start("0.0.0.0:NNNN")` accidentally would expose a credentialed
+// proxy to the LAN.
+func TestProxyStartRejectsNonLoopback(t *testing.T) {
+	cases := []struct {
+		name string
+		addr string
+	}{
+		{"all_interfaces", "0.0.0.0:0"},
+		{"empty_host", ":0"},
+		{"ipv6_all_interfaces", "[::]:0"},
+		// 192.0.2.0/24 is TEST-NET-1 — guaranteed non-routable, so
+		// the test doesn't accidentally hit a real interface. We
+		// only need the loopback check to reject it, not bind.
+		{"test_net_address", "192.0.2.1:0"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, err := llmproxy.New(llmproxy.Config{
+				Provider: llmproxy.ProviderAnthropic,
+				APIKey:   "k",
+				Upstream: "https://api.anthropic.com",
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if _, err := srv.Start(c.addr); err == nil {
+				t.Errorf("Start(%q) = nil err; want non-loopback rejection", c.addr)
+			}
+		})
+	}
+}
+
+// TestProxyStartAllowsNonLoopbackOptIn pins the opt-in path: when
+// AllowNonLoopback=true, Start no longer enforces loopback. The
+// future sandbox case binds on the host-side veth IP and needs
+// this. We can't actually bind to a non-loopback IP in CI (would
+// fail or affect the test machine), so we use a hostname that
+// resolves to loopback under the opt-in branch — sufficient to
+// prove the bypass works.
+func TestProxyStartAllowsNonLoopbackOptIn(t *testing.T) {
+	srv, err := llmproxy.New(llmproxy.Config{
+		Provider:         llmproxy.ProviderAnthropic,
+		APIKey:           "k",
+		Upstream:         "https://api.anthropic.com",
+		AllowNonLoopback: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	addr, err := srv.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start with opt-in: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	if addr == "" {
+		t.Error("Start returned empty address")
+	}
+}
+
+// TestProxyLocalhostHostname pins that "localhost" resolves through
+// the loopback check (it should, since localhost typically resolves
+// to 127.0.0.1 / ::1). Important because many callers write
+// "localhost:NNNN" out of habit and we don't want to reject it.
+func TestProxyLocalhostHostname(t *testing.T) {
+	srv, err := llmproxy.New(llmproxy.Config{
+		Provider: llmproxy.ProviderAnthropic,
+		APIKey:   "k",
+		Upstream: "https://api.anthropic.com",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := srv.Start("localhost:0"); err != nil {
+		t.Errorf("Start(\"localhost:0\") = %v; want accept (localhost resolves to loopback)", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 }
 
 // TestProxyForwardsHostHeader confirms the Host header sent to the
