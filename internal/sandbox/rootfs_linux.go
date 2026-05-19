@@ -18,6 +18,13 @@ import (
 	"time"
 )
 
+// alpineCommunityRepo is the community repository for the same alpine
+// version pinned in rootfs.go. Some toolchain packages (ripgrep, go)
+// live in community rather than main, so the cache build enables this
+// repo before invoking apk-add. Linux-only — referenced exclusively
+// from the chroot+apk path in this file.
+const alpineCommunityRepo = "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
+
 // rootfsCacheMu serializes ensureRootfs across concurrent Wrap calls.
 // We use a mutex rather than sync.Once because sync.Once permanently
 // caches the first call's result — a transient failure (CDN flap,
