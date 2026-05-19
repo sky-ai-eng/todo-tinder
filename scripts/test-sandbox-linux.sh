@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
-# SKY-254 sandbox smoke test for Linux.
+# Sandbox smoke test for Linux.
 #
-# Validates the gVisor/runsc sandbox primitives end-to-end on a real
-# Linux box. Everything the SKY-254 acceptance criteria asks for —
-# Property B, fs isolation, non-root UID, cleanup, reaper — runs
-# against busybox payloads, so the node-in-rootfs gap (follow-up
-# ticket) does NOT block us.
+# One-shot validation of the internal/sandbox package against real
+# runsc on a real Linux box — runs the unit suite, the agentproc
+# helpers, and the build-tagged integration tests that exercise the
+# full netns + veth + iptables + OCI + runsc pipeline.
 #
-# What this script does NOT cover (deferred to follow-ups):
-#   - node /sdk/wrapper.mjs running inside the alpine rootfs
-#   - SDK reaching Anthropic via in-sandbox proxy
-#   - End-to-end agentproc.Run path
+# Why a wrapper script instead of just `go test -tags integration`:
+#   - Self-heals PATH for the sudo+brew interaction (secure_path)
+#   - Re-execs under sudo with CAP_NET_ADMIN + CAP_SYS_ADMIN
+#   - Validates prereqs (runsc, iptables, ip, node, go) with install
+#     hints when missing
+#   - Inventory of pre-/post-test netns + veth + iptables orphans, so
+#     any cleanup regression surfaces immediately
+#
+# Until we have a CI runner that grants CAP_SYS_ADMIN (gVisor's
+# minimum), this script is the de facto CI for the sandbox package.
 #
 # Usage:
 #   ./scripts/test-sandbox-linux.sh
 #
-# Re-execs under sudo automatically — netns / veth / iptables need
-# CAP_NET_ADMIN + CAP_SYS_ADMIN. Logs land in /tmp/sky-254-sandbox-test/.
-#
-# This is a temporary throwaway; delete after PR merges.
+# Logs land in /tmp/sky-254-sandbox-test/ (overridable via LOG_DIR).
 
 set -uo pipefail
 
@@ -235,13 +237,12 @@ if [[ -n "${integration_failed:-}" || $leak -ne 0 ]]; then
   exit 1
 else
   green "VERDICT: PASS"
-  echo "  Sandbox primitives validated end-to-end:"
+  echo "  Validated:"
   echo "    - boot, non-root UID, fs isolation, Property B env curation"
-  echo "    - cleanup on Close, orphan recovery via ReapOrphans"
-  echo "  Not validated by this script (deferred):"
-  echo "    - node binary running inside the alpine rootfs (follow-up ticket)"
-  echo "    - SDK auth against Anthropic via in-sandbox proxy (SKY-335)"
+  echo "    - cleanup on Close, orphan recovery (netns + iptables)"
+  echo "  Coverage scope is whatever lives in internal/sandbox/*_test.go +"
+  echo "  internal/sandbox/integration_linux_test.go — add new cases there"
+  echo "  as the sandbox surface grows (node-in-rootfs, proxy wiring, etc)."
   echo
-  echo "  Logs:       $LOG_DIR"
-  echo "  Next step:  proceed with follow-up tickets, then end-to-end agentproc.Run."
+  echo "  Logs: $LOG_DIR"
 fi
