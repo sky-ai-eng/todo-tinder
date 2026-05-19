@@ -54,12 +54,13 @@ func TestMain(m *testing.M) {
 
 // shouldPreWarmRootfs gates the pre-warm on the same prereqs the
 // integration tests themselves check. No point downloading 500MB if
-// the suite is going to skip every test anyway.
+// the suite is going to skip every test anyway — keep this list in
+// sync with requireRunsc + requireApk.
 func shouldPreWarmRootfs() bool {
 	if os.Geteuid() != 0 {
 		return false
 	}
-	for _, bin := range []string{"runsc", "chroot"} {
+	for _, bin := range []string{"runsc", "ip", "iptables", "chroot"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			return false
 		}
