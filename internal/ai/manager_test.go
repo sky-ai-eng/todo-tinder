@@ -119,7 +119,9 @@ func TestManager_StopIdempotent(t *testing.T) {
 	m := NewManager(nil, scores, nil, RunnerCallbacks{})
 
 	m.Trigger("org-a")
-	waitFor(t, time.Second, func() bool { return scores.callsFor("org-a") >= 1 })
+	if !waitFor(t, time.Second, func() bool { return scores.callsFor("org-a") >= 1 }) {
+		t.Fatalf("UnscoredTasks was not called for org-a within 1s")
+	}
 
 	m.Stop()
 	m.Stop() // second call must not panic
