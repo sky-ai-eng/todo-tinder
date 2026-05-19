@@ -68,6 +68,27 @@ type RunOptions struct {
 	// Storage-neutral: delegate uses the agent run UUID, the curator
 	// uses its own message-group id.
 	TraceID string
+
+	// OrgID scopes credential resolution for this invocation. In
+	// multi mode the runner resolves the org's configured Anthropic /
+	// Bedrock credentials via Secrets and injects them into the Node
+	// subprocess's env, stripping credential-bearing keys from the
+	// inherited env so a misconfigured operator-level env var can't
+	// leak across tenants. In local mode an empty OrgID — or the
+	// LocalDefaultOrg sentinel with no configured per-org override —
+	// falls back to the host's Claude Code subscription via the
+	// inherited env (no env injection or filtering).
+	//
+	// Required in multi mode; empty + multi-mode raises a typed
+	// ErrNoCredentialsConfigured error before the subprocess spawns.
+	OrgID string
+
+	// Secrets is the per-org secret reader used when OrgID is non-
+	// empty. Callers pass their db.SecretStore (which satisfies
+	// SecretsReader structurally). May be nil in local mode with
+	// empty OrgID — the resolver no-ops and the subprocess inherits
+	// the host env unchanged.
+	Secrets SecretsReader
 }
 
 // NoopSink discards all stream events. Suitable for one-shot agent
@@ -141,6 +162,17 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Resolve per-org LLM credentials *before* spawning Node so
+	// multi-mode-with-no-creds fails fast with a typed error instead
+	// of waiting for the SDK to ENOAUTH inside the subprocess. The
+	// resolver returns an empty map in local-mode when no per-org
+	// credentials are configured; mergeEnv detects that and preserves
+	// the inherited env (subscription / shell-env fallback).
+	creds, err := resolveCredentials(runCtx, opts.Secrets, opts.OrgID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve credentials for org %q: %w", opts.OrgID, err)
+	}
+
 	// EnsureSDK installs Node + Agent SDK + wrapper.mjs on first call
 	// and returns the absolute wrapper path. Failures here are usually
 	// "Node not on PATH" — surface them to the caller so the run lands
@@ -170,7 +202,7 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	nodeArgs := append([]string{wrapperPath}, BuildArgs(opts)...)
 	cmd := exec.CommandContext(runCtx, "node", nodeArgs...)
 	cmd.Dir = opts.Cwd
-	cmd.Env = append(os.Environ(), opts.ExtraEnv...)
+	cmd.Env = mergeEnv(os.Environ(), opts.ExtraEnv, creds)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		// Process is non-nil here because the watcher only fires after
