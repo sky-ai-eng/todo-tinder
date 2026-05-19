@@ -9,9 +9,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
 )
 
 // RunOptions configures one `claude -p` invocation. Callers populate
@@ -162,17 +164,6 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Resolve per-org LLM credentials *before* spawning Node so
-	// multi-mode-with-no-creds fails fast with a typed error instead
-	// of waiting for the SDK to ENOAUTH inside the subprocess. The
-	// resolver returns an empty map in local-mode when no per-org
-	// credentials are configured; mergeEnv detects that and preserves
-	// the inherited env (subscription / shell-env fallback).
-	creds, err := resolveCredentials(runCtx, opts.Secrets, opts.OrgID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve credentials for org %q: %w", opts.OrgID, err)
-	}
-
 	// EnsureSDK installs Node + Agent SDK + wrapper.mjs on first call
 	// and returns the absolute wrapper path. Failures here are usually
 	// "Node not on PATH" — surface them to the caller so the run lands
@@ -200,17 +191,106 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	// runtime-agnostic. The SDK uses the same auth / config / session
 	// store as Claude Code, so behavior is identical for the user.
 	nodeArgs := append([]string{wrapperPath}, BuildArgs(opts)...)
-	cmd := exec.CommandContext(runCtx, "node", nodeArgs...)
-	cmd.Dir = opts.Cwd
-	cmd.Env = mergeEnv(os.Environ(), opts.ExtraEnv, creds)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		// Process is non-nil here because the watcher only fires after
-		// Start has succeeded. ESRCH is fine — it just means the
-		// process group already exited on its own between Wait
-		// returning and the cancel watcher reading runCtx.Done(),
-		// which is a race exec handles internally.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+
+	// Branch: multi-mode + Linux routes through the gVisor sandbox
+	// for tenant isolation. Local-mode + non-Linux take the direct
+	// subprocess path (unchanged behavior).
+	var (
+		cmd *exec.Cmd
+		sb  *sandbox.Sandbox
+	)
+	if shouldSandbox() {
+		// PROPERTY B INVARIANT: the sandbox path deliberately skips
+		// resolveCredentials. Real credentials never enter the sandbox
+		// env. A future ticket will inject proxy URL + placeholder
+		// credential entries so the agent can reach an in-host proxy
+		// that holds the real key.
+		nodeBin, err := exec.LookPath("node")
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: node binary: %w", err)
+		}
+		sdkDir := filepath.Dir(wrapperPath)
+
+		// Some callers (scorer, classifier stage1, profiler) are
+		// prompt-only — they send a prompt, get JSON back, and never
+		// touch the host filesystem. They have no natural Cwd. The
+		// sandbox still needs *something* to bind-mount at /work,
+		// so when the caller didn't pass one, materialize a per-run
+		// scratch tmpdir. Cleaned up alongside the sandbox in defer
+		// below.
+		workCwd := opts.Cwd
+		var scratchCwd string
+		if workCwd == "" {
+			scratchCwd, err = os.MkdirTemp("", "agentproc-scratch-")
+			if err != nil {
+				return nil, fmt.Errorf("sandbox: scratch cwd: %w", err)
+			}
+			workCwd = scratchCwd
+			defer func() { _ = os.RemoveAll(scratchCwd) }()
+		}
+		if err := chownWorktreeForSandbox(workCwd); err != nil {
+			return nil, fmt.Errorf("sandbox: chown worktree: %w", err)
+		}
+		// Translate any host-path env values (e.g. TRIAGE_FACTORY_RUN_ROOT)
+		// to /work-relative paths before the sandbox sees them.
+		sbExtraEnv := translateEnvForSandbox(opts.ExtraEnv, workCwd)
+		sbEnv := buildSandboxEnv(sbExtraEnv)
+
+		// Translate AddDirs (host paths under workCwd) into their
+		// /work-relative equivalents inside the sandbox. Without this
+		// the agent's `--add-dir` flags reference paths that don't
+		// exist inside the sandbox rootfs and Claude Code's per-tool
+		// path checks reject every write attempt to those subtrees.
+		// Build a shallow copy of opts so BuildArgs picks up the
+		// translated paths without mutating the caller's struct.
+		sandboxOpts := opts
+		sandboxOpts.AddDirs = translateAddDirsForSandbox(opts.AddDirs, workCwd)
+
+		// The sandbox's argv targets /usr/local/bin/node + /sdk/wrapper.mjs
+		// (bind-mount destinations inside the sandbox), not the host
+		// paths. Build the sandbox-side argv from scratch.
+		argv := append(
+			[]string{"/usr/local/bin/node", "/sdk/wrapper.mjs"},
+			BuildArgs(sandboxOpts)...,
+		)
+
+		sandboxCmd, sandbox, err := sandbox.Wrap(runCtx, sandbox.Config{
+			RunID:      opts.TraceID,
+			Worktree:   workCwd,
+			SDKDir:     sdkDir,
+			NodeBinary: nodeBin,
+			Argv:       argv,
+			Env:        sbEnv,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: %w", err)
+		}
+		cmd, sb = sandboxCmd, sandbox
+		defer func() { _ = sb.Close() }()
+	} else {
+		// Direct-path: resolve per-org LLM credentials before spawning
+		// Node so multi-mode-with-no-creds (in local-mode-but-no-keychain
+		// boxes) fails fast with a typed error rather than waiting for
+		// the SDK to ENOAUTH inside the subprocess. Resolver returns an
+		// empty map when no per-org credentials are configured; mergeEnv
+		// detects that and preserves the inherited env (subscription /
+		// shell-env fallback).
+		creds, err := resolveCredentials(runCtx, opts.Secrets, opts.OrgID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve credentials for org %q: %w", opts.OrgID, err)
+		}
+		cmd = exec.CommandContext(runCtx, "node", nodeArgs...)
+		cmd.Dir = opts.Cwd
+		cmd.Env = mergeEnv(os.Environ(), opts.ExtraEnv, creds)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			// Process is non-nil here because the watcher only fires after
+			// Start has succeeded. ESRCH is fine — it just means the
+			// process group already exited on its own between Wait
+			// returning and the cancel watcher reading runCtx.Done(),
+			// which is a race exec handles internally.
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 	}
 
 	stdout, err := cmd.StdoutPipe()

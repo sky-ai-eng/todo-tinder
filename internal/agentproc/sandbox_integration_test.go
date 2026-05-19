@@ -1,0 +1,181 @@
+package agentproc
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestTranslateAddDirsForSandbox(t *testing.T) {
+	cases := []struct {
+		name    string
+		addDirs []string
+		cwd     string
+		want    []string
+	}{
+		{
+			name:    "nil_input",
+			addDirs: nil,
+			cwd:     "/data/worktrees/abc",
+			want:    nil,
+		},
+		{
+			name:    "empty_cwd_drops_everything",
+			addDirs: []string{"/some/path"},
+			cwd:     "",
+			want:    []string{},
+		},
+		{
+			name:    "absolute_under_cwd_translates",
+			addDirs: []string{"/data/worktrees/abc/knowledge-base"},
+			cwd:     "/data/worktrees/abc",
+			want:    []string{"/work/knowledge-base"},
+		},
+		{
+			name:    "nested_subpath_preserved",
+			addDirs: []string{"/data/worktrees/abc/repos/project1/src"},
+			cwd:     "/data/worktrees/abc",
+			want:    []string{"/work/repos/project1/src"},
+		},
+		{
+			name:    "outside_cwd_dropped",
+			addDirs: []string{"/etc/passwd"},
+			cwd:     "/data/worktrees/abc",
+			want:    []string{},
+		},
+		{
+			name:    "mixed_in_and_out",
+			addDirs: []string{"/data/worktrees/abc/kb", "/etc/passwd", "/data/worktrees/abc/repos"},
+			cwd:     "/data/worktrees/abc",
+			want:    []string{"/work/kb", "/work/repos"},
+		},
+		{
+			name:    "empty_entries_skipped",
+			addDirs: []string{"/data/worktrees/abc/kb", "", "/data/worktrees/abc/repos"},
+			cwd:     "/data/worktrees/abc",
+			want:    []string{"/work/kb", "/work/repos"},
+		},
+		{
+			name:    "cwd_itself_becomes_work",
+			addDirs: []string{"/data/worktrees/abc"},
+			cwd:     "/data/worktrees/abc",
+			want:    []string{"/work"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := translateAddDirsForSandbox(c.addDirs, c.cwd)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("translateAddDirsForSandbox(%v, %q) = %v, want %v",
+					c.addDirs, c.cwd, got, c.want)
+			}
+		})
+	}
+}
+
+func TestTranslateEnvForSandbox(t *testing.T) {
+	cases := []struct {
+		name string
+		env  []string
+		cwd  string
+		want []string
+	}{
+		{
+			name: "nil_input",
+			env:  nil,
+			cwd:  "/data/worktrees/abc",
+			want: nil,
+		},
+		{
+			name: "non_path_values_passthrough",
+			env: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_REPO=owner/repo",
+				"TRIAGE_FACTORY_REVIEW_PREVIEW=1",
+			},
+			cwd: "/data/worktrees/abc",
+			want: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_REPO=owner/repo",
+				"TRIAGE_FACTORY_REVIEW_PREVIEW=1",
+			},
+		},
+		{
+			name: "abs_path_under_cwd_translates",
+			env:  []string{"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"TRIAGE_FACTORY_RUN_ROOT=/work"},
+		},
+		{
+			name: "abs_subpath_under_cwd_translates",
+			env:  []string{"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc/_scratch"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"TRIAGE_FACTORY_RUN_ROOT=/work/_scratch"},
+		},
+		{
+			name: "abs_path_outside_cwd_dropped",
+			env:  []string{"JAVA_HOME=/usr/lib/jvm/openjdk"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{},
+		},
+		{
+			name: "mixed_keep_translate_drop",
+			env: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc",
+				"JAVA_HOME=/usr/lib/jvm/openjdk",
+			},
+			cwd: "/data/worktrees/abc",
+			want: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_RUN_ROOT=/work",
+			},
+		},
+		{
+			name: "empty_cwd_drops_abs_paths_keeps_others",
+			env: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+				"TRIAGE_FACTORY_RUN_ROOT=/data/worktrees/abc",
+			},
+			cwd: "",
+			want: []string{
+				"TRIAGE_FACTORY_RUN_ID=abc-123",
+			},
+		},
+		{
+			name: "malformed_no_equals_passthrough",
+			env:  []string{"NOT_A_VALID_ENTRY"},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"NOT_A_VALID_ENTRY"},
+		},
+		{
+			name: "empty_value_passthrough",
+			env:  []string{"TRIAGE_FACTORY_RUN_ROOT="},
+			cwd:  "/data/worktrees/abc",
+			want: []string{"TRIAGE_FACTORY_RUN_ROOT="},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := translateEnvForSandbox(c.env, c.cwd)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("translateEnvForSandbox(%v, %q) = %v, want %v",
+					c.env, c.cwd, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTranslateAddDirsForSandbox_DropsSymlinkEscapes pins the
+// defensive drop for paths that look in-tree but resolve outside.
+// Pure filepath.Rel-level check — doesn't follow symlinks (the
+// sandbox bind-mount handles those at the filesystem boundary).
+func TestTranslateAddDirsForSandbox_DropsSymlinkEscapes(t *testing.T) {
+	// `..` in the input — filepath.Rel would resolve outside cwd.
+	got := translateAddDirsForSandbox(
+		[]string{"/data/worktrees/abc/../other-worktree/sneaky"},
+		"/data/worktrees/abc",
+	)
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty (the path resolves outside cwd)", got)
+	}
+}

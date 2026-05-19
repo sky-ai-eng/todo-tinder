@@ -8,6 +8,7 @@ require github.com/google/uuid v1.6.0
 
 require (
 	github.com/coder/websocket v1.8.14
+	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/pressly/goose/v3 v3.27.1
 	modernc.org/sqlite v1.50.0
 )
