@@ -75,7 +75,7 @@ func (s *Server) Serve(l net.Listener) error {
 		s.inflight.Add(1)
 		go func() {
 			defer s.inflight.Done()
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			s.handleConn(conn)
 		}()
 	}

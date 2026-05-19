@@ -131,7 +131,7 @@ func Handle(args []string) {
 		}
 		client := ghclient.NewClient(baseURL, ghPAT)
 		host := buildAgentHost()
-		defer host.Close()
+		defer func() { _ = host.Close() }()
 		gh.Handle(client, host, cmdArgs)
 
 	case "jira":
@@ -155,14 +155,14 @@ func Handle(args []string) {
 		// No credentials needed — workspace acts on the agenthost client
 		// (DB + filesystem in local mode, IPC + filesystem in sandbox).
 		host := buildAgentHost()
-		defer host.Close()
+		defer func() { _ = host.Close() }()
 		workspace.Handle(host, cmdArgs)
 
 	case "chain":
 		// No credentials needed — chain verdict only writes a verdict
 		// row keyed by the daemon's run identity.
 		host := buildAgentHost()
-		defer host.Close()
+		defer func() { _ = host.Close() }()
 		chain.Handle(host, cmdArgs)
 
 	default:

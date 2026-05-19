@@ -69,7 +69,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", socketPath, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := conn.SetDeadline(time.Now().Add(rpcTimeout)); err != nil {
 		return fmt.Errorf("set deadline: %w", err)
 	}
