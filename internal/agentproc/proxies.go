@@ -37,21 +37,22 @@ type runProxies struct {
 	// git *gitproxy.Server // sibling ticket (SKY-335's twin)
 }
 
-// Shutdown stops every proxy in the bundle. Best-effort: individual
-// shutdown errors are logged via the returned multi-error, but the
-// caller proceeds — the worst case is a leaked goroutine that the
-// sandbox teardown later cleans up alongside the netns.
+// Shutdown stops every proxy in the bundle. Returns errors.Join of
+// every proxy's Shutdown error so a future bundle with multiple
+// proxies (git proxy slot) surfaces all failures, not just the
+// first. Today, with only the LLM proxy wired, the result is either
+// nil or a single wrapped error.
 func (p *runProxies) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
-	var firstErr error
+	var errs []error
 	if p.llm != nil {
 		if err := p.llm.Shutdown(ctx); err != nil {
-			firstErr = fmt.Errorf("llm proxy shutdown: %w", err)
+			errs = append(errs, fmt.Errorf("llm proxy shutdown: %w", err))
 		}
 	}
-	return firstErr
+	return errors.Join(errs...)
 }
 
 // ErrUnsupportedSandboxCredentials is returned when the resolved
@@ -242,11 +243,14 @@ func buildSandboxProxyEnv(cfg sandboxProxyConfig, llmURL string) []string {
 }
 
 // validateProxyUpstream is a pre-flight check that mirrors the
-// llmproxy.New validation. Done here too so a malformed org-configured
+// llmproxy.New validation. Done here so a malformed org-configured
 // ANTHROPIC_BASE_URL surfaces at proxy-config time (before any
-// listener is opened) with a message that names "anthropic upstream"
+// listener opens) with a message that names "anthropic upstream"
 // rather than the generic "llmproxy: parse upstream URL" error from
-// inside the proxy package.
+// inside the proxy package. Keep the rules in lockstep with
+// llmproxy.New: any rule added there must be added here, or
+// org-configured gateway URLs will pass this check and fail later
+// with a less debuggable error.
 func validateProxyUpstream(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -254,6 +258,30 @@ func validateProxyUpstream(raw string) error {
 	}
 	if u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("missing scheme or host: %q", raw)
+	}
+	// llmproxy.New forwards the incoming request path verbatim; an
+	// upstream with a path component (other than "/") would route
+	// requests to "/<path>/<request-path>" and 404 at the real
+	// upstream. Reject here so the admin-facing error names which
+	// proxy upstream is malformed.
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("must not include a path: %q", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("must not include query or fragment: %q", raw)
+	}
+	// Cleartext-credential guard: the real key travels on the
+	// proxy→upstream hop inside the rewritten auth header. http://
+	// is only safe when the upstream is loopback (httptest pattern).
+	if u.Scheme != "https" {
+		host, _, _ := net.SplitHostPort(u.Host)
+		if host == "" {
+			host = u.Host
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("must use https (loopback http allowed for tests): %q", raw)
+		}
 	}
 	return nil
 }

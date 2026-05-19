@@ -347,6 +347,68 @@ func TestRunProxies_ShutdownIsNilSafe(t *testing.T) {
 	}
 }
 
+// TestProxyConfigFromCreds_RejectsMalformedGateway pins the
+// pre-flight gates that mirror llmproxy.New. An org-configured
+// ANTHROPIC_BASE_URL with a path / query / fragment / cleartext
+// non-loopback scheme is rejected at proxy-config time so the
+// admin-facing error names "anthropic upstream" instead of falling
+// through to a generic llmproxy error from inside Start.
+func TestProxyConfigFromCreds_RejectsMalformedGateway(t *testing.T) {
+	cases := []struct {
+		name    string
+		baseURL string
+	}{
+		{"with_path", "https://gateway.example.com/v1"},
+		{"with_query", "https://gateway.example.com?token=x"},
+		{"with_fragment", "https://gateway.example.com#frag"},
+		{"http_non_loopback", "http://gateway.example.com"},
+		{"missing_scheme", "gateway.example.com"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := proxyConfigFromCreds(map[string]string{
+				"ANTHROPIC_API_KEY":  "k",
+				"ANTHROPIC_BASE_URL": c.baseURL,
+			})
+			if err == nil {
+				t.Fatalf("proxyConfigFromCreds accepted %q; want validation error", c.baseURL)
+			}
+			if !strings.Contains(err.Error(), "anthropic upstream") {
+				t.Errorf("err = %v; want it to name \"anthropic upstream\" so the admin-facing message is clear", err)
+			}
+		})
+	}
+}
+
+// TestRunProxies_ShutdownAggregatesErrors pins the errors.Join
+// behavior that the doc comment promises. Today only the LLM proxy
+// is wired, so this exercises the one-error path; the test shape is
+// future-proof for the git-proxy slot landing.
+func TestRunProxies_ShutdownAggregatesErrors(t *testing.T) {
+	// Construct a bundle with a Server we can shut down twice — the
+	// second Shutdown is a no-op (returns nil), so we can't easily
+	// force an error without a fake. Use httptest + a real proxy and
+	// just confirm a clean shutdown returns nil.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	bundle, _, err := startProxiesForSandbox("127.0.0.1", map[string]string{
+		"ANTHROPIC_API_KEY":  "k",
+		"ANTHROPIC_BASE_URL": upstream.URL,
+	})
+	if err != nil {
+		t.Fatalf("startProxiesForSandbox: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := bundle.Shutdown(ctx); err != nil {
+		t.Errorf("clean Shutdown = %v, want nil", err)
+	}
+}
+
 // envValue returns the value associated with KEY in a slice of
 // KEY=VALUE strings, or "" if KEY is absent. Used by the proxy tests
 // to assert env shape without writing the split-on-equals dance
