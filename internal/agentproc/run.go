@@ -230,12 +230,22 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		sbEnv := buildSandboxEnv(opts.ExtraEnv)
 		sandboxCreds = nil // explicit: no creds, no merge
 
+		// Translate AddDirs (host paths under opts.Cwd) into their
+		// /work-relative equivalents inside the sandbox. Without this
+		// the agent's `--add-dir` flags reference paths that don't
+		// exist inside the sandbox rootfs and Claude Code's per-tool
+		// path checks reject every write attempt to those subtrees.
+		// Build a shallow copy of opts so BuildArgs picks up the
+		// translated paths without mutating the caller's struct.
+		sandboxOpts := opts
+		sandboxOpts.AddDirs = translateAddDirsForSandbox(opts.AddDirs, opts.Cwd)
+
 		// The sandbox's argv targets /usr/local/bin/node + /sdk/wrapper.mjs
 		// (bind-mount destinations inside the sandbox), not the host
 		// paths. Build the sandbox-side argv from scratch.
 		argv := append(
 			[]string{"/usr/local/bin/node", "/sdk/wrapper.mjs"},
-			BuildArgs(opts)...,
+			BuildArgs(sandboxOpts)...,
 		)
 
 		sandboxCmd, sandbox, err := sandbox.Wrap(runCtx, sandbox.Config{

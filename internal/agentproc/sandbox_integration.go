@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
@@ -63,6 +64,14 @@ func buildSandboxEnv(extraEnv []string) []string {
 //
 // On non-Linux this is a no-op; the sandbox path isn't reachable
 // off Linux per shouldSandbox.
+//
+// SECURITY: uses os.Lchown (not os.Chown) so a symlink inside the
+// repo can't redirect the chown to a host file outside the worktree.
+// filepath.Walk does not follow symlinks during the walk itself, so
+// the recursion stays inside the worktree; the per-entry Lchown
+// ensures we change the link's own owner rather than the target's.
+// Without this, a repo containing `link -> /etc/passwd` would chown
+// the host's passwd file when this runs as root in multi mode.
 func chownWorktreeForSandbox(worktree string) error {
 	if worktree == "" {
 		return nil
@@ -74,9 +83,53 @@ func chownWorktreeForSandbox(worktree string) error {
 		if err != nil {
 			return err
 		}
-		if cerr := os.Chown(path, sandbox.WorktreeUID, sandbox.WorktreeGID); cerr != nil {
-			return fmt.Errorf("chown %s: %w", path, cerr)
+		if cerr := os.Lchown(path, sandbox.WorktreeUID, sandbox.WorktreeGID); cerr != nil {
+			return fmt.Errorf("lchown %s: %w", path, cerr)
 		}
 		return nil
 	})
+}
+
+// translateAddDirsForSandbox rewrites the host paths in opts.AddDirs
+// into their sandbox-side equivalents under /work. The agent's tool
+// permission checks consume these via `--add-dir` flags; if we
+// leave them as host paths (e.g. /data/worktrees/abc/knowledge-base)
+// the agent's path checks reject every write attempt because no such
+// path exists inside the sandbox rootfs.
+//
+// Paths that aren't under cwd are dropped — they're not reachable
+// from inside the sandbox, so there's nothing useful to do with
+// them. Empty entries are dropped too (matches BuildArgs's own
+// behavior).
+//
+// Returns nil for nil input, an empty slice for an empty/all-dropped
+// input, so the caller can distinguish "not set" from "set to nothing
+// after filtering."
+func translateAddDirsForSandbox(addDirs []string, cwd string) []string {
+	if len(addDirs) == 0 {
+		return nil
+	}
+	if cwd == "" {
+		// Without cwd we can't compute relative paths; safest to
+		// drop everything rather than pass through host paths that
+		// don't exist in the sandbox.
+		return []string{}
+	}
+	out := make([]string, 0, len(addDirs))
+	for _, dir := range addDirs {
+		if dir == "" {
+			continue
+		}
+		// filepath.Rel handles both absolute paths under cwd and
+		// already-relative paths. Anything that comes back with
+		// ".." prefix is outside cwd; drop it.
+		rel, err := filepath.Rel(cwd, dir)
+		if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+			continue
+		}
+		// "/work" + relative path. Use filepath.Join to handle the
+		// rel == "." case (cwd itself), which becomes "/work".
+		out = append(out, filepath.Join("/work", rel))
+	}
+	return out
 }
