@@ -26,70 +26,55 @@ const dialTimeout = 5 * time.Second
 // timeout error rather than letting the agent stall indefinitely.
 const callTimeout = 30 * time.Second
 
-// IPCClient is the unix-socket implementation of Client. Each
-// instance owns one connection; the socket is opened lazily on the
-// first call and reused for every subsequent call so a chain of
-// agent-side subcommand invocations doesn't pay accept overhead per
-// call. The mutex serializes calls — the protocol is request/response
-// one-at-a-time and the daemon doesn't expect interleaved frames on
-// a single conn.
+// IPCClient is the unix-socket implementation of Client. Each call
+// opens its own connection and closes it on return — the daemon's
+// handleConn is one-shot (read one frame, write one frame, hang up),
+// so reusing a connection across calls would EOF on the second read.
+// Unix-socket accept on a local listener is microseconds; the per-
+// call dial overhead is irrelevant against any DB op the daemon
+// services.
+//
+// The mutex serializes calls so two goroutines in the same process
+// can't interleave on the same client (cmd/exec subcommands are
+// single-goroutine, but a future caller might not be).
 type IPCClient struct {
 	socketPath string
 
 	mu     sync.Mutex
-	conn   net.Conn
 	closed bool
 }
 
-// Dial returns an IPCClient bound to socketPath. The connection is
-// not opened here — that happens lazily on the first call so the
-// caller can ping/Stat the socket separately if it wants a fast
-// liveness check.
+// Dial returns an IPCClient bound to socketPath. No connection is
+// opened until the first call — each call gets a fresh dial.
 func Dial(socketPath string) *IPCClient {
 	return &IPCClient{socketPath: socketPath}
 }
 
-// connect lazily opens the unix socket. Caller must hold c.mu.
-func (c *IPCClient) connect() error {
-	if c.closed {
-		return errors.New("agenthost: client closed")
-	}
-	if c.conn != nil {
-		return nil
-	}
-	dialer := net.Dialer{Timeout: dialTimeout}
-	conn, err := dialer.Dial("unix", c.socketPath)
-	if err != nil {
-		return fmt.Errorf("agenthost: dial %s: %w", c.socketPath, err)
-	}
-	c.conn = conn
-	return nil
-}
-
-// Close closes the underlying unix socket. Subsequent calls return a
-// "client closed" error. Idempotent — closing a never-connected
-// client is fine.
+// Close marks the client closed so subsequent calls fail fast.
+// No conn to release — every call is dial-on-demand.
 func (c *IPCClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
-	if c.conn == nil {
-		return nil
-	}
-	err := c.conn.Close()
-	c.conn = nil
-	return err
+	return nil
 }
 
-// call sends one request and decodes the response. Handles connection
-// reset on transient errors by closing and letting the next call re-
-// dial, so a daemon restart doesn't permanently brick the client.
+// call dials the daemon, sends one request, reads one response, and
+// closes the connection. Matches the server's one-shot handleConn
+// contract — any state on the wire is bounded by a single RPC.
 func (c *IPCClient) call(ctx context.Context, method string, args any, result any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.connect(); err != nil {
-		return err
+	if c.closed {
+		return errors.New("agenthost: client closed")
 	}
+
+	dialer := net.Dialer{Timeout: dialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
+	if err != nil {
+		return fmt.Errorf("agenthost: dial %s: %w", c.socketPath, err)
+	}
+	defer func() { _ = conn.Close() }()
 
 	// Apply ctx and the absolute timeout as a single deadline. Whichever
 	// fires first wins. SetDeadline on a unix socket interrupts in-flight
@@ -99,14 +84,9 @@ func (c *IPCClient) call(ctx context.Context, method string, args any, result an
 	if !ok || deadlineCap.Before(deadline) {
 		deadline = deadlineCap
 	}
-	if err := c.conn.SetDeadline(deadline); err != nil {
+	if err := conn.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("agenthost: set deadline: %w", err)
 	}
-	defer func() {
-		// Best-effort: clear the deadline so a subsequent call starts
-		// fresh. If the conn is already closed it's a no-op.
-		_ = c.conn.SetDeadline(time.Time{})
-	}()
 
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
@@ -117,14 +97,12 @@ func (c *IPCClient) call(ctx context.Context, method string, args any, result an
 		Method:  method,
 		Args:    argsJSON,
 	}
-	if err := writeFrame(c.conn, req); err != nil {
-		c.dropConn()
+	if err := writeFrame(conn, req); err != nil {
 		return err
 	}
 
 	var resp response
-	if err := readFrame(c.conn, &resp); err != nil {
-		c.dropConn()
+	if err := readFrame(conn, &resp); err != nil {
 		if errors.Is(err, io.EOF) {
 			return fmt.Errorf("agenthost: daemon closed connection during %s: %w", method, err)
 		}
@@ -144,16 +122,6 @@ func (c *IPCClient) call(ctx context.Context, method string, args any, result an
 		return fmt.Errorf("agenthost: decode %s result: %w", method, err)
 	}
 	return nil
-}
-
-// dropConn closes and clears the cached connection so the next call
-// re-dials. Used after any I/O error to avoid serving a bad conn to
-// subsequent calls. Caller must hold c.mu.
-func (c *IPCClient) dropConn() {
-	if c.conn != nil {
-		_ = c.conn.Close()
-		c.conn = nil
-	}
 }
 
 // --- Client interface implementation ---

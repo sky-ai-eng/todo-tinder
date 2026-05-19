@@ -112,6 +112,45 @@ func TestProtocol_OversizedFrameRejected(t *testing.T) {
 	}
 }
 
+// TestIPCClient_MultiCall_PerCallDial pins the bug that prompted the
+// per-call dial: the server's handleConn is one-shot (close after
+// reply), so a client that cached a single conn across calls would
+// EOF on the second read. The test drives three RPCs through one
+// client; each must succeed. Without per-call dialing in IPCClient,
+// the second call would fail.
+func TestIPCClient_MultiCall_PerCallDial(t *testing.T) {
+	stores, _ := newTestDB(t)
+	info := RunInfo{
+		OrgID:  runmode.LocalDefaultOrg,
+		UserID: "user-1",
+		RunID:  "run-multi",
+	}
+	sockPath := tempSocket(t)
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := NewServer(stores, info)
+	go func() { _ = srv.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = srv.Shutdown(context.Background())
+	})
+
+	client := Dial(sockPath)
+	defer client.Close()
+
+	for i := 0; i < 3; i++ {
+		got, err := client.LookupRun(context.Background())
+		if err != nil {
+			t.Fatalf("LookupRun call %d: %v", i, err)
+		}
+		if got != info {
+			t.Errorf("call %d: identity mismatch: got %+v, want %+v", i, got, info)
+		}
+	}
+}
+
 // TestServer_LookupRun_RoundTrip exercises the full
 // Server.Serve → IPCClient.LookupRun loop over a real (temporary)
 // unix socket. The probe RPC matches what the integration test +
