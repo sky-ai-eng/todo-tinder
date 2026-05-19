@@ -1,0 +1,190 @@
+//go:build linux
+
+package agenthost
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
+)
+
+// hostSocketRoot is the per-host directory that holds the per-run
+// unix sockets. Created with mode 0700 the first time a run needs it
+// — owner-only access defends against a hostile second tenant
+// scanning /run for sockets to dial while a sandbox is mid-construction
+// (between net.Listen and chown/chmod).
+//
+// `/run/` requires root to create on most distros; the multi-mode TF
+// container already runs as root for netns/iptables (CAP_SYS_ADMIN +
+// CAP_NET_ADMIN), so this is the natural choice. A deployment running
+// unprivileged would need $XDG_RUNTIME_DIR/triagefactory/<run_id>.sock
+// instead — left as a follow-up if/when that deployment shape lands.
+const hostSocketRoot = "/run/tf"
+
+// HostDaemon is the per-run socket + server lifecycle the spawner
+// owns. Start() creates the socket, chowns it to the sandbox UID,
+// spawns the daemon goroutine, and returns. Close() unblocks the
+// accept loop, drains in-flight handlers, and removes the socket
+// file.
+//
+// One HostDaemon per delegated run. The spawner's deferred-cleanup
+// chain looks like:
+//
+//	hd, mount, err := Start(stores, info)
+//	if err != nil { ... }
+//	defer hd.Close()
+//	// add `mount` to sandbox.Config.ExtraMounts; sb.Wrap; cmd.Wait
+type HostDaemon struct {
+	listener net.Listener
+	sockPath string
+	server   *Server
+	doneCh   chan struct{}
+}
+
+// Start creates the per-run unix socket, chowns it to the sandbox UID,
+// chmod's it 0600, and spawns the daemon goroutine. The agent in the
+// sandbox sees the socket at /run/tf.sock by way of the returned bind
+// mount.
+//
+// Property B / fs-permissions invariant (load-bearing):
+//
+//  1. Parent dir mkdir 0700 — any race window between socket-create
+//     and chown is unreachable from a second tenant (the dir is
+//     owner-only). Without this, an attacker on the host could
+//     enumerate /run for sockets that haven't been chmod'd yet.
+//
+//  2. net.Listen("unix", ...) — creates the socket file with the
+//     process umask applied (typically 0666 or 0755); either is too
+//     permissive on its own, but step 1 locks the parent so nobody
+//     can reach it yet.
+//
+//  3. Chown to sandbox.WorktreeUID — the sandbox process runs as UID
+//     10000; without this it can't connect (EACCES on connect).
+//
+//  4. Chmod 0600 — owner-only RW. Other host UIDs can't connect even
+//     if they somehow learn the path. The sandbox UID can both read
+//     (accept the bind-mounted socket via veth) and write (send RPCs).
+//
+// Caller MUST invoke .Close() exactly once (typically via defer)
+// regardless of how the surrounding sandbox terminates — the listener
+// close drains the daemon goroutine, the os.Remove cleans up the
+// socket file.
+func Start(stores db.Stores, info RunInfo) (*HostDaemon, sandbox.Mount, error) {
+	if info.RunID == "" {
+		return nil, sandbox.Mount{}, fmt.Errorf("agenthost: RunInfo.RunID required")
+	}
+	if err := os.MkdirAll(hostSocketRoot, 0o700); err != nil {
+		return nil, sandbox.Mount{}, fmt.Errorf("agenthost: mkdir %s: %w", hostSocketRoot, err)
+	}
+	sockPath := filepath.Join(hostSocketRoot, sanitizeSocketName(info.RunID)+".sock")
+
+	// Remove any stale socket file from a previous crash. net.Listen
+	// would otherwise EADDRINUSE on a path that's actually unused.
+	// Stale files in /run/tf/ are by definition from a previous TF
+	// process — the only writer is this codepath — so removal is safe.
+	_ = os.Remove(sockPath)
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return nil, sandbox.Mount{}, fmt.Errorf("agenthost: listen %s: %w", sockPath, err)
+	}
+	if err := os.Chown(sockPath, sandbox.WorktreeUID, sandbox.WorktreeGID); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(sockPath)
+		return nil, sandbox.Mount{}, fmt.Errorf("agenthost: chown %s to uid=%d: %w", sockPath, sandbox.WorktreeUID, err)
+	}
+	if err := os.Chmod(sockPath, 0o600); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(sockPath)
+		return nil, sandbox.Mount{}, fmt.Errorf("agenthost: chmod %s: %w", sockPath, err)
+	}
+
+	server := NewServer(stores, info)
+	hd := &HostDaemon{
+		listener: listener,
+		sockPath: sockPath,
+		server:   server,
+		doneCh:   make(chan struct{}),
+	}
+	go func() {
+		defer close(hd.doneCh)
+		if err := server.Serve(listener); err != nil {
+			log.Printf("[agenthost] daemon serve: %v", err)
+		}
+	}()
+
+	mount := sandbox.Mount{
+		Source:      sockPath,
+		Destination: DefaultSocketPath,
+		// rw is the default; the sandbox needs to both connect (read
+		// the daemon's response) and send requests (write to the
+		// socket). No `ro` here.
+	}
+	return hd, mount, nil
+}
+
+// Close shuts down the daemon goroutine and removes the socket file.
+// Idempotent. Order matters — close the listener first to unblock
+// Serve's accept loop, then wait briefly for in-flight handlers to
+// drain, then remove the file so a post-crash startup scan doesn't
+// see a dangling socket pointing at a dead inode.
+func (h *HostDaemon) Close() error {
+	if h == nil {
+		return nil
+	}
+	// Stop accepting and wait for the accept loop to exit. The
+	// listener close interrupts Accept; the daemon goroutine notices
+	// net.ErrClosed and returns.
+	_ = h.listener.Close()
+	select {
+	case <-h.doneCh:
+	case <-time.After(2 * time.Second):
+		log.Printf("[agenthost] daemon accept-loop drain timed out (sock=%s)", h.sockPath)
+	}
+	// Drain in-flight handlers up to a bounded budget. RPCs that are
+	// mid-DB-write commit on the host process and don't need network
+	// access; the timeout just caps how long we wait for them to
+	// release the conn and complete their last write.
+	drainCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.server.Shutdown(drainCtx); err != nil {
+		log.Printf("[agenthost] daemon shutdown drain: %v", err)
+	}
+	_ = os.Remove(h.sockPath)
+	return nil
+}
+
+// SocketPath returns the host-side path of the per-run socket. Useful
+// for tests that need to point an IPCClient at the daemon without
+// going through the bind-mount-into-sandbox shape.
+func (h *HostDaemon) SocketPath() string { return h.sockPath }
+
+// sanitizeSocketName trims a run id to a fs-safe form. RunIDs are
+// already UUIDs in production callers so this is a defense-in-depth
+// guard against future callers using a less-constrained shape (the
+// integration test uses "itest..." strings, for instance).
+func sanitizeSocketName(s string) string {
+	r := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-' || r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, s)
+	if len(r) > 64 {
+		r = r[:64]
+	}
+	return r
+}

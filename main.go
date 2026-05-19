@@ -690,6 +690,11 @@ func main() {
 
 	// Create spawner once — credentials are hot-swapped in place
 	spawner := delegate.NewSpawner(database, stores.Prompts, stores.Agents, stores.Chains, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, stores.Tx, nil, wsHub, "")
+	// Hand the full Stores bundle so the sandbox-branch agenthost
+	// daemon can serve every routing-sensitive RPC the agent's
+	// `triagefactory exec` invocations send. Local-mode + non-sandbox
+	// paths never read this back; nil-safe inside the spawner.
+	spawner.SetStores(stores)
 	srv.SetSpawner(spawner)
 
 	// SKY-220: wire the classifier wait into the spawner's setup path.

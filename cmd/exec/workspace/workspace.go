@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 )
 
 // HelpText is the help block for `workspace` commands, surfaced both
@@ -45,17 +45,19 @@ Usage notes:
   - 'add' rejects unconfigured repos with a "not configured" error; use
     'list' to enumerate options before guessing.`
 
-// Handle dispatches workspace subcommands.
-func Handle(stores db.Stores, args []string) {
+// Handle dispatches workspace subcommands. host is the agenthost.Client
+// every DB-touching path routes through (local SQLite or daemon IPC,
+// chosen by agenthost.AutoDetect at the top of cmd/exec/exec.go).
+func Handle(host agenthost.Client, args []string) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		printHelp()
 		return
 	}
 	switch args[0] {
 	case "add":
-		runAdd(stores, args[1:])
+		runAdd(host, args[1:])
 	case "list":
-		runList(stores, args[1:])
+		runList(host, args[1:])
 	default:
 		exitErr("unknown workspace command: " + args[0])
 	}

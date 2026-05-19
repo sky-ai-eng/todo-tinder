@@ -83,6 +83,19 @@ type Spawner struct {
 
 	agentToolsOnce  sync.Once
 	agentToolsCache string
+
+	// stores is the full db.Stores bundle the per-run agenthost daemon
+	// hands to its LocalClient at request dispatch. Set post-
+	// construction via SetStores so we don't have to thread another
+	// arg through every test fixture's NewSpawner call — the sandbox
+	// branch is Linux+multi-mode only and unit tests never reach it.
+	//
+	// Pointer (rather than db.Stores value) so callers can branch on
+	// `stores != nil` cleanly. The earlier `db.Stores{} != stores`
+	// shape relied on every field being a comparable interface and
+	// would runtime-panic the moment a future field landed with a
+	// non-comparable concrete type (slice/map/func).
+	stores *db.Stores
 }
 
 func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, chains db.ChainStore, tasks db.TaskStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, events db.EventStore, taskMemory db.TaskMemoryStore, runWorktrees db.RunWorktreeStore, tx db.TxRunner, ghClient *ghclient.Client, wsHub *websocket.Hub, model string) *Spawner {
@@ -107,6 +120,30 @@ func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, 
 		takenOver:    make(map[string]bool),
 		chainRunIDs:  make(map[string]bool),
 	}
+}
+
+// SetStores hands the per-run agenthost daemon's store bundle to the
+// spawner. The bundle is consulted only inside the sandbox branch
+// (multi-mode + Linux); local-mode spawning ignores it entirely. main
+// calls this once at startup post-NewSpawner; tests that don't
+// exercise the sandbox path can leave it unset.
+func (s *Spawner) SetStores(stores db.Stores) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stores = &stores
+}
+
+// getStores returns the configured store bundle and a bool indicating
+// whether it was set. Callers branch on the bool rather than
+// comparing the value against db.Stores{} so a future non-comparable
+// field on db.Stores can't turn the check into a runtime panic.
+func (s *Spawner) getStores() (db.Stores, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stores == nil {
+		return db.Stores{}, false
+	}
+	return *s.stores, true
 }
 
 // wasTakenOver reports whether Takeover() has claimed this run. The

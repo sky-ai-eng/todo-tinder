@@ -11,8 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sky-ai-eng/triage-factory/cmd/exec/runident"
-	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
@@ -22,10 +21,11 @@ import (
 // touching the filesystem. Production wiring uses defaultAddDeps which
 // delegates to the worktree package.
 //
-// Only the worktree-mutating surface is injectable. The DB calls go through
-// the supplied *db.DB directly because tests already have a real in-memory
-// SQLite via newTestDB; mocking the DB layer would test less of the actual
-// SQL than letting it run.
+// Only the worktree-mutating surface is injectable. The agenthost calls
+// go through the supplied Client directly because tests construct a
+// LocalClient over an in-memory SQLite db.Stores; mocking the IPC
+// layer would test less of the actual code than exercising LocalClient
+// end-to-end.
 type addDeps struct {
 	createWorktree func(ctx context.Context, owner, repo, cloneURL, baseBranch, featureBranch, runID, runRoot string) (string, error)
 	removeWorktree func(path, runID string) error
@@ -96,14 +96,14 @@ func validateEntityKey(key string) error {
 // Returns the absolute worktree path the agent should cd into.
 //
 // Concurrency: the cross-process serialization point is the
-// run_worktrees PK insert (`InsertRunWorktree`'s INSERT OR IGNORE).
-// Two concurrent invocations both passing the idempotency precheck
-// race at insert time; the loser sees inserted=false and returns the
-// winner's path without touching git. Reserving BEFORE the create is
-// load-bearing — if we created first, both racing processes would
-// hit `git worktree add` against the same deterministic target dir
-// and the second would fail on "directory exists" before ever
-// reaching the PK conflict.
+// run_worktrees PK insert (`InsertRunWorktree`'s INSERT OR IGNORE),
+// hidden behind host.InsertRunWorktree. Two concurrent invocations
+// both passing the idempotency precheck race at insert time; the
+// loser sees inserted=false and returns the winner's path without
+// touching git. Reserving BEFORE the create is load-bearing — if we
+// created first, both racing processes would hit `git worktree add`
+// against the same deterministic target dir and the second would
+// fail on "directory exists" before ever reaching the PK conflict.
 //
 // Order:
 //  1. Run + task validation, Jira-vs-GitHub gate.
@@ -117,7 +117,7 @@ func validateEntityKey(key string) error {
 //  5. Loser path: return winner's path immediately.
 //  6. Winner path: create the worktree on disk. On failure, release
 //     the reservation so the next attempt can retry.
-func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps addDeps) (string, error) {
+func materializeWorkspace(host agenthost.Client, ownerRepoArg string, deps addDeps) (string, error) {
 	owner, repo, ok := splitOwnerRepo(ownerRepoArg)
 	if !ok {
 		return "", fmt.Errorf("%w: %q", errInvalidOwnerRepo, ownerRepoArg)
@@ -125,27 +125,25 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 	repoID := owner + "/" + repo
 
 	ctx := context.Background()
-	ident, err := runident.ResolveRunIdentity(ctx, stores, runID)
-	switch {
-	case errors.Is(err, runident.ErrRunIdentityMissing):
-		return "", errMissingRunID
-	case errors.Is(err, runident.ErrRunIdentityNotFound):
-		return "", fmt.Errorf("%w: %s", errRunNotFound, runID)
-	case err != nil:
-		return "", fmt.Errorf("workspace add: %w", err)
+	info, err := host.LookupRun(ctx)
+	if err != nil {
+		// runID is empty at this point — LookupRun is what would have
+		// produced it. The NotFound branch of translateLookupErr is
+		// unreachable in the LocalClient path (LookupRun only errors
+		// when the env-derived runID was empty at construction), so
+		// passing "" is correct: only the ErrRunIdentityMissing branch
+		// fires here, and it ignores the runID argument.
+		return "", translateLookupErr("workspace add", "", err)
 	}
 
-	// Re-read the run for its task_id — see list.go for the rationale
-	// (kept off RunIdentity to avoid threading one-call-site fields
-	// through the shared helper).
-	run, err := stores.AgentRuns.GetSystem(ctx, ident.OrgID, ident.RunID)
+	run, err := host.GetAgentRun(ctx)
 	if err != nil {
 		return "", fmt.Errorf("workspace add: load run: %w", err)
 	}
 	if run == nil {
-		return "", fmt.Errorf("%w: %s", errRunNotFound, runID)
+		return "", fmt.Errorf("%w: %s", errRunNotFound, info.RunID)
 	}
-	task, err := stores.Tasks.GetSystem(ctx, ident.OrgID, run.TaskID)
+	task, err := host.GetTask(ctx, run.TaskID)
 	if err != nil {
 		return "", fmt.Errorf("workspace add: load task: %w", err)
 	}
@@ -182,17 +180,7 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 	// inside the `staleReservationAge` window; killed-mid-create rows
 	// outlive it. Pre-staleness, trust the row. Past staleness with
 	// the path still missing, drop the row and re-reserve.
-	//
-	// The startup-cleanup-leaves-stale-row scenario doesn't matter for
-	// this gate either way: runs don't resume across server restarts,
-	// so no agent process invokes workspace add for a row whose dir was
-	// wiped post-crash. Genuinely stale rows
-	// outlive only their original run and are unreachable.
-	//
-	// Reads route through the admin pool; the deleteReservation
-	// closure below routes the WRITE through synth-claims (manual) or
-	// admin-pool (event-triggered) per ident's branch.
-	existing, err := stores.RunWorktrees.GetByRepoSystem(ctx, ident.OrgID, ident.RunID, repoID)
+	existing, err := host.GetRunWorktreeByRepo(ctx, repoID)
 	if err != nil {
 		return "", fmt.Errorf("workspace add: lookup existing worktree: %w", err)
 	}
@@ -213,8 +201,8 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 			// Stale: reservation outlived its creator without a
 			// completed worktree. Drop and fall through to re-reserve.
 			log.Printf("workspace add: dropping stale reservation for run %s repo %s (path %s missing, row age %s exceeds threshold %s)",
-				ident.RunID, repoID, existing.Path, age, staleReservationAge)
-			if delErr := deleteRunWorktreeReservation(ctx, stores, ident, repoID); delErr != nil {
+				info.RunID, repoID, existing.Path, age, staleReservationAge)
+			if delErr := host.DeleteRunWorktreeByRepo(ctx, repoID); delErr != nil {
 				return "", fmt.Errorf("workspace add: delete stale reservation: %w", delErr)
 			}
 		default:
@@ -224,7 +212,7 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 		}
 	}
 
-	profile, err := stores.Repos.GetSystem(ctx, ident.OrgID, repoID)
+	profile, err := host.GetRepo(ctx, repoID)
 	if err != nil {
 		return "", fmt.Errorf("workspace add: load repo profile: %w", err)
 	}
@@ -240,7 +228,7 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 		baseBranch = profile.DefaultBranch
 	}
 	featureBranch := "feature/" + task.EntitySourceID
-	runRoot := worktree.RunRoot(ident.RunID)
+	runRoot := worktree.RunRoot(info.RunID)
 	// Path is deterministic from CreateForBranchInRoot's contract:
 	// filepath.Join(runRoot, owner, repo). Compute it here so we can
 	// reserve the row BEFORE the create runs.
@@ -249,12 +237,12 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 	// Reserve. Two concurrent processes that both reach this point
 	// race at the PK; the loser short-circuits before touching git.
 	row := domain.RunWorktree{
-		RunID:         ident.RunID,
+		RunID:         info.RunID,
 		RepoID:        repoID,
 		Path:          wtPath,
 		FeatureBranch: featureBranch,
 	}
-	inserted, winningPath, err := insertRunWorktreeReservation(ctx, stores, ident, row)
+	inserted, winningPath, err := host.InsertRunWorktree(ctx, row)
 	if err != nil {
 		return "", fmt.Errorf("workspace add: reserve worktree row: %w", err)
 	}
@@ -274,13 +262,13 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 		profile.Owner, profile.Repo,
 		profile.CloneURL,
 		baseBranch, featureBranch,
-		ident.RunID, runRoot,
+		info.RunID, runRoot,
 	)
 	if err != nil {
 		// Release the reservation so the next attempt can retry.
 		// Delete failures are logged but don't shadow the create error
 		// the caller actually needs.
-		if delErr := deleteRunWorktreeReservation(ctx, stores, ident, repoID); delErr != nil {
+		if delErr := host.DeleteRunWorktreeByRepo(ctx, repoID); delErr != nil {
 			log.Printf("workspace add: release reservation after create failure: %v", delErr)
 		}
 		return "", fmt.Errorf("workspace add: create worktree: %w", err)
@@ -291,53 +279,10 @@ func materializeWorkspace(stores db.Stores, runID, ownerRepoArg string, deps add
 		// worktree library changed and our reservation path no longer
 		// matches reality. Surface loudly rather than silently storing
 		// the wrong path.
-		log.Printf("workspace add: created path %q diverges from reserved %q (run=%s repo=%s); investigate", gotPath, wtPath, ident.RunID, repoID)
+		log.Printf("workspace add: created path %q diverges from reserved %q (run=%s repo=%s); investigate", gotPath, wtPath, info.RunID, repoID)
 	}
 
 	return wtPath, nil
-}
-
-// insertRunWorktreeReservation routes the run_worktrees INSERT through
-// synthetic-claims (manual runs) or the admin pool (event-triggered).
-// SKY-302 — same routing pattern the delegate spawner uses for its
-// terminal bookkeeping writes.
-func insertRunWorktreeReservation(
-	ctx context.Context,
-	stores db.Stores,
-	ident runident.RunIdentity,
-	row domain.RunWorktree,
-) (bool, string, error) {
-	if ident.IsEventTriggered {
-		return stores.RunWorktrees.InsertSystem(ctx, ident.OrgID, row)
-	}
-	var (
-		inserted    bool
-		winningPath string
-	)
-	err := stores.Tx.SyntheticClaimsWithTx(ctx, ident.OrgID, ident.UserID, func(ts db.TxStores) error {
-		i, w, ierr := ts.RunWorktrees.Insert(ctx, ident.OrgID, row)
-		inserted = i
-		winningPath = w
-		return ierr
-	})
-	return inserted, winningPath, err
-}
-
-// deleteRunWorktreeReservation routes the run_worktrees DELETE through
-// synthetic-claims (manual runs) or the admin pool (event-triggered).
-// Same SKY-302 routing pattern as insertRunWorktreeReservation.
-func deleteRunWorktreeReservation(
-	ctx context.Context,
-	stores db.Stores,
-	ident runident.RunIdentity,
-	repoID string,
-) error {
-	if ident.IsEventTriggered {
-		return stores.RunWorktrees.DeleteByRepoSystem(ctx, ident.OrgID, ident.RunID, repoID)
-	}
-	return stores.Tx.SyntheticClaimsWithTx(ctx, ident.OrgID, ident.UserID, func(ts db.TxStores) error {
-		return ts.RunWorktrees.DeleteByRepo(ctx, ident.OrgID, ident.RunID, repoID)
-	})
 }
 
 // runAdd is the CLI entrypoint: argv → materializeWorkspace → stdout/stderr.
@@ -345,14 +290,13 @@ func deleteRunWorktreeReservation(
 // exit and the agent sees a clear message on stderr. Successful resolution
 // (first add or idempotent re-add) prints the absolute worktree path on
 // stdout for `cd "$(... workspace add owner/repo)"`.
-func runAdd(stores db.Stores, args []string) {
+func runAdd(host agenthost.Client, args []string) {
 	if len(args) == 0 {
 		exitErr("workspace add: missing argument; expected owner/repo")
 	}
 
 	path, err := materializeWorkspace(
-		stores,
-		os.Getenv(runident.RunIdentityEnvVar),
+		host,
 		strings.TrimSpace(args[0]),
 		defaultAddDeps(),
 	)

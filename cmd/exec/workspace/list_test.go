@@ -12,14 +12,14 @@ import (
 
 func TestListWorkspaces_MissingRunID(t *testing.T) {
 	stores, _ := newTestDB(t)
-	if _, err := listWorkspaces(stores, ""); !errors.Is(err, errMissingRunID) {
+	if _, err := listWorkspaces(hostFor(stores, "")); !errors.Is(err, errMissingRunID) {
 		t.Errorf("err = %v, want errMissingRunID", err)
 	}
 }
 
 func TestListWorkspaces_RunNotFound(t *testing.T) {
 	stores, _ := newTestDB(t)
-	if _, err := listWorkspaces(stores, "missing-run"); !errors.Is(err, errRunNotFound) {
+	if _, err := listWorkspaces(hostFor(stores, "missing-run")); !errors.Is(err, errRunNotFound) {
 		t.Errorf("err = %v, want errRunNotFound", err)
 	}
 }
@@ -28,7 +28,7 @@ func TestListWorkspaces_RejectsGitHubPRRun(t *testing.T) {
 	stores, database := newTestDB(t)
 	seedGitHubRun(t, database, "gh-run")
 
-	_, err := listWorkspaces(stores, "gh-run")
+	_, err := listWorkspaces(hostFor(stores, "gh-run"))
 	if !errors.Is(err, errNotJiraRun) {
 		t.Errorf("err = %v, want errNotJiraRun (workspace list must reject GitHub PR runs to keep its contract aligned with workspace add)", err)
 	}
@@ -49,7 +49,7 @@ func TestListWorkspaces_AvailableFiltersOutMaterialized(t *testing.T) {
 		t.Fatalf("seed materialized: %v", err)
 	}
 
-	out, err := listWorkspaces(stores, "r1")
+	out, err := listWorkspaces(hostFor(stores, "r1"))
 	if err != nil {
 		t.Fatalf("listWorkspaces: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestListWorkspaces_NoConfiguredRepos(t *testing.T) {
 	stores, database := newTestDB(t)
 	seedJiraRun(t, database, "r1", "SKY-1")
 
-	out, err := listWorkspaces(stores, "r1")
+	out, err := listWorkspaces(hostFor(stores, "r1"))
 	if err != nil {
 		t.Fatalf("listWorkspaces: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestListWorkspaces_ScopedToRun(t *testing.T) {
 		t.Fatalf("seed r2 materialized: %v", err)
 	}
 
-	out, err := listWorkspaces(stores, "r1")
+	out, err := listWorkspaces(hostFor(stores, "r1"))
 	if err != nil {
 		t.Fatalf("listWorkspaces r1: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestListWorkspaces_AvailableSurfacesDescription(t *testing.T) {
 		t.Fatalf("upsert skeleton: %v", err)
 	}
 
-	out, err := listWorkspaces(stores, "r1")
+	out, err := listWorkspaces(hostFor(stores, "r1"))
 	if err != nil {
 		t.Fatalf("listWorkspaces: %v", err)
 	}
