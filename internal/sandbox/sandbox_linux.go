@@ -100,7 +100,7 @@ func wrap(ctx context.Context, cfg Config) (*exec.Cmd, *Sandbox, error) {
 	}
 
 	// Step 10: rootfs + OCI bundle.
-	rootfsPath, err := ensureRootfs()
+	rootfsPath, err := ensureRootfs(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sandbox: %w", err)
 	}

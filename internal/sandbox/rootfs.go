@@ -3,12 +3,88 @@ package sandbox
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
+
+// alpineRootfsURL pins the alpine minirootfs the sandbox uses. Same
+// tarball as the validation probe (probe.sh line 64) so the runtime
+// behavior matches what was tested. Bumping requires re-running the
+// probe to verify nothing changed in alpine's syscall surface that
+// the SDK depends on.
+const (
+	alpineRootfsURL    = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz"
+	alpineRootfsSHA256 = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
+
+	// alpineCommunityRepo is the community repository for the same
+	// alpine version. Some packages we install (ripgrep, go) live in
+	// community rather than main, so the cache build enables this
+	// repo before invoking apk-add.
+	alpineCommunityRepo = "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
+)
+
+// apkPackages is the toolchain installed into the cached alpine
+// rootfs after extraction. Any change here invalidates the rootfs
+// cache key (rootfsCacheKey hashes this slice alongside the alpine
+// tarball sha) so a fresh extraction picks up the new package set
+// on the next sandbox launch.
+//
+//   - nodejs/npm — agent SDK runtime; corepack ships with npm so
+//     pnpm/yarn are available on demand without a separate apk add.
+//   - git — every delegate/curator flow does status/diff/commit/push.
+//   - ripgrep — agent's primary code-search tool; faster than grep
+//     on large repos.
+//   - bash — alpine ships ash by default; many shell scripts and
+//     agent invocations assume bash.
+//   - ca-certificates — outbound TLS from in-sandbox tools (git over
+//     HTTPS, npm registry, the in-host proxy a follow-up ticket
+//     wires in).
+//   - python3 — common in build scripts and tooling glue.
+//   - go — Go projects need go build/test/mod tidy to verify changes.
+//   - make — ubiquitous in build flows.
+//   - curl — ubiquitous, tiny, expected.
+//   - openssh-client — git over SSH and any tooling that calls ssh.
+//   - build-base — gcc + make + musl-dev; required for native deps
+//     (node-gyp, cgo, anything that compiles at install time).
+var apkPackages = []string{
+	"nodejs", "npm", "git", "ripgrep", "bash", "ca-certificates",
+	"python3", "go", "make", "curl", "openssh-client", "build-base",
+}
+
+// rootfsCacheKey returns the 12-hex-char cache key for the current
+// rootfs build inputs.
+func rootfsCacheKey() string {
+	return rootfsCacheKeyFor(alpineRootfsSHA256, apkPackages)
+}
+
+// rootfsCacheKeyFor hashes (alpine_sha, sorted-package-set) and
+// returns the first 12 hex chars. Sorting before hashing means the
+// key depends on the package set, not on slice ordering — a future
+// maintainer reshuffling apkPackages won't silently invalidate a
+// cache that's actually still correct.
+//
+// The cache directory is derived from this key, so adding a package
+// produces a new key, forces a fresh extraction, and avoids the
+// failure mode where the on-disk cache contains the old toolchain
+// while the running binary expects the new one.
+func rootfsCacheKeyFor(alpineSha string, packages []string) string {
+	sorted := append([]string(nil), packages...)
+	sort.Strings(sorted)
+	h := sha256.New()
+	h.Write([]byte(alpineSha))
+	h.Write([]byte{0})
+	for _, p := range sorted {
+		h.Write([]byte(p))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
+}
 
 // extractTarGz unpacks a gzip-compressed tar archive into dst.
 // Two-pass for security:
