@@ -3,23 +3,18 @@
 === RUN   TestCleanupBundle_Idempotent
 --- PASS: TestCleanupBundle_Idempotent (0.00s)
 === RUN   TestIntegration_BootBusyboxPayload
-    integration_linux_test.go:90: Wrap: sandbox: rootfs: verify sha256: sha256 mismatch: got d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c, want f4f5ed83a611d3d2d27ff37d8d019e96e1c405d83e51b8d553fc36f4d0ad6c00
---- FAIL: TestIntegration_BootBusyboxPayload (0.22s)
+--- PASS: TestIntegration_BootBusyboxPayload (0.41s)
 === RUN   TestIntegration_PropertyB_NoCredentialsInEnv
-    integration_linux_test.go:121: Wrap: sandbox: rootfs: verify sha256: sha256 mismatch: got d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c, want f4f5ed83a611d3d2d27ff37d8d019e96e1c405d83e51b8d553fc36f4d0ad6c00
---- FAIL: TestIntegration_PropertyB_NoCredentialsInEnv (0.11s)
+--- PASS: TestIntegration_PropertyB_NoCredentialsInEnv (0.28s)
 === RUN   TestIntegration_NonRootUID
-    integration_linux_test.go:153: Wrap: sandbox: rootfs: verify sha256: sha256 mismatch: got d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c, want f4f5ed83a611d3d2d27ff37d8d019e96e1c405d83e51b8d553fc36f4d0ad6c00
---- FAIL: TestIntegration_NonRootUID (0.09s)
+--- PASS: TestIntegration_NonRootUID (0.25s)
 === RUN   TestIntegration_WorktreeIsolation
-    integration_linux_test.go:187: Wrap: sandbox: rootfs: verify sha256: sha256 mismatch: got d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c, want f4f5ed83a611d3d2d27ff37d8d019e96e1c405d83e51b8d553fc36f4d0ad6c00
---- FAIL: TestIntegration_WorktreeIsolation (0.09s)
+--- PASS: TestIntegration_WorktreeIsolation (0.31s)
 === RUN   TestIntegration_CleanupRemovesNetns
-    integration_linux_test.go:208: Wrap: sandbox: rootfs: verify sha256: sha256 mismatch: got d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c, want f4f5ed83a611d3d2d27ff37d8d019e96e1c405d83e51b8d553fc36f4d0ad6c00
---- FAIL: TestIntegration_CleanupRemovesNetns (0.10s)
+--- PASS: TestIntegration_CleanupRemovesNetns (0.28s)
 === RUN   TestIntegration_ReapOrphans
-    integration_linux_test.go:236: Wrap: sandbox: rootfs: verify sha256: sha256 mismatch: got d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c, want f4f5ed83a611d3d2d27ff37d8d019e96e1c405d83e51b8d553fc36f4d0ad6c00
---- FAIL: TestIntegration_ReapOrphans (0.10s)
+    integration_linux_test.go:245: orphan netns /var/run/netns/tf-itestTes-0 not reaped
+--- FAIL: TestIntegration_ReapOrphans (0.06s)
 === RUN   TestReapBundleOrphans
 --- PASS: TestReapBundleOrphans (0.00s)
 === RUN   TestReapBundleOrphans_LeavesNonMatchingAlone
@@ -79,5 +74,5 @@
 === RUN   TestSubnetIdxFromNetnsName
 --- PASS: TestSubnetIdxFromNetnsName (0.00s)
 FAIL
-FAIL	github.com/sky-ai-eng/triage-factory/internal/sandbox	0.731s
+FAIL	github.com/sky-ai-eng/triage-factory/internal/sandbox	1.604s
 FAIL
