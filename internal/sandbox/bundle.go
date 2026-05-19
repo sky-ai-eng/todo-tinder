@@ -10,7 +10,7 @@ import (
 
 // writeBundle constructs the per-run OCI bundle directory on disk:
 //
-//	$TMPDIR/tf-bundle-<runID>/
+//	$TMPDIR/tf-bundle-<runID>-<rand>/
 //	├── config.json     (the OCI spec)
 //	├── resolv.conf     (1.1.1.1/8.8.8.8 — bind-mounted at /etc/resolv.conf)
 //	└── rootfs/         (symlink to the cached alpine minirootfs)
@@ -29,16 +29,14 @@ import (
 // isn't knowable until writeBundle has run, so buildSpec leaves the
 // mount slot empty and we fill it here.
 func writeBundle(cfg Config, spec *specs.Spec, rootfsPath string) (string, error) {
-	bundleDir := filepath.Join(os.TempDir(), "tf-bundle-"+cfg.RunID)
-
-	// Remove any leftover bundle dir from a crashed prior run with
-	// the same RunID — shouldn't happen because RunIDs are
-	// per-invocation UUIDs, but be defensive.
-	if err := os.RemoveAll(bundleDir); err != nil {
-		return "", fmt.Errorf("bundle: clean stale dir: %w", err)
-	}
-	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
-		return "", fmt.Errorf("bundle: mkdir: %w", err)
+	// Per-invocation unique bundle dir via MkdirTemp's random suffix.
+	// RunID isn't guaranteed unique per call (some callers pass fixed
+	// TraceIDs like "scorer-batch"), so a RunID-only path would let
+	// concurrent runs delete each other's bundle. RunID stays in the
+	// prefix purely for operator-grep-friendly naming.
+	bundleDir, err := os.MkdirTemp(os.TempDir(), "tf-bundle-"+sanitizeBundlePrefix(cfg.RunID)+"-")
+	if err != nil {
+		return "", fmt.Errorf("bundle: mkdtemp: %w", err)
 	}
 
 	// Symlink the cached rootfs into the bundle.
@@ -72,4 +70,31 @@ func cleanupBundle(bundleDir string) error {
 		return nil
 	}
 	return os.RemoveAll(bundleDir)
+}
+
+// sanitizeBundlePrefix strips characters that would break MkdirTemp's
+// path-safe assumption or make grep noisy. Replaces any non-[a-z0-9-]
+// with '-' and clips length so the final dir name stays well under
+// any OS path limits.
+func sanitizeBundlePrefix(s string) string {
+	const maxLen = 24
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
+			b = append(b, c)
+		case c >= 'A' && c <= 'Z':
+			b = append(b, c+32)
+		default:
+			b = append(b, '-')
+		}
+	}
+	if len(b) == 0 {
+		return "run"
+	}
+	return string(b)
 }

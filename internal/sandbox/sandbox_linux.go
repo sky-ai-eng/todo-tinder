@@ -116,7 +116,14 @@ func wrap(ctx context.Context, cfg Config) (*exec.Cmd, *Sandbox, error) {
 
 	// Step 11: construct the runsc command. Caller runs it via
 	// Start + Wait; cmd.Cancel handles ctx cancellation.
-	containerID := "tf-" + truncate(cfg.RunID, 11)
+	//
+	// Container ID must be unique per Wrap or runsc rejects the
+	// second concurrent start. RunID isn't unique on its own (some
+	// callers pass fixed TraceIDs like "scorer-batch"), but the
+	// subnet idx is — the allocator gives a fresh idx for every live
+	// Wrap. Pair them so the ID stays grep-friendly while being
+	// uniquely distinguishable.
+	containerID := fmt.Sprintf("tf-%s-%d", truncate(cfg.RunID, 11), idx)
 	cmd := newRunscCommand(ctx, bundleDir, containerID)
 
 	releaseOnError = false

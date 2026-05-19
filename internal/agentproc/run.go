@@ -164,17 +164,6 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Resolve per-org LLM credentials *before* spawning Node so
-	// multi-mode-with-no-creds fails fast with a typed error instead
-	// of waiting for the SDK to ENOAUTH inside the subprocess. The
-	// resolver returns an empty map in local-mode when no per-org
-	// credentials are configured; mergeEnv detects that and preserves
-	// the inherited env (subscription / shell-env fallback).
-	creds, err := resolveCredentials(runCtx, opts.Secrets, opts.OrgID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve credentials for org %q: %w", opts.OrgID, err)
-	}
-
 	// EnsureSDK installs Node + Agent SDK + wrapper.mjs on first call
 	// and returns the absolute wrapper path. Failures here are usually
 	// "Node not on PATH" — surface them to the caller so the run lands
@@ -207,18 +196,24 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	// for tenant isolation. Local-mode + non-Linux take the direct
 	// subprocess path (unchanged behavior).
 	var (
-		cmd          *exec.Cmd
-		sb           *sandbox.Sandbox
-		sandboxCreds map[string]string // empty for the direct path
+		cmd *exec.Cmd
+		sb  *sandbox.Sandbox
 	)
 	if shouldSandbox() {
-		// PROPERTY B INVARIANT (SKY-254):
-		// `creds` from resolveCredentials above is intentionally
-		// discarded in the sandbox path. Real credentials never
-		// enter the sandbox env. SKY-335 will append proxy URL +
-		// placeholder credential entries to sbEnv so the agent
-		// can reach an in-host proxy that holds the real key.
-		_ = creds // shadow to silence "declared but not used" — kept around for the direct-path branch
+		// PROPERTY B INVARIANT: the sandbox path deliberately skips
+		// resolveCredentials. Real credentials never enter the sandbox
+		// env. A future ticket will inject proxy URL + placeholder
+		// credential entries so the agent can reach an in-host proxy
+		// that holds the real key.
+		if opts.Cwd == "" {
+			// Sandbox needs a real worktree to bind-mount at /work. The
+			// proposed Copilot fix of "default the worktree" would silently
+			// sandbox the wrong directory; fail loudly instead and let the
+			// caller fix the gap (some agentproc.Run callers — scorer,
+			// classifier, profiler — currently pass empty Cwd and need
+			// multi-mode wiring before they can route through here).
+			return nil, fmt.Errorf("sandbox: opts.Cwd is required in multi-mode (caller passed empty)")
+		}
 		nodeBin, err := exec.LookPath("node")
 		if err != nil {
 			return nil, fmt.Errorf("sandbox: node binary: %w", err)
@@ -228,7 +223,6 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 			return nil, fmt.Errorf("sandbox: chown worktree: %w", err)
 		}
 		sbEnv := buildSandboxEnv(opts.ExtraEnv)
-		sandboxCreds = nil // explicit: no creds, no merge
 
 		// Translate AddDirs (host paths under opts.Cwd) into their
 		// /work-relative equivalents inside the sandbox. Without this
@@ -262,6 +256,17 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		cmd, sb = sandboxCmd, sandbox
 		defer func() { _ = sb.Close() }()
 	} else {
+		// Direct-path: resolve per-org LLM credentials before spawning
+		// Node so multi-mode-with-no-creds (in local-mode-but-no-keychain
+		// boxes) fails fast with a typed error rather than waiting for
+		// the SDK to ENOAUTH inside the subprocess. Resolver returns an
+		// empty map when no per-org credentials are configured; mergeEnv
+		// detects that and preserves the inherited env (subscription /
+		// shell-env fallback).
+		creds, err := resolveCredentials(runCtx, opts.Secrets, opts.OrgID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve credentials for org %q: %w", opts.OrgID, err)
+		}
 		cmd = exec.CommandContext(runCtx, "node", nodeArgs...)
 		cmd.Dir = opts.Cwd
 		cmd.Env = mergeEnv(os.Environ(), opts.ExtraEnv, creds)
@@ -275,7 +280,6 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}
-	_ = sandboxCreds // future SKY-335 hook; kept named for grep-discoverability
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

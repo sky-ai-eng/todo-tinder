@@ -54,7 +54,15 @@ func buildSpec(cfg Config, netnsPath string) (*specs.Spec, error) {
 	}
 
 	noNewPrivs := true
-	readonlyRootfs := false // /work is rw; rootfs itself stays writable for /tmp etc.
+	// Rootfs MUST be readonly: the cached alpine extraction is shared
+	// across every run on the host, so a writable mount would let one
+	// tenant's agent persist files into /usr/bin/* (or anywhere in the
+	// rootfs) that the next tenant's agent then reads/executes. The
+	// places the agent legitimately needs to write — /work (the bind-
+	// mounted worktree), /tmp (a per-run tmpfs), /dev (a per-run
+	// tmpfs) — are already separate mounts and stay writable
+	// regardless of this flag.
+	readonlyRootfs := true
 
 	spec := &specs.Spec{
 		Version: specs.Version,

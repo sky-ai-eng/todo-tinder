@@ -24,24 +24,25 @@ const (
 	alpineRootfsSHA256 = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
 )
 
-// rootfsCacheOnce protects single-installation of the cached rootfs.
-// Subsequent Wrap calls observe the populated cache and return its
-// path without re-downloading or re-extracting.
-var (
-	rootfsCacheOnce sync.Once
-	rootfsCachePath string
-	rootfsCacheErr  error
-)
+// rootfsCacheMu serializes ensureRootfs across concurrent Wrap calls.
+// We use a mutex rather than sync.Once because sync.Once permanently
+// caches the first call's result — a transient failure (CDN flap,
+// disk full at extract time) would then poison every subsequent
+// Wrap for the lifetime of the process. The mutex guards a check of
+// the on-disk sentinel file, so successful prior calls return fast
+// without re-extracting, while failures don't lock anyone out of
+// retrying.
+var rootfsCacheMu sync.Mutex
 
 // ensureRootfs idempotently downloads + verifies + extracts the
 // alpine minirootfs to ~/.triagefactory/sandbox/rootfs-<sha>/ and
-// returns the path. Concurrency-safe via sync.Once; first call does
-// the work, all callers observe the same result.
+// returns the path. Concurrency-safe via a mutex; success cached
+// via the sentinel file inside doEnsureRootfs (so re-entry after
+// a successful first call is just one os.Stat).
 func ensureRootfs() (string, error) {
-	rootfsCacheOnce.Do(func() {
-		rootfsCachePath, rootfsCacheErr = doEnsureRootfs()
-	})
-	return rootfsCachePath, rootfsCacheErr
+	rootfsCacheMu.Lock()
+	defer rootfsCacheMu.Unlock()
+	return doEnsureRootfs()
 }
 
 func doEnsureRootfs() (string, error) {
