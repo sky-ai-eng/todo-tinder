@@ -89,9 +89,10 @@ func TestResolveCredentials_AnthropicWinsOverBedrock(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeMulti)
 	const orgID = "33333333-3333-3333-3333-333333333333"
 	secrets := newFakeSecrets(orgID, map[string]string{
-		"anthropic_api_key":     "sk-ant-both",
-		"aws_access_key_id":     "AKIA-both",
-		"aws_secret_access_key": "secret-both",
+		"anthropic_api_key":        "sk-ant-both",
+		"aws_bearer_token_bedrock": "bedrock-bearer-both",
+		"aws_access_key_id":        "AKIA-both",
+		"aws_secret_access_key":    "secret-both",
 	})
 
 	env, err := resolveCredentials(context.Background(), secrets, orgID)
@@ -101,8 +102,74 @@ func TestResolveCredentials_AnthropicWinsOverBedrock(t *testing.T) {
 	if env["ANTHROPIC_API_KEY"] != "sk-ant-both" {
 		t.Errorf("ANTHROPIC_API_KEY = %q, want sk-ant-both", env["ANTHROPIC_API_KEY"])
 	}
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_BEARER_TOKEN_BEDROCK", "CLAUDE_CODE_USE_BEDROCK"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("env[%s] set when Anthropic configured; Anthropic should win exclusively", k)
+		}
+	}
+}
+
+// TestResolveCredentials_BedrockAPIKeyPath covers the Bedrock API
+// key auth path (Option E in the Claude Code docs) — a single
+// bearer token instead of the AWS access-key triple. The SDK reads
+// AWS_BEARER_TOKEN_BEDROCK; CLAUDE_CODE_USE_BEDROCK=1 still gates
+// the routing.
+func TestResolveCredentials_BedrockAPIKeyPath(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	const orgID = "77777777-7777-7777-7777-777777777777"
+	secrets := newFakeSecrets(orgID, map[string]string{
+		"aws_bearer_token_bedrock": "bdrk-test-bearer",
+		"aws_region":               "us-east-1",
+		"bedrock_model_id":         "us.anthropic.claude-sonnet-4-6",
+	})
+
+	env, err := resolveCredentials(context.Background(), secrets, orgID)
+	if err != nil {
+		t.Fatalf("resolveCredentials: %v", err)
+	}
+	if env["AWS_BEARER_TOKEN_BEDROCK"] != "bdrk-test-bearer" {
+		t.Errorf("AWS_BEARER_TOKEN_BEDROCK = %q, want bdrk-test-bearer", env["AWS_BEARER_TOKEN_BEDROCK"])
+	}
+	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
+		t.Errorf("CLAUDE_CODE_USE_BEDROCK = %q, want 1", env["CLAUDE_CODE_USE_BEDROCK"])
+	}
+	if env["AWS_REGION"] != "us-east-1" {
+		t.Errorf("AWS_REGION = %q, want us-east-1", env["AWS_REGION"])
+	}
+	if env["ANTHROPIC_MODEL"] != "us.anthropic.claude-sonnet-4-6" {
+		t.Errorf("ANTHROPIC_MODEL = %q, want us.anthropic.claude-sonnet-4-6", env["ANTHROPIC_MODEL"])
+	}
+	// AWS triple must NOT appear — the bearer path is mutually
+	// exclusive with the SigV4 path within the resolver.
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("env[%s] set on Bedrock-bearer path; AWS triple should be unset", k)
+		}
+	}
+}
+
+// TestResolveCredentials_BedrockBearerWinsOverTriple — when both
+// Bedrock bearer AND AWS triple are configured, bearer wins. Same
+// rationale as Anthropic-over-Bedrock: pick one rather than error
+// so a half-misconfigured org can still run.
+func TestResolveCredentials_BedrockBearerWinsOverTriple(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	const orgID = "88888888-8888-8888-8888-888888888888"
+	secrets := newFakeSecrets(orgID, map[string]string{
+		"aws_bearer_token_bedrock": "bearer-wins",
+		"aws_access_key_id":        "AKIA-loses",
+		"aws_secret_access_key":    "secret-loses",
+	})
+
+	env, err := resolveCredentials(context.Background(), secrets, orgID)
+	if err != nil {
+		t.Fatalf("resolveCredentials: %v", err)
+	}
+	if env["AWS_BEARER_TOKEN_BEDROCK"] != "bearer-wins" {
+		t.Errorf("AWS_BEARER_TOKEN_BEDROCK = %q, want bearer-wins", env["AWS_BEARER_TOKEN_BEDROCK"])
+	}
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
-		t.Errorf("AWS_ACCESS_KEY_ID set; Anthropic should win")
+		t.Errorf("AWS_ACCESS_KEY_ID set; bearer path should win")
 	}
 }
 
@@ -205,6 +272,9 @@ func TestMergeEnv_StripsParentCredsWhenResolved(t *testing.T) {
 		"HOME=/home/test",
 		"ANTHROPIC_API_KEY=parent-leak",
 		"AWS_ACCESS_KEY_ID=parent-aws-leak",
+		"AWS_PROFILE=operator-account",          // newly added to the leak guard
+		"CLAUDE_CODE_USE_VERTEX=1",              // alternate-provider toggle
+		"ANTHROPIC_BEDROCK_BASE_URL=https://op", // endpoint hijack
 		"NPM_CONFIG_CACHE=/cache",
 	}
 	extra := []string{"TRIAGE_FACTORY_RUN_ID=run-123"}
@@ -212,11 +282,16 @@ func TestMergeEnv_StripsParentCredsWhenResolved(t *testing.T) {
 
 	merged := mergeEnv(parent, extra, creds)
 
-	if containsKey(merged, "ANTHROPIC_API_KEY=parent-leak") {
-		t.Errorf("parent ANTHROPIC_API_KEY survived merge — leak guard broken")
-	}
-	if containsKey(merged, "AWS_ACCESS_KEY_ID=parent-aws-leak") {
-		t.Errorf("parent AWS_ACCESS_KEY_ID survived merge — leak guard broken")
+	for _, leak := range []string{
+		"ANTHROPIC_API_KEY=parent-leak",
+		"AWS_ACCESS_KEY_ID=parent-aws-leak",
+		"AWS_PROFILE=operator-account",
+		"CLAUDE_CODE_USE_VERTEX=1",
+		"ANTHROPIC_BEDROCK_BASE_URL=https://op",
+	} {
+		if containsKey(merged, leak) {
+			t.Errorf("parent leak survived merge: %q — leak guard broken", leak)
+		}
 	}
 	if !containsKey(merged, "ANTHROPIC_API_KEY=sk-ant-org-resolved") {
 		t.Errorf("resolved ANTHROPIC_API_KEY missing from merged env: %v", merged)

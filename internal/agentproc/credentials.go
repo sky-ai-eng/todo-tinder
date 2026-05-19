@@ -37,39 +37,109 @@ var ErrNoCredentialsConfigured = errors.New("agentproc: no LLM credentials confi
 // writing to the vault / keychain via SecretStore.Put — keep these
 // in sync with the admin-UI write path (D14, separate ticket).
 const (
+	// Direct Anthropic API auth.
 	secretAnthropicAPIKey   = "anthropic_api_key"
-	secretAWSAccessKeyID    = "aws_access_key_id"
-	secretAWSSecretKey      = "aws_secret_access_key"
-	secretAWSSessionToken   = "aws_session_token"
-	secretAWSRegion         = "aws_region"
-	secretBedrockModelID    = "bedrock_model_id"
+	secretAnthropicAuthMode = "anthropic_auth_token" // optional bearer for proxy/gateway
 	secretAnthropicBaseURL  = "anthropic_base_url"
-	secretAnthropicAuthMode = "anthropic_auth_token" // optional: gateway / proxy bearer
+
+	// AWS Bedrock auth — access-key triple path (Option B in the
+	// Claude Code docs).
+	secretAWSAccessKeyID  = "aws_access_key_id"
+	secretAWSSecretKey    = "aws_secret_access_key"
+	secretAWSSessionToken = "aws_session_token"
+	secretAWSRegion       = "aws_region"
+
+	// AWS Bedrock auth — Bedrock API key path (Option E in the
+	// Claude Code docs). Simpler than the AWS triple — no IAM, no
+	// SigV4 — but only valid for Bedrock model invocation.
+	secretAWSBearerTokenBedrock = "aws_bearer_token_bedrock"
+
+	// Bedrock model identification (inference profile ID or
+	// application inference profile ARN). Maps to ANTHROPIC_MODEL
+	// per the Claude Code env var contract.
+	secretBedrockModelID = "bedrock_model_id"
 )
 
-// credentialEnvKeys lists every env var the LLM SDK in wrapper.mjs
-// consumes to pick up auth material. The Run path treats these as
-// the parent-env leak surface: when the resolver returns per-org
-// creds, every key in this list is filtered out of os.Environ before
-// the subprocess inherits anything, so a misconfigured deployment
-// where the operator set ANTHROPIC_API_KEY at the systemd-unit
-// level can't silently override the org-scoped key.
+// credentialEnvKeys lists every env var the Claude Agent SDK (or
+// downstream @aws-sdk credential chain) reads to pick up auth or
+// routing material. The Run path treats these as the parent-env
+// leak surface: when the resolver returns per-org creds, every key
+// in this list is filtered out of os.Environ before the subprocess
+// inherits anything, so a misconfigured deployment where the
+// operator set ANTHROPIC_API_KEY (or AWS_PROFILE, or any other
+// entry below) at the systemd-unit level can't silently override
+// the org-scoped credentials.
 //
-// Keep this list synchronized with the SDK's defaults. Adding a new
-// env-driven auth path means adding it here AND adding the secret
-// key + mapping in resolveCredentials.
+// Sourced from a SDK source-grep of @anthropic-ai/claude-agent-sdk
+// (sdk.mjs / assistant.mjs / bridge.mjs) plus the official Claude
+// Code on Bedrock docs at code.claude.com/docs/en/amazon-bedrock.
+// When the SDK ships new env-driven auth surfaces, add them here
+// AND, if they're persisted per-org, add the matching secret key
+// in the catalog above + the resolver branch in resolveCredentials.
+//
+// Categories:
+//   - ANTHROPIC_*: direct Anthropic API auth + Anthropic-side
+//     workforce identity / federation tokens
+//   - AWS_*: standard AWS credential-chain env vars consumed by the
+//     downstream @aws-sdk Bedrock client + the Bedrock API key path
+//   - CLAUDE_CODE_USE_*: provider-selection toggles (Bedrock,
+//     Mantle, Vertex, Foundry, AnthropicAWS — leaving an operator's
+//     toggle in place could route a request to the wrong provider)
+//   - Endpoint overrides: ANTHROPIC_BEDROCK_BASE_URL etc — could
+//     redirect traffic to an operator-controlled proxy
 var credentialEnvKeys = []string{
+	// Anthropic direct API auth + Anthropic-side identity.
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"ANTHROPIC_FEDERATION_RULE_ID",
+	"ANTHROPIC_IDENTITY_TOKEN",
+	"ANTHROPIC_IDENTITY_TOKEN_FILE",
+	"ANTHROPIC_ORGANIZATION_ID",
+	"ANTHROPIC_PROFILE",
+	"ANTHROPIC_SCOPE",
+	"ANTHROPIC_SERVICE_ACCOUNT_ID",
+
+	// Bedrock / Mantle endpoint URLs + service tier + model ID.
+	// ANTHROPIC_MODEL crosses categories (used by direct API too)
+	// but stripping it on resolved-creds is safer than leaking a
+	// parent's pinned model.
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+	"ANTHROPIC_BEDROCK_SERVICE_TIER",
+	"ANTHROPIC_MODEL",
+	"ANTHROPIC_DEFAULT_OPUS_MODEL",
+	"ANTHROPIC_DEFAULT_SONNET_MODEL",
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+	"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+
+	// Provider-selection toggles. Leaving CLAUDE_CODE_USE_VERTEX in
+	// place when we resolved Bedrock creds could surface as the SDK
+	// trying both and failing in a confusing way.
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_MANTLE",
+	"CLAUDE_CODE_USE_VERTEX",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
+
+	// AWS standard credential chain + Bedrock-specific API key.
+	// The @aws-sdk client reads all of these by default; an
+	// operator's AWS_PROFILE pointing at a parent ~/.aws/credentials
+	// row would otherwise win over the resolver's injection.
 	"AWS_ACCESS_KEY_ID",
 	"AWS_SECRET_ACCESS_KEY",
 	"AWS_SESSION_TOKEN",
 	"AWS_REGION",
 	"AWS_DEFAULT_REGION",
-	"CLAUDE_CODE_USE_BEDROCK",
-	"ANTHROPIC_BEDROCK_BASE_URL",
-	"ANTHROPIC_MODEL",
+	"AWS_PROFILE",
+	"AWS_SHARED_CREDENTIALS_FILE",
+	"AWS_CONFIG_FILE",
+	"AWS_WEB_IDENTITY_TOKEN_FILE",
+	"AWS_ROLE_ARN",
+	"AWS_ROLE_SESSION_NAME",
+	"AWS_BEARER_TOKEN_BEDROCK",
 }
 
 // resolveCredentials looks up the env vars to inject into the Node
@@ -140,8 +210,34 @@ func resolveCredentials(ctx context.Context, secrets SecretsReader, orgID string
 		return env, nil
 	}
 
-	// Bedrock: require the access-key triple. Session token + region
-	// are optional (region defaults to us-east-1 in some setups; the
+	// Bedrock API key (Option E in the Claude Code docs): a single
+	// bearer token that skips the AWS SigV4 chain. Strictly simpler
+	// than the AWS triple and increasingly the recommended path for
+	// orgs that don't need full IAM roles. Region is still required
+	// for the SDK to construct the Bedrock endpoint URL.
+	bedrockBearer, err := secrets.Get(ctx, orgID, secretAWSBearerTokenBedrock)
+	if err != nil {
+		return nil, fmt.Errorf("resolve aws_bearer_token_bedrock: %w", err)
+	}
+	if bedrockBearer != "" {
+		env := map[string]string{
+			"AWS_BEARER_TOKEN_BEDROCK": bedrockBearer,
+			"CLAUDE_CODE_USE_BEDROCK":  "1",
+		}
+		region, _ := secrets.Get(ctx, orgID, secretAWSRegion)
+		if region != "" {
+			env["AWS_REGION"] = region
+		}
+		modelID, _ := secrets.Get(ctx, orgID, secretBedrockModelID)
+		if modelID != "" {
+			env["ANTHROPIC_MODEL"] = modelID
+		}
+		return env, nil
+	}
+
+	// Bedrock access-key triple: require both access key + secret.
+	// Session token + region are optional (region defaults to
+	// us-east-1 in some setups; the
 	// SDK has its own region resolution). Partial creds (e.g. access
 	// key set, secret missing) means a malformed admin config —
 	// treat as not-configured rather than half-injecting, so the
