@@ -205,26 +205,35 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		// env. A future ticket will inject proxy URL + placeholder
 		// credential entries so the agent can reach an in-host proxy
 		// that holds the real key.
-		if opts.Cwd == "" {
-			// Sandbox needs a real worktree to bind-mount at /work. The
-			// proposed Copilot fix of "default the worktree" would silently
-			// sandbox the wrong directory; fail loudly instead and let the
-			// caller fix the gap (some agentproc.Run callers — scorer,
-			// classifier, profiler — currently pass empty Cwd and need
-			// multi-mode wiring before they can route through here).
-			return nil, fmt.Errorf("sandbox: opts.Cwd is required in multi-mode (caller passed empty)")
-		}
 		nodeBin, err := exec.LookPath("node")
 		if err != nil {
 			return nil, fmt.Errorf("sandbox: node binary: %w", err)
 		}
 		sdkDir := filepath.Dir(wrapperPath)
-		if err := chownWorktreeForSandbox(opts.Cwd); err != nil {
+
+		// Some callers (scorer, classifier stage1, profiler) are
+		// prompt-only — they send a prompt, get JSON back, and never
+		// touch the host filesystem. They have no natural Cwd. The
+		// sandbox still needs *something* to bind-mount at /work,
+		// so when the caller didn't pass one, materialize a per-run
+		// scratch tmpdir. Cleaned up alongside the sandbox in defer
+		// below.
+		workCwd := opts.Cwd
+		var scratchCwd string
+		if workCwd == "" {
+			scratchCwd, err = os.MkdirTemp("", "agentproc-scratch-")
+			if err != nil {
+				return nil, fmt.Errorf("sandbox: scratch cwd: %w", err)
+			}
+			workCwd = scratchCwd
+			defer func() { _ = os.RemoveAll(scratchCwd) }()
+		}
+		if err := chownWorktreeForSandbox(workCwd); err != nil {
 			return nil, fmt.Errorf("sandbox: chown worktree: %w", err)
 		}
 		sbEnv := buildSandboxEnv(opts.ExtraEnv)
 
-		// Translate AddDirs (host paths under opts.Cwd) into their
+		// Translate AddDirs (host paths under workCwd) into their
 		// /work-relative equivalents inside the sandbox. Without this
 		// the agent's `--add-dir` flags reference paths that don't
 		// exist inside the sandbox rootfs and Claude Code's per-tool
@@ -232,7 +241,7 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		// Build a shallow copy of opts so BuildArgs picks up the
 		// translated paths without mutating the caller's struct.
 		sandboxOpts := opts
-		sandboxOpts.AddDirs = translateAddDirsForSandbox(opts.AddDirs, opts.Cwd)
+		sandboxOpts.AddDirs = translateAddDirsForSandbox(opts.AddDirs, workCwd)
 
 		// The sandbox's argv targets /usr/local/bin/node + /sdk/wrapper.mjs
 		// (bind-mount destinations inside the sandbox), not the host
@@ -244,7 +253,7 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 
 		sandboxCmd, sandbox, err := sandbox.Wrap(runCtx, sandbox.Config{
 			RunID:      opts.TraceID,
-			Worktree:   opts.Cwd,
+			Worktree:   workCwd,
 			SDKDir:     sdkDir,
 			NodeBinary: nodeBin,
 			Argv:       argv,
