@@ -1,0 +1,68 @@
+# Triage Factory — Fly.io Machines deployment.
+#
+# Build:    docker image at ./docker/Dockerfile (same artifact the GHCR
+#           workflow publishes).
+# Deploy:   fly deploy --remote-only
+# Region:   iad — low-latency to GitHub + Anthropic API endpoints.
+# Sandbox:  the in-container gVisor runner needs SYS_ADMIN + NET_ADMIN
+#           and unconfined seccomp; Fly Machines grant these by default
+#           (validated against the SKY-254 runsc probe — see the parent
+#           epic for the platform-compatibility log).
+#
+# Per-deployment secrets are set via flyctl, NOT committed here:
+#   fly secrets set TF_DATABASE_URL='postgresql://...'
+#   fly secrets set TF_GOTRUE_JWKS_URL='https://.../auth/v1/.well-known/jwks.json'
+#   fly secrets set TF_GOTRUE_SIGNING_KEY="$(cat jwk-private.pem)"
+#   fly secrets set TF_SESSION_KEY="$(openssl rand -hex 32)"
+#   fly secrets set TF_GITHUB_APP_PRIVATE_KEY="$(cat github-app.pem)"
+#   fly secrets set TF_GITHUB_APP_ID='123456'
+#   fly secrets set TF_AUTO_JWK_INIT='1'   # headless first-boot path
+#
+# Per-org credentials (ANTHROPIC_API_KEY, AWS bedrock creds, etc.) are
+# NOT Fly secrets — those land in the per-org SecretStore (SKY-249)
+# via the admin UI (SKY-257) or direct SQL.
+
+app = "triagefactory"
+primary_region = "iad"
+
+[build]
+  dockerfile = "docker/Dockerfile"
+
+[env]
+  TF_MODE = "multi"
+  TF_AUTO_JWK_INIT = "1"
+
+[deploy]
+  # Idempotent forward migrations. Runs in a one-shot Machine before
+  # rolling new Machines, so a schema-breaking release is caught
+  # before any traffic lands on the new code.
+  release_command = "triagefactory migrate up"
+  strategy = "rolling"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "off"   # long-lived pollers; don't suspend
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 100
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+  processes = ["app"]
+
+[checks]
+  [checks.health]
+    grace_period = "30s"
+    interval = "15s"
+    method = "GET"
+    path = "/api/health"
+    port = 3000
+    timeout = "5s"
+    type = "http"

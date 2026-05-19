@@ -1,0 +1,40 @@
+# Keep the build context small — only the inputs the Dockerfile
+# actually copies in.
+
+# Build outputs
+/triagefactory
+/triagefactory-*
+/frontend/dist
+/frontend/node_modules
+/dist
+/build
+
+# Editor / vcs noise
+.git
+.gitignore
+.github
+.idea
+.vscode
+*.swp
+*.swo
+
+# Local-only state (never want this in any image)
+.env
+.env.local
+*.db
+*.db-wal
+*.db-shm
+
+# Docs and scripts that aren't build inputs
+/docs
+/scripts
+*.md
+!CLAUDE.md
+
+# Test helpers that aren't needed for the image build
+**/testdata
+**/node_modules
+
+# CI / release tooling
+.golangci.yml
+.goreleaser.yaml

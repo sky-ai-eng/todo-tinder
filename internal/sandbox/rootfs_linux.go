@@ -89,13 +89,14 @@ func doEnsureRootfs(ctx context.Context) (string, error) {
 	// Download to a temp file, sha256-verify, then extract. Failing
 	// the verify means upstream alpine got tampered with or our pin
 	// is stale — refuse loudly rather than silently extract.
+	url, sha := currentArchRootfs()
 	tmpTarball := filepath.Join(cacheDir, ".alpine.tgz.partial")
-	if err := downloadFile(ctx, alpineRootfsURL, tmpTarball); err != nil {
+	if err := downloadFile(ctx, url, tmpTarball); err != nil {
 		return "", fmt.Errorf("rootfs: download: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpTarball) }()
 
-	if err := verifySHA256(tmpTarball, alpineRootfsSHA256); err != nil {
+	if err := verifySHA256(tmpTarball, sha); err != nil {
 		return "", fmt.Errorf("rootfs: verify sha256: %w", err)
 	}
 

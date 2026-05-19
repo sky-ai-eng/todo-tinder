@@ -79,6 +79,18 @@ func doInstall() (string, error) {
 		return "", fmt.Errorf("write wrapper.mjs: %w", err)
 	}
 
+	// Check the SDK presence first, then gate node/npm on actually
+	// needing to install. The Docker image pre-installs the SDK at
+	// build time (multi-stage builder) into ~/.triagefactory/sdk so
+	// the runtime alpine layer doesn't need node/npm at all — but
+	// the unconditional checkNode/checkNpm pair would error there
+	// because nothing on PATH satisfies them. Local-mode users on a
+	// fresh laptop still hit the install path and still get the
+	// human-readable "install Node 18+" error in that case.
+	if sdkAlreadyInstalled(sdkDir) {
+		return wrapperPath, nil
+	}
+
 	if err := checkNode(); err != nil {
 		return "", err
 	}
@@ -91,6 +103,17 @@ func doInstall() (string, error) {
 	}
 
 	return wrapperPath, nil
+}
+
+// sdkAlreadyInstalled returns true when the pinned SDK version is
+// present in node_modules. Mirrors the version-pinned check inside
+// installSDKIfNeeded so a sdkVersion bump in a future release still
+// triggers a re-install (with node/npm available locally) instead of
+// silently keeping the stale tree.
+func sdkAlreadyInstalled(sdkDir string) bool {
+	pkgFile := filepath.Join(sdkDir, "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json")
+	installed, err := readInstalledSDKVersion(pkgFile)
+	return err == nil && installed == sdkVersion
 }
 
 // writePackageJSON pins the SDK version. We re-write every install pass

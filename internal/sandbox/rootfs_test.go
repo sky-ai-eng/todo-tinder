@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -174,6 +175,68 @@ func TestRootfsCacheKey_AlpineShaContributes(t *testing.T) {
 	pkgs := []string{"nodejs"}
 	if rootfsCacheKeyFor("alpha", pkgs) == rootfsCacheKeyFor("beta", pkgs) {
 		t.Error("cache key ignores alpine sha; pin update wouldn't invalidate")
+	}
+}
+
+// TestAlpineRootfsForArch_KnownArches pins that both supported arches
+// resolve to non-empty URL + sha with the right /x86_64/ or /aarch64/
+// segment. Catches a copy-paste regression where someone swaps two
+// arms of the switch and amd64 starts fetching the arm tarball.
+func TestAlpineRootfsForArch_KnownArches(t *testing.T) {
+	urlAmd, shaAmd, err := alpineRootfsForArch("amd64")
+	if err != nil {
+		t.Fatalf("amd64: %v", err)
+	}
+	if !strings.Contains(urlAmd, "x86_64") || !strings.Contains(urlAmd, "amd64") && !strings.Contains(urlAmd, "x86_64") {
+		t.Errorf("amd64 URL %q missing x86_64 segment", urlAmd)
+	}
+	if shaAmd == "" {
+		t.Error("amd64 sha empty")
+	}
+
+	urlArm, shaArm, err := alpineRootfsForArch("arm64")
+	if err != nil {
+		t.Fatalf("arm64: %v", err)
+	}
+	if !strings.Contains(urlArm, "aarch64") {
+		t.Errorf("arm64 URL %q missing aarch64 segment", urlArm)
+	}
+	if shaArm == "" {
+		t.Error("arm64 sha empty (even the TODO placeholder must be non-empty so cache key isn't degenerate)")
+	}
+
+	if urlAmd == urlArm {
+		t.Error("amd64 and arm64 resolved to the same URL; per-arch dispatch broken")
+	}
+	if shaAmd == shaArm {
+		t.Error("amd64 and arm64 share a sha; per-arch cache key would collide")
+	}
+}
+
+// TestAlpineRootfsForArch_UnsupportedErrors pins the actionable-error
+// contract: an unknown GOARCH (ppc64le, s390x, ...) returns an error
+// naming the arch instead of a sha mismatch six minutes into the
+// download. The fatal path through currentArchRootfs depends on this
+// error being non-nil for the panic to fire on misconfiguration.
+func TestAlpineRootfsForArch_UnsupportedErrors(t *testing.T) {
+	_, _, err := alpineRootfsForArch("ppc64le")
+	if err == nil {
+		t.Fatal("expected error for unsupported arch, got nil")
+	}
+	if !strings.Contains(err.Error(), "ppc64le") {
+		t.Errorf("error %q should name the unsupported arch", err)
+	}
+}
+
+// TestRootfsCacheKey_PerArchSeparate pins that switching arch invalidates
+// the cache. Cross-compile workflows or arm64-on-amd64 dev boxes mustn't
+// reuse the other arch's extracted rootfs — the binaries are wrong-arch
+// and the sandbox would fail at first exec.
+func TestRootfsCacheKey_PerArchSeparate(t *testing.T) {
+	_, shaAmd, _ := alpineRootfsForArch("amd64")
+	_, shaArm, _ := alpineRootfsForArch("arm64")
+	if rootfsCacheKeyFor(shaAmd, apkPackages) == rootfsCacheKeyFor(shaArm, apkPackages) {
+		t.Error("amd64 and arm64 cache keys collide; cross-arch cache pollution risk")
 	}
 }
 

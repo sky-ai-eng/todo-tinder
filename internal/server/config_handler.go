@@ -30,6 +30,15 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleHealth is the liveness probe target. Returns 200 once the
+// server is accepting requests; platform restart logic uses this to
+// decide when a Machine/container has come up. Deliberately does NOT
+// reach into the DB or integrations — a flapping Postgres shouldn't
+// recycle the whole TF process via the platform's auto-restart.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // teamMembersResponse is the roster shown to Variant B (multi-person team)
 // of the predicate editor AND to SKY-330's per-card assignee picker.
 // Each row carries display_name + github_username + is_current_user so
