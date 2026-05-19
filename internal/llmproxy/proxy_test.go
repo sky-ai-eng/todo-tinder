@@ -470,3 +470,37 @@ func TestProxyForwardsHostHeader(t *testing.T) {
 		t.Errorf("upstream Host = %q, want %q (proxy must rewrite Host header to upstream's value)", rec.host, wantHost)
 	}
 }
+
+// TestProxyErrChannelCleanOnShutdown asserts that the Err() channel is
+// closed without sending an error when the server is shut down normally.
+// This is the expected path for every healthy run end.
+func TestProxyErrChannelCleanOnShutdown(t *testing.T) {
+	rec := &upstreamRecord{}
+	upstream := fakeUpstream(rec, false)
+	defer upstream.Close()
+
+	srv, _ := llmproxy.New(llmproxy.Config{
+		Provider: llmproxy.ProviderAnthropic,
+		APIKey:   "k",
+		Upstream: upstream.URL,
+	})
+	if _, err := srv.Start(""); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+
+	// After normal shutdown the channel must be closed (select falls
+	// through to the nil-error case) rather than containing an error.
+	select {
+	case err, ok := <-srv.Err():
+		if ok {
+			t.Errorf("Err() = %v after clean shutdown; want channel closed with no error", err)
+		}
+		// ok==false means channel closed cleanly — the expected path.
+	case <-time.After(time.Second):
+		t.Error("Err() channel not closed within 1s after Shutdown")
+	}
+}

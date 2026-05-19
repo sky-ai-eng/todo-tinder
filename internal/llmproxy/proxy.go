@@ -126,6 +126,10 @@ type Server struct {
 	// listener is owned once Start has been called. nil until then.
 	listener net.Listener
 	httpSrv  *http.Server
+	// serveErr receives the first non-ErrServerClosed error from
+	// httpSrv.Serve. Buffered(1) so the goroutine never blocks on
+	// send, even if the caller never reads it.
+	serveErr chan error
 }
 
 // New constructs a Server with the given config but does not start
@@ -267,6 +271,7 @@ func (s *Server) Start(addr string) (string, error) {
 		return "", fmt.Errorf("llmproxy: listen on %s: %w", addr, err)
 	}
 	s.listener = ln
+	s.serveErr = make(chan error, 1)
 	s.httpSrv = &http.Server{
 		Handler: s.proxy,
 		// Conservative timeouts. The SDK uses long-lived streaming
@@ -278,15 +283,26 @@ func (s *Server) Start(addr string) (string, error) {
 		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
-		// Errors here are either "server closed" (expected on shutdown)
-		// or a fatal bind/accept failure. The accept failure case is
-		// rare and we don't have a great way to surface it to the
-		// run, so we log via the default http.Server error logging.
-		// Future: surface via a dedicated channel.
-		_ = s.httpSrv.Serve(ln)
+		err := s.httpSrv.Serve(ln)
+		// ErrServerClosed is the normal return from Serve after
+		// Shutdown; anything else is an unexpected accept/listener
+		// failure that the caller may want to react to.
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.serveErr <- err
+		}
+		close(s.serveErr)
 	}()
 	return ln.Addr().String(), nil
 }
+
+// Err returns a channel that receives the first unexpected error from
+// the background Serve goroutine (i.e. not http.ErrServerClosed). The
+// channel is closed when the goroutine exits, so a range or select on
+// it unblocks after Shutdown.
+//
+// Callers that do not need to monitor the error can ignore this channel
+// safely — it is buffered and the goroutine never blocks on send.
+func (s *Server) Err() <-chan error { return s.serveErr }
 
 // Shutdown stops serving and waits for in-flight requests to drain
 // (up to the context's deadline). Idempotent.
