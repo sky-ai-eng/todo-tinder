@@ -253,10 +253,10 @@ func (s *Server) Start(addr string) (string, error) {
 	s.httpSrv = &http.Server{
 		Handler: s.proxy,
 		// Conservative timeouts. The SDK uses long-lived streaming
-		// connections for tool-use loops; ReadTimeout is the time to
-		// receive the request headers, not the body, so 30s is fine.
-		// Total request time is unbounded (no WriteTimeout) because
-		// streaming responses can run for minutes.
+		// connections for tool-use loops; ReadHeaderTimeout limits the
+		// time to receive the request headers, not the body, so 30s is
+		// fine. Total request time is unbounded (no WriteTimeout)
+		// because streaming responses can run for minutes.
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
