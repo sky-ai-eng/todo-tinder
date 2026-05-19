@@ -187,9 +187,9 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	// daemon's per-socket LocalClient routes writes through the right
 	// (orgID, userID) pair. Local-mode + non-sandbox calls never
 	// invoke this closure (agentproc gates on shouldSandbox).
-	stores := s.getStores()
+	stores, storesSet := s.getStores()
 	var startAgentHost func() (sandbox.Mount, io.Closer, error)
-	if (db.Stores{}) != stores {
+	if storesSet {
 		startAgentHost = func() (sandbox.Mount, io.Closer, error) {
 			info := agenthost.RunInfo{
 				OrgID:            orgID,

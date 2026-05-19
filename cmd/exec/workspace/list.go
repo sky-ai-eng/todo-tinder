@@ -69,7 +69,7 @@ func listWorkspaces(host agenthost.Client) (listOutput, error) {
 	ctx := context.Background()
 	info, err := host.LookupRun(ctx)
 	if err != nil {
-		return listOutput{}, translateLookupErr(err)
+		return listOutput{}, translateLookupErr("workspace list", "", err)
 	}
 
 	run, err := host.GetAgentRun(ctx)

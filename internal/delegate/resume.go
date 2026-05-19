@@ -369,9 +369,9 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, orgID, runID, sessionID
 	// invocation, so wire the same per-run agenthost daemon. The run
 	// identity is unchanged across resumes — only the prompt and the
 	// SessionID differ.
-	stores := s.getStores()
+	stores, storesSet := s.getStores()
 	var startAgentHost func() (sandbox.Mount, io.Closer, error)
-	if (db.Stores{}) != stores {
+	if storesSet {
 		startAgentHost = func() (sandbox.Mount, io.Closer, error) {
 			info := agenthost.RunInfo{
 				OrgID:            orgID,

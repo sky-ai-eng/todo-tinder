@@ -127,7 +127,13 @@ func materializeWorkspace(host agenthost.Client, ownerRepoArg string, deps addDe
 	ctx := context.Background()
 	info, err := host.LookupRun(ctx)
 	if err != nil {
-		return "", translateLookupErr(err)
+		// runID is empty at this point — LookupRun is what would have
+		// produced it. The NotFound branch of translateLookupErr is
+		// unreachable in the LocalClient path (LookupRun only errors
+		// when the env-derived runID was empty at construction), so
+		// passing "" is correct: only the ErrRunIdentityMissing branch
+		// fires here, and it ignores the runID argument.
+		return "", translateLookupErr("workspace add", "", err)
 	}
 
 	run, err := host.GetAgentRun(ctx)

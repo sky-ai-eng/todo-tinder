@@ -89,8 +89,13 @@ type Spawner struct {
 	// construction via SetStores so we don't have to thread another
 	// arg through every test fixture's NewSpawner call — the sandbox
 	// branch is Linux+multi-mode only and unit tests never reach it.
-	// Nil here is a hard error inside the sandbox branch of runAgent.
-	stores db.Stores
+	//
+	// Pointer (rather than db.Stores value) so callers can branch on
+	// `stores != nil` cleanly. The earlier `db.Stores{} != stores`
+	// shape relied on every field being a comparable interface and
+	// would runtime-panic the moment a future field landed with a
+	// non-comparable concrete type (slice/map/func).
+	stores *db.Stores
 }
 
 func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, chains db.ChainStore, tasks db.TaskStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, events db.EventStore, taskMemory db.TaskMemoryStore, runWorktrees db.RunWorktreeStore, tx db.TxRunner, ghClient *ghclient.Client, wsHub *websocket.Hub, model string) *Spawner {
@@ -125,13 +130,20 @@ func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, 
 func (s *Spawner) SetStores(stores db.Stores) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.stores = stores
+	s.stores = &stores
 }
 
-func (s *Spawner) getStores() db.Stores {
+// getStores returns the configured store bundle and a bool indicating
+// whether it was set. Callers branch on the bool rather than
+// comparing the value against db.Stores{} so a future non-comparable
+// field on db.Stores can't turn the check into a runtime panic.
+func (s *Spawner) getStores() (db.Stores, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.stores
+	if s.stores == nil {
+		return db.Stores{}, false
+	}
+	return *s.stores, true
 }
 
 // wasTakenOver reports whether Takeover() has claimed this run. The
