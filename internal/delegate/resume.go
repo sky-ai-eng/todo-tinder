@@ -370,6 +370,7 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, orgID, runID, sessionID
 		MaxTurns:     100,
 		ExtraEnv:     extraEnv,
 		TraceID:      runID,
+		OrgID:        orgID,
 	}, newRunSink(s, orgID, runID, triggerType, creatorUserID))
 
 	outcome := &ResumeOutcome{}

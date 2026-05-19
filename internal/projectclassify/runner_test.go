@@ -32,7 +32,7 @@ func TestRunner_AllErroredLeavesEntityForRetry(t *testing.T) {
 	// Force every Stage 1 vote to error (simulates claude CLI down).
 	origS1 := runStage1Haiku
 	t.Cleanup(func() { runStage1Haiku = origS1 })
-	runStage1Haiku = func(_ context.Context, prompt string) (int, string, error) {
+	runStage1Haiku = func(_ context.Context, _ string, prompt string) (int, string, error) {
 		return 0, "", errors.New("simulated CLI down")
 	}
 
@@ -76,7 +76,7 @@ func TestRunner_PartialErrorStillStamps(t *testing.T) {
 
 	origS1 := runStage1Haiku
 	t.Cleanup(func() { runStage1Haiku = origS1 })
-	runStage1Haiku = func(_ context.Context, prompt string) (int, string, error) {
+	runStage1Haiku = func(_ context.Context, _ string, prompt string) (int, string, error) {
 		if strings.Contains(prompt, "<project_name>\nFlaky\n</project_name>") {
 			return 0, "", errors.New("simulated CLI failure for Flaky")
 		}
