@@ -9,8 +9,9 @@
 # Why a wrapper script instead of just `go test -tags integration`:
 #   - Self-heals PATH for the sudo+brew interaction (secure_path)
 #   - Re-execs under sudo with CAP_NET_ADMIN + CAP_SYS_ADMIN
-#   - Validates prereqs (runsc, iptables, ip, node, go) with install
-#     hints when missing
+#   - Validates prereqs (runsc, iptables, ip, go, curl, chroot) with
+#     install hints when missing — note: host node is NOT a prereq
+#     anymore; nodejs lives in the cached alpine rootfs via apk-add
 #   - Inventory of pre-/post-test netns + veth + iptables orphans, so
 #     any cleanup regression surfaces immediately
 #

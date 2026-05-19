@@ -22,6 +22,7 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,42 @@ import (
 	"testing"
 	"time"
 )
+
+// TestMain pre-warms the rootfs cache once with a generous timeout
+// before the per-test suite runs. Without this, the first test to
+// call Wrap() on a fresh machine pays the full cold-cache cost
+// (download alpine tarball + apk-add ~500MB of toolchain) under its
+// own 30-second test context — which it will lose. After this pre-
+// warm, every test hits the hot-cache sentinel path and Wrap()
+// returns in milliseconds for the rootfs step.
+//
+// Best-effort: if runsc/chroot/root prereqs aren't met, the pre-warm
+// is skipped and individual tests still skip cleanly via require*.
+func TestMain(m *testing.M) {
+	if shouldPreWarmRootfs() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		if _, err := ensureRootfs(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "TestMain: rootfs pre-warm failed (tests may time out on cold cache): %v\n", err)
+		}
+		cancel()
+	}
+	os.Exit(m.Run())
+}
+
+// shouldPreWarmRootfs gates the pre-warm on the same prereqs the
+// integration tests themselves check. No point downloading 500MB if
+// the suite is going to skip every test anyway.
+func shouldPreWarmRootfs() bool {
+	if os.Geteuid() != 0 {
+		return false
+	}
+	for _, bin := range []string{"runsc", "chroot"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			return false
+		}
+	}
+	return true
+}
 
 func requireRunsc(t *testing.T) {
 	t.Helper()

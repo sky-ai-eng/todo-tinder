@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -28,17 +29,24 @@ import (
 var rootfsCacheMu sync.Mutex
 
 // ensureRootfs idempotently downloads + verifies + extracts the
-// alpine minirootfs to ~/.triagefactory/sandbox/rootfs-<sha>/ and
-// returns the path. Concurrency-safe via a mutex; success cached
-// via the sentinel file inside doEnsureRootfs (so re-entry after
-// a successful first call is just one os.Stat).
-func ensureRootfs() (string, error) {
+// alpine minirootfs and apk-installs the agent toolchain into
+// ~/.triagefactory/sandbox/rootfs-<cacheKey>/ (where cacheKey hashes
+// the alpine sha + the apk package set). Returns the path.
+// Concurrency-safe via a mutex; success cached via the sentinel file
+// inside doEnsureRootfs (so re-entry after a successful first call
+// is just one os.Stat).
+//
+// ctx threads through the cold-cache path: download honors deadline
+// via http.NewRequestWithContext; the apk-add chroot runs via
+// exec.CommandContext. The hot-cache path (sentinel hit) returns
+// without consulting ctx.
+func ensureRootfs(ctx context.Context) (string, error) {
 	rootfsCacheMu.Lock()
 	defer rootfsCacheMu.Unlock()
-	return doEnsureRootfs()
+	return doEnsureRootfs(ctx)
 }
 
-func doEnsureRootfs() (string, error) {
+func doEnsureRootfs(ctx context.Context) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("rootfs: resolve home: %w", err)
@@ -75,7 +83,7 @@ func doEnsureRootfs() (string, error) {
 	// the verify means upstream alpine got tampered with or our pin
 	// is stale — refuse loudly rather than silently extract.
 	tmpTarball := filepath.Join(cacheDir, ".alpine.tgz.partial")
-	if err := downloadFile(alpineRootfsURL, tmpTarball); err != nil {
+	if err := downloadFile(ctx, alpineRootfsURL, tmpTarball); err != nil {
 		return "", fmt.Errorf("rootfs: download: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpTarball) }()
@@ -94,7 +102,7 @@ func doEnsureRootfs() (string, error) {
 	// but every real agent run needs the toolchain. Done once per
 	// cache build, then frozen in the cached rootfs and reused
 	// across runs.
-	if err := installToolchain(cacheDir); err != nil {
+	if err := installToolchain(ctx, cacheDir); err != nil {
 		return "", fmt.Errorf("rootfs: install toolchain: %w", err)
 	}
 
@@ -108,14 +116,13 @@ func doEnsureRootfs() (string, error) {
 // via chroot. The bare alpine minirootfs has busybox only; every real
 // agent run needs node + git + rg + python + go + build tools.
 //
-// Requires root on the host (chroot syscall) — already a prerequisite
-// of the sandbox path (netns + iptables also need CAP_SYS_ADMIN /
-// CAP_NET_ADMIN), so this isn't a new requirement.
-//
-// `apk` ships as a static busybox-applet-style binary in the alpine
-// minirootfs, so we don't need host apk installed — the binary inside
-// the extracted rootfs handles the install.
-func installToolchain(rootfsDir string) error {
+// chroot(2) needs CAP_SYS_CHROOT, which root has. The sandbox path
+// already runs as root in production (netns + iptables manipulation
+// require their own caps, and the wrapper script re-execs under
+// sudo), so callers reach this with sufficient privilege; we don't
+// add a separate preflight. apk ships as a static binary inside the
+// alpine minirootfs, so we don't need apk installed on the host.
+func installToolchain(ctx context.Context, rootfsDir string) error {
 	// Some packages we install (ripgrep, go) live in the community
 	// repository, which the bare minirootfs does NOT enable by
 	// default. Enable it before apk-add or the install fails with
@@ -137,7 +144,7 @@ func installToolchain(rootfsDir string) error {
 	}
 
 	args := append([]string{rootfsDir, "/sbin/apk", "add", "--no-cache"}, apkPackages...)
-	cmd := exec.Command("chroot", args...)
+	cmd := exec.CommandContext(ctx, "chroot", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -164,9 +171,13 @@ func enableCommunityRepo(repoFile string) error {
 	return os.WriteFile(repoFile, data, 0o644)
 }
 
-func downloadFile(url, dst string) error {
+func downloadFile(ctx context.Context, url, dst string) error {
 	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
