@@ -1,0 +1,130 @@
+package sandbox
+
+import (
+	"context"
+	"os/exec"
+)
+
+// Config is the per-run sandbox spec. Caller owns all field values;
+// sandbox.Wrap does NOT synthesize from os.Environ or read host state
+// beyond what these fields name. The Property B invariant (no
+// credentials enter the sandbox) is preserved by ensuring Env
+// contains no credential-shaped values; sandbox itself does no
+// filtering or injection.
+type Config struct {
+	// RunID identifies the agent run. Used to name the netns
+	// (tf-<runID>-<subnetIdx>), veth pair (vh/vs-<id-fragment>),
+	// and OCI container id passed to runsc. Must be filesystem-safe
+	// and IFNAMSIZ-friendly; a UUID-without-dashes (32 hex chars)
+	// is the canonical input. Sandbox truncates the embedded
+	// portion of veth names so the interface name + subnet suffix
+	// fits in 15 bytes.
+	RunID string
+
+	// Worktree is the host path bind-mounted at /work inside the
+	// sandbox. Caller MUST have created and chowned it to UID
+	// WorktreeUID before invoking Wrap, or the agent's writes will
+	// EACCES.
+	Worktree string
+
+	// SDKDir is the host path containing wrapper.mjs + node_modules.
+	// Returned by agentproc.EnsureSDK. Bind-mounted RO at /sdk
+	// inside the sandbox.
+	SDKDir string
+
+	// NodeBinary is the host path to the `node` executable.
+	// Bind-mounted RO at /usr/local/bin/node. Caller resolves via
+	// exec.LookPath; sandbox does not search PATH itself so the
+	// caller's PATH controls which Node ends up in the sandbox.
+	NodeBinary string
+
+	// Argv is the command exec'd inside the sandbox. Typically
+	// ["/usr/local/bin/node", "/sdk/wrapper.mjs", ...BuildArgs(opts)].
+	// First element MUST be an absolute path that exists in the
+	// sandbox rootfs or via a bind mount (runsc does not invoke a
+	// shell to PATH-resolve).
+	Argv []string
+
+	// Env is the COMPLETE env exposed to the sandboxed process.
+	// sandbox does NOT merge with os.Environ; whatever the caller
+	// puts here is what the agent observes in /proc/self/environ.
+	// The Property B invariant is preserved by ensuring this slice
+	// contains no credentials in multi mode — see internal/agentproc
+	// and the package doc.
+	Env []string
+
+	// ExtraMounts is additional bind mounts the caller needs (none
+	// in SKY-254 — SKY-303 will add a unix-socket mount here for
+	// cmd/exec IPC).
+	ExtraMounts []Mount
+}
+
+// Mount declares an additional bind mount in the sandbox. Source is
+// a host path; Destination is the in-sandbox path. Options are
+// passed through to the OCI spec's mount options (e.g. ["ro"] for
+// read-only); sandbox prepends "rbind" automatically.
+type Mount struct {
+	Source      string
+	Destination string
+	Options     []string
+}
+
+// Sandbox is the live state for one sandboxed run. Returned by Wrap
+// alongside the *exec.Cmd; caller MUST invoke Close() (typically via
+// defer) regardless of how the cmd terminates.
+//
+// Fields are read-only from outside the package. RunID, Subnet,
+// HostIP, NetnsPath are exposed for logs + the SKY-335 wiring point
+// (proxies bind on HostIP).
+type Sandbox struct {
+	RunID     string // sandbox.Config.RunID, preserved for telemetry
+	Subnet    string // e.g. "10.42.7.0/24"
+	HostIP    string // host-side veth IP, e.g. "10.42.7.1" — SKY-335 binds proxies here
+	NetnsPath string // /var/run/netns/tf-<runID>-<idx>
+
+	// teardown holds the platform-specific cleanup state. On Linux
+	// it's a *teardownState (defined in sandbox_linux.go); on
+	// non-Linux it's always nil because Wrap returns early with
+	// ErrUnsupportedPlatform. Typed as any so the cross-platform
+	// Sandbox struct doesn't drag the Linux-only types into the
+	// non-Linux build. The unused-on-non-Linux lint warning is
+	// expected — only the Linux Close() reads this field.
+	teardown any //nolint:unused // used by sandbox_linux.go's Close
+}
+
+// Wrap prepares the sandbox (netns, veth, iptables MASQUERADE, OCI
+// bundle on disk) and returns an *exec.Cmd that, when Start+Wait'd,
+// invokes `runsc run` against the bundle. The cmd is configured so:
+//
+//   - cmd.Cancel SIGKILLs the runsc parent; runsc's supervision
+//     propagates termination into the sandboxed init.
+//   - cmd.Stdout / cmd.Stderr are unset; caller wires them.
+//
+// PROPERTY B INVARIANT: Wrap does NOT inject credentials into
+// cfg.Env, does NOT read os.Environ for ANTHROPIC_*/AWS_*, and does
+// NOT call agentproc.resolveCredentials. Caller is responsible for
+// the env it passes; in SKY-254 the caller's env is intentionally
+// credential-free.
+//
+// On any error, Wrap has cleaned up anything it created — caller
+// does NOT need to call Close() unless the returned error is nil.
+//
+// Non-Linux: returns ErrUnsupportedPlatform without doing any work.
+func Wrap(ctx context.Context, cfg Config) (*exec.Cmd, *Sandbox, error) {
+	return wrap(ctx, cfg)
+}
+
+// ReapOrphans scans /var/run/netns for tf-<id>-<idx> entries and
+// bundle dirs in $TMPDIR matching tf-bundle-* and tears down each.
+// Called once from main() at TF startup so a hard-crashed previous
+// TF process doesn't leak netns/veth/bundle dirs.
+//
+// Non-Linux: returns nil without scanning (nothing to reap).
+//
+// Errors from individual entries are logged via the supplied
+// context's logger if present; ReapOrphans returns only catastrophic
+// failures (e.g. /var/run/netns not readable). Per-entry failures
+// are not fatal — best-effort cleanup is the contract.
+func ReapOrphans(ctx context.Context) error {
+	return reapOrphans(ctx)
+}

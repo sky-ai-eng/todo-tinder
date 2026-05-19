@@ -9,9 +9,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
 )
 
 // RunOptions configures one `claude -p` invocation. Callers populate
@@ -200,18 +202,70 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	// runtime-agnostic. The SDK uses the same auth / config / session
 	// store as Claude Code, so behavior is identical for the user.
 	nodeArgs := append([]string{wrapperPath}, BuildArgs(opts)...)
-	cmd := exec.CommandContext(runCtx, "node", nodeArgs...)
-	cmd.Dir = opts.Cwd
-	cmd.Env = mergeEnv(os.Environ(), opts.ExtraEnv, creds)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		// Process is non-nil here because the watcher only fires after
-		// Start has succeeded. ESRCH is fine — it just means the
-		// process group already exited on its own between Wait
-		// returning and the cancel watcher reading runCtx.Done(),
-		// which is a race exec handles internally.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+
+	// Branch: multi-mode + Linux routes through the gVisor sandbox
+	// for tenant isolation. Local-mode + non-Linux take the direct
+	// subprocess path (unchanged behavior).
+	var (
+		cmd          *exec.Cmd
+		sb           *sandbox.Sandbox
+		sandboxCreds map[string]string // empty for the direct path
+	)
+	if shouldSandbox() {
+		// PROPERTY B INVARIANT (SKY-254):
+		// `creds` from resolveCredentials above is intentionally
+		// discarded in the sandbox path. Real credentials never
+		// enter the sandbox env. SKY-335 will append proxy URL +
+		// placeholder credential entries to sbEnv so the agent
+		// can reach an in-host proxy that holds the real key.
+		_ = creds // shadow to silence "declared but not used" — kept around for the direct-path branch
+		nodeBin, err := exec.LookPath("node")
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: node binary: %w", err)
+		}
+		sdkDir := filepath.Dir(wrapperPath)
+		if err := chownWorktreeForSandbox(opts.Cwd); err != nil {
+			return nil, fmt.Errorf("sandbox: chown worktree: %w", err)
+		}
+		sbEnv := buildSandboxEnv(opts.ExtraEnv)
+		sandboxCreds = nil // explicit: no creds, no merge
+
+		// The sandbox's argv targets /usr/local/bin/node + /sdk/wrapper.mjs
+		// (bind-mount destinations inside the sandbox), not the host
+		// paths. Build the sandbox-side argv from scratch.
+		argv := append(
+			[]string{"/usr/local/bin/node", "/sdk/wrapper.mjs"},
+			BuildArgs(opts)...,
+		)
+
+		sandboxCmd, sandbox, err := sandbox.Wrap(runCtx, sandbox.Config{
+			RunID:      opts.TraceID,
+			Worktree:   opts.Cwd,
+			SDKDir:     sdkDir,
+			NodeBinary: nodeBin,
+			Argv:       argv,
+			Env:        sbEnv,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: %w", err)
+		}
+		cmd, sb = sandboxCmd, sandbox
+		defer func() { _ = sb.Close() }()
+	} else {
+		cmd = exec.CommandContext(runCtx, "node", nodeArgs...)
+		cmd.Dir = opts.Cwd
+		cmd.Env = mergeEnv(os.Environ(), opts.ExtraEnv, creds)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			// Process is non-nil here because the watcher only fires after
+			// Start has succeeded. ESRCH is fine — it just means the
+			// process group already exited on its own between Wait
+			// returning and the cancel watcher reading runCtx.Done(),
+			// which is a race exec handles internally.
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 	}
+	_ = sandboxCreds // future SKY-335 hook; kept named for grep-discoverability
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

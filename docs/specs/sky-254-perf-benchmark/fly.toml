@@ -1,0 +1,21 @@
+# Fly App for the gVisor perf benchmark. Same shape as the SKY-254
+# validation probe Machine, sized small. Throwaway — destroy after the
+# benchmark completes.
+#
+# Workflow:
+#   1. fly apps create tf-bench-XXX --org personal
+#   2. Edit `app =` below to match
+#   3. fly deploy --remote-only --ha=false
+#   4. fly ssh console -C "sh /bench.sh" > results.csv
+#   5. fly apps destroy tf-bench-XXX --yes
+
+app = "tf-bench-1779157668"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpus = 1

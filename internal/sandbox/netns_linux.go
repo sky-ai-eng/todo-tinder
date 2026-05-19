@@ -1,0 +1,170 @@
+//go:build linux
+
+package sandbox
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// setupNetwork creates the netns + veth pair + addressing matching
+// the validated recipe in docs/specs/sky-254-runsc-validation/
+// precns-test.sh (lines 7-33). Shells out to `ip` rather than using
+// netlink Go bindings because:
+//
+//   - The TF runner image bundles iproute2 anyway (SKY-256), so no
+//     new dep weight.
+//   - Matches the probe verbatim, making it trivial to cross-check
+//     by hand and debug from `ip` man pages.
+//   - Per-run overhead is single-digit milliseconds vs ~80ms gVisor
+//     cold-start, so the speed difference doesn't matter.
+//
+// Returns netState with the names + IPs needed by teardown.
+func setupNetwork(ctx context.Context, runID string, subnetIdx uint8) (*netState, error) {
+	// Per-run identifiers. veth name length is constrained by
+	// IFNAMSIZ=16, leaving 13 chars after the "vh-"/"vs-" prefix.
+	// Use up to 11 hex chars from runID + the subnet idx.
+	idFrag := runID
+	if len(idFrag) > 8 {
+		idFrag = idFrag[:8]
+	}
+	netnsName := fmt.Sprintf("tf-%s-%d", idFrag, subnetIdx)
+	vethHost := fmt.Sprintf("vh-%s%d", idFrag[:min(len(idFrag), 4)], subnetIdx)
+	vethSandbox := fmt.Sprintf("vs-%s%d", idFrag[:min(len(idFrag), 4)], subnetIdx)
+	netnsPath := "/var/run/netns/" + netnsName
+
+	hostAddr := hostIP(subnetIdx)
+	sandboxAddr := sandboxIP(subnetIdx)
+	subnet := subnetCIDR(subnetIdx)
+
+	state := &netState{
+		netnsName:   netnsName,
+		netnsPath:   netnsPath,
+		vethHost:    vethHost,
+		vethSandbox: vethSandbox,
+		subnet:      subnet,
+	}
+
+	// Discover the upstream interface from the default route. Fly
+	// Machines use eth0 but self-host customers may differ.
+	upstreamIF, err := defaultRouteInterface(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("netns: discover upstream interface: %w", err)
+	}
+	state.upstreamIF = upstreamIF
+
+	// Each ip command is wrapped so failure → cleanup of partial state.
+	// We return the partial state on the way out so cleanup can use it.
+
+	steps := []struct {
+		name string
+		argv []string
+	}{
+		// netns add
+		{"netns add", []string{"netns", "add", netnsName}},
+		// veth pair
+		{"veth add", []string{"link", "add", vethHost, "type", "veth", "peer", "name", vethSandbox}},
+		// move sandbox side into netns
+		{"veth set ns", []string{"link", "set", vethSandbox, "netns", netnsName}},
+		// host side: address + up
+		{"host addr", []string{"addr", "add", hostAddr + "/24", "dev", vethHost}},
+		{"host up", []string{"link", "set", vethHost, "up"}},
+		// sandbox side: address + up (inside netns)
+		{"sandbox addr", []string{"-n", netnsName, "addr", "add", sandboxAddr + "/24", "dev", vethSandbox}},
+		{"sandbox up", []string{"-n", netnsName, "link", "set", vethSandbox, "up"}},
+		{"sandbox lo up", []string{"-n", netnsName, "link", "set", "lo", "up"}},
+		// default route in sandbox
+		{"sandbox default route", []string{"-n", netnsName, "route", "add", "default", "via", hostAddr}},
+	}
+	for _, step := range steps {
+		if err := runIP(ctx, step.argv...); err != nil {
+			return state, fmt.Errorf("netns: %s: %w", step.name, err)
+		}
+	}
+
+	return state, nil
+}
+
+// teardownNetwork is the reverse of setupNetwork. Idempotent — each
+// step swallows "does not exist" errors so it's safe to call against
+// a partial-init state.
+func teardownNetwork(ctx context.Context, state *netState) error {
+	if state == nil {
+		return nil
+	}
+	// `ip link delete` on the host veth also removes its peer in
+	// the netns (kernel keeps the pair atomic).
+	_ = runIPNoErr(ctx, "link", "delete", state.vethHost)
+	// `ip netns delete` unmounts /var/run/netns/<name> + removes
+	// the file.
+	_ = runIPNoErr(ctx, "netns", "delete", state.netnsName)
+	return nil
+}
+
+// runIP wraps `ip` with context + stderr capture. Returns an error
+// whose message includes the ip stderr output for debuggability.
+func runIP(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "ip", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip %s: %w (output: %s)",
+			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// runIPNoErr wraps runIP for cleanup paths that need "best-effort,
+// don't fail loudly if already gone."
+func runIPNoErr(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "ip", args...)
+	_ = cmd.Run() // ignore — cleanup is best-effort
+	return nil
+}
+
+// defaultRouteInterface returns the interface name carrying the
+// default route. Matches probe line 31's awk pattern:
+//
+//	ip route show default | awk '/default/ {for (i=1;i<=NF;i++)
+//	  if ($i == "dev") {print $(i+1); exit}}'
+//
+// Implemented in Go so we don't need an awk dep + so failures are
+// reported clearly.
+func defaultRouteInterface(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "ip", "route", "show", "default")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		for i, f := range fields {
+			if f == "dev" && i+1 < len(fields) {
+				return fields[i+1], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no default route found")
+}
+
+// netState collects per-run network identifiers for the teardown
+// path. Stored on Sandbox.teardown.
+type netState struct {
+	netnsName   string
+	netnsPath   string
+	vethHost    string
+	vethSandbox string
+	subnet      string
+	upstreamIF  string
+}
+
+// min is a local helper to avoid importing constraints for one use.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

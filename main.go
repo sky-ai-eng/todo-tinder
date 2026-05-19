@@ -343,6 +343,16 @@ func main() {
 		}
 		stores = sqlitestore.New(database)
 	case runmode.ModeMulti:
+		// When SKY-242's multi-mode boot wiring lands, add this call
+		// near the top of the multi-mode init (before the agentproc
+		// callers spawn anything):
+		//
+		//   if err := sandbox.ReapOrphans(ctx); err != nil {
+		//       log.Printf("sandbox: reap orphans at boot: %v", err)
+		//   }
+		//
+		// Reaps netns + bundle dirs leaked by a hard-crashed
+		// previous TF process. Best-effort; never fatal.
 		log.Fatalf("TF_MODE=multi: multi-tenant mode is not yet wired end-to-end; see SKY-242 (v1 multi-tenant epic). Unset TF_MODE to run in local mode.")
 	default:
 		log.Fatalf("unknown runmode: %v", runmode.Current())
