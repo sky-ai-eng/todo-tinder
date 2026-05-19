@@ -16,11 +16,13 @@
 // process's env in any form. A jailbroken agent dumping its own
 // /proc/self/environ finds only what the caller put there.
 //
-// In v1 (SKY-254 standalone) the caller's env is intentionally
-// credential-free; sandboxed agents will fail authentication
-// against api.anthropic.com. SKY-335 layers proxy URLs + placeholder
-// credentials on top so the agent can reach an in-host proxy that
-// holds the real key — the credential never enters the sandbox.
+// The caller's env is intentionally credential-free. SKY-335 layers
+// proxy URLs + placeholder credentials on top via the
+// ConfigureProxies callback: after the netns + veth are up but
+// before the OCI bundle is written, the caller binds a per-run LLM
+// proxy on Sandbox.HostIP and returns ANTHROPIC_BASE_URL +
+// placeholder env entries. The real credential lives in the proxy
+// process on the host; the sandbox env carries only the proxy URL.
 //
 // # Threat model (T1–T4)
 //

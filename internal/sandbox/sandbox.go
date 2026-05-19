@@ -51,6 +51,27 @@ type Config struct {
 	// in SKY-254 — SKY-303 will add a unix-socket mount here for
 	// cmd/exec IPC).
 	ExtraMounts []Mount
+
+	// ConfigureProxies, if non-nil, is invoked after the network is
+	// set up (subnet allocated, netns + veth created, MASQUERADE
+	// applied) but before the OCI bundle is built. The caller
+	// receives a partially-populated *Sandbox with HostIP / Subnet /
+	// NetnsPath set, so it can bind per-run LLM + git proxies on the
+	// host-side veth IP and return their addresses for injection into
+	// the sandbox env. The returned slice is appended to Config.Env
+	// when constructing the OCI spec.
+	//
+	// SKY-335 owns the consumer side: the proxies hold the org's real
+	// credential on the host, expose only a proxy URL to the agent.
+	// Property B holds because the returned env entries are URLs +
+	// placeholders, never the real credential.
+	//
+	// Lifecycle: sandbox does NOT shut down anything the callback
+	// started — the caller (internal/agentproc) tracks the proxy
+	// handles via its own defer chain and shuts them down after the
+	// agent process exits. If the callback returns an error, Wrap
+	// tears down any state it allocated and returns the error.
+	ConfigureProxies func(s *Sandbox) (envAdditions []string, err error)
 }
 
 // Mount declares an additional bind mount in the sandbox. Source is

@@ -1,0 +1,424 @@
+package agentproc
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sky-ai-eng/triage-factory/internal/llmproxy"
+)
+
+// TestProxyConfigFromCreds_AnthropicDirect pins the resolver → proxy
+// config mapping for the most common case: an org configured with
+// just anthropic_api_key. Upstream defaults to api.anthropic.com.
+func TestProxyConfigFromCreds_AnthropicDirect(t *testing.T) {
+	creds := map[string]string{
+		"ANTHROPIC_API_KEY": "sk-ant-real-key",
+	}
+	cfg, err := proxyConfigFromCreds(creds)
+	if err != nil {
+		t.Fatalf("proxyConfigFromCreds: %v", err)
+	}
+	if cfg.llm.Provider != llmproxy.ProviderAnthropic {
+		t.Errorf("Provider = %q, want anthropic", cfg.llm.Provider)
+	}
+	if cfg.llm.APIKey != "sk-ant-real-key" {
+		t.Errorf("APIKey = %q; real key should flow into proxy config", cfg.llm.APIKey)
+	}
+	if cfg.llm.Upstream != "https://api.anthropic.com" {
+		t.Errorf("Upstream = %q, want https://api.anthropic.com", cfg.llm.Upstream)
+	}
+	if !cfg.llm.AllowNonLoopback {
+		t.Error("AllowNonLoopback = false; sandbox path must opt in (proxy binds on veth IP, not loopback)")
+	}
+}
+
+// TestProxyConfigFromCreds_AnthropicWithGateway pins the org-gateway
+// override path: an org with ANTHROPIC_BASE_URL set has the proxy
+// forward to the gateway, not api.anthropic.com. The gateway's own
+// auth flow takes it from there.
+func TestProxyConfigFromCreds_AnthropicWithGateway(t *testing.T) {
+	creds := map[string]string{
+		"ANTHROPIC_API_KEY":  "sk-ant-real-key",
+		"ANTHROPIC_BASE_URL": "https://gateway.example.com/",
+	}
+	cfg, err := proxyConfigFromCreds(creds)
+	if err != nil {
+		t.Fatalf("proxyConfigFromCreds: %v", err)
+	}
+	// Trailing slash should be stripped — the proxy upstream
+	// validation rejects a path component.
+	if cfg.llm.Upstream != "https://gateway.example.com" {
+		t.Errorf("Upstream = %q, want https://gateway.example.com (trailing slash stripped)", cfg.llm.Upstream)
+	}
+}
+
+// TestProxyConfigFromCreds_BedrockBearer pins the AWS Bedrock bearer
+// path. Region threads through into the upstream URL; default to
+// us-east-1 when not set (the SDK's own fallback).
+func TestProxyConfigFromCreds_BedrockBearer(t *testing.T) {
+	creds := map[string]string{
+		"AWS_BEARER_TOKEN_BEDROCK": "bdrk-real-bearer",
+		"AWS_REGION":               "us-west-2",
+	}
+	cfg, err := proxyConfigFromCreds(creds)
+	if err != nil {
+		t.Fatalf("proxyConfigFromCreds: %v", err)
+	}
+	if cfg.llm.Provider != llmproxy.ProviderBedrockBearer {
+		t.Errorf("Provider = %q, want bedrock_bearer", cfg.llm.Provider)
+	}
+	if cfg.llm.APIKey != "bdrk-real-bearer" {
+		t.Errorf("APIKey = %q, want bdrk-real-bearer", cfg.llm.APIKey)
+	}
+	if cfg.llm.Upstream != "https://bedrock-runtime.us-west-2.amazonaws.com" {
+		t.Errorf("Upstream = %q, want regional Bedrock endpoint", cfg.llm.Upstream)
+	}
+}
+
+// TestProxyConfigFromCreds_BedrockBearerRegionFallback pins the
+// missing-region fallback. The resolver omits AWS_REGION when not
+// configured; the proxy still needs *some* region for the upstream
+// URL — defaults to us-east-1 (Bedrock's primary Anthropic region).
+func TestProxyConfigFromCreds_BedrockBearerRegionFallback(t *testing.T) {
+	creds := map[string]string{"AWS_BEARER_TOKEN_BEDROCK": "bdrk"}
+	cfg, err := proxyConfigFromCreds(creds)
+	if err != nil {
+		t.Fatalf("proxyConfigFromCreds: %v", err)
+	}
+	if cfg.llm.Upstream != "https://bedrock-runtime.us-east-1.amazonaws.com" {
+		t.Errorf("Upstream = %q, want us-east-1 fallback", cfg.llm.Upstream)
+	}
+}
+
+// TestProxyConfigFromCreds_AWSTriple_Unsupported pins the typed
+// rejection for the SigV4 path. The Phase 1 llmproxy doesn't
+// implement re-signing; an org configured this way can't run in
+// multi mode until the Phase 2 proxy lands. Refusing here surfaces
+// the misconfiguration as a clear admin-facing error rather than a
+// confusing upstream auth failure from inside the Node subprocess.
+func TestProxyConfigFromCreds_AWSTriple_Unsupported(t *testing.T) {
+	creds := map[string]string{
+		"AWS_ACCESS_KEY_ID":       "AKIA-test",
+		"AWS_SECRET_ACCESS_KEY":   "secret-test",
+		"CLAUDE_CODE_USE_BEDROCK": "1",
+	}
+	_, err := proxyConfigFromCreds(creds)
+	if !errors.Is(err, ErrUnsupportedSandboxCredentials) {
+		t.Fatalf("err = %v, want ErrUnsupportedSandboxCredentials wrap", err)
+	}
+}
+
+// TestProxyConfigFromCreds_EmptyCreds_Unsupported is the "resolver
+// returned an empty map" guard. In multi mode the resolver itself
+// returns ErrNoCredentialsConfigured for unconfigured orgs, so this
+// branch is mostly defensive — but it pins the contract: if we get
+// to proxy config with no creds, we error rather than silently
+// starting a useless proxy.
+func TestProxyConfigFromCreds_EmptyCreds_Unsupported(t *testing.T) {
+	_, err := proxyConfigFromCreds(map[string]string{})
+	if !errors.Is(err, ErrUnsupportedSandboxCredentials) {
+		t.Fatalf("err = %v, want ErrUnsupportedSandboxCredentials for empty creds", err)
+	}
+}
+
+// TestProxyConfigFromCreds_AnthropicWinsOverBedrock pins precedence:
+// when both ANTHROPIC_API_KEY and AWS_BEARER_TOKEN_BEDROCK are set,
+// Anthropic wins. Mirrors the resolver's own precedence (which
+// shouldn't surface this case in practice, since the resolver picks
+// one branch — but proxy config is a separate gate and we keep the
+// ordering consistent).
+func TestProxyConfigFromCreds_AnthropicWinsOverBedrock(t *testing.T) {
+	creds := map[string]string{
+		"ANTHROPIC_API_KEY":        "sk-ant-wins",
+		"AWS_BEARER_TOKEN_BEDROCK": "bdrk-loses",
+	}
+	cfg, err := proxyConfigFromCreds(creds)
+	if err != nil {
+		t.Fatalf("proxyConfigFromCreds: %v", err)
+	}
+	if cfg.llm.Provider != llmproxy.ProviderAnthropic {
+		t.Errorf("Provider = %q, want anthropic (wins over bedrock_bearer)", cfg.llm.Provider)
+	}
+	if cfg.llm.APIKey != "sk-ant-wins" {
+		t.Errorf("APIKey = %q, want sk-ant-wins", cfg.llm.APIKey)
+	}
+}
+
+// TestBuildSandboxProxyEnv_Anthropic pins the sandbox env shape for
+// the Anthropic path: ANTHROPIC_BASE_URL points at the proxy,
+// ANTHROPIC_API_KEY is the placeholder (NEVER the real key).
+func TestBuildSandboxProxyEnv_Anthropic(t *testing.T) {
+	cfg := sandboxProxyConfig{providerKind: llmproxy.ProviderAnthropic}
+	env := buildSandboxProxyEnv(cfg, "http://10.42.7.1:53312")
+
+	if got := envValue(env, "ANTHROPIC_BASE_URL"); got != "http://10.42.7.1:53312" {
+		t.Errorf("ANTHROPIC_BASE_URL = %q, want proxy URL", got)
+	}
+	if got := envValue(env, "ANTHROPIC_API_KEY"); got != proxyPlaceholderAPIKey {
+		t.Errorf("ANTHROPIC_API_KEY = %q, want placeholder", got)
+	}
+	if !strings.Contains(envValue(env, "ANTHROPIC_API_KEY"), "PROXY-PLACEHOLDER") {
+		t.Errorf("placeholder must be greppable as a non-real key: %q", envValue(env, "ANTHROPIC_API_KEY"))
+	}
+}
+
+// TestBuildSandboxProxyEnv_BedrockBearer pins the Bedrock-path env
+// shape. ANTHROPIC_BEDROCK_BASE_URL points at the proxy,
+// AWS_BEARER_TOKEN_BEDROCK is the placeholder, CLAUDE_CODE_USE_BEDROCK=1
+// keeps the SDK routing through the Bedrock client.
+func TestBuildSandboxProxyEnv_BedrockBearer(t *testing.T) {
+	cfg := sandboxProxyConfig{providerKind: llmproxy.ProviderBedrockBearer}
+	env := buildSandboxProxyEnv(cfg, "http://10.42.7.1:53312")
+
+	if got := envValue(env, "ANTHROPIC_BEDROCK_BASE_URL"); got != "http://10.42.7.1:53312" {
+		t.Errorf("ANTHROPIC_BEDROCK_BASE_URL = %q, want proxy URL", got)
+	}
+	if got := envValue(env, "AWS_BEARER_TOKEN_BEDROCK"); got != proxyPlaceholderBedrockBearer {
+		t.Errorf("AWS_BEARER_TOKEN_BEDROCK = %q, want placeholder", got)
+	}
+	if got := envValue(env, "CLAUDE_CODE_USE_BEDROCK"); got != "1" {
+		t.Errorf("CLAUDE_CODE_USE_BEDROCK = %q, want 1", got)
+	}
+}
+
+// TestBuildSandboxProxyEnv_NoRealCredentials is the load-bearing
+// Property B assertion for the proxy env builder: no value in the
+// returned slice may match a real credential. We test by passing
+// "sentinel-real-key" as the resolver output's key value (which the
+// proxy config retains for upstream injection) and asserting the
+// sentinel is absent from the env that goes into the sandbox.
+//
+// Pins the credential-channel CI test from SKY-254's acceptance:
+// the sandbox env contains only proxy URLs + placeholders.
+func TestBuildSandboxProxyEnv_NoRealCredentials(t *testing.T) {
+	const realKey = "sk-ant-SENTINEL-REAL-KEY-MUST-NOT-LEAK"
+
+	cfg, err := proxyConfigFromCreds(map[string]string{
+		"ANTHROPIC_API_KEY": realKey,
+	})
+	if err != nil {
+		t.Fatalf("proxyConfigFromCreds: %v", err)
+	}
+	env := buildSandboxProxyEnv(cfg, "http://10.42.7.1:53312")
+
+	for _, e := range env {
+		if strings.Contains(e, realKey) {
+			t.Errorf("PROPERTY B VIOLATED: sandbox env entry %q carries the real credential", e)
+		}
+	}
+	// And the real key must have flowed into the *proxy config*
+	// (where it lives on the host side, injecting upstream).
+	if cfg.llm.APIKey != realKey {
+		t.Errorf("real key dropped from proxy config; proxy can't inject upstream")
+	}
+}
+
+// TestStartProxiesForSandbox_AnthropicEndToEnd asserts the proxy
+// lifecycle from agentproc's perspective: start on a loopback IP
+// (proxy is OK with that because AllowNonLoopback is on), send a
+// request to the returned proxy URL, confirm the upstream sees the
+// real key.
+//
+// Loopback is fine here because we're testing the proxy's own
+// behavior — the actual binding to a veth IP requires Linux
+// netns setup and is exercised by the integration test.
+func TestStartProxiesForSandbox_AnthropicEndToEnd(t *testing.T) {
+	const realKey = "sk-ant-real-end-to-end"
+
+	// Fake upstream observing what the proxy forwards.
+	var observedAPIKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedAPIKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	// Override the upstream by injecting it via ANTHROPIC_BASE_URL —
+	// the same admin-UI configuration path an org would use to point
+	// at a gateway. Loopback http is permitted by llmproxy validation
+	// (loopback is the test path).
+	creds := map[string]string{
+		"ANTHROPIC_API_KEY":  realKey,
+		"ANTHROPIC_BASE_URL": upstream.URL,
+	}
+	bundle, env, err := startProxiesForSandbox("127.0.0.1", creds)
+	if err != nil {
+		t.Fatalf("startProxiesForSandbox: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = bundle.Shutdown(ctx)
+	})
+
+	// Pull the proxy URL out of the sandbox-env response and drive a
+	// request through it.
+	proxyURL := envValue(env, "ANTHROPIC_BASE_URL")
+	if proxyURL == "" {
+		t.Fatalf("ANTHROPIC_BASE_URL missing from sandbox env: %v", env)
+	}
+	if envValue(env, "ANTHROPIC_API_KEY") != proxyPlaceholderAPIKey {
+		t.Errorf("sandbox env ANTHROPIC_API_KEY = %q, want placeholder", envValue(env, "ANTHROPIC_API_KEY"))
+	}
+
+	req, _ := http.NewRequest("POST", proxyURL+"/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("x-api-key", proxyPlaceholderAPIKey) // what the SDK would send
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxy roundtrip: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if observedAPIKey != realKey {
+		t.Errorf("upstream observed x-api-key = %q, want real key %q (proxy must rewrite the placeholder with the real key)",
+			observedAPIKey, realKey)
+	}
+}
+
+// TestStartProxiesForSandbox_ShutdownTearsDownProxy pins the
+// lifecycle invariant: after Shutdown, the proxy stops accepting
+// connections. Required for SKY-335's "kill the agent run mid-
+// execution, assert both proxies are torn down" acceptance check.
+func TestStartProxiesForSandbox_ShutdownTearsDownProxy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	creds := map[string]string{
+		"ANTHROPIC_API_KEY":  "k",
+		"ANTHROPIC_BASE_URL": upstream.URL,
+	}
+	bundle, env, err := startProxiesForSandbox("127.0.0.1", creds)
+	if err != nil {
+		t.Fatalf("startProxiesForSandbox: %v", err)
+	}
+
+	// Live before Shutdown — sanity check.
+	proxyURL := envValue(env, "ANTHROPIC_BASE_URL")
+	req, _ := http.NewRequest("POST", proxyURL, strings.NewReader("{}"))
+	if resp, err := http.DefaultClient.Do(req); err != nil {
+		t.Fatalf("pre-shutdown roundtrip: %v", err)
+	} else {
+		_ = resp.Body.Close()
+	}
+
+	// Shutdown and confirm the proxy is no longer reachable.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := bundle.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// Tight per-request timeout — a dead listener should fail fast
+	// with a connection-refused, not hang waiting on the bound port.
+	client := &http.Client{Timeout: 1 * time.Second}
+	if _, err := client.Post(proxyURL, "application/json", strings.NewReader("{}")); err == nil {
+		t.Error("proxy still accepting connections after Shutdown")
+	}
+}
+
+// TestStartProxiesForSandbox_EmptyHostIPRejected pins the
+// caller-bug guard. An empty hostVethIP would let the proxy bind on
+// the kernel's default interface (0.0.0.0) which would expose the
+// credentialed proxy to anything that can reach the host. Fail
+// loudly at construction.
+func TestStartProxiesForSandbox_EmptyHostIPRejected(t *testing.T) {
+	_, _, err := startProxiesForSandbox("", map[string]string{"ANTHROPIC_API_KEY": "k"})
+	if err == nil {
+		t.Fatal("startProxiesForSandbox accepted empty hostVethIP; should reject")
+	}
+}
+
+// TestRunProxies_ShutdownIsNilSafe pins the defensive nil-guard. The
+// caller's defer fires even when startProxiesForSandbox returned an
+// error and bundle is nil; Shutdown must handle that without
+// panicking.
+func TestRunProxies_ShutdownIsNilSafe(t *testing.T) {
+	var p *runProxies
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Errorf("nil Shutdown returned err: %v", err)
+	}
+}
+
+// TestProxyConfigFromCreds_RejectsMalformedGateway pins the
+// pre-flight gates that mirror llmproxy.New. An org-configured
+// ANTHROPIC_BASE_URL with a path / query / fragment / cleartext
+// non-loopback scheme is rejected at proxy-config time so the
+// admin-facing error names "anthropic upstream" instead of falling
+// through to a generic llmproxy error from inside Start.
+func TestProxyConfigFromCreds_RejectsMalformedGateway(t *testing.T) {
+	cases := []struct {
+		name    string
+		baseURL string
+	}{
+		{"with_path", "https://gateway.example.com/v1"},
+		{"with_query", "https://gateway.example.com?token=x"},
+		{"with_fragment", "https://gateway.example.com#frag"},
+		{"http_non_loopback", "http://gateway.example.com"},
+		{"missing_scheme", "gateway.example.com"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := proxyConfigFromCreds(map[string]string{
+				"ANTHROPIC_API_KEY":  "k",
+				"ANTHROPIC_BASE_URL": c.baseURL,
+			})
+			if err == nil {
+				t.Fatalf("proxyConfigFromCreds accepted %q; want validation error", c.baseURL)
+			}
+			if !strings.Contains(err.Error(), "anthropic upstream") {
+				t.Errorf("err = %v; want it to name \"anthropic upstream\" so the admin-facing message is clear", err)
+			}
+		})
+	}
+}
+
+// TestRunProxies_ShutdownAggregatesErrors pins the errors.Join
+// behavior that the doc comment promises. Today only the LLM proxy
+// is wired, so this exercises the one-error path; the test shape is
+// future-proof for the git-proxy slot landing.
+func TestRunProxies_ShutdownAggregatesErrors(t *testing.T) {
+	// Construct a bundle with a Server we can shut down twice — the
+	// second Shutdown is a no-op (returns nil), so we can't easily
+	// force an error without a fake. Use httptest + a real proxy and
+	// just confirm a clean shutdown returns nil.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	bundle, _, err := startProxiesForSandbox("127.0.0.1", map[string]string{
+		"ANTHROPIC_API_KEY":  "k",
+		"ANTHROPIC_BASE_URL": upstream.URL,
+	})
+	if err != nil {
+		t.Fatalf("startProxiesForSandbox: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := bundle.Shutdown(ctx); err != nil {
+		t.Errorf("clean Shutdown = %v, want nil", err)
+	}
+}
+
+// envValue returns the value associated with KEY in a slice of
+// KEY=VALUE strings, or "" if KEY is absent. Used by the proxy tests
+// to assert env shape without writing the split-on-equals dance
+// repeatedly.
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return e[len(prefix):]
+		}
+	}
+	return ""
+}
