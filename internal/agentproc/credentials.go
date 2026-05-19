@@ -60,15 +60,36 @@ const (
 	secretBedrockModelID = "bedrock_model_id"
 )
 
-// credentialEnvKeys lists every env var the Claude Agent SDK (or
-// downstream @aws-sdk credential chain) reads to pick up auth or
-// routing material. The Run path treats these as the parent-env
-// leak surface: when the resolver returns per-org creds, every key
-// in this list is filtered out of os.Environ before the subprocess
-// inherits anything, so a misconfigured deployment where the
-// operator set ANTHROPIC_API_KEY (or AWS_PROFILE, or any other
-// entry below) at the systemd-unit level can't silently override
-// the org-scoped credentials.
+// credentialEnvKeys is the *credential-precedence* guard — NOT an
+// isolation boundary. When the resolver returns per-org creds,
+// every key in this list is filtered out of os.Environ before the
+// subprocess inherits, so a misconfigured deployment where the
+// operator set ANTHROPIC_API_KEY at the systemd-unit level can't
+// override the org-scoped key via inheritance ordering.
+//
+// # What this does NOT do
+//
+// It does NOT hide credentials from the agent process itself. The
+// resolver's output goes into the same process.env the SDK reads
+// from, so a malicious or jailbroken agent inside the subprocess
+// can still read its own ANTHROPIC_API_KEY. Provable protection
+// against that requires a local credentials proxy
+// (ANTHROPIC_BASE_URL pointing at a TF-controlled service that
+// injects the real key server-side) — separate ticket, post-D10.
+//
+// It does NOT hide host-process env or filesystem from the agent
+// in pre-sandbox multi mode. That state is unsafe to ship; SKY-254
+// (D10 gVisor) is the gate.
+//
+// # Where the strict allowlist actually lives
+//
+// SKY-254 builds the OCI bundle's process.env from scratch — see
+// the docs/specs/sky-254-runsc-validation/ probe, which curated
+// process.env to {PATH, TERM, AGENT_CURATED_KEY} and verified via
+// `env` inside the sandbox that nothing else leaked through. That
+// is the strict env-curation layer; this list is the lighter-touch
+// precedence guard that operates in front of it (and after it, as
+// the resolver's output flows through both).
 //
 // Sourced from a SDK source-grep of @anthropic-ai/claude-agent-sdk
 // (sdk.mjs / assistant.mjs / bridge.mjs) plus the official Claude
