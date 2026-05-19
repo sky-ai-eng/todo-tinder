@@ -21,12 +21,6 @@ import (
 const (
 	alpineRootfsURL    = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz"
 	alpineRootfsSHA256 = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
-
-	// alpineCommunityRepo is the community repository for the same
-	// alpine version. Some packages we install (ripgrep, go) live in
-	// community rather than main, so the cache build enables this
-	// repo before invoking apk-add.
-	alpineCommunityRepo = "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 )
 
 // apkPackages is the toolchain installed into the cached alpine
