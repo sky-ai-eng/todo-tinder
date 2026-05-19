@@ -25,6 +25,17 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Self-heal PATH for brew-installed tools. sudo's secure_path wipes
+# PATH back to /usr/sbin:/usr/bin:/sbin:/bin, which hides anything
+# installed via linuxbrew or macOS homebrew. Prepend known prefixes
+# so check_bin finds go/curl/etc regardless of invocation style.
+for brew_prefix in /home/linuxbrew/.linuxbrew /opt/homebrew /usr/local/Homebrew; do
+  if [[ -x "$brew_prefix/bin/brew" ]]; then
+    export PATH="$brew_prefix/bin:$brew_prefix/sbin:$PATH"
+    break
+  fi
+done
+
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
