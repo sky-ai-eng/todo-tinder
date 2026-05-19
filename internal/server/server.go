@@ -66,7 +66,7 @@ type Server struct {
 	// can't fire one org's poller restart with another org's PAT.
 	onGitHubChanged func(orgID string) // GitHub creds/repos changed — full restart + re-profile
 	onJiraChanged   func(orgID string) // Jira config changed — restart Jira poller only
-	scorerTrigger   func()             // invoked after non-poll task creation (e.g. carry-over) to kick scoring immediately
+	scorerTrigger   func(orgID string) // invoked after non-poll task creation (e.g. carry-over) to kick the per-org scorer immediately
 	lifetimeCounter *db.LifetimeDistinctCounter
 
 	// authDeps groups the multi-mode-only auth stack (JWKS verifier +
@@ -527,7 +527,7 @@ func (s *Server) SetOnJiraChanged(fn func(orgID string)) {
 // flows that create tasks outside the normal poll→event path (e.g.
 // carry-over) so scoring starts immediately rather than waiting for the
 // next poll cycle.
-func (s *Server) SetScorerTrigger(fn func()) {
+func (s *Server) SetScorerTrigger(fn func(orgID string)) {
 	s.scorerTrigger = fn
 }
 

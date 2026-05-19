@@ -28,7 +28,7 @@ func updateScores(t *testing.T, database *sql.DB, updates []domain.TaskScoreUpda
 // noopScorer satisfies the Scorer interface without doing anything.
 type noopScorer struct{}
 
-func (noopScorer) Trigger() {}
+func (noopScorer) Trigger(string) {}
 
 // newTestDB sets up an in-memory SQLite with schema + seed for integration tests.
 func newTestDB(t *testing.T) *sql.DB {
