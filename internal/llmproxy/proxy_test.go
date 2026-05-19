@@ -374,13 +374,30 @@ func TestProxyStartRejectsNonLoopback(t *testing.T) {
 }
 
 // TestProxyStartAllowsNonLoopbackOptIn pins the opt-in path: when
-// AllowNonLoopback=true, Start no longer enforces loopback. The
-// future sandbox case binds on the host-side veth IP and needs
-// this. We can't actually bind to a non-loopback IP in CI (would
-// fail or affect the test machine), so we use a hostname that
-// resolves to loopback under the opt-in branch — sufficient to
-// prove the bypass works.
+// AllowNonLoopback=true, assertLoopback is skipped and Start accepts
+// non-loopback addresses. We bind to 0.0.0.0:0 (all-interfaces) —
+// assertLoopback rejects that address without the flag, so a successful
+// Start with the flag proves the bypass is working. The test also
+// verifies the inverse: without AllowNonLoopback, the same address
+// is rejected before net.Listen is called.
 func TestProxyStartAllowsNonLoopbackOptIn(t *testing.T) {
+	// Inverse check: 0.0.0.0 is rejected without the flag.
+	srvStrict, err := llmproxy.New(llmproxy.Config{
+		Provider: llmproxy.ProviderAnthropic,
+		APIKey:   "k",
+		Upstream: "https://api.anthropic.com",
+	})
+	if err != nil {
+		t.Fatalf("New (strict): %v", err)
+	}
+	if _, err := srvStrict.Start("0.0.0.0:0"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srvStrict.Shutdown(ctx)
+		t.Fatal("Start(\"0.0.0.0:0\") without AllowNonLoopback must be rejected")
+	}
+
+	// Opt-in check: same address accepted with the flag.
 	srv, err := llmproxy.New(llmproxy.Config{
 		Provider:         llmproxy.ProviderAnthropic,
 		APIKey:           "k",
@@ -388,11 +405,11 @@ func TestProxyStartAllowsNonLoopbackOptIn(t *testing.T) {
 		AllowNonLoopback: true,
 	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("New (opt-in): %v", err)
 	}
-	addr, err := srv.Start("127.0.0.1:0")
+	addr, err := srv.Start("0.0.0.0:0")
 	if err != nil {
-		t.Fatalf("Start with opt-in: %v", err)
+		t.Fatalf("Start(\"0.0.0.0:0\") with AllowNonLoopback=true: %v", err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
