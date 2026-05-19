@@ -265,6 +265,7 @@ func TestProxyRejectsInvalidConfig(t *testing.T) {
 		{"upstream_with_path", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "https://api.anthropic.com/v1"}},
 		{"upstream_with_query", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "https://api.anthropic.com?x=1"}},
 		{"upstream_with_fragment", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "https://api.anthropic.com#frag"}},
+		{"upstream_http_non_loopback", llmproxy.Config{Provider: llmproxy.ProviderAnthropic, APIKey: "k", Upstream: "http://api.anthropic.com"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -286,6 +287,28 @@ func TestProxyUpstreamWithTrailingSlash(t *testing.T) {
 		Upstream: "https://api.anthropic.com/",
 	}); err != nil {
 		t.Errorf("trailing slash should be accepted: %v", err)
+	}
+}
+
+// TestProxyUpstreamLoopbackHTTPAllowed confirms that http:// upstreams
+// pointing at a loopback address are accepted — this is the httptest
+// pattern used by all unit tests. Non-loopback http must be rejected
+// (see upstream_http_non_loopback case in TestProxyRejectsInvalidConfig).
+func TestProxyUpstreamLoopbackHTTPAllowed(t *testing.T) {
+	cases := []string{
+		"http://127.0.0.1:8080",
+		"http://127.0.0.1",
+	}
+	for _, upstream := range cases {
+		t.Run(upstream, func(t *testing.T) {
+			if _, err := llmproxy.New(llmproxy.Config{
+				Provider: llmproxy.ProviderAnthropic,
+				APIKey:   "k",
+				Upstream: upstream,
+			}); err != nil {
+				t.Errorf("loopback http upstream should be accepted: %v", err)
+			}
+		})
 	}
 }
 

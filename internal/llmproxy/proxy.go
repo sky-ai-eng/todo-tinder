@@ -166,6 +166,20 @@ func New(cfg Config) (*Server, error) {
 	if u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("llmproxy: upstream URL must not include query or fragment: %q", cfg.Upstream)
 	}
+	// Require HTTPS for non-loopback upstreams — the real credential
+	// travels on this hop (in the rewritten auth header) and must not
+	// cross cleartext. Loopback http is permitted for httptest usage in
+	// unit tests; every real LLM provider uses https anyway.
+	if u.Scheme != "https" {
+		host, _, _ := net.SplitHostPort(u.Host)
+		if host == "" {
+			host = u.Host
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("llmproxy: upstream %q must use https (loopback http is allowed for tests)", cfg.Upstream)
+		}
+	}
 
 	s := &Server{cfg: cfg, upstreamURL: u}
 	s.proxy = &httputil.ReverseProxy{
