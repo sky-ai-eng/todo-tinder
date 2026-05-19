@@ -5,6 +5,8 @@ package sandbox
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -26,11 +28,15 @@ import (
 func setupNetwork(ctx context.Context, runID string, subnetIdx uint8) (*netState, error) {
 	// Per-run identifiers. veth name length is constrained by
 	// IFNAMSIZ=16, leaving 13 chars after the "vh-"/"vs-" prefix.
-	// Use up to 11 hex chars from runID + the subnet idx.
-	idFrag := runID
-	if len(idFrag) > 8 {
-		idFrag = idFrag[:8]
-	}
+	//
+	// idFrag MUST be hex — the reaper's regex (^tf-[0-9a-f]+-(\d+)$)
+	// strict-matches hex so it can't false-positive against unrelated
+	// tf-* netns owned by other processes. We can't trust the caller's
+	// runID to be hex (TraceID may be "live-smoke" or any free-form
+	// string), so derive a deterministic 8-hex-char fragment from a
+	// sha1 of the runID. Same runID → same fragment, every time.
+	h := sha1.Sum([]byte(runID))
+	idFrag := hex.EncodeToString(h[:])[:8]
 	netnsName := fmt.Sprintf("tf-%s-%d", idFrag, subnetIdx)
 	vethHost := fmt.Sprintf("vh-%s%d", idFrag[:min(len(idFrag), 4)], subnetIdx)
 	vethSandbox := fmt.Sprintf("vs-%s%d", idFrag[:min(len(idFrag), 4)], subnetIdx)

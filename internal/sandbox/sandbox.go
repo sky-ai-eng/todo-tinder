@@ -12,13 +12,12 @@ import (
 // contains no credential-shaped values; sandbox itself does no
 // filtering or injection.
 type Config struct {
-	// RunID identifies the agent run. Used to name the netns
-	// (tf-<runID>-<subnetIdx>), veth pair (vh/vs-<id-fragment>),
-	// and OCI container id passed to runsc. Must be filesystem-safe
-	// and IFNAMSIZ-friendly; a UUID-without-dashes (32 hex chars)
-	// is the canonical input. Sandbox truncates the embedded
-	// portion of veth names so the interface name + subnet suffix
-	// fits in 15 bytes.
+	// RunID identifies the agent run. Used as the OCI container id
+	// passed to runsc and as input to the netns / veth naming.
+	// Any string is accepted — sandbox sha1-hashes it internally to
+	// derive an 8-hex-char fragment for tf-<frag>-<subnetIdx>, so the
+	// reaper's strict hex regex matches regardless of caller shape
+	// (UUID, "live-smoke", anything). Same RunID → same fragment.
 	RunID string
 
 	// Worktree is the host path bind-mounted at /work inside the
