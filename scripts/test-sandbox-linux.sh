@@ -138,11 +138,14 @@ else
 fi
 
 # ---------- Stage 2: cross-package build sanity ----------------------------
+# `go build ./...` without -o compiles every package (typecheck +
+# link) but writes no binaries to disk. -o <file> ./... would error
+# with "cannot write multiple packages to non-directory" because
+# ./... matches more than one main package.
 blue "Stage 2: full build"
 build_log="$LOG_DIR/build.log"
-if go build -o /tmp/triagefactory-sandbox-build ./... > "$build_log" 2>&1; then
+if go build ./... > "$build_log" 2>&1; then
   green "  build clean"
-  rm -f /tmp/triagefactory-sandbox-build
 else
   red   "  build FAIL — full log: $build_log"
   echo "---- last 60 lines ----"
