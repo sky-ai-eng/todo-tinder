@@ -224,7 +224,7 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 		}
 		batch := withDocs[i:end]
 
-		results, err := profileBatch(ctx, batch)
+		results, err := profileBatch(ctx, orgID, batch)
 		if err != nil {
 			log.Printf("[repoprofile] batch %d failed: %v", i/profileBatchSize+1, err)
 			repoNames := make([]string, len(batch))
@@ -289,7 +289,7 @@ type repoProfileResult struct {
 	Profile string `json:"profile"`
 }
 
-func profileBatch(ctx context.Context, batch []repoWithDocs) ([]repoProfileResult, error) {
+func profileBatch(ctx context.Context, orgID string, batch []repoWithDocs) ([]repoProfileResult, error) {
 	inputs := make([]repoProfileInput, len(batch))
 	for i, d := range batch {
 		inputs[i] = repoProfileInput{
@@ -313,6 +313,7 @@ func profileBatch(ctx context.Context, batch []repoWithDocs) ([]repoProfileResul
 		Model:   profilingModel,
 		Message: prompt,
 		TraceID: "repoprofile-batch",
+		OrgID:   orgID,
 	}, agentproc.NoopSink{})
 	if err != nil {
 		stderr := ""

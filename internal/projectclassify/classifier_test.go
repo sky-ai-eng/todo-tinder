@@ -43,8 +43,11 @@ func stubStage1(t *testing.T, scoresByProjectName map[string]int) *callRecorder 
 	t.Helper()
 	rec := &callRecorder{}
 	orig := runStage1Haiku
-	runStage1Haiku = func(_ context.Context, prompt string) (int, string, error) {
+	runStage1Haiku = func(_ context.Context, orgID, prompt string) (int, string, error) {
 		rec.record(prompt)
+		rec.mu.Lock()
+		rec.orgIDs = append(rec.orgIDs, orgID)
+		rec.mu.Unlock()
 		for name, score := range scoresByProjectName {
 			if strings.Contains(prompt, "<project_name>\n"+name+"\n</project_name>") {
 				return score, "stage1 stub for " + name, nil
@@ -63,10 +66,11 @@ func stubStage2(t *testing.T, scoresByProjectName map[string]int) *callRecorder 
 	t.Helper()
 	rec := &callRecorder{}
 	orig := runStage2Haiku
-	runStage2Haiku = func(_ context.Context, prompt, cwd string) (int, string, error) {
+	runStage2Haiku = func(_ context.Context, orgID, prompt, cwd string) (int, string, error) {
 		rec.record(prompt)
 		rec.mu.Lock()
 		rec.cwds = append(rec.cwds, cwd)
+		rec.orgIDs = append(rec.orgIDs, orgID)
 		rec.mu.Unlock()
 		for name, score := range scoresByProjectName {
 			if strings.Contains(prompt, "<project_name>\n"+name+"\n</project_name>") {
@@ -84,6 +88,7 @@ type callRecorder struct {
 	calls  int
 	prompt []string
 	cwds   []string
+	orgIDs []string
 }
 
 func (c *callRecorder) record(p string) {
@@ -97,6 +102,43 @@ func (c *callRecorder) callCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.calls
+}
+
+func (c *callRecorder) orgIDList() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.orgIDs))
+	copy(out, c.orgIDs)
+	return out
+}
+
+// TestClassify_OrgIDFlowsToHaiku pins the SKY-323 contract: the orgID
+// passed to Classify is threaded down through the per-project vote
+// fan-out into the Haiku invocation, so agentproc.Run resolves the
+// right tenant's credentials. A regression that dropped the orgID
+// somewhere in the chain (Classify → runVotes → voteStage1 →
+// runStage1Haiku) would silently bill the wrong org in multi-mode.
+func TestClassify_OrgIDFlowsToHaiku(t *testing.T) {
+	isolateHome(t)
+	stage1 := stubStage1(t, map[string]int{"A": 80, "B": 20})
+	stubStage2(t, nil)
+
+	projects := []domain.Project{
+		{ID: "p-a", Name: "A"},
+		{ID: "p-b", Name: "B"},
+	}
+	const orgID = "11111111-2222-3333-4444-555555555555"
+	Classify(context.Background(), orgID, projects, domain.Entity{Title: "X"})
+
+	got := stage1.orgIDList()
+	if len(got) != 2 {
+		t.Fatalf("stage1 received %d calls; want 2 (one per project)", len(got))
+	}
+	for i, g := range got {
+		if g != orgID {
+			t.Errorf("stage1 call[%d] orgID = %q; want %q", i, g, orgID)
+		}
+	}
 }
 
 func TestClassify_WinnerAboveThreshold(t *testing.T) {
@@ -117,7 +159,7 @@ func TestClassify_WinnerAboveThreshold(t *testing.T) {
 		Title: "Migrate session token validation",
 	}
 
-	winner, votes := Classify(context.Background(), projects, entity)
+	winner, votes := Classify(context.Background(), "test-org", projects, entity)
 	if winner == nil {
 		t.Fatalf("expected winner, got nil; votes: %+v", votes)
 	}
@@ -143,7 +185,7 @@ func TestClassify_AllBelowThreshold_ReturnsNil(t *testing.T) {
 	}
 	entity := domain.Entity{ID: "e1", Title: "Random PR"}
 
-	winner, votes := Classify(context.Background(), projects, entity)
+	winner, votes := Classify(context.Background(), "test-org", projects, entity)
 	if winner != nil {
 		t.Errorf("expected nil winner, got %s", *winner)
 	}
@@ -170,7 +212,7 @@ func TestClassify_HighestAboveThresholdWins(t *testing.T) {
 		{ID: "p2", Name: "P2"},
 		{ID: "p3", Name: "P3"},
 	}
-	winner, _ := Classify(context.Background(), projects, domain.Entity{Title: "X"})
+	winner, _ := Classify(context.Background(), "test-org", projects, domain.Entity{Title: "X"})
 	if winner == nil || *winner != "p2" {
 		got := "<nil>"
 		if winner != nil {
@@ -192,7 +234,7 @@ func TestClassify_TiesGoToFirstReturned(t *testing.T) {
 		{ID: "p-alpha", Name: "Alpha"},
 		{ID: "p-beta", Name: "Beta"},
 	}
-	winner, _ := Classify(context.Background(), projects, domain.Entity{Title: "X"})
+	winner, _ := Classify(context.Background(), "test-org", projects, domain.Entity{Title: "X"})
 	if winner == nil {
 		t.Fatal("expected winner")
 	}
@@ -202,7 +244,7 @@ func TestClassify_TiesGoToFirstReturned(t *testing.T) {
 }
 
 func TestClassify_NoProjects_ReturnsNilNoVotes(t *testing.T) {
-	winner, votes := Classify(context.Background(), nil, domain.Entity{Title: "X"})
+	winner, votes := Classify(context.Background(), "test-org", nil, domain.Entity{Title: "X"})
 	if winner != nil {
 		t.Errorf("expected nil winner")
 	}
@@ -215,7 +257,7 @@ func TestClassify_HaikuErrorTreatedAsNoVote(t *testing.T) {
 	isolateHome(t)
 	origS1 := runStage1Haiku
 	t.Cleanup(func() { runStage1Haiku = origS1 })
-	runStage1Haiku = func(_ context.Context, prompt string) (int, string, error) {
+	runStage1Haiku = func(_ context.Context, _ string, prompt string) (int, string, error) {
 		if strings.Contains(prompt, "<project_name>\nFlaky\n</project_name>") {
 			return 0, "", errors.New("simulated CLI failure")
 		}
@@ -227,7 +269,7 @@ func TestClassify_HaikuErrorTreatedAsNoVote(t *testing.T) {
 		{ID: "p-flaky", Name: "Flaky"},
 		{ID: "p-good", Name: "Healthy"},
 	}
-	winner, votes := Classify(context.Background(), projects, domain.Entity{Title: "X"})
+	winner, votes := Classify(context.Background(), "test-org", projects, domain.Entity{Title: "X"})
 	if winner == nil || *winner != "p-good" {
 		got := "<nil>"
 		if winner != nil {
@@ -270,7 +312,7 @@ func TestClassify_Stage2EscalatesOnBorderlineTruncated(t *testing.T) {
 	projects := []domain.Project{
 		{ID: projectID, Name: "Borderline", Description: "Big-KB project"},
 	}
-	winner, votes := Classify(context.Background(), projects, domain.Entity{Title: "X"})
+	winner, votes := Classify(context.Background(), "test-org", projects, domain.Entity{Title: "X"})
 	if winner == nil || *winner != projectID {
 		got := "<nil>"
 		if winner != nil {
@@ -313,7 +355,7 @@ func TestClassify_Stage2DoesNotFireWithoutTruncation(t *testing.T) {
 	projects := []domain.Project{
 		{ID: "p-nt", Name: "NotTruncated"},
 	}
-	winner, _ := Classify(context.Background(), projects, domain.Entity{Title: "X"})
+	winner, _ := Classify(context.Background(), "test-org", projects, domain.Entity{Title: "X"})
 	if winner != nil {
 		t.Errorf("expected nil winner without escalation, got %s", *winner)
 	}

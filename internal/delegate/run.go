@@ -189,6 +189,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 		ExtraEnv:     extraEnv,
 		TraceID:      runID,
 		SystemPrompt: cfg.appendSysPrompt,
+		OrgID:        orgID,
 	}, newRunSink(s, orgID, runID, triggerType, creatorUserID))
 
 	// If Takeover() flipped the takenOver flag while we were streaming,

@@ -136,7 +136,7 @@ func (r *Runner) runOrg(ctx context.Context, orgID string) {
 	assigned := 0
 	skipped := 0
 	for _, e := range entities {
-		winner, votes := Classify(ctx, projects, e)
+		winner, votes := Classify(ctx, orgID, projects, e)
 		// All votes errored — leave classified_at NULL so the entity
 		// resurfaces next cycle. Stamping it here would permanently
 		// freeze the entity at unassigned even if the underlying

@@ -327,6 +327,7 @@ func (s *projectSession) dispatch(item queueItem) {
 			"TRIAGE_FACTORY_CURATOR_REQUEST_ID=" + requestID,
 		},
 		TraceID: requestID,
+		OrgID:   item.orgID,
 	}, newRequestSink(s.curator, s.projectID, requestID, item.orgID, item.creatorUserID))
 
 	// Cancellation observed → terminal cancelled status. Distinguish
