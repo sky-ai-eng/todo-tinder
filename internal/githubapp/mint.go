@@ -276,7 +276,11 @@ func (m *Minter) MintInstallationToken(ctx context.Context, installationID int64
 	if parsed.ExpiresAt.IsZero() {
 		return Token{}, errors.New("githubapp: installation token response missing expires_at field")
 	}
-	return Token{Value: parsed.Token, ExpiresAt: parsed.ExpiresAt.UTC()}, nil
+	expiresAt := parsed.ExpiresAt.UTC()
+	if !expiresAt.After(m.timeNow()) {
+		return Token{}, fmt.Errorf("githubapp: installation token response expires_at is not in the future: %s", expiresAt.Format(time.RFC3339))
+	}
+	return Token{Value: parsed.Token, ExpiresAt: expiresAt}, nil
 }
 
 // timeNow returns the current time, honoring the testable now hook.
