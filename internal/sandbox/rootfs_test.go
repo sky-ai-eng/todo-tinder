@@ -126,6 +126,57 @@ func TestExtractTarGz_NormalEntries(t *testing.T) {
 	}
 }
 
+// TestRootfsCacheKey_StableAcrossRuns pins the determinism contract:
+// the same inputs always produce the same key. If this ever fails,
+// the rootfs cache thrashes — every TF process startup re-runs the
+// 30-second download + apk-add chain instead of reusing the cached
+// extraction.
+func TestRootfsCacheKey_StableAcrossRuns(t *testing.T) {
+	a := rootfsCacheKey()
+	b := rootfsCacheKey()
+	if a != b {
+		t.Errorf("rootfsCacheKey not stable across calls: got %q then %q", a, b)
+	}
+}
+
+// TestRootfsCacheKey_ChangesWhenPackagesAdded pins the load-bearing
+// invariant: when apkPackages grows (someone adds rust, java, etc.),
+// the cache key MUST change so a long-running TF process doesn't
+// keep serving a stale rootfs that's missing the new toolchain. The
+// failure mode this protects against is silent — no error, just
+// ENOENT inside the sandbox six months after the package list grew.
+func TestRootfsCacheKey_ChangesWhenPackagesAdded(t *testing.T) {
+	base := []string{"nodejs", "git"}
+	extended := []string{"nodejs", "git", "rust"}
+	if rootfsCacheKeyFor("abc", base) == rootfsCacheKeyFor("abc", extended) {
+		t.Error("adding a package didn't change the cache key — stale cache risk")
+	}
+}
+
+// TestRootfsCacheKey_DeterministicOrder pins that the key depends on
+// the package SET, not the slice ordering. A maintainer reshuffling
+// apkPackages for readability shouldn't invalidate every operator's
+// cache. Sort-before-hash is the chosen mechanism (see
+// rootfsCacheKeyFor); this test guards it.
+func TestRootfsCacheKey_DeterministicOrder(t *testing.T) {
+	a := []string{"nodejs", "git", "ripgrep"}
+	b := []string{"ripgrep", "nodejs", "git"}
+	if rootfsCacheKeyFor("abc", a) != rootfsCacheKeyFor("abc", b) {
+		t.Error("cache key depends on slice ordering; should depend only on the package set")
+	}
+}
+
+// TestRootfsCacheKey_AlpineShaContributes pins that the alpine
+// tarball sha is part of the key. A future alpine version bump must
+// invalidate every operator's cache regardless of whether the
+// package list changed.
+func TestRootfsCacheKey_AlpineShaContributes(t *testing.T) {
+	pkgs := []string{"nodejs"}
+	if rootfsCacheKeyFor("alpha", pkgs) == rootfsCacheKeyFor("beta", pkgs) {
+		t.Error("cache key ignores alpine sha; pin update wouldn't invalidate")
+	}
+}
+
 func mustWriteFile(t *testing.T, tw *tar.Writer, name, content string) {
 	t.Helper()
 	if err := tw.WriteHeader(&tar.Header{

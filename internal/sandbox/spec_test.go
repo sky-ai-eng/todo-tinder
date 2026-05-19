@@ -14,11 +14,10 @@ import (
 // agentproc.RunOptions.
 func canonicalConfig() Config {
 	return Config{
-		RunID:      "abc123def",
-		Worktree:   "/data/worktrees/abc123def",
-		SDKDir:     "/home/tf/.triagefactory/sdk",
-		NodeBinary: "/usr/bin/node",
-		Argv:       []string{"/usr/local/bin/node", "/sdk/wrapper.mjs", "-p", "hi"},
+		RunID:    "abc123def",
+		Worktree: "/data/worktrees/abc123def",
+		SDKDir:   "/home/tf/.triagefactory/sdk",
+		Argv:     []string{"/usr/bin/node", "/sdk/wrapper.mjs", "-p", "hi"},
 		Env: []string{
 			"PATH=/usr/local/bin:/usr/bin:/bin",
 			"HOME=/work",
@@ -34,7 +33,6 @@ func TestBuildSpec_RequiredFields(t *testing.T) {
 		{"empty_runid", func(c *Config) { c.RunID = "" }},
 		{"empty_worktree", func(c *Config) { c.Worktree = "" }},
 		{"empty_sdkdir", func(c *Config) { c.SDKDir = "" }},
-		{"empty_node", func(c *Config) { c.NodeBinary = "" }},
 		{"empty_argv", func(c *Config) { c.Argv = nil }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -182,9 +180,8 @@ func TestBuildSpec_MountsIncludeWorktreeAndSDK(t *testing.T) {
 		t.Fatalf("buildSpec: %v", err)
 	}
 	wantMounts := map[string]string{
-		"/work":               cfg.Worktree,
-		"/sdk":                cfg.SDKDir,
-		"/usr/local/bin/node": cfg.NodeBinary,
+		"/work": cfg.Worktree,
+		"/sdk":  cfg.SDKDir,
 	}
 	for dst, src := range wantMounts {
 		var found bool

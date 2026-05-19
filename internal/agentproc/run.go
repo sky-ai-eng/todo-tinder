@@ -205,10 +205,6 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		// env. A future ticket will inject proxy URL + placeholder
 		// credential entries so the agent can reach an in-host proxy
 		// that holds the real key.
-		nodeBin, err := exec.LookPath("node")
-		if err != nil {
-			return nil, fmt.Errorf("sandbox: node binary: %w", err)
-		}
 		sdkDir := filepath.Dir(wrapperPath)
 
 		// Some callers (scorer, classifier stage1, profiler) are
@@ -246,21 +242,21 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		sandboxOpts := opts
 		sandboxOpts.AddDirs = translateAddDirsForSandbox(opts.AddDirs, workCwd)
 
-		// The sandbox's argv targets /usr/local/bin/node + /sdk/wrapper.mjs
-		// (bind-mount destinations inside the sandbox), not the host
-		// paths. Build the sandbox-side argv from scratch.
+		// The sandbox's argv targets /usr/bin/node (the apk-installed
+		// nodejs in the cached alpine rootfs) + /sdk/wrapper.mjs (the
+		// SDK bind-mount destination), not host paths. Build the
+		// sandbox-side argv from scratch.
 		argv := append(
-			[]string{"/usr/local/bin/node", "/sdk/wrapper.mjs"},
+			[]string{"/usr/bin/node", "/sdk/wrapper.mjs"},
 			BuildArgs(sandboxOpts)...,
 		)
 
 		sandboxCmd, sandbox, err := sandbox.Wrap(runCtx, sandbox.Config{
-			RunID:      opts.TraceID,
-			Worktree:   workCwd,
-			SDKDir:     sdkDir,
-			NodeBinary: nodeBin,
-			Argv:       argv,
-			Env:        sbEnv,
+			RunID:    opts.TraceID,
+			Worktree: workCwd,
+			SDKDir:   sdkDir,
+			Argv:     argv,
+			Env:      sbEnv,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("sandbox: %w", err)

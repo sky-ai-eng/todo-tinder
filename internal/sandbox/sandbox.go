@@ -31,17 +31,12 @@ type Config struct {
 	// inside the sandbox.
 	SDKDir string
 
-	// NodeBinary is the host path to the `node` executable.
-	// Bind-mounted RO at /usr/local/bin/node. Caller resolves via
-	// exec.LookPath; sandbox does not search PATH itself so the
-	// caller's PATH controls which Node ends up in the sandbox.
-	NodeBinary string
-
 	// Argv is the command exec'd inside the sandbox. Typically
-	// ["/usr/local/bin/node", "/sdk/wrapper.mjs", ...BuildArgs(opts)].
-	// First element MUST be an absolute path that exists in the
-	// sandbox rootfs or via a bind mount (runsc does not invoke a
-	// shell to PATH-resolve).
+	// ["/usr/bin/node", "/sdk/wrapper.mjs", ...BuildArgs(opts)] —
+	// /usr/bin/node is the apk-installed nodejs in the cached alpine
+	// rootfs. First element MUST be an absolute path that exists in
+	// the sandbox rootfs or via a bind mount (runsc does not invoke
+	// a shell to PATH-resolve).
 	Argv []string
 
 	// Env is the COMPLETE env exposed to the sandboxed process.

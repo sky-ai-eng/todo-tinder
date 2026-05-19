@@ -75,9 +75,9 @@ check_bin() {
 check_bin runsc    "curl -fsSL -o /tmp/runsc https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc && chmod +x /tmp/runsc && sudo mv /tmp/runsc /usr/local/bin/runsc"
 check_bin ip       "apt-get install -y iproute2"
 check_bin iptables "apt-get install -y iptables"
-check_bin node     "apt-get install -y nodejs   # only needed for exec.LookPath in tests; payloads use busybox"
 check_bin go       "https://go.dev/dl/"
 check_bin curl     "apt-get install -y curl   # used by alpine rootfs cache download"
+check_bin chroot   "apt-get install -y coreutils   # rootfs toolchain build uses chroot+apk"
 
 if (( missing != 0 )); then
   red "Aborting — install the missing tools above and re-run."
@@ -188,7 +188,12 @@ for test in \
   TestIntegration_NonRootUID \
   TestIntegration_WorktreeIsolation \
   TestIntegration_CleanupRemovesNetns \
-  TestIntegration_ReapOrphans; do
+  TestIntegration_ReapOrphans \
+  TestIntegration_RootfsHasNode \
+  TestIntegration_RootfsHasGit \
+  TestIntegration_RootfsHasRipgrep \
+  TestIntegration_RootfsHasPython \
+  TestIntegration_RootfsHasGo; do
   if   grep -q -- "--- PASS: $test" "$integ_log" 2>/dev/null; then green  "  PASS  $test"
   elif grep -q -- "--- SKIP: $test" "$integ_log" 2>/dev/null; then yellow "  SKIP  $test"
   elif grep -q -- "--- FAIL: $test" "$integ_log" 2>/dev/null; then red    "  FAIL  $test"

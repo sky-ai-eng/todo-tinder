@@ -3,25 +3,18 @@
 package sandbox
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
-)
-
-// alpineRootfsURL pins the alpine minirootfs the sandbox uses. Same
-// tarball as the validation probe (probe.sh line 64) so the runtime
-// behavior matches what was tested. Bumping requires re-running the
-// probe to verify nothing changed in alpine's syscall surface that
-// the SDK depends on.
-const (
-	alpineRootfsURL    = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz"
-	alpineRootfsSHA256 = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
 )
 
 // rootfsCacheMu serializes ensureRootfs across concurrent Wrap calls.
@@ -50,14 +43,16 @@ func doEnsureRootfs() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("rootfs: resolve home: %w", err)
 	}
-	// Embed the sha in the directory name so a pin change forces a
-	// fresh extraction without us having to detect drift manually.
+	// Cache key hashes (alpine sha, package set). Adding a package to
+	// apkPackages changes the key and forces a fresh extraction so we
+	// never serve a cached rootfs whose toolchain doesn't match the
+	// current build's expectations.
 	cacheDir := filepath.Join(home, ".triagefactory", "sandbox",
-		"rootfs-"+alpineRootfsSHA256[:12])
+		"rootfs-"+rootfsCacheKey())
 
-	// Sentinel file marking a successful extraction. Lets us
-	// distinguish "fully populated cache" from "extraction crashed
-	// halfway, leaving partial files."
+	// Sentinel file marking a successful extraction + toolchain
+	// install. Distinguishes "fully populated cache" from "crashed
+	// mid-build, leaving partial files."
 	sentinel := filepath.Join(cacheDir, ".extracted-ok")
 	if _, err := os.Stat(sentinel); err == nil {
 		return cacheDir, nil
@@ -93,10 +88,80 @@ func doEnsureRootfs() (string, error) {
 		return "", fmt.Errorf("rootfs: extract: %w", err)
 	}
 
+	// Layer the agent toolchain on top of the bare minirootfs via
+	// chroot+apk. Bare minirootfs ships busybox only — no node, git,
+	// rg, python, go — which suffices for boot-shaped smoke tests
+	// but every real agent run needs the toolchain. Done once per
+	// cache build, then frozen in the cached rootfs and reused
+	// across runs.
+	if err := installToolchain(cacheDir); err != nil {
+		return "", fmt.Errorf("rootfs: install toolchain: %w", err)
+	}
+
 	if err := os.WriteFile(sentinel, []byte("ok"), 0o644); err != nil {
 		return "", fmt.Errorf("rootfs: write sentinel: %w", err)
 	}
 	return cacheDir, nil
+}
+
+// installToolchain runs `apk add` inside the freshly extracted rootfs
+// via chroot. The bare alpine minirootfs has busybox only; every real
+// agent run needs node + git + rg + python + go + build tools.
+//
+// Requires root on the host (chroot syscall) — already a prerequisite
+// of the sandbox path (netns + iptables also need CAP_SYS_ADMIN /
+// CAP_NET_ADMIN), so this isn't a new requirement.
+//
+// `apk` ships as a static busybox-applet-style binary in the alpine
+// minirootfs, so we don't need host apk installed — the binary inside
+// the extracted rootfs handles the install.
+func installToolchain(rootfsDir string) error {
+	// Some packages we install (ripgrep, go) live in the community
+	// repository, which the bare minirootfs does NOT enable by
+	// default. Enable it before apk-add or the install fails with
+	// "unable to select packages."
+	if err := enableCommunityRepo(filepath.Join(rootfsDir, "etc", "apk", "repositories")); err != nil {
+		return fmt.Errorf("enable community repo: %w", err)
+	}
+
+	// apk needs DNS resolution to reach dl-cdn.alpinelinux.org from
+	// inside the chroot. The minirootfs has no /etc/resolv.conf, so
+	// without this apk fails with "temporary failure in name
+	// resolution." Reuse the same public-resolver config the sandbox
+	// itself uses at launch (the per-run resolv.conf bind mount
+	// overwrites this at runtime, so leaving it in the cached rootfs
+	// is cosmetic — no need to clean up after).
+	resolvPath := filepath.Join(rootfsDir, "etc", "resolv.conf")
+	if err := os.WriteFile(resolvPath, []byte(resolvConfContent), 0o644); err != nil {
+		return fmt.Errorf("write chroot resolv.conf: %w", err)
+	}
+
+	args := append([]string{rootfsDir, "/sbin/apk", "add", "--no-cache"}, apkPackages...)
+	cmd := exec.Command("chroot", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("chroot apk add: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// enableCommunityRepo appends the alpine community repo URL to the
+// rootfs's /etc/apk/repositories if it isn't already listed. The
+// minirootfs ships with main only.
+func enableCommunityRepo(repoFile string) error {
+	data, err := os.ReadFile(repoFile)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(data, []byte("/community")) {
+		return nil
+	}
+	if len(data) > 0 && !bytes.HasSuffix(data, []byte("\n")) {
+		data = append(data, '\n')
+	}
+	data = append(data, []byte(alpineCommunityRepo+"\n")...)
+	return os.WriteFile(repoFile, data, 0o644)
 }
 
 func downloadFile(url, dst string) error {

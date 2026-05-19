@@ -43,9 +43,6 @@ func buildSpec(cfg Config, netnsPath string) (*specs.Spec, error) {
 	if cfg.SDKDir == "" {
 		return nil, fmt.Errorf("spec: Config.SDKDir is required")
 	}
-	if cfg.NodeBinary == "" {
-		return nil, fmt.Errorf("spec: Config.NodeBinary is required")
-	}
 	if len(cfg.Argv) == 0 {
 		return nil, fmt.Errorf("spec: Config.Argv is required")
 	}
@@ -121,27 +118,11 @@ func buildSpec(cfg Config, netnsPath string) (*specs.Spec, error) {
 				Options: []string{"rbind", "rw"}},
 
 			// Agent SDK install — bind-mount RO. The agent loads
-			// wrapper.mjs + node_modules from /sdk.
+			// wrapper.mjs + node_modules from /sdk. The `node` binary
+			// itself comes from the apk-installed nodejs package in
+			// the cached rootfs (musl-linked, matches alpine's libc),
+			// not from the host — so no node bind-mount is needed.
 			{Destination: "/sdk", Type: "bind", Source: cfg.SDKDir,
-				Options: []string{"rbind", "ro"}},
-
-			// Node binary — bind-mount RO. The agent execs node from
-			// /usr/local/bin/node (the absolute path in cfg.Argv).
-			//
-			// KNOWN LIMITATION (follow-up ticket): host node may be
-			// glibc-linked while the alpine rootfs is musl. The
-			// bind-mounted binary's dynamic loader (typically
-			// /lib64/ld-linux-x86-64.so.2 on glibc) won't exist
-			// inside alpine, so node fails to exec with "not
-			// found". Resolved by either (a) bundling a musl-linked
-			// node into the cached rootfs via apk-add at extraction
-			// time, (b) using a node-on-alpine base image instead
-			// of bare alpine minirootfs, or (c) shipping a
-			// statically-linked node binary. Tracked as a sibling
-			// ticket. The SKY-254 integration tests use busybox
-			// payloads (echo, env, cat, id) which work fine, so
-			// the sandbox acceptance is unaffected by this gap.
-			{Destination: "/usr/local/bin/node", Type: "bind", Source: cfg.NodeBinary,
 				Options: []string{"rbind", "ro"}},
 
 			// CA certificates from the host so outbound TLS (to the
