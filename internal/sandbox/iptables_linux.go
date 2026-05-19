@@ -57,22 +57,22 @@ func teardownIptables(ctx context.Context, rule iptablesRule) error {
 	return nil
 }
 
-// applyEgressPolicy is the SKY-335 hook point. Called with an empty
-// allowlist in SKY-254 — does nothing, leaves MASQUERADE wide open
-// for the test/dev path. SKY-335 will pass actual proxy IPs here
-// and this function will install FORWARD-chain rules that DROP
-// everything except those.
+// applyEgressPolicy is the egress-allowlist hook. SKY-335 wired the
+// proxy-URL injection side (sandbox.Config.ConfigureProxies) but
+// deliberately left the FORWARD-chain tightening for a follow-up:
+// per-run egress restriction is "per-run policy at the proxies",
+// explicitly out of scope per the SKY-335 ticket body. Today the
+// MASQUERADE rule installed by applyMasquerade lets the sandbox
+// reach anything; a future ticket will pass the per-run proxy IPs
+// here and install DROP rules for everything outside the allowlist.
 //
-// Kept here (rather than as a no-op in agentproc.Run) so the SKY-335
-// PR has an obvious single place to wire its logic without touching
-// run.go.
+// Kept here (rather than as a no-op in agentproc.Run) so that
+// follow-up can land as a pure addition inside this function.
 func applyEgressPolicy(_ context.Context, _ string, allowed []netip.Prefix) error {
 	if len(allowed) == 0 {
-		// SKY-254 path: no allowlist enforced. MASQUERADE alone lets
-		// sandbox traffic out. SKY-335 will tighten this.
 		return nil
 	}
-	// SKY-335 implementation goes here. The signature is locked so
+	// Follow-up implementation goes here. The signature is locked so
 	// the future PR is a pure addition inside this function.
 	return nil
 }

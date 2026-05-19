@@ -99,12 +99,35 @@ func wrap(ctx context.Context, cfg Config) (*exec.Cmd, *Sandbox, error) {
 		return nil, nil, fmt.Errorf("sandbox: egress policy: %w", err)
 	}
 
+	// Step 9.5: invoke the proxy-configuration callback (SKY-335) so
+	// the caller can bind per-run LLM / git proxies on sb.HostIP and
+	// return the env entries naming them. The proxies have to be
+	// listening before the OCI bundle's env is finalized — that env
+	// is what the agent process reads from /proc/self/environ — so
+	// we sequence this between network-up and bundle-write. Property
+	// B holds because the returned slice contains only URLs +
+	// placeholders; the real credentials live on the host inside the
+	// proxy processes.
+	specCfg := cfg
+	if cfg.ConfigureProxies != nil {
+		proxyEnv, perr := cfg.ConfigureProxies(sb)
+		if perr != nil {
+			return nil, nil, fmt.Errorf("sandbox: configure proxies: %w", perr)
+		}
+		if len(proxyEnv) > 0 {
+			merged := make([]string, 0, len(cfg.Env)+len(proxyEnv))
+			merged = append(merged, cfg.Env...)
+			merged = append(merged, proxyEnv...)
+			specCfg.Env = merged
+		}
+	}
+
 	// Step 10: rootfs + OCI bundle.
 	rootfsPath, err := ensureRootfs(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sandbox: %w", err)
 	}
-	spec, err := buildSpec(cfg, netSt.netnsPath)
+	spec, err := buildSpec(specCfg, netSt.netnsPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sandbox: %w", err)
 	}

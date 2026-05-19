@@ -25,18 +25,15 @@ func shouldSandbox() bool {
 	return runmode.Current() == runmode.ModeMulti && runtime.GOOS == "linux"
 }
 
-// buildSandboxEnv constructs the *complete* env exposed to the
-// sandboxed agent. PROPERTY B INVARIANT: this slice contains
+// buildSandboxEnv constructs the *base* env exposed to the
+// sandboxed agent — the slice the sandbox's ConfigureProxies hook
+// then appends ANTHROPIC_BASE_URL / placeholder credentials onto
+// (see proxies.go). PROPERTY B INVARIANT: this slice contains
 // NO credential-shaped entries. The agent's process.env / FDs /
-// memory contain only the keys below; a jailbroken agent dumping
-// its own state into a tool result / commit message / model
-// response leaks nothing usable.
-//
-// SKY-335 will append ANTHROPIC_BASE_URL + a placeholder
-// ANTHROPIC_API_KEY to the returned slice so the agent can reach
-// an in-host proxy that holds the real key. Until then, the agent
-// will ENOAUTH against api.anthropic.com — that's the intended
-// interim state (multi mode isn't shipped to users yet).
+// memory contain only the keys below + the proxy URL/placeholder
+// pair that ConfigureProxies adds; a jailbroken agent dumping its
+// own state into a tool result / commit message / model response
+// leaks nothing usable.
 func buildSandboxEnv(extraEnv []string) []string {
 	// Floor: just enough for Node to find its binaries + cache dirs.
 	// Deliberately minimal; the sandbox's filesystem layout fills in

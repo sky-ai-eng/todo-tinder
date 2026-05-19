@@ -341,6 +341,108 @@ func TestIntegration_RootfsHasGo(t *testing.T) {
 	toolchainTest(t, []string{"/usr/bin/go", "version"}, "go version")
 }
 
+// TestIntegration_ConfigureProxies_InjectsEnv is the SKY-335
+// sandbox-side proxy wiring test. Asserts:
+//
+//   - The ConfigureProxies callback is invoked with a Sandbox whose
+//     HostIP is populated (the network is up by the time it fires)
+//   - Env entries returned by the callback show up in the agent's
+//     /proc/self/environ exactly as written
+//   - The original Config.Env is preserved alongside (the callback
+//     ADDS to, doesn't replace)
+//
+// Pins the load-bearing behavior of the SKY-335 hook so a future
+// refactor that misorders the network/spec phases or drops the env
+// merge will fail loudly.
+func TestIntegration_ConfigureProxies_InjectsEnv(t *testing.T) {
+	requireRunsc(t)
+	cfg := minimalConfig(t)
+	cfg.Argv = []string{"/usr/bin/env"}
+
+	var observedHostIP string
+	cfg.ConfigureProxies = func(s *Sandbox) ([]string, error) {
+		observedHostIP = s.HostIP
+		// Sentinel env entries the agent should see. Real callers
+		// inject ANTHROPIC_BASE_URL etc — we use neutral sentinels
+		// so the test doesn't conflate "callback ran" with "real
+		// proxy is up".
+		return []string{
+			"SKY335_PROXY_URL=http://" + s.HostIP + ":54321",
+			"SKY335_PLACEHOLDER=sk-PROXY-PLACEHOLDER",
+		}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd, sb, err := Wrap(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	defer sb.Close()
+
+	if observedHostIP == "" {
+		t.Fatal("ConfigureProxies invoked but HostIP empty; network setup must complete before callback")
+	}
+	if observedHostIP != sb.HostIP {
+		t.Errorf("callback saw HostIP %q, Sandbox reports %q; mismatch", observedHostIP, sb.HostIP)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("env in sandbox: %v (output: %s)", err, out)
+	}
+
+	if !strings.Contains(string(out), "SKY335_PROXY_URL=http://"+observedHostIP+":54321") {
+		t.Errorf("sandbox env missing proxy URL injected by callback:\n%s", out)
+	}
+	if !strings.Contains(string(out), "SKY335_PLACEHOLDER=sk-PROXY-PLACEHOLDER") {
+		t.Errorf("sandbox env missing placeholder injected by callback:\n%s", out)
+	}
+	// Original cfg.Env entries must also survive — the callback
+	// adds to, doesn't replace.
+	if !strings.Contains(string(out), "PATH=/usr/local/bin:/usr/bin:/bin") {
+		t.Errorf("sandbox env missing original PATH; callback overrode instead of appending:\n%s", out)
+	}
+}
+
+// TestIntegration_ConfigureProxies_ErrorAborts pins the error
+// propagation invariant: when the callback returns an error, Wrap
+// fails (no sandbox is started, no bundle is left on disk) and the
+// caller can defer Shutdown safely on the nil return.
+func TestIntegration_ConfigureProxies_ErrorAborts(t *testing.T) {
+	requireRunsc(t)
+	cfg := minimalConfig(t)
+	wantErr := "synthetic proxy startup failure"
+	cfg.ConfigureProxies = func(s *Sandbox) ([]string, error) {
+		return nil, &configureProxyError{msg: wantErr}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd, sb, err := Wrap(ctx, cfg)
+	if err == nil {
+		if sb != nil {
+			_ = sb.Close()
+		}
+		t.Fatal("Wrap returned nil err despite ConfigureProxies failure")
+	}
+	if !strings.Contains(err.Error(), wantErr) {
+		t.Errorf("err = %v; want it to wrap %q", err, wantErr)
+	}
+	if cmd != nil {
+		t.Error("Wrap returned non-nil cmd on error path; caller would mistakenly try to Start")
+	}
+	if sb != nil {
+		t.Error("Wrap returned non-nil Sandbox on error path; caller's defer Close would target a torn-down state")
+	}
+}
+
+type configureProxyError struct{ msg string }
+
+func (e *configureProxyError) Error() string { return e.msg }
+
 // Ensure filepath is used (defensive; gofmt would otherwise drop it
 // if the only reference goes away during a future edit).
 var _ = filepath.Join

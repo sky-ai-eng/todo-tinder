@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
@@ -196,16 +197,39 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	// for tenant isolation. Local-mode + non-Linux take the direct
 	// subprocess path (unchanged behavior).
 	var (
-		cmd *exec.Cmd
-		sb  *sandbox.Sandbox
+		cmd     *exec.Cmd
+		sb      *sandbox.Sandbox
+		proxies *runProxies
 	)
+	// Proxy shutdown runs unconditionally on Run exit — covers normal
+	// completion, ctx cancellation, and stream errors. Detached
+	// context so a cancelled run still gets a clean Shutdown drain
+	// rather than a torn TCP close that leaks the proxy goroutine.
+	defer func() {
+		if proxies == nil {
+			return
+		}
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := proxies.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[agentproc] proxy shutdown: %v", err)
+		}
+	}()
+
 	if shouldSandbox() {
-		// PROPERTY B INVARIANT: the sandbox path deliberately skips
-		// resolveCredentials. Real credentials never enter the sandbox
-		// env. A future ticket will inject proxy URL + placeholder
-		// credential entries so the agent can reach an in-host proxy
-		// that holds the real key.
+		// PROPERTY B INVARIANT: the sandbox path resolves credentials
+		// on the host side, then routes them through a per-run LLM
+		// proxy bound to the sandbox's host-side veth IP. The agent's
+		// env carries only the proxy URL + a placeholder credential;
+		// the real key lives in the proxy process on the host and is
+		// injected into the upstream HTTP request right before it
+		// leaves the box.
 		sdkDir := filepath.Dir(wrapperPath)
+
+		creds, err := resolveCredentials(runCtx, opts.Secrets, opts.OrgID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve credentials for org %q: %w", opts.OrgID, err)
+		}
 
 		// Some callers (scorer, classifier stage1, profiler) are
 		// prompt-only — they send a prompt, get JSON back, and never
@@ -251,17 +275,37 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 			BuildArgs(sandboxOpts)...,
 		)
 
-		sandboxCmd, sandbox, err := sandbox.Wrap(runCtx, sandbox.Config{
-			RunID:    opts.TraceID,
-			Worktree: workCwd,
-			SDKDir:   sdkDir,
-			Argv:     argv,
-			Env:      sbEnv,
+		// Multi-mode credential injection: when the sandbox calls
+		// ConfigureProxies after wiring the netns, we start the LLM
+		// proxy on the host-side veth IP and return the env entries
+		// naming it. The proxy holds the real key on the host side;
+		// the sandbox env carries only the proxy URL + placeholder.
+		// See proxies.go for the mapping from resolved creds to
+		// proxy provider / upstream.
+		configureProxies := func(s *sandbox.Sandbox) ([]string, error) {
+			bundle, proxyEnv, perr := startProxiesForSandbox(s.HostIP, creds)
+			if perr != nil {
+				return nil, perr
+			}
+			// Hand the bundle to the outer scope so the deferred
+			// Shutdown above tears down the proxy on every exit
+			// path (normal, error, ctx cancellation).
+			proxies = bundle
+			return proxyEnv, nil
+		}
+
+		sandboxCmd, sboxObj, err := sandbox.Wrap(runCtx, sandbox.Config{
+			RunID:            opts.TraceID,
+			Worktree:         workCwd,
+			SDKDir:           sdkDir,
+			Argv:             argv,
+			Env:              sbEnv,
+			ConfigureProxies: configureProxies,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("sandbox: %w", err)
 		}
-		cmd, sb = sandboxCmd, sandbox
+		cmd, sb = sandboxCmd, sboxObj
 		defer func() { _ = sb.Close() }()
 	} else {
 		// Direct-path: resolve per-org LLM credentials before spawning
