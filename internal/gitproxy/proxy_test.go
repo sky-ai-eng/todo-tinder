@@ -216,66 +216,143 @@ func TestProxyCachesToken(t *testing.T) {
 }
 
 // TestProxyRefreshesNearExpiry pins that the cache rotates when the
-// stored token is within refreshThreshold of expiry. Without this,
+// stored token ages within refreshThreshold of expiry. Without this,
 // long-running runs would hit GitHub with expired tokens and see 401s
 // near the 1-hour mark.
 //
-// Mechanism: token source returns an already-near-expiry token on
-// first call, then a fresh one on subsequent calls. Asserts the
-// second proxy call mints again.
+// Mechanism: pin the proxy's clock so the first request caches a
+// fresh-when-cached 1-hour token, then advance the clock past the
+// refresh threshold and observe the second request triggers a new
+// mint. Avoids real sleeps and avoids the dead-code-path that would
+// result from feeding the source itself a too-short-TTL token (which
+// the proxy rejects at TokenSource time — see TestProxyRejectsExpiredTokenFromSource).
 func TestProxyRefreshesNearExpiry(t *testing.T) {
 	rec := &fakeUpstreamRecord{}
 	upstream := fakeGitHub(rec)
 	defer upstream.Close()
 
+	// Injected clock the test advances between requests. Protected
+	// because the proxy reads it from request goroutines while the
+	// test mutates it from the main goroutine.
 	var (
-		mu    sync.Mutex
-		calls int
+		clockMu sync.Mutex
+		fakeNow = time.Now()
+	)
+	clock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return fakeNow
+	}
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		fakeNow = fakeNow.Add(d)
+	}
+
+	var (
+		callsMu sync.Mutex
+		calls   int
 	)
 	source := func(ctx context.Context) (gitproxy.Token, error) {
-		mu.Lock()
-		defer mu.Unlock()
+		callsMu.Lock()
+		defer callsMu.Unlock()
 		calls++
-		if calls == 1 {
-			// Near-expiry token: 1 minute from now, well inside the
-			// 5-minute refresh threshold. The proxy should mint again
-			// on the next request.
-			return gitproxy.Token{
-				Value:     "ghs_NEAREXPIRY",
-				ExpiresAt: time.Now().Add(1 * time.Minute),
-			}, nil
-		}
 		return gitproxy.Token{
-			Value:     "ghs_FRESH",
-			ExpiresAt: time.Now().Add(time.Hour),
+			Value:     fmt.Sprintf("ghs_TOKEN_%d", calls),
+			ExpiresAt: clock().Add(time.Hour),
 		}, nil
 	}
-	_, proxyURL := startProxy(t, source, upstream.URL)
+	srv, proxyURL := startProxy(t, source, upstream.URL)
+	srv.SetNowForTest(clock)
 
+	// First request: cache empty → mint → cache (1h TTL from now).
 	req1, _ := http.NewRequest("GET", proxyURL+"/x.git/info/refs", nil)
-	if _, err := http.DefaultClient.Do(req1); err != nil {
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
+	_ = resp1.Body.Close()
 	_, _, firstAuth, _, _ := rec.snapshot()
 
+	// Age the clock 56 minutes — cached token now has 4 minutes left,
+	// inside the 5-minute refresh threshold.
+	advance(56 * time.Minute)
+
+	// Second request: cache check fails (within threshold) → re-mint.
 	req2, _ := http.NewRequest("GET", proxyURL+"/x.git/info/refs", nil)
-	if _, err := http.DefaultClient.Do(req2); err != nil {
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
+	_ = resp2.Body.Close()
 	_, _, secondAuth, _, _ := rec.snapshot()
 
-	mu.Lock()
+	callsMu.Lock()
 	gotCalls := calls
-	mu.Unlock()
+	callsMu.Unlock()
 	if gotCalls != 2 {
-		t.Errorf("TokenSource invocations = %d, want 2 (near-expiry should trigger refresh)", gotCalls)
+		t.Errorf("TokenSource invocations = %d, want 2 (cache aging past threshold should re-mint)", gotCalls)
+	}
+	if firstAuth == "" {
+		t.Errorf("first request did not reach upstream — proxy returned an error before forwarding")
 	}
 	if firstAuth == secondAuth {
 		t.Errorf("first and second auth headers identical — refresh did not rotate the token")
 	}
-	wantSecond := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghs_FRESH"))
+	wantFirst := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghs_TOKEN_1"))
+	wantSecond := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghs_TOKEN_2"))
+	if firstAuth != wantFirst {
+		t.Errorf("first auth = %q, want %q", firstAuth, wantFirst)
+	}
 	if secondAuth != wantSecond {
 		t.Errorf("second auth = %q, want %q", secondAuth, wantSecond)
+	}
+}
+
+// TestProxyRejectsExpiredTokenFromSource pins the defensive check on
+// the return value of TokenSource: a token that's already past expiry,
+// or with TTL shorter than refreshThreshold, is rejected with 502
+// rather than cached. Catches a TokenSource implementation that
+// silently hands back a stale credential — without the check, the
+// proxy would forward the request, GitHub would 401, and the agent
+// would see a confusing failure rather than fail-fast.
+func TestProxyRejectsExpiredTokenFromSource(t *testing.T) {
+	rec := &fakeUpstreamRecord{}
+	upstream := fakeGitHub(rec)
+	defer upstream.Close()
+
+	cases := []struct {
+		name      string
+		expiresIn time.Duration
+	}{
+		{"already_expired", -5 * time.Minute},
+		{"expires_now", 0},
+		{"within_refresh_threshold", 4 * time.Minute},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			source := func(ctx context.Context) (gitproxy.Token, error) {
+				return gitproxy.Token{
+					Value:     "ghs_STALE",
+					ExpiresAt: time.Now().Add(c.expiresIn),
+				}, nil
+			}
+			startCount := rec.hits.Load()
+			_, proxyURL := startProxy(t, source, upstream.URL)
+			req, _ := http.NewRequest("GET", proxyURL+"/x.git/info/refs", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("roundtrip: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502 (stale token must not be cached or forwarded)", resp.StatusCode)
+			}
+			if got := rec.hits.Load() - startCount; got != 0 {
+				t.Errorf("upstream hits = %d, want 0 (stale token must not reach upstream)", got)
+			}
+		})
 	}
 }
 
@@ -588,6 +665,12 @@ func TestProxyShutdownIdempotent(t *testing.T) {
 // The token lives only in the proxy's memory; the agent sees a proxy
 // URL and nothing else.
 //
+// The proxy's Upstream is pinned to a local httptest server so the
+// test runs entirely on loopback — no DNS, no outbound network, no
+// flake on offline CI runners. Git still exercises the full proxy
+// roundtrip (forward-proxy mode with absolute URI in the request line)
+// and the test still inspects exactly what the ticket asks for.
+//
 // Skips if git isn't installed (CI runners without git would only
 // produce a noisy false-pass otherwise; the test is about the env
 // shape, not git's behavior).
@@ -597,6 +680,13 @@ func TestPropertyB_TokenNotObservableInChildProcess(t *testing.T) {
 		t.Skipf("git not installed; skipping Property B check: %v", err)
 	}
 
+	// Fake upstream stands in for github.com. Returns a smart-HTTP
+	// service advertisement so git's ls-remote progresses past
+	// connection setup and the proxy roundtrip is fully exercised.
+	rec := &fakeUpstreamRecord{}
+	upstream := fakeGitHub(rec)
+	defer upstream.Close()
+
 	// Marker token: a distinctive string that, if it appears in any
 	// child-observable surface, definitively proves a leak. The
 	// "_LEAK_CANARY_" substring is what tests grep for.
@@ -605,7 +695,7 @@ func TestPropertyB_TokenNotObservableInChildProcess(t *testing.T) {
 		value:     markerToken,
 		expiresAt: time.Now().Add(time.Hour),
 	}
-	_, proxyURL := startProxy(t, ts.source, "https://github.com")
+	_, proxyURL := startProxy(t, ts.source, upstream.URL)
 
 	// Set up a synthetic HOME for the child so the test reads back a
 	// .gitconfig under our control rather than the developer's real
@@ -633,15 +723,18 @@ func TestPropertyB_TokenNotObservableInChildProcess(t *testing.T) {
 		}
 	}
 
-	// Run a quick git command that exercises the proxy path. Use
-	// `git ls-remote http://github.com/test/test.git` so git uses the
-	// HTTP forward-proxy mode (not CONNECT-tunneled HTTPS, which a
-	// reverse-proxy listener can't terminate without a custom CA).
-	// We don't care whether ls-remote succeeds — only that the child
-	// runs and exits, so we can inspect its observable surfaces.
+	// Run git against an http:// URL so it uses HTTP forward-proxy
+	// mode (not CONNECT-tunneled HTTPS, which a reverse-proxy listener
+	// can't terminate without a custom CA). The remote URL's host is
+	// irrelevant: in forward-proxy mode git sends the absolute URI to
+	// the proxy and our proxy rewrites the destination to Upstream
+	// (the local httptest server). Using a .invalid TLD guarantees no
+	// real DNS lookup ever succeeds, so a regression that bypassed the
+	// proxy would fail loudly rather than silently leak to the
+	// internet.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, gitBin, "ls-remote", "http://github.com/octocat/Hello-World.git")
+	cmd := exec.CommandContext(ctx, gitBin, "ls-remote", "http://gitproxy-test.invalid/owner/repo.git")
 	cmd.Env = childEnv
 	cmd.Dir = tmpHome
 	// Capture combined output so we can also grep for the token in
@@ -682,6 +775,23 @@ func TestPropertyB_TokenNotObservableInChildProcess(t *testing.T) {
 	if strings.Contains(string(gitconfigContent), markerToken) ||
 		strings.Contains(string(out), markerToken) {
 		t.Errorf("marker token observed in child surfaces; full output: %s", out)
+	}
+
+	// 5. Positive assertion: the proxy actually forwarded the request
+	//    AND injected the credential upstream. Without this, a buggy
+	//    proxy that 502'd before forwarding would trivially "pass" the
+	//    leak checks above — there's nothing to leak if nothing
+	//    happened. The marker must be visible on the upstream side
+	//    (base64-decoded out of the Basic-auth header) while invisible
+	//    on the child side.
+	if rec.hits.Load() == 0 {
+		t.Errorf("upstream received 0 requests — git didn't reach the proxy, so the leak assertions above are vacuous (out: %s)", out)
+	}
+	_, _, upstreamAuth, _, _ := rec.snapshot()
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+markerToken))
+	if upstreamAuth != want {
+		t.Errorf("upstream Authorization = %q, want %q — proxy is not actually injecting credentials, so the no-leak result is meaningless",
+			upstreamAuth, want)
 	}
 }
 

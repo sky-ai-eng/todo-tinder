@@ -100,7 +100,13 @@ func TestParsePrivateKey_RejectsInvalidInput(t *testing.T) {
 }
 
 // TestNewMinter_RejectsInvalidConfig pins eager construction-time
-// validation so a missing key or zero AppID fails at boot.
+// validation so a missing key, zero AppID, or malformed APIBase fails
+// at boot rather than on the first mint attempt.
+//
+// The APIBase cases mirror llmproxy / gitproxy validation: a base
+// without scheme or host, with query or fragment, or http to a non-
+// loopback host are all rejected. The JWT we send to APIBase is a
+// Bearer-class secret and must not cross cleartext on a real network.
 func TestNewMinter_RejectsInvalidConfig(t *testing.T) {
 	validKey := newTestKey(t)
 	cases := []struct {
@@ -110,11 +116,42 @@ func TestNewMinter_RejectsInvalidConfig(t *testing.T) {
 		{"nil_key", githubapp.Config{PrivateKey: nil, AppID: 1}},
 		{"zero_app_id", githubapp.Config{PrivateKey: validKey, AppID: 0}},
 		{"negative_app_id", githubapp.Config{PrivateKey: validKey, AppID: -1}},
+		{"apibase_no_scheme", githubapp.Config{PrivateKey: validKey, AppID: 1, APIBase: "api.github.com"}},
+		{"apibase_with_query", githubapp.Config{PrivateKey: validKey, AppID: 1, APIBase: "https://api.github.com?x=1"}},
+		{"apibase_with_fragment", githubapp.Config{PrivateKey: validKey, AppID: 1, APIBase: "https://api.github.com#frag"}},
+		{"apibase_http_non_loopback", githubapp.Config{PrivateKey: validKey, AppID: 1, APIBase: "http://api.github.com"}},
+		{"apibase_unparseable", githubapp.Config{PrivateKey: validKey, AppID: 1, APIBase: "https://%zz"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := githubapp.NewMinter(c.cfg); err == nil {
 				t.Errorf("NewMinter(%+v) = nil err; want validation error", c.cfg)
+			}
+		})
+	}
+}
+
+// TestNewMinter_AcceptsValidAPIBase pins the shapes a real caller
+// would pass. The GHE path-on-base case ("https://<ghe>/api/v3") is
+// load-bearing: rejecting it would block self-hosted GitHub Enterprise
+// integration.
+func TestNewMinter_AcceptsValidAPIBase(t *testing.T) {
+	validKey := newTestKey(t)
+	cases := []string{
+		"https://api.github.com",
+		"https://api.github.com/",
+		"https://ghe.example.com/api/v3", // GHE — non-empty path is allowed
+		"http://127.0.0.1:8080",          // loopback http is permitted for httptest
+		"http://[::1]:8080",              // IPv6 loopback for httptest
+	}
+	for _, base := range cases {
+		t.Run(base, func(t *testing.T) {
+			if _, err := githubapp.NewMinter(githubapp.Config{
+				PrivateKey: validKey,
+				AppID:      1,
+				APIBase:    base,
+			}); err != nil {
+				t.Errorf("NewMinter with valid APIBase %q rejected: %v", base, err)
 			}
 		})
 	}

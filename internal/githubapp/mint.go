@@ -57,7 +57,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -155,6 +157,9 @@ func NewMinter(cfg Config) (*Minter, error) {
 	// "https://api.github.com" or "https://api.github.com/" without a
 	// resulting "//app/installations/..." in the request URL.
 	base = strings.TrimRight(base, "/")
+	if err := validateAPIBase(base); err != nil {
+		return nil, err
+	}
 	client := cfg.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
@@ -165,6 +170,39 @@ func NewMinter(cfg Config) (*Minter, error) {
 		apiBase:    base,
 		httpClient: client,
 	}, nil
+}
+
+// validateAPIBase rejects APIBase values that would silently misbehave:
+// missing scheme/host, query/fragment, or http to a non-loopback host
+// (the JWT we sign is a Bearer-class secret and must not cross
+// cleartext on a real network).
+//
+// A non-empty path IS allowed — GitHub Enterprise Server installations
+// pin the API under "https://<ghe-host>/api/v3", and the request URL
+// is built by appending "/app/installations/<id>/access_tokens" to the
+// base, which handles either shape correctly.
+func validateAPIBase(base string) error {
+	u, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("githubapp: parse APIBase %q: %w", base, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("githubapp: APIBase %q missing scheme or host (expected e.g. https://api.github.com)", base)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("githubapp: APIBase %q must not include query or fragment", base)
+	}
+	if u.Scheme != "https" {
+		host, _, _ := net.SplitHostPort(u.Host)
+		if host == "" {
+			host = u.Host
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("githubapp: APIBase %q must use https (loopback http is allowed for tests)", base)
+		}
+	}
+	return nil
 }
 
 // ParsePrivateKey accepts PEM-encoded RSA private key bytes in either
