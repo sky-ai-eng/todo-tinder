@@ -11,12 +11,12 @@ import (
 // workspace-specific sentinels callers (tests + the CLI body) expect.
 // Errors that don't match runident's typed sentinels pass through
 // wrapped so the message carries "workspace add:" context.
-func translateLookupErr(err error) error {
+func translateLookupErr(runID string, err error) error {
 	switch {
 	case errors.Is(err, runident.ErrRunIdentityMissing):
 		return errMissingRunID
 	case errors.Is(err, runident.ErrRunIdentityNotFound):
-		return fmt.Errorf("%w: %s", errRunNotFound, err.Error())
+		return fmt.Errorf("%w: %s", errRunNotFound, runID)
 	default:
 		return fmt.Errorf("workspace add: %w", err)
 	}
