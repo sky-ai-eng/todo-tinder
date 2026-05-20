@@ -164,6 +164,16 @@ services:
   # `ghcr.io/sky-ai-eng/triage-factory:<tag>` instead (see the commented
   # `image:` below). Same compose file works for both — comment the
   # `build:` block and uncomment `image:` to switch.
+  #
+  # GoTrue keypair: this service does NOT auto-generate the GoTrue
+  # signing keys. Those belong to the gotrue service above (which
+  # reads GOTRUE_JWT_KEYS + GOTRUE_JWT_SECRET from the host .env),
+  # and a key generated inside this container would never reach
+  # GoTrue's process env. Operator runs the host-side workflow
+  # documented in the file header (and .env.example):
+  #
+  #   ./triagefactory jwk-init --write-env .env
+  #   docker compose up -d
   triagefactory:
     build:
       context: .
@@ -177,11 +187,6 @@ services:
       postgres-postinit: { condition: service_completed_successfully }
     environment:
       TF_MODE: multi
-      # Headless first-boot. The entrypoint generates the GoTrue
-      # keypair on first run if the env doesn't already carry one.
-      # Operators wanting the interactive flow can run the image
-      # under `docker run -it ...` once before `docker compose up`.
-      TF_AUTO_JWK_INIT: "1"
       TF_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD (see .env.example)}@postgres:5432/postgres
       TF_GOTRUE_URL: http://gotrue:9999
       TF_GOTRUE_JWKS_URL: http://gotrue:9999/.well-known/jwks.json

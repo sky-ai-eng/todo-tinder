@@ -2,20 +2,29 @@
 # Triage Factory container entrypoint.
 #
 # Behavior summary:
-#   1. Multi-mode only — if no GoTrue keypair exists at
-#      /root/.triagefactory/.env, prompt interactively (TTY) or
-#      auto-generate when TF_AUTO_JWK_INIT=1 (headless).
-#   2. Multi-mode only — wait for the Postgres server named in
+#   1. Multi-mode only — wait for the Postgres server named in
 #      TF_DATABASE_URL to accept connections. Compose typically
 #      starts pg + tf together; this loop covers the first-boot race.
-#   3. Run goose-managed forward migrations. Idempotent — safe to run
+#   2. Run goose-managed forward migrations. Idempotent — safe to run
 #      on every container start, including restarts and rollbacks.
-#   4. exec the binary so tini/the container sees its signals
+#   3. exec the binary so tini/the container sees its signals
 #      directly (no shell intermediary swallowing SIGTERM).
 #
-# Local-mode (the default) skips steps 1 and 2; the binary's SQLite
-# init handles everything else. So a plain `docker run` boots a
-# working single-tenant TF without any env wiring at all.
+# Local-mode (the default) skips step 1; the binary's SQLite init
+# handles everything else. So a plain `docker run` boots a working
+# single-tenant TF without any env wiring at all.
+#
+# Note on GoTrue keys: the entrypoint deliberately does NOT generate
+# the GoTrue RS256 keypair. GoTrue runs in a separate container and
+# reads GOTRUE_JWT_KEYS / GOTRUE_JWT_SECRET from its own env; a key
+# generated inside THIS container can't reach it. Operators provision
+# the keypair once on the host before `docker compose up`:
+#
+#   triagefactory jwk-init --write-env .env
+#
+# That writes the values into the compose .env which both services
+# interpolate from. Same model for Fly: pass the generated values to
+# the GoTrue deployment's secrets, not this image's environment.
 
 set -eu
 
@@ -24,48 +33,15 @@ ENV_FILE="${TF_ENV_FILE:-$TF_HOME/.env}"
 
 mkdir -p "$TF_HOME"
 
-# Source the env file so JWK + DB vars set by jwk-init or the
-# operator's first-boot setup are visible to migrate + the server.
+# Source the env file so any DB / app vars the operator stashed there
+# are visible to migrate + the server. Optional — both Fly secrets
+# and compose env: blocks set these directly in the process env.
 if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     set -a; . "$ENV_FILE"; set +a
 fi
 
-# --- 1. First-boot JWK init (multi-mode only) ------------------------------
-
-if [ "${TF_MODE:-local}" = "multi" ]; then
-    # The keypair lands in $ENV_FILE as GOTRUE_JWT_KEYS + GOTRUE_JWT_SECRET
-    # — jwk-init's --write-env target. Presence of GOTRUE_JWT_KEYS in the
-    # process env (sourced above) is the signal that init has already run.
-    if [ -z "${GOTRUE_JWT_KEYS:-}" ]; then
-        if [ -t 0 ] && [ -t 1 ]; then
-            printf "GoTrue keypair not found at %s. Generate one now? [y/N] " "$ENV_FILE"
-            read -r answer
-            case "$answer" in
-                y|Y|yes|YES)
-                    triagefactory jwk-init --write-env "$ENV_FILE"
-                    # shellcheck disable=SC1090
-                    set -a; . "$ENV_FILE"; set +a
-                    ;;
-                *)
-                    echo "Aborting; multi-mode requires a keypair." >&2
-                    exit 1
-                    ;;
-            esac
-        elif [ "${TF_AUTO_JWK_INIT:-0}" = "1" ]; then
-            echo "Auto-generating GoTrue keypair into $ENV_FILE (TF_AUTO_JWK_INIT=1)" >&2
-            triagefactory jwk-init --write-env "$ENV_FILE"
-            # shellcheck disable=SC1090
-            set -a; . "$ENV_FILE"; set +a
-        else
-            echo "Multi-mode requires a GoTrue keypair, none found at $ENV_FILE." >&2
-            echo "Run with -it for interactive setup, or set TF_AUTO_JWK_INIT=1 for headless." >&2
-            exit 1
-        fi
-    fi
-fi
-
-# --- 2. Wait for Postgres (multi-mode only) --------------------------------
+# --- 1. Wait for Postgres (multi-mode only) --------------------------------
 #
 # Compose's depends_on/healthcheck handles this in the happy path, but
 # Fly Machines + manual restarts don't have that wiring. A bounded
@@ -86,7 +62,7 @@ if [ "${TF_MODE:-local}" = "multi" ] && [ -n "${TF_DATABASE_URL:-}" ]; then
     done
 fi
 
-# --- 3. Migrations (always) ------------------------------------------------
+# --- 2. Migrations (always) ------------------------------------------------
 #
 # Goose forward-only migrations are idempotent — re-running is a no-op
 # when the schema is already at head. Both modes hit this; local mode
@@ -94,7 +70,7 @@ fi
 
 triagefactory migrate up
 
-# --- 4. exec the binary ----------------------------------------------------
+# --- 3. exec the binary ----------------------------------------------------
 #
 # exec replaces the shell with the Go process so tini's signal
 # forwarding lands directly on triagefactory. Without the exec, a

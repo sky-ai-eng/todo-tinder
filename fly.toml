@@ -9,14 +9,23 @@
 #           (validated against the SKY-254 runsc probe — see the parent
 #           epic for the platform-compatibility log).
 #
-# Per-deployment secrets are set via flyctl, NOT committed here:
+# Per-deployment secrets the TF process consumes — set via flyctl,
+# NOT committed here:
 #   fly secrets set TF_DATABASE_URL='postgresql://...'
-#   fly secrets set TF_GOTRUE_JWKS_URL='https://.../auth/v1/.well-known/jwks.json'
-#   fly secrets set TF_GOTRUE_SIGNING_KEY="$(cat jwk-private.pem)"
-#   fly secrets set TF_SESSION_KEY="$(openssl rand -hex 32)"
+#   fly secrets set TF_GOTRUE_URL='https://gotrue.example.com'
+#   fly secrets set TF_GOTRUE_JWKS_URL='https://gotrue.example.com/.well-known/jwks.json'
+#   fly secrets set TF_GOTRUE_ISSUER='https://triagefactory.example.com/auth/v1'
+#   fly secrets set TF_SESSION_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+#   fly secrets set TF_COOKIE_SECRET="$(openssl rand -hex 32)"
 #   fly secrets set TF_GITHUB_APP_PRIVATE_KEY="$(cat github-app.pem)"
 #   fly secrets set TF_GITHUB_APP_ID='123456'
-#   fly secrets set TF_AUTO_JWK_INIT='1'   # headless first-boot path
+#
+# NOT here: the GoTrue RS256 keypair (GOTRUE_JWT_KEYS /
+# GOTRUE_JWT_SECRET). Those live on the GoTrue deployment's secrets,
+# not TF's — TF only verifies tokens against the public JWKS URL,
+# the signing material stays on the issuer. Generate the pair once
+# with `triagefactory jwk-init`, copy the GoTrue half to the GoTrue
+# app's secrets, then forget about it here.
 #
 # Per-org credentials (ANTHROPIC_API_KEY, AWS bedrock creds, etc.) are
 # NOT Fly secrets — those land in the per-org SecretStore (SKY-249)
@@ -30,7 +39,6 @@ primary_region = "iad"
 
 [env]
   TF_MODE = "multi"
-  TF_AUTO_JWK_INIT = "1"
 
 [deploy]
   # Idempotent forward migrations. Runs in a one-shot Machine before

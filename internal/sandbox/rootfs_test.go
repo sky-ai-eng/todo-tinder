@@ -179,20 +179,26 @@ func TestRootfsCacheKey_AlpineShaContributes(t *testing.T) {
 }
 
 // TestAlpineRootfsForArch_KnownArches pins that both supported arches
-// resolve to non-empty URL + sha with the right /x86_64/ or /aarch64/
-// segment. Catches a copy-paste regression where someone swaps two
-// arms of the switch and amd64 starts fetching the arm tarball.
+// resolve to a URL with the right /x86_64/ or /aarch64/ segment and a
+// concrete 64-hex sha256 (NOT a TODO placeholder). Catches two
+// distinct regressions:
+//
+//  1. Copy-paste in the switch — someone swaps amd64 and arm64 arms
+//     and the wrong tarball gets fetched.
+//  2. Re-introduced TODO sentinel — an earlier draft of this code
+//     shipped with "TODO_PIN_AARCH64_SHA256" as the arm64 sha, which
+//     compiled fine but failed sha verify at sandbox-launch time.
+//     The shape check (64 hex chars) rejects any future regression
+//     in the same direction.
 func TestAlpineRootfsForArch_KnownArches(t *testing.T) {
 	urlAmd, shaAmd, err := alpineRootfsForArch("amd64")
 	if err != nil {
 		t.Fatalf("amd64: %v", err)
 	}
-	if !strings.Contains(urlAmd, "x86_64") || !strings.Contains(urlAmd, "amd64") && !strings.Contains(urlAmd, "x86_64") {
+	if !strings.Contains(urlAmd, "x86_64") {
 		t.Errorf("amd64 URL %q missing x86_64 segment", urlAmd)
 	}
-	if shaAmd == "" {
-		t.Error("amd64 sha empty")
-	}
+	assertConcreteSHA256(t, "amd64", shaAmd)
 
 	urlArm, shaArm, err := alpineRootfsForArch("arm64")
 	if err != nil {
@@ -201,15 +207,36 @@ func TestAlpineRootfsForArch_KnownArches(t *testing.T) {
 	if !strings.Contains(urlArm, "aarch64") {
 		t.Errorf("arm64 URL %q missing aarch64 segment", urlArm)
 	}
-	if shaArm == "" {
-		t.Error("arm64 sha empty (even the TODO placeholder must be non-empty so cache key isn't degenerate)")
-	}
+	assertConcreteSHA256(t, "arm64", shaArm)
 
 	if urlAmd == urlArm {
 		t.Error("amd64 and arm64 resolved to the same URL; per-arch dispatch broken")
 	}
 	if shaAmd == shaArm {
 		t.Error("amd64 and arm64 share a sha; per-arch cache key would collide")
+	}
+}
+
+// assertConcreteSHA256 fails the test unless sha is a 64-hex-char
+// string with no obviously-placeholder substrings. Sandbox launch
+// hits sha-verify against the real alpine tarball, so a placeholder
+// here would CI-pass but always fail at runtime.
+func assertConcreteSHA256(t *testing.T, arch, sha string) {
+	t.Helper()
+	if len(sha) != 64 {
+		t.Errorf("%s sha %q is %d chars; want 64-hex sha256", arch, sha, len(sha))
+		return
+	}
+	for _, c := range sha {
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			t.Errorf("%s sha %q contains non-hex char %q", arch, sha, c)
+			return
+		}
+	}
+	for _, sentinel := range []string{"TODO", "PLACEHOLDER", "FIXME", "XXX"} {
+		if strings.Contains(strings.ToUpper(sha), sentinel) {
+			t.Errorf("%s sha %q looks like a placeholder (contains %q)", arch, sha, sentinel)
+		}
 	}
 }
 
