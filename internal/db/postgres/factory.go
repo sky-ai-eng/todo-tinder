@@ -13,10 +13,9 @@ import (
 // factoryReadStore is the Postgres impl of db.FactoryReadStore. Wired
 // against the admin pool (see postgres.New): the factory snapshot is
 // a system-level view that must see every in-flight run regardless of
-// which user kicked it off, and the LifetimeDistinctCounter Hydrate
-// path runs at server startup before any JWT claims exist. Running as
-// the per-request tf_app role with RLS active would only show the
-// factory its own creator_user_id rows.
+// which user kicked it off. Running as the per-request tf_app role
+// with RLS active would only show the factory its own
+// creator_user_id rows.
 //
 // SQL is written fresh against D3's schema: org_id in every WHERE
 // clause as defense in depth, $N placeholders, JSONB extraction for
@@ -65,7 +64,7 @@ func (s *factoryReadStore) EventCountsSince(ctx context.Context, orgID string, s
 	return out, rows.Err()
 }
 
-func (s *factoryReadStore) DistinctEntityCountsLifetime(ctx context.Context, orgID string) (map[string]int, error) {
+func (s *factoryReadStore) LifetimeDistinctByEventType(ctx context.Context, orgID string) (map[string]int, error) {
 	rows, err := s.q.QueryContext(ctx, `
 		SELECT event_type, COUNT(DISTINCT entity_id)
 		FROM events

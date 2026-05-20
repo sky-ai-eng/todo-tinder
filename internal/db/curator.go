@@ -177,9 +177,10 @@ func InFlightCuratorRequestForProject(database *sql.DB, projectID string) (*doma
 // delete that races a never-picked-up queued row still flips that
 // row to a terminal state before the project FK cascade fires.
 // Cross-process recovery is out of scope: process-restart cancels
-// every non-terminal row at startup (CancelOrphanedNonTerminalCuratorRequests),
-// so by the time anything calls this helper, only rows enqueued
-// during the current process lifetime can be observed.
+// every non-terminal row at startup via
+// CuratorStore.CancelOrphanedNonTerminalRequests, so by the time
+// anything calls this helper, only rows enqueued during the current
+// process lifetime can be observed.
 func QueuedCuratorRequestsForProject(database *sql.DB, projectID string) ([]domain.CuratorRequest, error) {
 	rows, err := database.Query(`
 		SELECT id, project_id, status, user_input, error_msg,
@@ -205,33 +206,6 @@ func QueuedCuratorRequestsForProject(database *sql.DB, projectID string) ([]doma
 		}
 	}
 	return out, rows.Err()
-}
-
-// CancelOrphanedNonTerminalCuratorRequests is the startup recovery
-// pass: any rows left non-terminal from a previous process are
-// stranded — running rows lost their goroutine + agentproc
-// subprocess at process exit (we can't resume mid-stream), and
-// queued rows lost the goroutine that was supposed to pick them up.
-//
-// Auto-replaying a stale queued row would be more surprising than
-// dropping it: the user's mental model after a restart is "the
-// app started fresh," and a chat message that suddenly starts
-// streaming a reply seconds later — possibly referencing a
-// project state that's since changed — would feel like a bug.
-// Cancelling both classes lets the user re-send if they actually
-// wanted that message processed. Idempotent.
-func CancelOrphanedNonTerminalCuratorRequests(database *sql.DB) (int64, error) {
-	res, err := database.Exec(`
-		UPDATE curator_requests
-		SET status = 'cancelled',
-		    error_msg = COALESCE(error_msg, 'process restarted'),
-		    finished_at = COALESCE(finished_at, ?)
-		WHERE status IN ('queued', 'running')
-	`, time.Now().UTC())
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
 }
 
 // SetProjectCuratorSessionID persists the captured Claude Code

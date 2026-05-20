@@ -185,46 +185,6 @@ func TestInFlightCuratorRequestForProject_NoneReturnsNil(t *testing.T) {
 	}
 }
 
-func TestCancelOrphanedNonTerminalCuratorRequests_FlipsQueuedAndRunning(t *testing.T) {
-	// Pin the new startup recovery contract: BOTH queued and running
-	// rows get cancelled because neither can survive a process
-	// restart in a useful state. Terminal rows are untouched. The
-	// previous contract left queued rows alone "for the next process
-	// to pick up," but that contract was never actually wired —
-	// queued rows would have dangled forever.
-	database := newTestDB(t)
-	projectID := seedProjectForCurator(t, database)
-
-	runningID, _ := CreateCuratorRequest(database, projectID, "running")
-	_ = MarkCuratorRequestRunning(database, runningID)
-
-	queuedID, _ := CreateCuratorRequest(database, projectID, "queued")
-
-	doneID, _ := CreateCuratorRequest(database, projectID, "done")
-	_, _ = CompleteCuratorRequest(database, doneID, "done", "", 0.1, 100, 1)
-
-	n, err := CancelOrphanedNonTerminalCuratorRequests(database)
-	if err != nil {
-		t.Fatalf("recovery: %v", err)
-	}
-	if n != 2 {
-		t.Errorf("flipped %d rows, want 2 (running + queued)", n)
-	}
-
-	getStatus := func(id string) string {
-		got, _ := GetCuratorRequest(database, id)
-		return got.Status
-	}
-	if got := getStatus(runningID); got != "cancelled" {
-		t.Errorf("running row status = %q, want cancelled", got)
-	}
-	if got := getStatus(queuedID); got != "cancelled" {
-		t.Errorf("queued row status = %q, want cancelled", got)
-	}
-	if got := getStatus(doneID); got != "done" {
-		t.Errorf("done row status = %q, want done (untouched)", got)
-	}
-}
 
 // TestCompleteCuratorRequest_DoesNotClobberCancelled is the load-
 // bearing race-protection test: a row that was cancelled (e.g. by

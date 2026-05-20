@@ -80,10 +80,9 @@ type Stores struct {
 	Tasks TaskStore
 
 	// Factory is the read-only projection that backs the
-	// /api/factory/snapshot handler and the LifetimeDistinctCounter
-	// reconciliation path. Admin pool in Postgres — the snapshot is
-	// a system-level view (no per-user identity) and the hydrate
-	// path runs at startup before any JWT claims are in scope.
+	// /api/factory/snapshot handler. Admin pool in Postgres — the
+	// snapshot is a system-level view (no per-user identity) and
+	// runs cross-org against the events/tasks/entities tables.
 	Factory FactoryReadStore
 
 	// AgentRuns owns runs + run_messages — agent run lifecycle,

@@ -22,13 +22,20 @@ import (
 // tf.current_user_id()), so a write outside synthetic claims would
 // fail; a read of someone else's row would return zero rows.
 //
-// Holds one queryer. Inside a SyntheticClaimsWithTx the queryer is
-// the in-flight *sql.Tx; outside (no current production caller) it
-// would be the *sql.DB and the inTx helper bootstraps a short tx
-// for the multi-statement consume/revert paths.
-type curatorStore struct{ q queryer }
+// Holds two queryers. q is the app pool (or the in-flight *sql.Tx
+// when composed from txStoresFromTx); admin is the admin pool used
+// by CancelOrphanedNonTerminalRequests, which is a cross-tenant
+// system-service sweep run at process startup before any JWT-claims
+// context exists. Both args collapse to the same queryer for the
+// NewForTx test door.
+type curatorStore struct {
+	q     queryer
+	admin queryer
+}
 
-func newCuratorStore(q queryer) db.CuratorStore { return &curatorStore{q: q} }
+func newCuratorStore(q, admin queryer) db.CuratorStore {
+	return &curatorStore{q: q, admin: admin}
+}
 
 var _ db.CuratorStore = (*curatorStore)(nil)
 
@@ -323,6 +330,32 @@ func (s *curatorStore) DeletePendingContextForSession(ctx context.Context, orgID
 		 WHERE org_id = $1 AND project_id = $2 AND curator_session_id = $3
 	`, orgID, projectID, sessionID)
 	return err
+}
+
+// CancelOrphanedNonTerminalRequests is the boot-time cross-tenant
+// sweep. Routes through the admin pool because the caller is
+// main.go's startup path with no JWT-claims context — RLS would
+// otherwise refuse the UPDATE. org_id is intentionally omitted: the
+// sweep affects every tenant whose chat was in-flight at the moment
+// of restart, documented as intentional (single-pod multi-mode in
+// v1; per-pod sharding is the only thing that would let us scope
+// narrower, and it doesn't exist yet).
+func (s *curatorStore) CancelOrphanedNonTerminalRequests(ctx context.Context) (int, error) {
+	res, err := s.admin.ExecContext(ctx, `
+		UPDATE curator_requests
+		SET status = 'cancelled',
+		    error_msg = COALESCE(error_msg, 'process restarted'),
+		    finished_at = COALESCE(finished_at, now())
+		WHERE status IN ('queued', 'running')
+	`)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
 }
 
 // intPtrAny maps an *int to a bind-compatible value (nil for NULL,

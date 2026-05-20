@@ -35,8 +35,9 @@ type Curator struct {
 	closed bool
 }
 
-// New constructs a Curator. Call db.CancelOrphanedNonTerminalCuratorRequests
-// at startup before constructing — see main.go wiring.
+// New constructs a Curator. Call
+// stores.Curator.CancelOrphanedNonTerminalRequests at startup
+// before constructing — see main.go wiring.
 //
 // stores carries the Tx runner (for SyntheticClaimsWithTx wraps), the
 // CuratorStore (per-turn writes), the ProjectStore (session-id
