@@ -24,11 +24,16 @@ import (
 // against *sql.DB; those are out of scope for this ticket and tracked
 // by SKY-253.
 //
-// Read methods (Get/List) live in the package-level helpers for now —
-// the goroutine's writes are the auth surface that matters under RLS.
-// One read does live here, GetRequest, because the dispatch goroutine
-// reads it inside the same per-turn synthetic-claims wrap as the
-// MarkRunning write and we want the read to honor RLS in Postgres.
+// Read methods (Get/List) mostly live in the package-level helpers
+// for now — the goroutine's writes are the auth surface that matters
+// under RLS. The reads that DO live here (GetRequest,
+// ListPendingContext) belong on the interface because their callers
+// need a per-resource handle they can wire through (the curator
+// goroutine reads GetRequest inside the same per-turn synthetic-
+// claims wrap as MarkRunning; the project-bundle export reads
+// ListPendingContext alongside the handler-side InsertPendingContext
+// path). Both must honor RLS in Postgres, so callers run them under
+// claims-bound execution (SyntheticClaimsWithTx or WithTx).
 type CuratorStore interface {
 	// CreateRequest inserts a new queued curator_request row and
 	// returns its id. creatorUserID is the requesting user — in
@@ -94,4 +99,32 @@ type CuratorStore interface {
 	// Used on terminal `cancelled` or `failed`. See the package-
 	// level helper for the merge semantics.
 	RevertPendingContext(ctx context.Context, orgID, requestID string) error
+
+	// InsertPendingContext queues a context-change delta for the
+	// next curator dispatch on (orgID, projectID, sessionID,
+	// changeType). Coalescing is enforced by the partial unique
+	// index on (project_id, curator_session_id, change_type)
+	// WHERE consumed_at IS NULL: a second PATCH between user
+	// messages hits ON CONFLICT DO NOTHING and the *earliest*
+	// baseline_value wins, which is the correct "snapshot before
+	// the first unconsumed change" anchor for diffing at consume
+	// time. baselineJSON must be a JSON-encoded representation of
+	// the value before the PATCH applied.
+	//
+	// Caller is responsible for ensuring sessionID is non-empty —
+	// there is no point queueing pending rows for a project whose
+	// Curator has never been spun up.
+	InsertPendingContext(ctx context.Context, orgID, projectID, sessionID, changeType, baselineJSON string) error
+
+	// ListPendingContext returns every row for a project regardless
+	// of consumed status, ordered by created_at. Used by the
+	// project-bundle export to inspect outstanding deltas.
+	ListPendingContext(ctx context.Context, orgID, projectID string) ([]domain.CuratorPendingContext, error)
+
+	// DeletePendingContextForSession removes every pending or
+	// consumed row for a (projectID, sessionID). Used when the
+	// session is reset so the new session's envelope renders
+	// current values directly without phantom deltas describing
+	// transitions the new agent never witnessed.
+	DeletePendingContextForSession(ctx context.Context, orgID, projectID, sessionID string) error
 }

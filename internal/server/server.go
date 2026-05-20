@@ -43,6 +43,7 @@ type Server struct {
 	pendingPRs    db.PendingPRStore   // SKY-287: pending_prs CRUD for pending_prs handler, agent status payload, drag-back-to-queue cleanup
 	repos         db.RepoStore        // SKY-288: repo_profiles CRUD for repos/settings/projects handlers and curator pinned-repo materialization
 	projects      db.ProjectStore     // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
+	curatorStore  db.CuratorStore     // curator-runtime CRUD (curator_requests / curator_messages / curator_pending_context) — handler-side writes go through here so Postgres mode honors RLS and uses the right placeholder syntax
 	events        db.EventStore       // SKY-305: events audit log Record/Latest for stock carry-over + factory drag-to-delegate
 	taskMemory    db.TaskMemoryStore  // run_memory writes (human verdict capture on review/PR submit, swipe-discard cleanup)
 	secrets       db.SecretStore      // canonical credential read/write path — local-mode keychain, multi-mode vault
@@ -202,7 +203,7 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 // argument list grows one store at a time as their callers migrate;
 // raw *sql.DB stays available for handlers that haven't been ported
 // to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, tx db.TxRunner) *Server {
+func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, tx db.TxRunner) *Server {
 	s := &Server{
 		db:            database,
 		prompts:       prompts,
@@ -224,6 +225,7 @@ func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboa
 		events:        events,
 		taskMemory:    taskMemory,
 		secrets:       secrets,
+		curatorStore:  curatorStore,
 		tx:            tx,
 		mux:           http.NewServeMux(),
 		ws:            websocket.NewHub(),
@@ -281,6 +283,10 @@ func (s *Server) routes() {
 	//        at boot to pick the login flow; must answer before any
 	//        session exists. The handler returns only deployment_mode;
 	//        per-user identity lives on /api/me.
+	//   GET  /api/health                — platform liveness probe (Fly
+	//        checks, compose healthcheck, k8s liveness). Pre-auth so
+	//        the probe doesn't need a session; deliberately doesn't
+	//        consult the DB (see handleHealth).
 	//   /auth/v1/                        — GoTrue reverse proxy; auth
 	//        happens upstream, not in our middleware.
 	//   /                                — SPA fallback; static-file
@@ -289,6 +295,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/auth/callback", s.handleOAuthCallback)
 	s.mux.Handle("POST /api/auth/logout", s.withCSRFOriginCheck(http.HandlerFunc(s.handleLogout)))
 	s.mux.HandleFunc("GET /api/config", s.handleConfig)
+	// Liveness probe — pre-auth so platform healthchecks (Fly checks,
+	// compose healthcheck, k8s liveness) can hit it without a session.
+	// Plain 200 OK with a tiny JSON body. Don't expand this into a
+	// readiness probe (which would couple to DB + integrations) — the
+	// platforms use auto-restart on liveness failure and we don't want
+	// a flapping integration to recycle the whole process.
+	s.mux.HandleFunc("GET /api/health", s.handleHealth)
 	// /auth/v1/* reverse-proxy to gotrue, wired lazily inside
 	// SetAuthDeps. The closure here re-reads s.authProxy each
 	// request so local-mode (where it stays nil) returns 404

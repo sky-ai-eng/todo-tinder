@@ -142,7 +142,7 @@ func TestCuratorStore_SQLite_PendingContextRoundTrip(t *testing.T) {
 	// Seed a pending context row directly via the package-level helper
 	// (the projects handler calls this on PATCH; the goroutine never
 	// inserts pending rows itself, only consumes them).
-	if err := db.InsertPendingContext(conn, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["foo/bar"]`); err != nil {
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["foo/bar"]`); err != nil {
 		t.Fatalf("seed pending: %v", err)
 	}
 
@@ -182,7 +182,7 @@ func TestCuratorStore_SQLite_PendingContextRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RevertPendingContext: %v", err)
 	}
-	all, err := db.ListPendingContext(conn, projectID)
+	all, err := stores.Curator.ListPendingContext(ctx, runmode.LocalDefaultOrgID, projectID)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestCuratorStore_SQLite_PendingContextRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("consume+finalize: %v", err)
 	}
-	all, err = db.ListPendingContext(conn, projectID)
+	all, err = stores.Curator.ListPendingContext(ctx, runmode.LocalDefaultOrgID, projectID)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestCuratorStore_SQLite_RevertCleansAuditRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	if err := db.InsertPendingContext(conn, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["foo/bar"]`); err != nil {
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["foo/bar"]`); err != nil {
 		t.Fatalf("seed pending: %v", err)
 	}
 	requestID, err := db.CreateCuratorRequest(conn, projectID, "msg")
@@ -273,7 +273,7 @@ func TestCuratorStore_SQLite_RevertCleansAuditRow(t *testing.T) {
 		t.Errorf("post-revert audit row count = %d, want 0", got)
 	}
 	// Pending row re-armed (un-consumed).
-	pending, err := db.ListPendingContext(conn, projectID)
+	pending, err := stores.Curator.ListPendingContext(ctx, runmode.LocalDefaultOrgID, projectID)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
@@ -352,6 +352,121 @@ func TestProjectStore_SQLite_SetCuratorSessionID(t *testing.T) {
 	// deleted mid-turn.
 	if err := stores.Projects.SetCuratorSessionID(ctx, runmode.LocalDefaultOrgID, "00000000-0000-0000-0000-000000000ghost", "sess-x"); err != nil {
 		t.Errorf("SetCuratorSessionID on missing project should be best-effort nil, got %v", err)
+	}
+}
+
+// TestCuratorStore_SQLite_InsertPendingContext_Coalesces pins the
+// coalescing contract on the partial-unique index: a second insert
+// against the same (project, session, change_type) tuple while the
+// first row is still unconsumed must drop on ON CONFLICT DO NOTHING
+// — the earliest baseline is the truer "snapshot before the first
+// unconsumed change" anchor.
+func TestCuratorStore_SQLite_InsertPendingContext_Coalesces(t *testing.T) {
+	conn := newSQLiteForCuratorTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+	projectID, err := stores.Projects.Create(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultTeamID,
+		domain.Project{Name: "p", CuratorSessionID: "sess-1"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["a/b"]`); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["c/d"]`); err != nil {
+		t.Fatalf("second insert: %v", err)
+	}
+
+	rows, err := stores.Curator.ListPendingContext(ctx, runmode.LocalDefaultOrgID, projectID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row after coalesce, got %d", len(rows))
+	}
+	if rows[0].BaselineValue != `["a/b"]` {
+		t.Errorf("baseline = %q, want %q (earliest wins)", rows[0].BaselineValue, `["a/b"]`)
+	}
+}
+
+// TestCuratorStore_SQLite_ListPendingContext_MixedConsumed verifies the
+// list returns every row regardless of consumed state, in created_at
+// order — the project-bundle export needs both halves of the lifecycle.
+func TestCuratorStore_SQLite_ListPendingContext_MixedConsumed(t *testing.T) {
+	conn := newSQLiteForCuratorTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+	projectID, err := stores.Projects.Create(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultTeamID,
+		domain.Project{Name: "p", CuratorSessionID: "sess-1"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["x"]`); err != nil {
+		t.Fatalf("insert pinned: %v", err)
+	}
+	requestID, err := db.CreateCuratorRequest(conn, projectID, "consume me")
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	// Consume the first row so it transitions to consumed.
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, func(ts db.TxStores) error {
+		_, _, err := ts.Curator.ConsumePendingContext(ctx, runmode.LocalDefaultOrgID, projectID, requestID)
+		return err
+	}); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	// Insert a fresh unconsumed row for a different change_type.
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1", domain.ChangeTypeJiraProjectKey, `null`); err != nil {
+		t.Fatalf("insert jira: %v", err)
+	}
+
+	rows, err := stores.Curator.ListPendingContext(ctx, runmode.LocalDefaultOrgID, projectID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows (1 consumed + 1 pending), got %d (%+v)", len(rows), rows)
+	}
+	if rows[0].ConsumedAt == nil {
+		t.Errorf("expected first row to be consumed, got %+v", rows[0])
+	}
+	if rows[1].ConsumedAt != nil {
+		t.Errorf("expected second row to be pending, got %+v", rows[1])
+	}
+}
+
+// TestCuratorStore_SQLite_DeletePendingContextForSession scopes deletion
+// to (project, session): rows tied to a different session must stay.
+func TestCuratorStore_SQLite_DeletePendingContextForSession(t *testing.T) {
+	conn := newSQLiteForCuratorTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+	projectID, err := stores.Projects.Create(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultTeamID,
+		domain.Project{Name: "p", CuratorSessionID: "sess-1"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["a"]`); err != nil {
+		t.Fatalf("insert sess-1: %v", err)
+	}
+	if err := stores.Curator.InsertPendingContext(ctx, runmode.LocalDefaultOrgID, projectID, "sess-2", domain.ChangeTypePinnedRepos, `["b"]`); err != nil {
+		t.Fatalf("insert sess-2: %v", err)
+	}
+
+	if err := stores.Curator.DeletePendingContextForSession(ctx, runmode.LocalDefaultOrgID, projectID, "sess-1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	rows, err := stores.Curator.ListPendingContext(ctx, runmode.LocalDefaultOrgID, projectID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row left (sess-2), got %d (%+v)", len(rows), rows)
+	}
+	if rows[0].CuratorSessionID != "sess-2" {
+		t.Errorf("wrong session survived: %q", rows[0].CuratorSessionID)
 	}
 }
 

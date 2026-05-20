@@ -10,8 +10,8 @@ import (
 // Preview returns the exact file list and aggregate size that Export would
 // include for the given project. orgID scopes every store lookup so a
 // multi-mode caller cannot read another tenant's project state.
-func Preview(ctx context.Context, database *sql.DB, projects db.ProjectStore, orgID, projectID string) (*ExportPreview, error) {
-	state, err := collectExportState(ctx, database, projects, orgID, projectID)
+func Preview(ctx context.Context, database *sql.DB, projects db.ProjectStore, curatorStore db.CuratorStore, orgID, projectID string) (*ExportPreview, error) {
+	state, err := collectExportState(ctx, database, projects, curatorStore, orgID, projectID)
 	if err != nil {
 		return nil, err
 	}

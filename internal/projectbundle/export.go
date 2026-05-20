@@ -14,8 +14,8 @@ import (
 // Export builds a project bundle and streams it as a ZIP reader. orgID
 // scopes every store lookup performed inside the bundler so a multi-mode
 // caller cannot accidentally read another tenant's project state.
-func Export(ctx context.Context, database *sql.DB, projects db.ProjectStore, orgID, projectID string) (io.ReadCloser, error) {
-	state, err := collectExportState(ctx, database, projects, orgID, projectID)
+func Export(ctx context.Context, database *sql.DB, projects db.ProjectStore, curatorStore db.CuratorStore, orgID, projectID string) (io.ReadCloser, error) {
+	state, err := collectExportState(ctx, database, projects, curatorStore, orgID, projectID)
 	if err != nil {
 		return nil, err
 	}

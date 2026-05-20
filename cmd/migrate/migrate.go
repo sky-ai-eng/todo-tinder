@@ -14,11 +14,46 @@
 package migrate
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
+
+// openTarget returns the (db, dialect) pair for the current runmode.
+// Local mode opens the same SQLite file the server uses; multi mode
+// opens TF_DATABASE_URL via pgx. This is the only path through the
+// CLI that touches a Postgres handle today — the server side is
+// stubbed by main.go pending the rest of SKY-242's multi-mode wiring,
+// but the migrate subcommand needs to work standalone so the Docker
+// image's entrypoint can bring the schema to head before the server
+// process starts.
+func openTarget() (*sql.DB, string, error) {
+	if runmode.Current() == runmode.ModeMulti {
+		dsn := os.Getenv("TF_DATABASE_URL")
+		if dsn == "" {
+			return nil, "", fmt.Errorf("TF_MODE=multi requires TF_DATABASE_URL")
+		}
+		conn, err := sql.Open("pgx", dsn)
+		if err != nil {
+			return nil, "", fmt.Errorf("open postgres: %w", err)
+		}
+		if err := conn.Ping(); err != nil {
+			conn.Close()
+			return nil, "", fmt.Errorf("ping postgres: %w", err)
+		}
+		return conn, "postgres", nil
+	}
+	conn, err := db.Open()
+	if err != nil {
+		return nil, "", fmt.Errorf("open database: %w", err)
+	}
+	return conn, "sqlite3", nil
+}
 
 // Handle is the entrypoint dispatched from main.go on
 // `triagefactory migrate ...`. The first argv after `migrate` is the
@@ -44,13 +79,13 @@ func Handle(args []string) {
 }
 
 func runUp() {
-	database, err := db.Open()
+	database, dialect, err := openTarget()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open database: %v\n", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	defer database.Close()
-	if err := db.Migrate(database, "sqlite3"); err != nil {
+	if err := db.Migrate(database, dialect); err != nil {
 		fmt.Fprintf(os.Stderr, "migrate up: %v\n", err)
 		os.Exit(1)
 	}
@@ -58,13 +93,13 @@ func runUp() {
 }
 
 func runStatus() {
-	database, err := db.Open()
+	database, dialect, err := openTarget()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open database: %v\n", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	defer database.Close()
-	if err := db.MigrationStatus(database, "sqlite3", os.Stdout); err != nil {
+	if err := db.MigrationStatus(database, dialect, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "migrate status: %v\n", err)
 		os.Exit(1)
 	}

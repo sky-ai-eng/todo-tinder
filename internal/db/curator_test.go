@@ -452,7 +452,11 @@ func TestResetCuratorForProject_WipesEverythingAndClearsSession(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed msg: %v", err)
 	}
-	if err := InsertPendingContext(database, projectID, "stale-session", "pinned_repos", `[]`); err != nil {
+	if _, err := database.Exec(`
+		INSERT INTO curator_pending_context
+			(project_id, curator_session_id, change_type, baseline_value)
+		VALUES (?, ?, ?, ?)
+	`, projectID, "stale-session", "pinned_repos", `[]`); err != nil {
 		t.Fatalf("seed pending: %v", err)
 	}
 
@@ -482,12 +486,14 @@ func TestResetCuratorForProject_WipesEverythingAndClearsSession(t *testing.T) {
 	}
 
 	// Pending-context rows for the wiped session also gone.
-	pending, err := ListPendingContext(database, projectID)
-	if err != nil {
-		t.Fatalf("list pending: %v", err)
+	var pendingCount int
+	if err := database.QueryRow(
+		`SELECT COUNT(*) FROM curator_pending_context WHERE project_id = ?`, projectID,
+	).Scan(&pendingCount); err != nil {
+		t.Fatalf("count pending: %v", err)
 	}
-	if len(pending) != 0 {
-		t.Errorf("expected pending wiped, got %d", len(pending))
+	if pendingCount != 0 {
+		t.Errorf("expected pending wiped, got %d", pendingCount)
 	}
 }
 

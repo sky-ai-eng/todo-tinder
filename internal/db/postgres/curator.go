@@ -274,6 +274,57 @@ func (s *curatorStore) RevertPendingContext(ctx context.Context, orgID, requestI
 	})
 }
 
+// InsertPendingContext queues a coalesced context-change delta.
+// creator_user_id binds via tf.current_user_id() — the same pattern
+// every other app-pool curator INSERT uses (curator_messages,
+// curator_requests). The ON CONFLICT target names the partial-unique
+// index columns explicitly with its predicate so Postgres matches the
+// idx_curator_pending_context_one_pending_per_type index for the
+// upsert resolution.
+func (s *curatorStore) InsertPendingContext(ctx context.Context, orgID, projectID, sessionID, changeType, baselineJSON string) error {
+	_, err := s.q.ExecContext(ctx, `
+		INSERT INTO curator_pending_context
+			(org_id, creator_user_id, project_id, curator_session_id, change_type, baseline_value)
+		VALUES ($1, tf.current_user_id(), $2, $3, $4, $5)
+		ON CONFLICT (project_id, curator_session_id, change_type)
+		WHERE consumed_at IS NULL
+		DO NOTHING
+	`, orgID, projectID, sessionID, changeType, baselineJSON)
+	return err
+}
+
+func (s *curatorStore) ListPendingContext(ctx context.Context, orgID, projectID string) ([]domain.CuratorPendingContext, error) {
+	rows, err := s.q.QueryContext(ctx, `
+		SELECT id, project_id::text, curator_session_id, change_type, baseline_value,
+		       consumed_at, consumed_by_request_id::text, created_at
+		  FROM curator_pending_context
+		 WHERE org_id = $1 AND project_id = $2
+		 ORDER BY created_at ASC, id ASC
+	`, orgID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []domain.CuratorPendingContext{}
+	for rows.Next() {
+		row, err := scanPgPendingContext(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (s *curatorStore) DeletePendingContextForSession(ctx context.Context, orgID, projectID, sessionID string) error {
+	_, err := s.q.ExecContext(ctx, `
+		DELETE FROM curator_pending_context
+		 WHERE org_id = $1 AND project_id = $2 AND curator_session_id = $3
+	`, orgID, projectID, sessionID)
+	return err
+}
+
 // intPtrAny maps an *int to a bind-compatible value (nil for NULL,
 // int otherwise). Postgres-side variant of the package-db nullInt
 // helper — kept local to avoid widening the package-db helpers'

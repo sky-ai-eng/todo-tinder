@@ -1,0 +1,99 @@
+# Build + publish the multi-arch Triage Factory image to GHCR.
+#
+# Trigger surface:
+#   - push to main         → ghcr.io/<owner>/triage-factory:sha-<short>,
+#                            ghcr.io/<owner>/triage-factory:edge
+#   - push of a v* tag     → ghcr.io/<owner>/triage-factory:vX.Y.Z,
+#                            ghcr.io/<owner>/triage-factory:latest
+#   - manual workflow_dispatch — same as a tag push without the tag,
+#                            useful for testing the workflow itself.
+#
+# Multi-arch via buildx + QEMU; the alpine runtime image and the
+# static Go binary both build cleanly on amd64 + arm64 because:
+#   - The Go binary uses CGO_ENABLED=0 and the Dockerfile threads
+#     GOOS/GOARCH from $TARGETARCH.
+#   - The runtime stage uses $TARGETARCH to pick the right runsc
+#     download URL (x86_64 vs aarch64 on storage.googleapis.com/gvisor).
+#
+# Image is published unauthenticated-pullable if the repo is public,
+# private otherwise (GHCR inherits the repo's visibility on the first
+# publish). For private repos, consumers need a PAT with read:packages.
+
+name: docker-publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU lets the amd64 runner cross-build the arm64 image
+      # without provisioning a native arm runner. Slow but free.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derives the right tag set automatically from the trigger:
+      #   - branch push          → sha-<short>, edge
+      #   - tag push (v1.2.3)    → 1.2.3, 1.2, 1, latest
+      # repo coordinates default to ghcr.io/<owner>/<repo>; we pin to
+      # the canonical lowercase name so case-sensitive registries don't
+      # surprise pull commands.
+      - name: Compute tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/triage-factory
+          # Tag rules:
+          #   - sha-<short> on every build, for pin-by-commit consumers.
+          #   - edge on main pushes. type=raw is the right type for a
+          #     constant tag; type=ref derives from the ref name and
+          #     doesn't honor value=, so an earlier draft published
+          #     `:main` instead of `:edge`.
+          #   - v-prefixed semver tags on v* git pushes, matching the
+          #     git tag exactly (`git tag v1.2.3` → `:v1.2.3, :v1.2,
+          #     :v1, :latest`). prefix=v is what makes the docker tag
+          #     match the source-of-truth git tag.
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build + push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA cache halves repeat-build times. Scoped per-arch so
+          # cross-build doesn't poison the native cache.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
