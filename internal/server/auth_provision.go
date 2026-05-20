@@ -399,4 +399,3 @@ func slugify(in string) string {
 	}
 	return out
 }
-
