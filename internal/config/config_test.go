@@ -9,6 +9,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // openDB returns an in-memory SQLite handle with the v1.11.0 baseline
@@ -125,7 +126,7 @@ func TestSave_EmptyOrgLLMRefsPersistAsNull(t *testing.T) {
 	err := conn.QueryRow(`
 		SELECT anthropic_api_key_ref, bedrock_credentials_ref, max_llm_model_tier
 		FROM org_settings WHERE org_id = ?
-	`, "00000000-0000-0000-0000-000000000001").Scan(&anthRef, &bedRef, &maxTier)
+	`, runmode.LocalDefaultOrgID).Scan(&anthRef, &bedRef, &maxTier)
 	if err != nil {
 		t.Fatalf("read org_settings: %v", err)
 	}
@@ -141,10 +142,11 @@ func TestSave_EmptyOrgLLMRefsPersistAsNull(t *testing.T) {
 }
 
 // TestMaxLLMModelTierCheckConstraint pins the CHECK constraint at the
-// SQLite layer: rows with an invalid tier are rejected at write time.
-// The Postgres mirror is exercised in pgtest (skipped when Docker is
-// unavailable) — this test guarantees the check still bites in local
-// mode when an admin path bypasses Save().
+// SQLite layer: rows with an invalid tier are rejected at write time,
+// so local-mode admin paths that bypass Save() can't slip a bad value
+// into org_settings. The Postgres mirror is pinned by
+// TestBaseline_OrgSettingsMaxLLMTier_CHECKFires in internal/db/pgtest
+// (skipped when Docker is unavailable).
 func TestMaxLLMModelTierCheckConstraint(t *testing.T) {
 	conn := openDB(t)
 	// Need an org_settings row first; seed via Save() through the sentinel.
