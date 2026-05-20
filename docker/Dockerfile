@@ -99,22 +99,35 @@ RUN apk add --no-cache \
     tzdata \
     curl
 
-# Pull the per-arch runsc binary. gVisor's release tree publishes both
-# x86_64 and aarch64 builds at the same URL prefix; TARGETARCH (set by
-# buildx) selects the right one. SHA512 ships alongside; verify before
-# install so a tampered CDN fails loudly at image build time.
+# Pull the per-arch runsc binary from a pinned gVisor release.
+#
+# Pinning (rather than tracking /release/latest/) keeps image builds
+# reproducible: a rebuild six months from now of the same TF commit
+# produces a runsc with identical behavior and identical syscall
+# semantics. SHA512 is also pinned in-repo per arch and verified
+# before install — a CDN compromise or accidental upstream rewrite
+# fails the build loudly instead of silently shipping a different
+# sandbox runtime.
+#
+# Bumping: pick a newer release tag from
+#   https://storage.googleapis.com/storage/v1/b/gvisor/o?prefix=releases/release/&delimiter=/
+# refresh both SHA512s from the sidecar files at
+#   https://storage.googleapis.com/gvisor/releases/release/<VER>/<arch>/runsc.sha512
+# and re-run the SKY-254 validation probe to confirm nothing in the
+# syscall surface that TF depends on has changed.
+ARG GVISOR_RELEASE=20260511
+ARG GVISOR_RUNSC_SHA512_AMD64=e227a71c95e794119f6648a44083df945392c6cd457f36abbc49c2b6e0b87c7f01b94e6bf4632f4cb22ee34fbec7a2c34ca03d30efa9c689db76a6215a6e44e1
+ARG GVISOR_RUNSC_SHA512_ARM64=1a1da6060bbfb98fcd98304a7e73afb2c23a897ae4a8bf741e1c6a16cf07e0cd14bcd9d0f0e51aff201feb0cf8d19952f944aeb5eb5d92b091509374b9702a26
 ARG TARGETARCH
 RUN set -eux; \
     case "$TARGETARCH" in \
-        amd64) GVISOR_ARCH=x86_64 ;; \
-        arm64) GVISOR_ARCH=aarch64 ;; \
+        amd64) GVISOR_ARCH=x86_64; EXPECTED_SHA=$GVISOR_RUNSC_SHA512_AMD64 ;; \
+        arm64) GVISOR_ARCH=aarch64; EXPECTED_SHA=$GVISOR_RUNSC_SHA512_ARM64 ;; \
         *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    base=https://storage.googleapis.com/gvisor/releases/release/latest/${GVISOR_ARCH}; \
+    base=https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/${GVISOR_ARCH}; \
     curl -fsSL -o /usr/local/bin/runsc "$base/runsc"; \
-    curl -fsSL -o /tmp/runsc.sha512 "$base/runsc.sha512"; \
-    (cd /usr/local/bin && sha512sum -c /tmp/runsc.sha512); \
-    rm -f /tmp/runsc.sha512; \
+    echo "${EXPECTED_SHA}  /usr/local/bin/runsc" | sha512sum -c -; \
     chmod 0755 /usr/local/bin/runsc
 
 # Pre-installed Agent SDK. EnsureSDK reads os.UserHomeDir() → /root
@@ -124,8 +137,10 @@ COPY --from=sdk-builder /sdk-install /root/.triagefactory/sdk
 # The TF binary itself.
 COPY --from=go-builder /out/triagefactory /usr/local/bin/triagefactory
 
-# Entrypoint script: first-boot JWK init, Postgres wait, migrations,
-# then exec the binary. Lives in the repo at docker/entrypoint.sh.
+# Entrypoint script: runs goose migrations with bounded retry against
+# a not-yet-ready Postgres, then exec's the binary so tini's signal
+# forwarding lands directly on it. See docker/entrypoint.sh for the
+# full behavior + GoTrue-keys note.
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod 0755 /entrypoint.sh
 

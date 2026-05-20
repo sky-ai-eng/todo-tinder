@@ -228,7 +228,7 @@ func assertConcreteSHA256(t *testing.T, arch, sha string) {
 		return
 	}
 	for _, c := range sha {
-		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Errorf("%s sha %q contains non-hex char %q", arch, sha, c)
 			return
 		}

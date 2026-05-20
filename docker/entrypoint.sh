@@ -2,17 +2,16 @@
 # Triage Factory container entrypoint.
 #
 # Behavior summary:
-#   1. Multi-mode only — wait for the Postgres server named in
-#      TF_DATABASE_URL to accept connections. Compose typically
-#      starts pg + tf together; this loop covers the first-boot race.
-#   2. Run goose-managed forward migrations. Idempotent — safe to run
-#      on every container start, including restarts and rollbacks.
-#   3. exec the binary so tini/the container sees its signals
+#   1. Run goose-managed forward migrations, retrying on connection
+#      failure so a not-yet-ready Postgres doesn't hard-fail the
+#      container before compose/Fly finishes wiring DNS. Idempotent
+#      and safe to re-run on every restart.
+#   2. exec the binary so tini/the container sees its signals
 #      directly (no shell intermediary swallowing SIGTERM).
 #
-# Local-mode (the default) skips step 1; the binary's SQLite init
-# handles everything else. So a plain `docker run` boots a working
-# single-tenant TF without any env wiring at all.
+# Local-mode (the default) hits step 1 against the local SQLite file
+# — no network races, succeeds immediately. So a plain `docker run`
+# boots a working single-tenant TF without any env wiring at all.
 #
 # Note on GoTrue keys: the entrypoint deliberately does NOT generate
 # the GoTrue RS256 keypair. GoTrue runs in a separate container and
@@ -41,36 +40,41 @@ if [ -f "$ENV_FILE" ]; then
     set -a; . "$ENV_FILE"; set +a
 fi
 
-# --- 1. Wait for Postgres (multi-mode only) --------------------------------
+# --- 1. Migrations (with bounded retry) ------------------------------------
 #
-# Compose's depends_on/healthcheck handles this in the happy path, but
-# Fly Machines + manual restarts don't have that wiring. A bounded
-# wait makes container start order forgiving without masking a truly
-# unreachable DB — 30s ceiling, 1s polls, then fall through to
-# migrate, which will fail loudly with the real connection error.
-
-if [ "${TF_MODE:-local}" = "multi" ] && [ -n "${TF_DATABASE_URL:-}" ]; then
-    echo "Waiting for Postgres (up to 30s)..." >&2
-    i=0
-    until triagefactory migrate status >/dev/null 2>&1; do
-        i=$((i + 1))
-        if [ "$i" -ge 30 ]; then
-            echo "Postgres not reachable after 30s; proceeding anyway (migrate will surface the real error)." >&2
-            break
-        fi
-        sleep 1
-    done
-fi
-
-# --- 2. Migrations (always) ------------------------------------------------
+# `triagefactory migrate up` opens the DB (Ping included) before
+# invoking goose, so a connection failure surfaces here as a non-zero
+# exit. Retrying the whole command — instead of probing connectivity
+# separately — handles a few things at once:
 #
-# Goose forward-only migrations are idempotent — re-running is a no-op
-# when the schema is already at head. Both modes hit this; local mode
-# stamps the SQLite file at ~/.triagefactory/triagefactory.db.
+#   - First boot: pg is reachable but goose tables don't exist yet.
+#     A separate "wait" probe based on `migrate status` would
+#     mis-classify this as "not ready" and burn the whole timeout.
+#   - Restart with schema at head: migrate is a fast no-op.
+#   - Truly unreachable DB: we surface the real error from migrate
+#     after the retry budget is exhausted, so compose/Fly logs
+#     contain the diagnostic instead of a generic "wait timed out".
+#
+# Goose's forward migrations are idempotent — re-running once pg is
+# up is safe.
 
-triagefactory migrate up
+attempts=30
+sleep_s=1
+attempt=0
+while :; do
+    attempt=$((attempt + 1))
+    if triagefactory migrate up; then
+        break
+    fi
+    if [ "$attempt" -ge "$attempts" ]; then
+        echo "migrate up failed after ${attempts} attempts; giving up." >&2
+        exit 1
+    fi
+    echo "migrate up failed (attempt ${attempt}/${attempts}); retrying in ${sleep_s}s..." >&2
+    sleep "$sleep_s"
+done
 
-# --- 3. exec the binary ----------------------------------------------------
+# --- 2. exec the binary ----------------------------------------------------
 #
 # exec replaces the shell with the Go process so tini's signal
 # forwarding lands directly on triagefactory. Without the exec, a
