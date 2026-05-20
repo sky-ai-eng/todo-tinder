@@ -387,6 +387,11 @@ func TestAuthFlow_LoginToMe(t *testing.T) {
 // field (omitempty) rather than render it as an empty string.
 func TestAuthFlow_Me_NoMemberships_OmitsActiveOrgID(t *testing.T) {
 	r := newAuthRig(t)
+	// SKY-345: pin the join policy to invite-only so the callback's
+	// auto-provisioning short-circuits — the test scenario IS a user
+	// landing with zero memberships, which only happens under
+	// invite-only after SKY-345.
+	runmode.SetJoinPolicyForTest(t, runmode.JoinPolicyInviteOnly)
 	userID := r.seedUser()
 	// Deliberately no seedOrg — session lands with active_org_id NULL.
 

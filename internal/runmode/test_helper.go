@@ -50,3 +50,27 @@ func SetForTest(t TestT, m Mode) {
 		modeMu.Unlock()
 	})
 }
+
+// SetJoinPolicyForTest swaps the process join policy for the duration
+// of t and restores the previous (currentJoinPolicy, joinPolicyInitialized)
+// pair via t.Cleanup. Same caveats as SetForTest — data-race-free but
+// not safe for overlapping parallel tests that mutate the same global.
+func SetJoinPolicyForTest(t TestT, p JoinPolicy) {
+	t.Helper()
+	if p != JoinPolicyPersonalOrgOnSignup &&
+		p != JoinPolicyAutoJoinDefault &&
+		p != JoinPolicyInviteOnly {
+		t.Fatalf("runmode.SetJoinPolicyForTest: unknown join policy %q", p)
+	}
+	joinPolicyMu.Lock()
+	prev, prevInit := currentJoinPolicy, joinPolicyInitialized
+	currentJoinPolicy = p
+	joinPolicyInitialized = true
+	joinPolicyMu.Unlock()
+	t.Cleanup(func() {
+		joinPolicyMu.Lock()
+		currentJoinPolicy = prev
+		joinPolicyInitialized = prevInit
+		joinPolicyMu.Unlock()
+	})
+}
