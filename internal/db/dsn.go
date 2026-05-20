@@ -18,6 +18,12 @@ import (
 // URL parser covers every caller. Returns an error on a malformed
 // DSN or one that doesn't parse as a URL.
 func RewriteDSNCreds(dsn, user, password string) (string, error) {
+	if dsn == "" {
+		return "", fmt.Errorf("dsn is empty")
+	}
+	if user == "" {
+		return "", fmt.Errorf("user is empty")
+	}
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return "", fmt.Errorf("parse dsn: %w", err)

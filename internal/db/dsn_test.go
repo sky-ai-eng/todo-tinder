@@ -103,6 +103,16 @@ func TestRewriteDSNCreds_Errors(t *testing.T) {
 	}
 }
 
+func TestRewriteDSNCreds_EmptyUser(t *testing.T) {
+	_, err := RewriteDSNCreds("postgres://postgres:secret@postgres:5432/postgres", "", "pw")
+	if err == nil {
+		t.Fatalf("want error on empty user, got nil")
+	}
+	if !strings.Contains(err.Error(), "user") {
+		t.Errorf("error %q lacks expected context", err)
+	}
+}
+
 func TestRewriteDSNCreds_PostgresqlScheme(t *testing.T) {
 	// The `postgresql://` scheme is the long-form synonym for
 	// `postgres://`; both should be accepted.

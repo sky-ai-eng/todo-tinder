@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -72,6 +73,31 @@ func pluralize(n int, singular, plural string) string {
 		return singular
 	}
 	return plural
+}
+
+// validateHTTPURL parses raw as a URL and rejects anything that
+// isn't an absolute http(s) URL with a host. Used by multi-mode boot
+// for TF_PUBLIC_URL — that value flows into SetAuthDeps where it
+// drives the OAuth redirect base and the Secure-cookie flag. An
+// empty or scheme-less value would either crash on the redirect or
+// silently disable Secure on session cookies (HasPrefix("https://")
+// returns false on "" too). Failing at boot makes the misconfig
+// loud.
+func validateHTTPURL(name, raw string) error {
+	if raw == "" {
+		return fmt.Errorf("%s is empty", name)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s: parse %q: %w", name, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s: scheme must be http or https, got %q", name, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s: missing host in %q", name, raw)
+	}
+	return nil
 }
 
 // applyPGPoolDefaults sets connection-pool ceilings on a Postgres
@@ -470,6 +496,18 @@ func main() {
 	// top-level cancel today).
 	if runmode.Current() == runmode.ModeMulti {
 		ctxBoot := context.Background()
+
+		// Validate TF_PUBLIC_URL up front. SetAuthDeps derives the
+		// secureCookies flag from `strings.HasPrefix(publicURL, "https://")`
+		// — an empty or typo'd URL would silently land in the non-secure
+		// branch and emit OAuth-state cookies without the Secure flag.
+		// Failing fast here is much louder than the runtime cookie-flag
+		// drift, and the OAuth redirect URLs also need a real scheme+host.
+		publicURL := os.Getenv("TF_PUBLIC_URL")
+		if err := validateHTTPURL("TF_PUBLIC_URL", publicURL); err != nil {
+			log.Fatalf("%v", err)
+		}
+
 		verifier, err := verify.NewVerifier(
 			ctxBoot,
 			os.Getenv("TF_GOTRUE_JWKS_URL"),
@@ -495,7 +533,7 @@ func main() {
 			verifier,
 			sessionStore,
 			os.Getenv("TF_GOTRUE_URL"),
-			os.Getenv("TF_PUBLIC_URL"),
+			publicURL,
 			cookieKey,
 		); err != nil {
 			log.Fatalf("wire auth deps: %v", err)
