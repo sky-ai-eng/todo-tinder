@@ -34,6 +34,20 @@ type Config struct {
 	Jira   JiraConfig   `json:"jira"`
 	Server ServerConfig `json:"server"`
 	AI     AIConfig     `json:"ai"`
+	OrgLLM OrgLLMConfig `json:"org_llm"`
+}
+
+// OrgLLMConfig holds org-scope LLM cost-control settings persisted in
+// org_settings. The credential fields are vault refs — the raw API
+// key/Bedrock credentials live in the SecretStore (keychain in local
+// mode, vault in multi-mode) and are looked up by ref at request time.
+// Empty ref means "use deployment default" on hosted SaaS or "not
+// configured yet" on self-host. MaxModelTier caps the Claude tier teams
+// and users may select; empty means no cap.
+type OrgLLMConfig struct {
+	AnthropicAPIKeyRef    string `json:"anthropic_api_key_ref,omitempty"`
+	BedrockCredentialsRef string `json:"bedrock_credentials_ref,omitempty"`
+	MaxModelTier          string `json:"max_model_tier,omitempty"`
 }
 
 type GitHubConfig struct {
@@ -290,14 +304,22 @@ func Load() (Config, error) {
 		cfg.Server.TakeoverDir = takeover
 	}
 
-	// org_settings (github + jira URLs and intervals)
-	var ghURL, jiraURL sql.NullString
+	// org_settings (github + jira URLs and intervals, plus org-scope LLM
+	// cost-control fields). anthropic_api_key_ref, bedrock_credentials_ref,
+	// and max_llm_model_tier are nullable — empty refs mean "use deployment
+	// default" / "no cap" and degrade to the zero-value string on Config.
+	var ghURL, jiraURL, anthRef, bedRef, maxTier sql.NullString
 	var ghInterval, jiraInterval, cloneProto string
 	switch err := db.QueryRowContext(ctx, `
 		SELECT github_base_url, github_poll_interval, github_clone_protocol,
-		       jira_base_url, jira_poll_interval
+		       jira_base_url, jira_poll_interval,
+		       anthropic_api_key_ref, bedrock_credentials_ref, max_llm_model_tier
 		FROM org_settings WHERE org_id = ?
-	`, runmode.LocalDefaultOrgID).Scan(&ghURL, &ghInterval, &cloneProto, &jiraURL, &jiraInterval); {
+	`, runmode.LocalDefaultOrgID).Scan(
+		&ghURL, &ghInterval, &cloneProto,
+		&jiraURL, &jiraInterval,
+		&anthRef, &bedRef, &maxTier,
+	); {
 	case errors.Is(err, sql.ErrNoRows):
 		// keep Default()
 	case err != nil:
@@ -320,12 +342,22 @@ func Load() (Config, error) {
 			return loadFail(fmt.Errorf("parse org_settings jira_poll_interval %q: %w", jiraInterval, err))
 		}
 		cfg.Jira.PollInterval = d
+		if anthRef.Valid {
+			cfg.OrgLLM.AnthropicAPIKeyRef = anthRef.String
+		}
+		if bedRef.Valid {
+			cfg.OrgLLM.BedrockCredentialsRef = bedRef.String
+		}
+		if maxTier.Valid {
+			cfg.OrgLLM.MaxModelTier = maxTier.String
+		}
 	}
 
-	// team_settings (AI thresholds). The AI columns ship NOT NULL DEFAULT
-	// in both backends, so scanning directly into int is safe — the schema
-	// invariant holds whether the row was inserted by Save() or by any
-	// future admin path.
+	// team_settings (AI thresholds + the AI model/auto-delegate policy
+	// that moved off user_settings). All AI columns ship NOT NULL DEFAULT
+	// in both backends, so scanning directly into the Go types is safe —
+	// the schema invariant holds whether the row was inserted by Save()
+	// or by any future admin path.
 	//
 	// jira_projects is read for compatibility but not used as the source
 	// of truth — jira_project_status_rules is. The column stays in sync
@@ -333,10 +365,16 @@ func Load() (Config, error) {
 	// joining, but Load assembles cfg.Jira.Projects from the rules table.
 	var projectsJSON string
 	var aiThreshold, aiInterval int
+	var defaultModel string
+	var autoDelegate bool
 	switch err := db.QueryRowContext(ctx, `
-		SELECT jira_projects, ai_reprioritize_threshold, ai_preference_update_interval
+		SELECT jira_projects, ai_reprioritize_threshold, ai_preference_update_interval,
+		       default_model, auto_delegate_enabled
 		FROM team_settings WHERE team_id = ?
-	`, runmode.LocalDefaultTeamID).Scan(&projectsJSON, &aiThreshold, &aiInterval); {
+	`, runmode.LocalDefaultTeamID).Scan(
+		&projectsJSON, &aiThreshold, &aiInterval,
+		&defaultModel, &autoDelegate,
+	); {
 	case errors.Is(err, sql.ErrNoRows):
 		// keep Default()
 	case err != nil:
@@ -344,22 +382,8 @@ func Load() (Config, error) {
 	default:
 		cfg.AI.ReprioritizeThreshold = aiThreshold
 		cfg.AI.PreferenceUpdateInterval = aiInterval
-	}
-
-	// user_settings (AI model + auto-delegate)
-	var aiModel string
-	var aiAutoDelegate bool
-	switch err := db.QueryRowContext(ctx, `
-		SELECT ai_model, ai_auto_delegate_enabled
-		FROM user_settings WHERE user_id = ?
-	`, runmode.LocalDefaultUserID).Scan(&aiModel, &aiAutoDelegate); {
-	case errors.Is(err, sql.ErrNoRows):
-		// keep Default()
-	case err != nil:
-		return loadFail(fmt.Errorf("read user_settings: %w", err))
-	default:
-		cfg.AI.Model = aiModel
-		cfg.AI.AutoDelegateEnabled = aiAutoDelegate
+		cfg.AI.Model = defaultModel
+		cfg.AI.AutoDelegateEnabled = autoDelegate
 	}
 
 	// jira_project_status_rules — one row per project key, each carrying
@@ -481,18 +505,27 @@ func Save(cfg Config) error {
 		return fmt.Errorf("upsert instance_config: %w", err)
 	}
 
-	// org_settings
+	// org_settings — also persists the org-scope LLM cost-control fields
+	// (Anthropic/Bedrock vault refs + max model tier). Empty refs / tier
+	// store as NULL so the CHECK constraint on max_llm_model_tier is
+	// satisfied and the "use deployment default / no cap" semantics
+	// survive the round-trip.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO org_settings (
 			org_id, github_base_url, github_poll_interval, github_clone_protocol,
-			jira_base_url, jira_poll_interval, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			jira_base_url, jira_poll_interval,
+			anthropic_api_key_ref, bedrock_credentials_ref, max_llm_model_tier,
+			updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(org_id) DO UPDATE SET
 			github_base_url = excluded.github_base_url,
 			github_poll_interval = excluded.github_poll_interval,
 			github_clone_protocol = excluded.github_clone_protocol,
 			jira_base_url = excluded.jira_base_url,
 			jira_poll_interval = excluded.jira_poll_interval,
+			anthropic_api_key_ref = excluded.anthropic_api_key_ref,
+			bedrock_credentials_ref = excluded.bedrock_credentials_ref,
+			max_llm_model_tier = excluded.max_llm_model_tier,
 			updated_at = CURRENT_TIMESTAMP
 	`,
 		runmode.LocalDefaultOrgID,
@@ -501,6 +534,9 @@ func Save(cfg Config) error {
 		defaultedCloneProtocol(cfg.GitHub.CloneProtocol),
 		nullIfEmpty(cfg.Jira.BaseURL),
 		cfg.Jira.PollInterval.String(),
+		nullIfEmpty(cfg.OrgLLM.AnthropicAPIKeyRef),
+		nullIfEmpty(cfg.OrgLLM.BedrockCredentialsRef),
+		nullIfEmpty(cfg.OrgLLM.MaxModelTier),
 	); err != nil {
 		return fmt.Errorf("upsert org_settings: %w", err)
 	}
@@ -519,38 +555,31 @@ func Save(cfg Config) error {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO team_settings (
 			team_id, jira_projects, ai_reprioritize_threshold,
-			ai_preference_update_interval, updated_at
-		) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+			ai_preference_update_interval, default_model, auto_delegate_enabled,
+			updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(team_id) DO UPDATE SET
 			jira_projects = excluded.jira_projects,
 			ai_reprioritize_threshold = excluded.ai_reprioritize_threshold,
 			ai_preference_update_interval = excluded.ai_preference_update_interval,
+			default_model = excluded.default_model,
+			auto_delegate_enabled = excluded.auto_delegate_enabled,
 			updated_at = CURRENT_TIMESTAMP
 	`,
 		runmode.LocalDefaultTeamID,
 		string(projectsJSON),
 		cfg.AI.ReprioritizeThreshold,
 		cfg.AI.PreferenceUpdateInterval,
+		cfg.AI.Model,
+		cfg.AI.AutoDelegateEnabled,
 	); err != nil {
 		return fmt.Errorf("upsert team_settings: %w", err)
 	}
 
-	// user_settings
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO user_settings (
-			user_id, ai_model, ai_auto_delegate_enabled, updated_at
-		) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(user_id) DO UPDATE SET
-			ai_model = excluded.ai_model,
-			ai_auto_delegate_enabled = excluded.ai_auto_delegate_enabled,
-			updated_at = CURRENT_TIMESTAMP
-	`,
-		runmode.LocalDefaultUserID,
-		cfg.AI.Model,
-		cfg.AI.AutoDelegateEnabled,
-	); err != nil {
-		return fmt.Errorf("upsert user_settings: %w", err)
-	}
+	// user_settings intentionally not written here — the table is empty
+	// post-cleanup (just user_id + updated_at). Future per-user prefs
+	// (theme, notification destinations, swipe sensitivity) will reinstate
+	// an upsert here.
 
 	// jira_project_status_rules — upsert one row per project, then
 	// drop rows for projects no longer in the list. Per-project values
