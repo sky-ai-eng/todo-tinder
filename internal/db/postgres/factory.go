@@ -10,12 +10,13 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// factoryReadStore is the Postgres impl of db.FactoryReadStore. Wired
-// against the admin pool (see postgres.New): the factory snapshot is
-// a system-level view that must see every in-flight run regardless of
-// which user kicked it off. Running as the per-request tf_app role
-// with RLS active would only show the factory its own
-// creator_user_id rows.
+// factoryReadStore is the Postgres impl of db.FactoryReadStore. The
+// non-tx Stores.Factory wiring routes through the admin pool (see
+// postgres.New) as defense-in-depth for any future caller that
+// happens to read outside a claims-set tx; production usage flows
+// through TxStores.Factory inside WithTx, which is tx-bound and runs
+// as tf_app with RLS active. Either way every method takes an
+// explicit orgID and binds it in every WHERE clause.
 //
 // SQL is written fresh against D3's schema: org_id in every WHERE
 // clause as defense in depth, $N placeholders, JSONB extraction for

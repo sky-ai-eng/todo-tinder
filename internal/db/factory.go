@@ -31,9 +31,14 @@ type FactoryReadStore interface {
 	// LifetimeDistinctByEventType counts the distinct entities that
 	// have ever produced an event of each event_type, scoped to the
 	// given org. Read per snapshot request — the factory endpoint is
-	// not a hot path and the partial covering index on
-	// (org_id, entity_id) WHERE entity_id IS NOT NULL keeps the cost
-	// predictable. Replaces the prior in-memory cross-process counter
+	// not a hot path. In Postgres the partial index
+	// idx_events_org_type_entity (org_id, event_type, entity_id) WHERE
+	// entity_id IS NOT NULL is an index-only scan: each org's groups
+	// are contiguous and per-group entity_ids are adjacent, so
+	// DISTINCT collapses to adjacency dedup with no temp B-tree.
+	// SQLite's existing idx_events_type_entity (event_type, entity_id)
+	// WHERE entity_id IS NOT NULL covers the single-tenant query
+	// equivalently. Replaces the prior in-memory cross-process counter
 	// that folded every tenant's events into one map.
 	LifetimeDistinctByEventType(ctx context.Context, orgID string) (map[string]int, error)
 
