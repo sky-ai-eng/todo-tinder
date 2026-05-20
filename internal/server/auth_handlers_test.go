@@ -1274,17 +1274,22 @@ func TestGoTrueTokenRequests_AreJSON(t *testing.T) {
 		contentType string
 		body        map[string]string
 	}
-	var got []captured
+	var (
+		mu  sync.Mutex
+		got []captured
+	)
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
 		got = append(got, captured{
 			path:        r.URL.Path + "?" + r.URL.RawQuery,
 			contentType: r.Header.Get("Content-Type"),
 			body:        body,
 		})
-		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","expires_at":0}`))
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","expires_in":3600}`))
 	}))
 	defer upstream.Close()
 
@@ -1298,6 +1303,8 @@ func TestGoTrueTokenRequests_AreJSON(t *testing.T) {
 		t.Fatalf("refresh: %v", err)
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	if len(got) != 2 {
 		t.Fatalf("expected 2 upstream calls, got %d", len(got))
 	}
