@@ -777,6 +777,16 @@ CREATE TABLE public.orgs (
     owner_user_id uuid NOT NULL,
     sso_provider_id uuid,
     sso_enforced boolean DEFAULT false NOT NULL,
+    -- SKY-345: distinguishes a user's auto-provisioned personal org
+    -- (created on first signup under personal-org-on-signup policy)
+    -- from explicit enterprise orgs. Future UI keys off this — "you
+    -- can't delete your personal org", billing surfaces, picker
+    -- filters. No UNIQUE constraint on (owner_user_id, is_personal):
+    -- the data model permits a user to own a personal org and also
+    -- create additional orgs. Race-safety on first-signup provisioning
+    -- lives in the auth callback's pg_advisory_xact_lock + inside-tx
+    -- zero-membership check, not at the schema level.
+    is_personal boolean DEFAULT false NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     deleted_at timestamp with time zone
