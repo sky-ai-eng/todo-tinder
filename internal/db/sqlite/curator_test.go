@@ -470,6 +470,87 @@ func TestCuratorStore_SQLite_DeletePendingContextForSession(t *testing.T) {
 	}
 }
 
+// TestCuratorStore_SQLite_CancelOrphanedNonTerminalRequests pins the
+// startup recovery contract: BOTH queued and running rows get
+// cancelled because neither can survive a process restart in a useful
+// state. Terminal rows are untouched.
+func TestCuratorStore_SQLite_CancelOrphanedNonTerminalRequests(t *testing.T) {
+	conn := newSQLiteForCuratorTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+
+	projectID, err := stores.Projects.Create(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultTeamID,
+		domain.Project{Name: "p"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	create := func(input string) string {
+		t.Helper()
+		var id string
+		if err := stores.Tx.SyntheticClaimsWithTx(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, func(ts db.TxStores) error {
+			rid, err := ts.Curator.CreateRequest(ctx, runmode.LocalDefaultOrgID, projectID, runmode.LocalDefaultUserID, input)
+			if err != nil {
+				return err
+			}
+			id = rid
+			return nil
+		}); err != nil {
+			t.Fatalf("CreateRequest %s: %v", input, err)
+		}
+		return id
+	}
+
+	runningID := create("running")
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, func(ts db.TxStores) error {
+		return ts.Curator.MarkRequestRunning(ctx, runmode.LocalDefaultOrgID, runningID)
+	}); err != nil {
+		t.Fatalf("MarkRequestRunning: %v", err)
+	}
+
+	queuedID := create("queued")
+
+	doneID := create("done")
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, func(ts db.TxStores) error {
+		_, err := ts.Curator.CompleteRequest(ctx, runmode.LocalDefaultOrgID, doneID, "done", "", 0.1, 100, 1)
+		return err
+	}); err != nil {
+		t.Fatalf("CompleteRequest: %v", err)
+	}
+
+	n, err := stores.Curator.CancelOrphanedNonTerminalRequests(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("flipped %d rows, want 2 (running + queued)", n)
+	}
+
+	getStatus := func(id string) string {
+		var status string
+		if err := stores.Tx.SyntheticClaimsWithTx(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, func(ts db.TxStores) error {
+			r, err := ts.Curator.GetRequest(ctx, runmode.LocalDefaultOrgID, id)
+			if err != nil {
+				return err
+			}
+			status = r.Status
+			return nil
+		}); err != nil {
+			t.Fatalf("GetRequest %s: %v", id, err)
+		}
+		return status
+	}
+	if got := getStatus(runningID); got != "cancelled" {
+		t.Errorf("running row status = %q, want cancelled", got)
+	}
+	if got := getStatus(queuedID); got != "cancelled" {
+		t.Errorf("queued row status = %q, want cancelled", got)
+	}
+	if got := getStatus(doneID); got != "done" {
+		t.Errorf("done row status = %q, want done (untouched)", got)
+	}
+}
+
 func newSQLiteForCuratorTest(t *testing.T) *sql.DB {
 	t.Helper()
 	conn, err := sql.Open("sqlite", ":memory:?_pragma=foreign_keys(on)")

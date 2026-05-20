@@ -127,4 +127,26 @@ type CuratorStore interface {
 	// current values directly without phantom deltas describing
 	// transitions the new agent never witnessed.
 	DeletePendingContextForSession(ctx context.Context, orgID, projectID, sessionID string) error
+
+	// CancelOrphanedNonTerminalRequests sweeps every queued/running
+	// curator_request row across every org in the database, flipping
+	// them to cancelled with finished_at stamped to now. Called once
+	// at process startup as the recovery pass: a binary restart kills
+	// every per-project curator goroutine + agentproc subprocess in
+	// this process, so any row left non-terminal from a previous
+	// process is by definition stranded (running rows lost their
+	// goroutine, queued rows lost the goroutine that would have
+	// picked them up). Auto-replaying a stale message after restart
+	// would surprise the user more than dropping it; cancelling lets
+	// the user re-send if they actually wanted that message
+	// processed. Returns the row-count flipped.
+	//
+	// No orgID parameter by design: this is a cross-tenant system
+	// service running outside any request context. In Postgres the
+	// impl routes through the admin pool (BYPASSRLS); in SQLite the
+	// single tenant means the sweep is equivalent to a single-org
+	// reset. Multi-pod per-org sharding would let us scope this
+	// per-pod, but pod sharding doesn't exist (single-pod multi-mode
+	// in v1).
+	CancelOrphanedNonTerminalRequests(ctx context.Context) (int, error)
 }

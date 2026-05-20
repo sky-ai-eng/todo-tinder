@@ -437,6 +437,91 @@ func setProjectSession(t *testing.T, h *pgtest.Harness, projectID, sessionID str
 	}
 }
 
+// TestCuratorStore_Postgres_CancelOrphanedNonTerminalRequests pins
+// the cross-tenant sweep contract documented on the store interface:
+// every queued/running curator_request across every org gets
+// cancelled. The boot path has no JWT-claims context, so the impl
+// routes through the admin pool (BYPASSRLS); this test seeds rows
+// under two distinct orgs and asserts both are affected.
+func TestCuratorStore_Postgres_CancelOrphanedNonTerminalRequests(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	stores := pgstore.New(h.AdminDB, h.AppDB)
+	ctx := context.Background()
+
+	orgA, alice, _ := seedPgProjectOrg(t, h)
+	orgB, bob, _ := seedPgProjectOrg(t, h)
+	projectA := seedPgEntityProject(t, h, orgA, alice, "sweep-a")
+	projectB := seedPgEntityProject(t, h, orgB, bob, "sweep-b")
+
+	createReq := func(orgID, userID, projectID, input string) string {
+		t.Helper()
+		var id string
+		if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, userID, func(ts db.TxStores) error {
+			rid, err := ts.Curator.CreateRequest(ctx, orgID, projectID, userID, input)
+			if err != nil {
+				return err
+			}
+			id = rid
+			return nil
+		}); err != nil {
+			t.Fatalf("create %s: %v", input, err)
+		}
+		return id
+	}
+
+	queuedA := createReq(orgA, alice, projectA, "queued-a")
+	runningA := createReq(orgA, alice, projectA, "running-a")
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgA, alice, func(ts db.TxStores) error {
+		return ts.Curator.MarkRequestRunning(ctx, orgA, runningA)
+	}); err != nil {
+		t.Fatalf("mark running A: %v", err)
+	}
+	doneA := createReq(orgA, alice, projectA, "done-a")
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgA, alice, func(ts db.TxStores) error {
+		_, err := ts.Curator.CompleteRequest(ctx, orgA, doneA, "done", "", 0.01, 10, 1)
+		return err
+	}); err != nil {
+		t.Fatalf("complete A: %v", err)
+	}
+
+	queuedB := createReq(orgB, bob, projectB, "queued-b")
+	runningB := createReq(orgB, bob, projectB, "running-b")
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgB, bob, func(ts db.TxStores) error {
+		return ts.Curator.MarkRequestRunning(ctx, orgB, runningB)
+	}); err != nil {
+		t.Fatalf("mark running B: %v", err)
+	}
+
+	n, err := stores.Curator.CancelOrphanedNonTerminalRequests(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("sweep flipped %d rows, want 4 (queued+running across two orgs)", n)
+	}
+
+	// Read status via admin pool to bypass RLS.
+	getStatus := func(id string) string {
+		t.Helper()
+		var status string
+		if err := h.AdminDB.QueryRow(
+			`SELECT status FROM curator_requests WHERE id = $1`, id,
+		).Scan(&status); err != nil {
+			t.Fatalf("read status %s: %v", id, err)
+		}
+		return status
+	}
+	for _, id := range []string{queuedA, runningA, queuedB, runningB} {
+		if got := getStatus(id); got != "cancelled" {
+			t.Errorf("row %s status = %q, want cancelled", id, got)
+		}
+	}
+	if got := getStatus(doneA); got != "done" {
+		t.Errorf("terminal row %s status = %q, want done (untouched)", doneA, got)
+	}
+}
+
 // runFullTurn replays the per-message write set the goroutine would
 // emit for one turn under (orgID, userID). Returns the request id and
 // the inserted message id so the caller can spot-check attribution.

@@ -1938,10 +1938,16 @@ CREATE INDEX idx_events_org_type_created ON public.events USING btree (org_id, e
 
 
 --
--- Name: idx_events_type_entity; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_events_org_type_entity; Type: INDEX; Schema: public; Owner: -
+--
+-- Supports the per-org SELECT event_type, COUNT(DISTINCT entity_id)
+-- aggregate behind FactoryReadStore.LifetimeDistinctByEventType. The
+-- row layout is sorted by (org_id, event_type, entity_id) so each
+-- org's groups are contiguous and per-group entity_ids are adjacent —
+-- DISTINCT collapses to adjacency dedup, no temp B-tree.
 --
 
-CREATE INDEX idx_events_type_entity ON public.events USING btree (event_type, entity_id) WHERE (entity_id IS NOT NULL);
+CREATE INDEX idx_events_org_type_entity ON public.events USING btree (org_id, event_type, entity_id) WHERE (entity_id IS NOT NULL);
 
 
 --

@@ -37,8 +37,8 @@ type factoryStationJSON struct {
 	// intentional: those stations need to render their counter even
 	// when otherwise quiet. The frontend ignores any event_type it
 	// doesn't have a station for, so the wider keyset is harmless;
-	// system events stay out because the lifetime counter never
-	// records nil-entity rows in the first place.
+	// system events stay out because the aggregate filters on
+	// entity_id IS NOT NULL.
 	ItemsLifetime int              `json:"items_lifetime"`
 	Runs          []factoryRunJSON `json:"runs"`
 }
@@ -201,7 +201,7 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	// the whole endpoint — the factory should still render for a user who's
 	// only set up Jira.
 	var ghUsername string
-	var eventCounts, taskCounts map[string]int
+	var eventCounts, taskCounts, lifetimeCounts map[string]int
 	var activeRuns []domain.FactoryActiveRun
 	var entityRows []domain.FactoryEntityRow
 	var recentByEntity map[string][]domain.FactoryRecentEvent
@@ -218,6 +218,10 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 			return e
 		}
 		taskCounts, e = tx.Factory.TaskCountsSince(r.Context(), orgID, since)
+		if e != nil {
+			return e
+		}
+		lifetimeCounts, e = tx.Factory.LifetimeDistinctByEventType(r.Context(), orgID)
 		if e != nil {
 			return e
 		}
@@ -268,15 +272,6 @@ func (s *Server) handleFactorySnapshot(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		internalError(w, "factory", err)
 		return
-	}
-
-	// Lifetime distinct-entity counts come from the in-memory aggregate
-	// (hydrated once at startup, kept warm by the SetOnEventRecorded
-	// hook inside RecordEvent itself) so this path stays O(1) regardless
-	// of total events table size.
-	var lifetimeCounts map[string]int
-	if s.lifetimeCounter != nil {
-		lifetimeCounts = s.lifetimeCounter.Snapshot()
 	}
 
 	stations := map[string]factoryStationJSON{}

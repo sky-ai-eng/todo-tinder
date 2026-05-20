@@ -18,41 +18,16 @@ import (
 //   - created_at is bound from time.Now() (ns resolution) rather
 //     than the schema's CURRENT_TIMESTAMP default (second
 //     resolution) so same-tx writes order by insertion order.
-//   - Hook firing is dispatched through per-pool EventHook fields
-//     so tx-bound writes can defer to the post-commit drain in
-//     runTx. In SQLite every write goes through the single tx
-//     connection, so both app and admin hook the same pending
-//     buffer — on rollback the LifetimeDistinctCounter never
-//     observes the events.
 //
 // The constructor takes two queryers for signature parity with the
 // Postgres impl, but both collapse onto the same queryer.
 type eventStore struct {
-	q         queryer
-	admin     queryer
-	appHook   db.EventHook
-	adminHook db.EventHook
+	q     queryer
+	admin queryer
 }
 
 func newEventStore(q, admin queryer) db.EventStore {
-	return &eventStore{
-		q:         q,
-		admin:     admin,
-		appHook:   db.NotifyEventRecorded,
-		adminHook: db.NotifyEventRecorded,
-	}
-}
-
-// newTxEventStore is the tx-bound variant for runTx. Both halves
-// collapse to the same tx in SQLite, and the deferral buffer is
-// shared too — runTx drains it post-commit.
-func newTxEventStore(q, admin queryer, appHook, adminHook db.EventHook) db.EventStore {
-	return &eventStore{
-		q:         q,
-		admin:     admin,
-		appHook:   appHook,
-		adminHook: adminHook,
-	}
+	return &eventStore{q: q, admin: admin}
 }
 
 var _ db.EventStore = (*eventStore)(nil)
@@ -61,17 +36,17 @@ func (s *eventStore) Record(ctx context.Context, orgID string, evt domain.Event)
 	if err := assertLocalOrg(orgID); err != nil {
 		return "", err
 	}
-	return recordEvent(ctx, s.q, s.appHook, evt)
+	return recordEvent(ctx, s.q, evt)
 }
 
 func (s *eventStore) RecordSystem(ctx context.Context, orgID string, evt domain.Event) (string, error) {
 	if err := assertLocalOrg(orgID); err != nil {
 		return "", err
 	}
-	return recordEvent(ctx, s.admin, s.adminHook, evt)
+	return recordEvent(ctx, s.admin, evt)
 }
 
-func recordEvent(ctx context.Context, q queryer, hook db.EventHook, evt domain.Event) (string, error) {
+func recordEvent(ctx context.Context, q queryer, evt domain.Event) (string, error) {
 	id := evt.ID
 	if id == "" {
 		id = uuid.New().String()
@@ -101,9 +76,6 @@ func recordEvent(ctx context.Context, q queryer, hook db.EventHook, evt domain.E
 	`, id, entityID, evt.EventType, evt.DedupKey, evt.MetadataJSON, occurredAt, createdAt); err != nil {
 		return "", err
 	}
-	evt.ID = id
-	evt.CreatedAt = createdAt
-	hook(evt)
 	return id, nil
 }
 

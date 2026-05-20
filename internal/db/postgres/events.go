@@ -28,59 +28,26 @@ import (
 //     goroutine consumers without a JWT-claims context route here
 //     via the `...System` methods. org_id stays bound in the
 //     INSERT/SELECT as defense in depth.
-//
-// Each pool gets its own EventHook so hook firing can be deferred to
-// commit time for tx-bound writes without affecting writes that
-// commit autonomously. In production WithTx: appHook is
-// PendingEventHooks.Add (drained post-commit); adminHook is
-// NotifyEventRecorded (immediate, the admin pool is autonomous from
-// the outer tx).
 type eventStore struct {
-	q         queryer
-	admin     queryer
-	appHook   db.EventHook
-	adminHook db.EventHook
+	q     queryer
+	admin queryer
 }
 
-// newEventStore is the eager-hook variant used by Store.New for
-// non-tx wiring. Both pools fire SetOnEventRecorded the moment
-// ExecContext returns nil, matching the pre-SKY-305 behavior.
 func newEventStore(q, admin queryer) db.EventStore {
-	return &eventStore{
-		q:         q,
-		admin:     admin,
-		appHook:   db.NotifyEventRecorded,
-		adminHook: db.NotifyEventRecorded,
-	}
-}
-
-// newTxEventStore is the tx-bound variant. The hook arguments are
-// the dispatch targets for Record and RecordSystem respectively —
-// pass PendingEventHooks.Add to defer, db.NotifyEventRecorded to
-// fire eagerly. Production WithTx (txStoresFromTx) passes a deferred
-// hook for the app pool and an eager hook for admin (autonomous);
-// NewForTx (test door) can pass two eager hooks or share a buffer
-// across both.
-func newTxEventStore(q, admin queryer, appHook, adminHook db.EventHook) db.EventStore {
-	return &eventStore{
-		q:         q,
-		admin:     admin,
-		appHook:   appHook,
-		adminHook: adminHook,
-	}
+	return &eventStore{q: q, admin: admin}
 }
 
 var _ db.EventStore = (*eventStore)(nil)
 
 func (s *eventStore) Record(ctx context.Context, orgID string, evt domain.Event) (string, error) {
-	return recordEvent(ctx, s.q, s.appHook, orgID, evt)
+	return recordEvent(ctx, s.q, orgID, evt)
 }
 
 func (s *eventStore) RecordSystem(ctx context.Context, orgID string, evt domain.Event) (string, error) {
-	return recordEvent(ctx, s.admin, s.adminHook, orgID, evt)
+	return recordEvent(ctx, s.admin, orgID, evt)
 }
 
-// recordEvent runs the INSERT and dispatches the event through hook.
+// recordEvent runs the INSERT and returns the generated event ID.
 //
 // metadata_json casts to jsonb at the placeholder so the caller
 // hands a marshalled string — same pattern ProjectStore uses for
@@ -98,7 +65,7 @@ func (s *eventStore) RecordSystem(ctx context.Context, orgID string, evt domain.
 // sequential calls.
 //
 // occurred_at follows the nullable contract: zero time → NULL.
-func recordEvent(ctx context.Context, q queryer, hook db.EventHook, orgID string, evt domain.Event) (string, error) {
+func recordEvent(ctx context.Context, q queryer, orgID string, evt domain.Event) (string, error) {
 	id := evt.ID
 	if id == "" {
 		id = uuid.New().String()
@@ -122,9 +89,6 @@ func recordEvent(ctx context.Context, q queryer, hook db.EventHook, orgID string
 	`, id, orgID, entityID, evt.EventType, evt.DedupKey, metadata, occurredAt, createdAt); err != nil {
 		return "", err
 	}
-	evt.ID = id
-	evt.CreatedAt = createdAt
-	hook(evt)
 	return id, nil
 }
 

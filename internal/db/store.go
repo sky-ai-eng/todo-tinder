@@ -80,10 +80,12 @@ type Stores struct {
 	Tasks TaskStore
 
 	// Factory is the read-only projection that backs the
-	// /api/factory/snapshot handler and the LifetimeDistinctCounter
-	// reconciliation path. Admin pool in Postgres — the snapshot is
-	// a system-level view (no per-user identity) and the hydrate
-	// path runs at startup before any JWT claims are in scope.
+	// /api/factory/snapshot handler. Every method is org-scoped via
+	// an explicit orgID parameter (the handler reads from request
+	// claims and forwards it). Admin-pool in Postgres for the
+	// non-tx wiring on this bundle; production callers always run
+	// inside WithTx and get the tx-bound, claims-set Factory via
+	// TxStores instead.
 	Factory FactoryReadStore
 
 	// AgentRuns owns runs + run_messages — agent run lifecycle,

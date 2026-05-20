@@ -68,7 +68,6 @@ type Server struct {
 	onGitHubChanged func(orgID string) // GitHub creds/repos changed — full restart + re-profile
 	onJiraChanged   func(orgID string) // Jira config changed — restart Jira poller only
 	scorerTrigger   func(orgID string) // invoked after non-poll task creation (e.g. carry-over) to kick the per-org scorer immediately
-	lifetimeCounter *db.LifetimeDistinctCounter
 
 	// authDeps groups the multi-mode-only auth stack (JWKS verifier +
 	// session store + gotrue HTTP client). Nil in local mode; checked
@@ -542,14 +541,6 @@ func (s *Server) SetOnJiraChanged(fn func(orgID string)) {
 // next poll cycle.
 func (s *Server) SetScorerTrigger(fn func(orgID string)) {
 	s.scorerTrigger = fn
-}
-
-// SetLifetimeCounter wires the in-memory distinct-entity counter the
-// factory snapshot reads. Hydrated once at startup and maintained by an
-// eventbus subscriber; replaces the per-request COUNT(DISTINCT entity_id)
-// scan that grew with the events table.
-func (s *Server) SetLifetimeCounter(c *db.LifetimeDistinctCounter) {
-	s.lifetimeCounter = c
 }
 
 // SetGitHubClient sets the GitHub client for review approval submissions.
