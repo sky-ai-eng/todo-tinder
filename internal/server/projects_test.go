@@ -99,6 +99,42 @@ func TestProjectCreate_Happy(t *testing.T) {
 	}
 }
 
+// TestProjectCreate_BindsToOrgDefaultTeam pins the SKY-340 fix:
+// handleProjectCreate must resolve team_id via TeamsStore.GetDefaultForOrgSystem
+// for the request's authenticated org rather than hardcoding the
+// local-mode sentinel. In local mode that resolves to the same
+// sentinel team, but the *path* matters — in multi mode the same
+// code branch would resolve to the requesting tenant's default team,
+// so the SQL inserts a FK-valid row.
+func TestProjectCreate_BindsToOrgDefaultTeam(t *testing.T) {
+	s := newTestServer(t)
+	rec := doJSON(t, s, http.MethodPost, "/api/projects", map[string]any{
+		"name": "Bound Project",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	var got domain.Project
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// team_id isn't projected through the Project struct; read it
+	// directly so the test asserts on what the SQL actually wrote
+	// rather than what the JSON response chose to surface.
+	var teamID string
+	if err := s.db.QueryRow(`SELECT team_id FROM projects WHERE id = ?`, got.ID).Scan(&teamID); err != nil {
+		t.Fatalf("read team_id: %v", err)
+	}
+	wantTeamID, err := s.teams.GetDefaultForOrgSystem(t.Context(), runmode.LocalDefaultOrg)
+	if err != nil {
+		t.Fatalf("resolve expected team: %v", err)
+	}
+	if teamID != wantTeamID {
+		t.Errorf("team_id = %q; want %q (default team for org %s)", teamID, wantTeamID, runmode.LocalDefaultOrg)
+	}
+}
+
 func TestProjectCreate_RejectsEmptyName(t *testing.T) {
 	s := newTestServer(t)
 	for _, name := range []string{"", "   ", "\t"} {

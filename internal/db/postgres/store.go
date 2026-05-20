@@ -200,6 +200,13 @@ func New(admin, app *sql.DB) db.Stores {
 		// set at boot/poll-tick; they have no JWT-claims context, and
 		// the iteration is by definition cross-org.
 		Orgs: newOrgsStore(admin),
+		// Teams wires admin — see the TeamsStore interface comment.
+		// Callers are request handlers resolving the org's default
+		// team for newly-synthesized rows; the JWT-claims tx around
+		// the call carries the user's identity, the team lookup
+		// itself runs on admin so the path is uniform with
+		// cmd/exec/curator-dispatch callers that have no claims.
+		Teams: newTeamsStore(admin),
 		// Curator wires the app pool. The per-project goroutine
 		// wraps each turn's writes in Tx.SyntheticClaimsWithTx
 		// under the requesting user's identity; the tx-bound
@@ -272,6 +279,7 @@ func NewForTx(tx *sql.Tx) db.TxStores {
 		TaskMemory:     newTaskMemoryStore(tx, tx),
 		RunWorktrees:   newRunWorktreeStore(tx, tx),
 		Orgs:           newOrgsStore(tx),
+		Teams:          newTeamsStore(tx),
 		Curator:        newCuratorStore(tx, tx),
 	}
 }

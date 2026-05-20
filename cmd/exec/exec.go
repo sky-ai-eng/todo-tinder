@@ -95,16 +95,28 @@ func Handle(args []string) {
 
 	// Credentials route through the SecretStore. exec is invoked per-run
 	// with TRIAGE_FACTORY_RUN_ID; resolve the run's orgID so the
-	// SecretStore read is scoped to the right tenant. Local mode collapses
-	// to runmode.LocalDefaultOrgID, but the resolver shape stays multi-mode
-	// ready. Help paths skip the lookup so `--help` still works without a
-	// real run.
+	// SecretStore read is scoped to the right tenant.
+	//
+	// Local mode falls back to runmode.LocalDefaultOrgID when
+	// ResolveRunIdentity errors so `--help` (and stray invocations
+	// outside a delegated run) still load the configured creds for
+	// the single tenant. Multi mode refuses: an unidentified exec
+	// invocation has no valid tenant to bill against, and resolving
+	// to the sentinel org would hit a SecretStore with no rows at
+	// best, leak to the wrong tenant at worst. Help paths short-
+	// circuit before loadCreds runs, so this branch never fires for
+	// genuine `--help`.
 	loadCreds := func() (string, string, string, string, error) {
 		ctx := context.Background()
 		ident, err := runident.ResolveRunIdentity(ctx, stores, os.Getenv(runident.RunIdentityEnvVar))
-		orgID := runmode.LocalDefaultOrgID
-		if err == nil {
+		var orgID string
+		switch {
+		case err == nil:
 			orgID = ident.OrgID
+		case runmode.Current() == runmode.ModeLocal:
+			orgID = runmode.LocalDefaultOrgID
+		default:
+			return "", "", "", "", fmt.Errorf("cmd/exec invoked without a valid %s; this command can only run inside a delegated agent run", runident.RunIdentityEnvVar)
 		}
 		c, lerr := integrations.Load(ctx, stores.Secrets, orgID)
 		return c.GitHubURL, c.GitHubPAT, c.JiraURL, c.JiraPAT, lerr

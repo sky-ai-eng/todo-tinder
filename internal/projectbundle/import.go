@@ -21,7 +21,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -80,11 +79,20 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// Import reads a .tfproject ZIP and materializes it into a new local project.
+// Import reads a .tfproject ZIP and materializes it into a new project
+// owned by orgID + teamID, with userID stamped as the creator. The
+// caller resolves all three from the request context (orgID + userID
+// from JWT claims, teamID from TeamsStore.GetDefaultForOrgSystem).
+//
+// SQLite-only today — the body opens its own *sql.Tx and writes via
+// raw `?`-placeholder INSERTs. handleProjectImport mode-gates the
+// endpoint to local-mode for that reason; porting to per-dialect store
+// methods is a follow-up.
 func Import(
 	ctx context.Context,
 	database *sql.DB,
 	projects db.ProjectStore,
+	orgID, teamID, userID string,
 	readerAt io.ReaderAt,
 	size int64,
 	probe GitHubProbe,
@@ -105,7 +113,7 @@ func Import(
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := ensureUniqueProjectName(ctx, projects, manifest.Project.Name); err != nil {
+	if err := ensureUniqueProjectName(ctx, projects, orgID, manifest.Project.Name); err != nil {
 		return nil, nil, err
 	}
 	cloneURLs, err := preflightPinnedRepos(ctx, manifest.Project.PinnedRepos, probe)
@@ -156,7 +164,7 @@ func Import(
 	}
 	defer tx.Rollback()
 
-	if err := insertImportedProject(tx, newProjectID, newSessionID, manifest.Project); err != nil {
+	if err := insertImportedProject(tx, newProjectID, newSessionID, orgID, teamID, userID, manifest.Project); err != nil {
 		return nil, nil, err
 	}
 
@@ -194,7 +202,7 @@ func Import(
 	committed = true
 
 	warnings := clonePinnedRepos(ctx, manifest.Project.PinnedRepos, cloneURLs)
-	project, err := projects.Get(ctx, runmode.LocalDefaultOrg, newProjectID)
+	project, err := projects.Get(ctx, orgID, newProjectID)
 	if err != nil {
 		return nil, warnings, fmt.Errorf("load imported project: %w", err)
 	}
@@ -260,9 +268,9 @@ func readZipFileLimited(zf *zip.File, maxBytes int64) ([]byte, error) {
 	return body, nil
 }
 
-func ensureUniqueProjectName(ctx context.Context, projects db.ProjectStore, incoming string) error {
+func ensureUniqueProjectName(ctx context.Context, projects db.ProjectStore, orgID, incoming string) error {
 	incoming = strings.TrimSpace(incoming)
-	rows, err := projects.List(ctx, runmode.LocalDefaultOrg)
+	rows, err := projects.List(ctx, orgID)
 	if err != nil {
 		return fmt.Errorf("list projects: %w", err)
 	}
@@ -313,13 +321,14 @@ func preflightPinnedRepos(ctx context.Context, pinned []string, probe GitHubProb
 }
 
 // insertImportedProject inserts a row into projects from a bundle
-// manifest. Local-mode only: team_id is pinned to LocalDefaultTeamID.
-// When SKY-253 D9 lands the org-scoping pass, this should be
-// rewritten to route through a ProjectStore that derives team_id
-// from the session context — until then, calling this in multi mode
-// would silently bind every imported project to LocalDefaultTeamID.
-// Guarded only by main.go's log.Fatalf on TF_MODE=multi.
-func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID string, manifestProject ManifestProject) error {
+// manifest. org_id, team_id, and creator_user_id are bound from the
+// request handler's resolved identity (orgID + userID from JWT claims;
+// teamID from TeamsStore.GetDefaultForOrgSystem) rather than left to
+// SQLite column defaults — that way `projects.List(ctx, orgID)` and
+// `Import(..., orgID, ...)` agree on the row's owning tenant even if
+// the caller ever passes a non-default value. SQLite-only SQL today;
+// see Import's docstring for the porting note.
+func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID, orgID, teamID, userID string, manifestProject ManifestProject) error {
 	pinned := cloneStrings(manifestProject.PinnedRepos)
 	if pinned == nil {
 		pinned = []string{}
@@ -333,8 +342,9 @@ func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID string, manif
 		INSERT INTO projects (
 			id, name, description,
 			curator_session_id, pinned_repos, jira_project_key,
-			linear_project_key, team_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			linear_project_key, org_id, team_id, creator_user_id,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		projectID,
 		strings.TrimSpace(manifestProject.Name),
@@ -343,7 +353,9 @@ func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID string, manif
 		string(pinnedJSON),
 		nullIfEmptyString(manifestProject.JiraProjectKey),
 		nullIfEmptyString(manifestProject.LinearProjectKey),
-		runmode.LocalDefaultTeamID,
+		orgID,
+		teamID,
+		userID,
 		now,
 		now,
 	)

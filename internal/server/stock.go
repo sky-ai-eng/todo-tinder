@@ -15,7 +15,6 @@ import (
 	jiraevents "github.com/sky-ai-eng/triage-factory/internal/domain/events"
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 )
 
@@ -329,6 +328,16 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+	if err != nil {
+		internalError(w, "stock", fmt.Errorf("default team lookup: %w", err))
+		return
+	}
+	if teamID == "" {
+		internalError(w, "stock", fmt.Errorf("org %s has no default team", orgID))
+		return
+	}
+
 	// Batch-fetch the set of Jira entities that already have an active task so
 	// eligibility checks run in O(1) per action. Fail the request if this
 	// fails — otherwise we'd act on tickets without knowing whether they're
@@ -461,7 +470,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 				if e != nil {
 					return e
 				}
-				_, _, e = tx.Tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, eventType, "", eventID, 0.5)
+				_, _, e = tx.Tasks.FindOrCreate(r.Context(), orgID, teamID, entity.ID, eventType, "", eventID, 0.5)
 				return e
 			}); err != nil {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, err.Error()})
@@ -519,7 +528,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 				if e != nil {
 					return fmt.Errorf("record event: %w", e)
 				}
-				task, _, e = tx.Tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5)
+				task, _, e = tx.Tasks.FindOrCreate(r.Context(), orgID, teamID, entity.ID, domain.EventJiraIssueAssigned, "", eventID, 0.5)
 				if e != nil {
 					return e
 				}

@@ -170,6 +170,12 @@ func (s *Store) txStoresFromTx(tx *sql.Tx) db.TxStores {
 		// but composing it here keeps wiring drift impossible against
 		// the Stores bundle.
 		Orgs: newOrgsStore(tx),
+		// Teams: pinned to s.admin (not tx). GetDefaultForOrgSystem
+		// is an admin-pool read by design — see the TeamsStore
+		// interface comment. Routing the lookup outside the tx means
+		// it composes safely from any handler regardless of which
+		// pool the surrounding tx was bound to.
+		Teams: newTeamsStore(s.admin),
 		// Curator: app-side write routes through the tx; admin half
 		// stays pinned to the real admin pool so
 		// CancelOrphanedNonTerminalRequests inside WithTx routes

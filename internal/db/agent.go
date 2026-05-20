@@ -271,6 +271,14 @@ type AgentRunStore interface {
 	// System variant: takeover is always user-initiated, so its
 	// path goes through synthetic-claims rather than the admin pool.
 	GetSystem(ctx context.Context, orgID, runID string) (*domain.AgentRun, error)
+	// LookupOrgForRunSystem returns the owning orgID for the given
+	// runID, or the empty string with a nil error if no such run
+	// exists. Used by the cmd/exec runident helper to discover the
+	// run's tenant before any other read — at agent-subprocess cold
+	// start the orgID isn't yet known, only TRIAGE_FACTORY_RUN_ID
+	// has been passed in. Routes through the admin pool because the
+	// agent subprocess has no JWT-claims context yet.
+	LookupOrgForRunSystem(ctx context.Context, runID string) (string, error)
 	CompleteSystem(ctx context.Context, orgID, runID, status string, costUSD float64, durationMs, numTurns int, stopReason, resultSummary string) error
 	AddPartialTotalsSystem(ctx context.Context, orgID, runID string, costUSD float64, durationMs, numTurns int) error
 	MarkAwaitingInputSystem(ctx context.Context, orgID, runID string) (bool, error)

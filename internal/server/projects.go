@@ -114,6 +114,16 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+	if err != nil {
+		internalError(w, "projects", fmt.Errorf("default team lookup: %w", err))
+		return
+	}
+	if teamID == "" {
+		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
+		return
+	}
+
 	// Default the spec-authorship skill to the seeded system prompt
 	// when it exists. Doing this at the API layer (not in db.CreateProject)
 	// keeps the DB layer free of any "system prompt must exist" coupling
@@ -128,7 +138,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		} else if def != nil {
 			specPromptID = domain.SystemTicketSpecPromptID
 		}
-		id, createErr := tx.Projects.Create(r.Context(), orgID, runmode.LocalDefaultTeamID, domain.Project{
+		id, createErr := tx.Projects.Create(r.Context(), orgID, teamID, domain.Project{
 			Name:                   name,
 			Description:            req.Description,
 			PinnedRepos:            pinned,
@@ -270,6 +280,20 @@ func (s *Server) handleProjectExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	// projectbundle.Import is still SQLite-only — it opens its own
+	// *sql.Tx and writes via raw `?`-placeholder INSERTs that have no
+	// Postgres counterpart. Gate the endpoint until the bundle
+	// import/export path is ported to per-dialect store methods so a
+	// multi-mode tenant doesn't get a 500 the first time they try to
+	// import. Local-mode behavior is unchanged.
+	if runmode.Current() != runmode.ModeLocal {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "project import is not yet supported in multi-mode deployments"})
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, projectBundleMaxUploadBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "multipart parse: " + err.Error()})
@@ -298,10 +322,24 @@ func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+	if err != nil {
+		internalError(w, "projects", fmt.Errorf("default team lookup: %w", err))
+		return
+	}
+	if teamID == "" {
+		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+
 	project, warnings, err := projectbundle.Import(
 		r.Context(),
 		s.db,
 		s.projects,
+		orgID,
+		teamID,
+		userID,
 		file,
 		size,
 		projectBundleGitHubProbe{client: s.ghClient},

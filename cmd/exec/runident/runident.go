@@ -27,7 +27,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // RunIdentityEnvVar is the env var name the delegate spawner sets on
@@ -54,9 +53,11 @@ var ErrRunIdentityNotFound = errors.New("TRIAGE_FACTORY_RUN_ID points at a run t
 // every subcommand's entry point so the body can branch on
 // IsEventTriggered to pick its store-routing strategy.
 type RunIdentity struct {
-	// OrgID is the run's owning org. In local mode this is always
-	// runmode.LocalDefaultOrg; the field exists for SKY-269's
-	// eventual multi-org switch where it will come from run.OrgID.
+	// OrgID is the run's owning org, read from the agent_runs row
+	// keyed by TRIAGE_FACTORY_RUN_ID. In local mode this collapses
+	// to runmode.LocalDefaultOrg (the single seeded tenant); in
+	// multi mode it carries the real tenant UUID so every
+	// subcommand write attributes to the correct org.
 	OrgID string
 
 	// UserID is the run's creator_user_id — non-empty for manual
@@ -95,18 +96,23 @@ func ResolveRunIdentityFromEnv(ctx context.Context, stores db.Stores) (RunIdenti
 // fields. Empty runID surfaces as ErrRunIdentityMissing — callers
 // reading from env should validate up front and not pass "".
 //
-// The lookup goes through GetSystem because we haven't entered a
-// claims-bound tx — we don't know who to claim AS until after the
-// lookup tells us run.CreatorUserID. SKY-296's GetSystem on the
-// admin pool is the right tool for the cold-start identity probe.
+// Two admin-pool reads: first resolve the run's owning org by
+// runID alone (the agent subprocess only has TRIAGE_FACTORY_RUN_ID
+// in env, never the orgID), then load the full run row scoped to
+// that org. Both reads bypass RLS because the subprocess hasn't
+// entered a claims-bound tx — we don't know who to claim AS until
+// after the lookup tells us run.CreatorUserID.
 func ResolveRunIdentity(ctx context.Context, stores db.Stores, runID string) (RunIdentity, error) {
 	if runID == "" {
 		return RunIdentity{}, ErrRunIdentityMissing
 	}
-	// SKY-269 will replace runmode.LocalDefaultOrg with the run's
-	// real org_id once multi-tenant scoping lands. The admin-pool
-	// GetSystem read works the same way regardless.
-	orgID := runmode.LocalDefaultOrg
+	orgID, err := stores.AgentRuns.LookupOrgForRunSystem(ctx, runID)
+	if err != nil {
+		return RunIdentity{}, fmt.Errorf("lookup org for run %s: %w", runID, err)
+	}
+	if orgID == "" {
+		return RunIdentity{}, fmt.Errorf("%w: %s", ErrRunIdentityNotFound, runID)
+	}
 	run, err := stores.AgentRuns.GetSystem(ctx, orgID, runID)
 	if err != nil {
 		return RunIdentity{}, fmt.Errorf("lookup run %s: %w", runID, err)

@@ -5,7 +5,6 @@ import (
 	"log"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -26,7 +25,7 @@ import (
 // repo_profiles (validatePinnedRepos), so a missing profile here
 // indicates a race: the user removed the repo from configured-repos
 // AFTER pinning. Same handling — log + skip.
-func materializePinnedRepos(ctx context.Context, repos db.RepoStore, projectID, projectDir string, pinnedRepos []string) {
+func materializePinnedRepos(ctx context.Context, repos db.RepoStore, orgID, projectID, projectDir string, pinnedRepos []string) {
 	for _, slug := range pinnedRepos {
 		if ctx.Err() != nil {
 			return
@@ -36,7 +35,7 @@ func materializePinnedRepos(ctx context.Context, repos db.RepoStore, projectID, 
 			log.Printf("[curator] project %s: malformed pinned repo %q (skipping)", projectID, slug)
 			continue
 		}
-		profile, err := repos.Get(ctx, runmode.LocalDefaultOrgID, slug)
+		profile, err := repos.Get(ctx, orgID, slug)
 		if err != nil {
 			log.Printf("[curator] project %s: load profile for %s: %v (skipping)", projectID, slug, err)
 			continue

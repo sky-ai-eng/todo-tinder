@@ -521,6 +521,15 @@ func (s *agentRunStore) GetSystem(ctx context.Context, orgID, runID string) (*do
 	return getRun(ctx, s.admin, orgID, runID)
 }
 
+func (s *agentRunStore) LookupOrgForRunSystem(ctx context.Context, runID string) (string, error) {
+	var orgID string
+	err := s.admin.QueryRowContext(ctx, `SELECT org_id::text FROM runs WHERE id = $1`, runID).Scan(&orgID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return orgID, err
+}
+
 func getRun(ctx context.Context, q queryer, orgID, runID string) (*domain.AgentRun, error) {
 	row := q.QueryRowContext(ctx, `
 		SELECT `+pgRunColumns+`
