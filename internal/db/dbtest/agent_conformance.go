@@ -28,10 +28,10 @@ type AgentStoreFactory func(t *testing.T) (store db.AgentStore, orgID, patUserID
 //   - GetForOrg returns (nil, nil) when no row exists yet.
 //   - Update applies display_name + default_model + autonomy +
 //     jira_service_account_id.
-//   - SetGitHubAppInstallation + SetGitHubPATUser are mutually
-//     exclusive — each clears the other field as a side effect.
-//   - Postgres invalid-UUID guards: Update / SetGitHubApp / SetGitHubPAT
-//     return nil instead of bubbling 22P02 parse errors.
+//   - SetGitHubPATUser writes the PAT-borrow FK; malformed input is
+//     refused before any UPDATE runs.
+//   - Postgres invalid-UUID guards: Update / SetGitHubPAT return nil
+//     instead of bubbling 22P02 parse errors.
 //   - DisplayName defaulting: empty input fills "Triage Factory Bot".
 func RunAgentStoreConformance(t *testing.T, factory AgentStoreFactory) {
 	t.Helper()
@@ -216,56 +216,16 @@ func RunAgentStoreConformance(t *testing.T, factory AgentStoreFactory) {
 		}
 	})
 
-	t.Run("SetGitHubAppInstallation_WritesAndClearsPATUser", func(t *testing.T) {
-		// The Postgres impl needs a real users(id) for GitHubPATUserID
-		// because of the FK. We exercise the mutual-exclusion property
-		// by starting with an installation-only row and clearing it via
-		// the App-set call.
-		store, orgID, _ := factory(t)
-		ctx := context.Background()
-		id, err := store.Create(ctx, orgID, domain.Agent{
-			DisplayName:             "Test",
-			GitHubAppInstallationID: "12345",
-		})
-		if err != nil {
-			t.Fatalf("Create: %v", err)
-		}
-		// Switch to a different installation_id.
-		if err := store.SetGitHubAppInstallation(ctx, orgID, id, "99999"); err != nil {
-			t.Fatalf("SetGitHubAppInstallation: %v", err)
-		}
-		got, _ := store.GetForOrg(ctx, orgID)
-		if got == nil {
-			t.Fatal("row missing after SetGitHubAppInstallation")
-		}
-		if got.GitHubAppInstallationID != "99999" {
-			t.Errorf("installation_id=%q want 99999", got.GitHubAppInstallationID)
-		}
-		if got.GitHubPATUserID != "" {
-			t.Errorf("PAT user not cleared on App-set; got=%q", got.GitHubPATUserID)
-		}
-	})
-
-	t.Run("SetGitHubAppInstallation_OnInvalidUUID_IsNoop", func(t *testing.T) {
-		store, orgID, _ := factory(t)
-		if err := store.SetGitHubAppInstallation(context.Background(), orgID, "not-a-uuid", "12345"); err != nil {
-			t.Errorf("SetGitHubAppInstallation invalid UUID: want nil, got %v", err)
-		}
-	})
-
-	t.Run("SetGitHubPATUser_WritesAndClearsApp", func(t *testing.T) {
-		// Mirror of SetGitHubAppInstallation_WritesAndClearsPATUser
-		// for the other credential source. Start with App-installed,
-		// switch to PAT-borrow, verify both:
-		//   1. github_pat_user_id is now the new userID
-		//   2. github_app_installation_id is NULL — "exactly one
-		//      credential source" invariant holds in both directions.
+	t.Run("SetGitHubPATUser_WritesPATUserFK", func(t *testing.T) {
+		// PAT-borrow is tier 3 of the credential resolver. Start with
+		// a freshly-created agent and write a real users(id) into the
+		// FK; the read-back must match. Postgres needs a real
+		// users.id (the factory pre-seeds one and hands the UUID back);
+		// SQLite accepts any UUID-shaped string but the FK to users(id)
+		// exists too post-SKY-269.
 		store, orgID, patUserID := factory(t)
 		ctx := context.Background()
-		id, err := store.Create(ctx, orgID, domain.Agent{
-			DisplayName:             "Test",
-			GitHubAppInstallationID: "55555",
-		})
+		id, err := store.Create(ctx, orgID, domain.Agent{DisplayName: "Test"})
 		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
@@ -279,41 +239,37 @@ func RunAgentStoreConformance(t *testing.T, factory AgentStoreFactory) {
 		if got.GitHubPATUserID != patUserID {
 			t.Errorf("PAT user_id=%q want %q", got.GitHubPATUserID, patUserID)
 		}
-		if got.GitHubAppInstallationID != "" {
-			t.Errorf("App installation_id not cleared on PAT-set; got=%q", got.GitHubAppInstallationID)
-		}
 	})
 
 	t.Run("SetGitHubPATUser_RejectsMalformedUserID", func(t *testing.T) {
-		// Regression: an earlier version of both impls passed
-		// userID through nullUUID() / nullString() unconditionally, so a
+		// Regression: an earlier version of both impls passed userID
+		// through nullUUID() / nullString() unconditionally, so a
 		// caller passing a non-UUID non-empty value (e.g. "alice@x.com"
-		// from a typo) would silently NULL-out github_pat_user_id AND
-		// clear github_app_installation_id in the same statement,
-		// wiping the agent's credentials entirely. Both impls now
-		// refuse malformed input loudly. Empty stays the explicit-clear
-		// path because that's a legitimate state transition.
-		store, orgID, _ := factory(t)
+		// from a typo) would silently NULL-out github_pat_user_id and
+		// wipe the agent's credentials entirely. Both impls now refuse
+		// malformed input loudly. Empty stays the explicit-clear path
+		// because that's a legitimate state transition.
+		store, orgID, patUserID := factory(t)
 		ctx := context.Background()
-		id, err := store.Create(ctx, orgID, domain.Agent{
-			DisplayName:             "Test",
-			GitHubAppInstallationID: "77777",
-		})
+		id, err := store.Create(ctx, orgID, domain.Agent{DisplayName: "Test"})
 		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
+		// Seed a valid PAT user first so we can prove the refused call
+		// leaves it untouched.
+		if err := store.SetGitHubPATUser(ctx, orgID, id, patUserID); err != nil {
+			t.Fatalf("seed SetGitHubPATUser: %v", err)
+		}
 		err = store.SetGitHubPATUser(ctx, orgID, id, "alice@example.com")
 		if err == nil {
-			t.Fatal("SetGitHubPATUser accepted malformed userID; would silently wipe both credential fields")
+			t.Fatal("SetGitHubPATUser accepted malformed userID; would silently wipe the credential field")
 		}
-		// And the original credentials must be untouched — refusal
-		// means no UPDATE ran.
 		got, _ := store.GetForOrg(ctx, orgID)
 		if got == nil {
 			t.Fatal("row missing after refused SetGitHubPATUser")
 		}
-		if got.GitHubAppInstallationID != "77777" {
-			t.Errorf("App installation_id corrupted by refused call: %q", got.GitHubAppInstallationID)
+		if got.GitHubPATUserID != patUserID {
+			t.Errorf("PAT user_id corrupted by refused call: got=%q want=%q", got.GitHubPATUserID, patUserID)
 		}
 	})
 

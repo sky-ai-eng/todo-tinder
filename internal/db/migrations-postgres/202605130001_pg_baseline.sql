@@ -478,7 +478,6 @@ CREATE TABLE public.agents (
     display_name text DEFAULT 'Triage Factory Bot'::text NOT NULL,
     default_model text,
     default_autonomy_suitability real,
-    github_app_installation_id text,
     github_pat_user_id uuid,
     jira_service_account_id text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -4875,6 +4874,127 @@ CREATE POLICY chain_runs_delete ON public.chain_runs FOR DELETE
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.prompt_chain_steps TO tf_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.chain_runs         TO tf_app;
+
+
+--
+-- Per-org GitHub App registration + installation tracking.
+--
+-- Per-org App is the v1 multi-mode default; orgs using the deployment-default
+-- (hosted) App have NO org_github_apps row. The `_ref` columns hold Vault
+-- secret-name pointers (the actual client_secret / PEM / webhook signing
+-- secret are written via vault.create_secret in the manifest backend) so
+-- app secrets never live in the relational schema.
+--
+-- Installations are 1:N from an org (and observed from GitHub's webhook
+-- stream). They are NOT pointed back at org_github_apps: each org has at
+-- most one App registered at any moment, so the org_id is sufficient to
+-- resolve the App that produced the installation. When an org switches
+-- Apps in the future, GitHub forces a fresh install ceremony and the
+-- installation_ids change naturally.
+--
+-- App-pool writes on org_github_app_installations are blocked at the
+-- policy layer: rows are mirrored from GitHub's webhook stream by the
+-- webhook handler running on the admin pool. App-pool members can read
+-- but never insert / update / delete.
+
+CREATE TABLE public.org_github_apps (
+    org_id uuid NOT NULL,
+    app_id text NOT NULL,
+    slug text NOT NULL,
+    client_id text NOT NULL,
+    client_secret_ref text NOT NULL,
+    pem_ref text NOT NULL,
+    webhook_secret_ref text NOT NULL,
+    registered_at timestamp with time zone DEFAULT now() NOT NULL,
+    registered_by_user_id uuid,
+    active boolean DEFAULT true NOT NULL
+);
+
+ALTER TABLE ONLY public.org_github_apps
+    ADD CONSTRAINT org_github_apps_pkey PRIMARY KEY (org_id);
+
+ALTER TABLE ONLY public.org_github_apps
+    ADD CONSTRAINT org_github_apps_app_id_key UNIQUE (app_id);
+
+ALTER TABLE ONLY public.org_github_apps
+    ADD CONSTRAINT org_github_apps_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.org_github_apps
+    ADD CONSTRAINT org_github_apps_registered_by_user_id_fkey FOREIGN KEY (registered_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+ALTER TABLE public.org_github_apps ENABLE ROW LEVEL SECURITY;
+
+-- Writes are admin-only (registering / rotating an App registration is
+-- a sensitive workspace gesture). Reads open to any org member so
+-- ResolveCredential() running on the app pool can see whether the org
+-- has its own App on the read path.
+CREATE POLICY org_github_apps_select ON public.org_github_apps FOR SELECT TO tf_app
+    USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id)));
+
+CREATE POLICY org_github_apps_insert ON public.org_github_apps FOR INSERT TO tf_app
+    WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_is_org_admin(org_id)));
+
+CREATE POLICY org_github_apps_update ON public.org_github_apps FOR UPDATE TO tf_app
+    USING (((org_id = tf.current_org_id()) AND tf.user_is_org_admin(org_id)))
+    WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_is_org_admin(org_id)));
+
+CREATE POLICY org_github_apps_delete ON public.org_github_apps FOR DELETE TO tf_app
+    USING (((org_id = tf.current_org_id()) AND tf.user_is_org_admin(org_id)));
+
+
+CREATE TABLE public.org_github_app_installations (
+    installation_id text NOT NULL,
+    org_id uuid NOT NULL,
+    account_type text NOT NULL,
+    account_login text NOT NULL,
+    installed_at timestamp with time zone DEFAULT now() NOT NULL,
+    removed_at timestamp with time zone,
+    CONSTRAINT org_github_app_installations_account_type_check
+        CHECK ((account_type = ANY (ARRAY['Organization'::text, 'User'::text])))
+);
+
+ALTER TABLE ONLY public.org_github_app_installations
+    ADD CONSTRAINT org_github_app_installations_pkey PRIMARY KEY (installation_id);
+
+ALTER TABLE ONLY public.org_github_app_installations
+    ADD CONSTRAINT org_github_app_installations_org_login_key UNIQUE (org_id, account_login);
+
+ALTER TABLE ONLY public.org_github_app_installations
+    ADD CONSTRAINT org_github_app_installations_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;
+
+CREATE INDEX org_github_app_installations_org_idx
+    ON public.org_github_app_installations (org_id);
+
+ALTER TABLE public.org_github_app_installations ENABLE ROW LEVEL SECURITY;
+
+-- Installation rows mirror GitHub-side state and are written exclusively
+-- by the webhook handler (admin pool, system context). App-pool members
+-- read but never write — any user gesture that needs to add or remove an
+-- installation goes through the GitHub install / uninstall ceremony,
+-- whose result we discover via webhook.
+CREATE POLICY org_github_app_installations_select ON public.org_github_app_installations FOR SELECT TO tf_app
+    USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id)));
+
+CREATE POLICY org_github_app_installations_insert ON public.org_github_app_installations FOR INSERT TO tf_app
+    WITH CHECK (false);
+
+CREATE POLICY org_github_app_installations_update ON public.org_github_app_installations FOR UPDATE TO tf_app
+    USING (false);
+
+CREATE POLICY org_github_app_installations_delete ON public.org_github_app_installations FOR DELETE TO tf_app
+    USING (false);
+
+GRANT ALL ON TABLE public.org_github_apps TO postgres;
+GRANT ALL ON TABLE public.org_github_apps TO anon;
+GRANT ALL ON TABLE public.org_github_apps TO authenticated;
+GRANT ALL ON TABLE public.org_github_apps TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.org_github_apps TO tf_app;
+
+GRANT ALL ON TABLE public.org_github_app_installations TO postgres;
+GRANT ALL ON TABLE public.org_github_app_installations TO anon;
+GRANT ALL ON TABLE public.org_github_app_installations TO authenticated;
+GRANT ALL ON TABLE public.org_github_app_installations TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.org_github_app_installations TO tf_app;
 
 
 -- +goose Down

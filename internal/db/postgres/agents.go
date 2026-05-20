@@ -14,9 +14,9 @@ import (
 //
 // # Pool split
 //
-//   - app   — tf_app, RLS-active. GetForOrg, Update, SetGitHubApp*,
-//     SetGitHubPATUser. The agents_select policy gates SELECTs by org
-//     access; agents_update/insert/delete gate by org admin.
+//   - app   — tf_app, RLS-active. GetForOrg, Update, SetGitHubPATUser.
+//     The agents_select policy gates SELECTs by org access;
+//     agents_update/insert/delete gate by org admin.
 //   - admin — supabase_admin, BYPASSRLS. Create only. Justified
 //     because the only legitimate caller is bootstrap (org-create
 //     handler, internal/db/bootstrap.go), and at that moment the
@@ -50,7 +50,7 @@ func newTxAgentStore(tx queryer) db.AgentStore {
 var _ db.AgentStore = (*agentStore)(nil)
 
 const pgAgentColumns = `id, display_name, default_model, default_autonomy_suitability,
-       github_app_installation_id, github_pat_user_id, jira_service_account_id,
+       github_pat_user_id, jira_service_account_id,
        created_at, updated_at`
 
 func (s *agentStore) GetForOrg(ctx context.Context, orgID string) (*domain.Agent, error) {
@@ -111,12 +111,12 @@ func (s *agentStore) Create(ctx context.Context, orgID string, a domain.Agent) (
 	err := s.admin.QueryRowContext(ctx, `
 		INSERT INTO agents
 			(id, org_id, display_name, default_model, default_autonomy_suitability,
-			 github_app_installation_id, github_pat_user_id, jira_service_account_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 github_pat_user_id, jira_service_account_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (org_id) DO NOTHING
 		RETURNING id
 	`, id, orgID, displayName, nullString(a.DefaultModel), a.DefaultAutonomySuitability,
-		nullString(a.GitHubAppInstallationID), nullUUID(a.GitHubPATUserID), nullString(a.JiraServiceAccountID),
+		nullUUID(a.GitHubPATUserID), nullString(a.JiraServiceAccountID),
 	).Scan(&insertedID)
 	if err == nil {
 		return insertedID, nil
@@ -151,23 +151,6 @@ func (s *agentStore) Update(ctx context.Context, orgID string, a domain.Agent) e
 	return err
 }
 
-func (s *agentStore) SetGitHubAppInstallation(ctx context.Context, orgID, agentID, installationID string) error {
-	if !isValidUUID(agentID) {
-		return nil
-	}
-	// Clear github_pat_user_id in the same statement so the "at most
-	// one credential source" invariant holds at all times. App-install
-	// is the recommended multi-mode path; switching from PAT-borrow
-	// to App-install nulls the PAT FK as a side effect.
-	_, err := s.app.ExecContext(ctx, `
-		UPDATE agents
-		SET github_app_installation_id = $1,
-		    github_pat_user_id = NULL
-		WHERE org_id = $2 AND id = $3
-	`, nullString(installationID), orgID, agentID)
-	return err
-}
-
 func (s *agentStore) SetGitHubPATUser(ctx context.Context, orgID, agentID, userID string) error {
 	if !isValidUUID(agentID) {
 		return nil
@@ -175,16 +158,15 @@ func (s *agentStore) SetGitHubPATUser(ctx context.Context, orgID, agentID, userI
 	// "" = caller-intentional clear, valid UUID = caller-intentional set.
 	// Any other shape (e.g. "alice@example.com" passed by mistake) is a
 	// programmer bug we refuse loudly rather than silently treating as
-	// clear — silently clearing would wipe BOTH credential fields in the
-	// same statement and leave the agent with no auth source, an
-	// outcome no caller intended.
+	// clear — the underlying github_pat_user_id column is a UUID FK and
+	// the cast would 22P02-error anyway, but refusing up front gives a
+	// caller-friendly error shape.
 	if userID != "" && !isValidUUID(userID) {
 		return fmt.Errorf("postgres agents: SetGitHubPATUser: userID %q is not empty and not a valid UUID", userID)
 	}
 	_, err := s.app.ExecContext(ctx, `
 		UPDATE agents
-		SET github_pat_user_id = $1,
-		    github_app_installation_id = NULL
+		SET github_pat_user_id = $1
 		WHERE org_id = $2 AND id = $3
 	`, nullUUID(userID), orgID, agentID)
 	return err
@@ -210,11 +192,11 @@ func nullUUID(s string) any {
 
 func scanAgentRowPG(row *sql.Row) (domain.Agent, error) {
 	var a domain.Agent
-	var defaultModel, ghApp, jiraSvc sql.NullString
+	var defaultModel, jiraSvc sql.NullString
 	var ghPATUser sql.NullString
 	var defAutonomy sql.NullFloat64
 	if err := row.Scan(&a.ID, &a.DisplayName, &defaultModel, &defAutonomy,
-		&ghApp, &ghPATUser, &jiraSvc, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		&ghPATUser, &jiraSvc, &a.CreatedAt, &a.UpdatedAt); err != nil {
 		return a, err
 	}
 	a.DefaultModel = defaultModel.String
@@ -222,7 +204,6 @@ func scanAgentRowPG(row *sql.Row) (domain.Agent, error) {
 		v := defAutonomy.Float64
 		a.DefaultAutonomySuitability = &v
 	}
-	a.GitHubAppInstallationID = ghApp.String
 	a.GitHubPATUserID = ghPATUser.String
 	a.JiraServiceAccountID = jiraSvc.String
 	return a, nil
