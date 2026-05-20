@@ -31,9 +31,10 @@ import (
 // handler. The no-cookie and garbage-value variants reject before any DB
 // access; the unknown-sid variant still performs a session lookup against
 // the sessions table to confirm the row doesn't exist, but it still
-// returns 401 without needing session-row fixtures. The path-param
-// substitutions don't have to resolve to real entities because
-// middleware fires before path-param parsing.
+// returns 401 without needing session-row fixtures. The mux extracts
+// path values during routing (before middleware runs), but the handler
+// never gets the chance to consume them, so the substituted values
+// only need to match the pattern's segment shape.
 //
 // What this test does NOT cover:
 //
@@ -110,8 +111,9 @@ func TestAllProtectedRoutes_RejectUnauthenticated(t *testing.T) {
 // We use Origin: https://evil.example and no cookie. CSRF fires
 // outside the auth wrap, so the no-cookie case still produces a 403
 // (not a 401) — that's the assertion. Path-param substitutions reuse
-// the unauth-test helper since CSRF, like auth, rejects before any
-// path-param parsing or DB query.
+// the unauth-test helper since CSRF, like auth, rejects before the
+// handler runs — the mux extracts path values during routing, but
+// no handler-level parsing or DB query happens past the rejection.
 func TestAllMutatingRoutes_RejectCrossOrigin(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeMulti)
 	rig := newAuthRig(t)
@@ -129,15 +131,16 @@ func TestAllMutatingRoutes_RejectCrossOrigin(t *testing.T) {
 
 	for _, route := range mutating {
 		method, pattern := splitMethodAndPath(route.pattern)
-		// withCSRFOriginCheck pre-passes GET/HEAD/OPTIONS. Mutating
-		// routes are mounted with POST/PUT/PATCH/DELETE today, but a
-		// future apiMutating-on-GET would be a footgun — skip with a
-		// clear marker rather than asserting on a request the check
-		// intentionally ignores.
+		// withCSRFOriginCheck pre-passes GET/HEAD/OPTIONS, which is
+		// correct for those methods — but apiMutating on a safe method
+		// is itself the footgun. The handler author believes they have
+		// CSRF protection; CSRF silently passes through; nothing fires.
+		// Fail hard so a future GET/HEAD/OPTIONS mount on apiMutating
+		// gets caught here instead of in production.
 		switch method {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
-			t.Run(method+" "+pattern+"/skipped-safe-method", func(t *testing.T) {
-				t.Skipf("apiMutating mounted on safe method %s — CSRF check passes through", method)
+			t.Run(method+" "+pattern+"/apiMutating-on-safe-method", func(t *testing.T) {
+				t.Errorf("apiMutating mounted on safe method %s — CSRF passes through, so the route has no CSRF protection. Either re-mount via s.api (read-only intent) or change the verb to a mutating one.", method)
 			})
 			continue
 		}
@@ -236,10 +239,12 @@ func splitMethodAndPath(pattern string) (method, path string) {
 }
 
 // substitutePathParams replaces every {name} placeholder with a
-// concrete value the mux pattern will match. Middleware rejects unauth
-// requests before any handler or path-param parsing runs, so the values
-// don't need to resolve to real entities — they only need to satisfy
-// the pattern's path-segment shape (no slashes inside a {name}).
+// concrete value the mux pattern will match. The substituted values
+// only need to satisfy the pattern's path-segment shape (no slashes
+// inside a {name}) so the mux's routing-time pattern match succeeds —
+// the rejecting middleware short-circuits before the handler runs, so
+// the values never have to resolve to real entities or pass any
+// handler-level validation.
 func substitutePathParams(path string) string {
 	zeroUUID := "00000000-0000-0000-0000-000000000000"
 	replacements := map[string]string{
