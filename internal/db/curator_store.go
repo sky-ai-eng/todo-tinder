@@ -24,11 +24,16 @@ import (
 // against *sql.DB; those are out of scope for this ticket and tracked
 // by SKY-253.
 //
-// Read methods (Get/List) live in the package-level helpers for now —
-// the goroutine's writes are the auth surface that matters under RLS.
-// One read does live here, GetRequest, because the dispatch goroutine
-// reads it inside the same per-turn synthetic-claims wrap as the
-// MarkRunning write and we want the read to honor RLS in Postgres.
+// Read methods (Get/List) mostly live in the package-level helpers
+// for now — the goroutine's writes are the auth surface that matters
+// under RLS. The reads that DO live here (GetRequest,
+// ListPendingContext) belong on the interface because their callers
+// need a per-resource handle they can wire through (the curator
+// goroutine reads GetRequest inside the same per-turn synthetic-
+// claims wrap as MarkRunning; the project-bundle export reads
+// ListPendingContext alongside the handler-side InsertPendingContext
+// path). Both must honor RLS in Postgres, so callers run them under
+// claims-bound execution (SyntheticClaimsWithTx or WithTx).
 type CuratorStore interface {
 	// CreateRequest inserts a new queued curator_request row and
 	// returns its id. creatorUserID is the requesting user — in
