@@ -165,3 +165,129 @@ func TestSetForTest_FlipsInitialized(t *testing.T) {
 		t.Errorf("Init(ModeMulti) after SetForTest(local) should error, got nil")
 	}
 }
+
+// SKY-345: join-policy parsing + init contract mirror the mode tests.
+
+func TestJoinPolicyFromEnv(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    JoinPolicy
+		wantErr bool
+	}{
+		{"", JoinPolicyPersonalOrgOnSignup, false},
+		{"personal-org-on-signup", JoinPolicyPersonalOrgOnSignup, false},
+		{"auto-join-default", JoinPolicyAutoJoinDefault, false},
+		{"invite-only", JoinPolicyInviteOnly, false},
+		// Typos must fatal, not silently degrade to a default.
+		{"personal_org_signup", "", true},
+		{"Personal-Org-On-Signup", "", true}, // exact match, no case fold
+		{"open", "", true},
+		{" invite-only ", "", true}, // no whitespace tolerance
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := JoinPolicyFromEnv(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("JoinPolicyFromEnv(%q) = %q, nil; want error", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("JoinPolicyFromEnv(%q) errored: %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("JoinPolicyFromEnv(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// withCleanJoinPolicyInit mirrors withCleanInit for the join-policy
+// state. Tests that exercise InitJoinPolicy's first-call branch use
+// this so the package-init state doesn't leak across test ordering.
+func withCleanJoinPolicyInit(t *testing.T) {
+	t.Helper()
+	joinPolicyMu.Lock()
+	prev, prevInit := currentJoinPolicy, joinPolicyInitialized
+	currentJoinPolicy = JoinPolicyPersonalOrgOnSignup
+	joinPolicyInitialized = false
+	joinPolicyMu.Unlock()
+	t.Cleanup(func() {
+		joinPolicyMu.Lock()
+		currentJoinPolicy = prev
+		joinPolicyInitialized = prevInit
+		joinPolicyMu.Unlock()
+	})
+}
+
+func TestJoinPolicy_DefaultsToPersonalOrgOnSignup(t *testing.T) {
+	withCleanJoinPolicyInit(t)
+	if got := JoinPolicyCurrent(); got != JoinPolicyPersonalOrgOnSignup {
+		t.Errorf("JoinPolicyCurrent() = %q at init time, want %q", got, JoinPolicyPersonalOrgOnSignup)
+	}
+}
+
+func TestInitJoinPolicy_FirstCall(t *testing.T) {
+	withCleanJoinPolicyInit(t)
+	if err := InitJoinPolicy(JoinPolicyInviteOnly); err != nil {
+		t.Errorf("InitJoinPolicy(invite-only) errored on clean slate: %v", err)
+	}
+	if got := JoinPolicyCurrent(); got != JoinPolicyInviteOnly {
+		t.Errorf("after InitJoinPolicy(invite-only), JoinPolicyCurrent() = %q", got)
+	}
+}
+
+func TestInitJoinPolicy_IdempotentOnSame(t *testing.T) {
+	withCleanJoinPolicyInit(t)
+	if err := InitJoinPolicy(JoinPolicyAutoJoinDefault); err != nil {
+		t.Fatalf("first InitJoinPolicy: %v", err)
+	}
+	if err := InitJoinPolicy(JoinPolicyAutoJoinDefault); err != nil {
+		t.Errorf("second InitJoinPolicy with same value should be a no-op, errored: %v", err)
+	}
+}
+
+func TestInitJoinPolicy_RejectsConflictingReInit(t *testing.T) {
+	withCleanJoinPolicyInit(t)
+	if err := InitJoinPolicy(JoinPolicyPersonalOrgOnSignup); err != nil {
+		t.Fatalf("first InitJoinPolicy: %v", err)
+	}
+	err := InitJoinPolicy(JoinPolicyAutoJoinDefault)
+	if err == nil {
+		t.Fatalf("conflicting InitJoinPolicy should have errored")
+	}
+	if !strings.Contains(err.Error(), "already initialized") {
+		t.Errorf("error should mention 'already initialized'; got %q", err.Error())
+	}
+	if got := JoinPolicyCurrent(); got != JoinPolicyPersonalOrgOnSignup {
+		t.Errorf("after rejected re-init, JoinPolicyCurrent() = %q (must be unchanged)", got)
+	}
+}
+
+func TestInitJoinPolicy_RejectsUnknown(t *testing.T) {
+	withCleanJoinPolicyInit(t)
+	err := InitJoinPolicy(JoinPolicy("bogus"))
+	if err == nil {
+		t.Fatalf("InitJoinPolicy(bogus) should have errored")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Errorf("error should reference bad value; got %q", err.Error())
+	}
+}
+
+func TestSetJoinPolicyForTest_RestoresAfter(t *testing.T) {
+	SetJoinPolicyForTest(t, JoinPolicyPersonalOrgOnSignup)
+	if got := JoinPolicyCurrent(); got != JoinPolicyPersonalOrgOnSignup {
+		t.Fatalf("setup: JoinPolicyCurrent() = %q", got)
+	}
+	t.Run("inner-flips-to-invite-only", func(t *testing.T) {
+		SetJoinPolicyForTest(t, JoinPolicyInviteOnly)
+		if got := JoinPolicyCurrent(); got != JoinPolicyInviteOnly {
+			t.Errorf("inside subtest: JoinPolicyCurrent() = %q", got)
+		}
+	})
+	if got := JoinPolicyCurrent(); got != JoinPolicyPersonalOrgOnSignup {
+		t.Errorf("after subtest restore: JoinPolicyCurrent() = %q", got)
+	}
+}

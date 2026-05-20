@@ -167,3 +167,119 @@ func ModeFromEnv(s string) (Mode, error) {
 		return "", fmt.Errorf("unknown TF_MODE=%q (want %q or %q, or empty for local)", s, ModeLocal, ModeMulti)
 	}
 }
+
+// JoinPolicy names the rule the multi-mode signup callback applies
+// when a new user lands with zero org memberships. Set once at
+// startup from TF_DEFAULT_JOIN_POLICY via InitJoinPolicyFromEnv,
+// never reassigned outside tests. SKY-345.
+//
+// Local mode ignores the env var entirely — local installs use the
+// pre-seeded LocalDefaultOrg sentinel and never run the multi-mode
+// signup callback.
+type JoinPolicy string
+
+const (
+	// JoinPolicyPersonalOrgOnSignup creates a personal org + default
+	// team + admin membership on first signup. Default when
+	// TF_DEFAULT_JOIN_POLICY is unset; the right behavior for hosted
+	// SaaS and unconfigured self-hosts.
+	JoinPolicyPersonalOrgOnSignup JoinPolicy = "personal-org-on-signup"
+
+	// JoinPolicyAutoJoinDefault adds the new user to the instance's
+	// existing "Default" org (id = LocalDefaultOrgID) as a member,
+	// on its default team. For small self-hosts where everyone shares
+	// one org. If the Default org doesn't exist yet, the first signup
+	// creates it and joins as admin; subsequent signups join as
+	// members.
+	JoinPolicyAutoJoinDefault JoinPolicy = "auto-join-default"
+
+	// JoinPolicyInviteOnly does nothing on signup — the user lands at
+	// /no-orgs and stays there until an admin adds them to an org.
+	// For strict enterprise self-hosts gated on admin action.
+	JoinPolicyInviteOnly JoinPolicy = "invite-only"
+)
+
+// currentJoinPolicy + joinPolicyInitialized + joinPolicyMu mirror the
+// mode-state machinery above. Reads through JoinPolicyCurrent() take
+// an RLock; SetJoinPolicyForTest snapshots both fields and restores
+// via t.Cleanup. Default is JoinPolicyPersonalOrgOnSignup so an
+// unconfigured install does the right thing.
+var (
+	currentJoinPolicy     JoinPolicy = JoinPolicyPersonalOrgOnSignup
+	joinPolicyInitialized bool
+	joinPolicyMu          sync.RWMutex
+)
+
+// JoinPolicyCurrent returns the active join policy. Safe from any
+// goroutine. Always returns a valid value — the default is
+// JoinPolicyPersonalOrgOnSignup even before InitJoinPolicyFromEnv
+// runs, so callers that check it during boot (or in local-mode tests
+// that never init it) get a sensible answer.
+func JoinPolicyCurrent() JoinPolicy {
+	joinPolicyMu.RLock()
+	defer joinPolicyMu.RUnlock()
+	return currentJoinPolicy
+}
+
+// InitJoinPolicy sets the process-wide join policy. Same idempotency
+// contract as Init: first call with a valid policy sets state and
+// returns nil; subsequent call with the same value is a no-op;
+// subsequent call with a different value returns an error without
+// mutating state.
+func InitJoinPolicy(p JoinPolicy) error {
+	if p != JoinPolicyPersonalOrgOnSignup &&
+		p != JoinPolicyAutoJoinDefault &&
+		p != JoinPolicyInviteOnly {
+		return fmt.Errorf("unknown join policy %q (want %q, %q, or %q)",
+			p, JoinPolicyPersonalOrgOnSignup, JoinPolicyAutoJoinDefault, JoinPolicyInviteOnly)
+	}
+	joinPolicyMu.Lock()
+	defer joinPolicyMu.Unlock()
+	if joinPolicyInitialized {
+		if currentJoinPolicy == p {
+			return nil
+		}
+		return fmt.Errorf("join policy already initialized as %q; cannot re-init as %q", currentJoinPolicy, p)
+	}
+	currentJoinPolicy = p
+	joinPolicyInitialized = true
+	return nil
+}
+
+// InitJoinPolicyFromEnv reads TF_DEFAULT_JOIN_POLICY from the
+// environment and initializes the join policy accordingly. Empty /
+// unset → JoinPolicyPersonalOrgOnSignup (the safe default).
+//
+// Only meaningful in multi mode — local mode bootstrap is fully
+// determined by the existing sentinel-org seed and never consults
+// this knob. main.go gates the call accordingly.
+func InitJoinPolicyFromEnv() error {
+	p, err := JoinPolicyFromEnv(os.Getenv("TF_DEFAULT_JOIN_POLICY"))
+	if err != nil {
+		return err
+	}
+	return InitJoinPolicy(p)
+}
+
+// JoinPolicyFromEnv parses a TF_DEFAULT_JOIN_POLICY env-var string
+// into a JoinPolicy. Empty maps to the default
+// (JoinPolicyPersonalOrgOnSignup); known values map to their
+// constants; anything else errors. The match is exact, not
+// case-insensitive — the values are dashed kebab strings written by
+// operators into .env files, and silently accepting "Personal-Org-On-Signup"
+// would hide drift between docs and code.
+func JoinPolicyFromEnv(s string) (JoinPolicy, error) {
+	switch s {
+	case "":
+		return JoinPolicyPersonalOrgOnSignup, nil
+	case string(JoinPolicyPersonalOrgOnSignup):
+		return JoinPolicyPersonalOrgOnSignup, nil
+	case string(JoinPolicyAutoJoinDefault):
+		return JoinPolicyAutoJoinDefault, nil
+	case string(JoinPolicyInviteOnly):
+		return JoinPolicyInviteOnly, nil
+	default:
+		return "", fmt.Errorf("unknown TF_DEFAULT_JOIN_POLICY=%q (want %q, %q, or %q)",
+			s, JoinPolicyPersonalOrgOnSignup, JoinPolicyAutoJoinDefault, JoinPolicyInviteOnly)
+	}
+}

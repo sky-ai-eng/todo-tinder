@@ -269,24 +269,23 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SKY-313: default the session's active_org_id to the user's
-	// earliest membership (created_at ASC, org_id ASC as deterministic
-	// tiebreak). Zero memberships → Valid=false → row stores NULL and
-	// handlers 409 until the user calls POST /api/me/active-org.
-	// Admin pool — this read is part of the auth flow itself, before a
-	// claim context is installed for app-pool RLS.
-	var defaultOrg uuid.NullUUID
-	if oerr := s.db.QueryRowContext(r.Context(), `
-		SELECT org_id
-		  FROM public.org_memberships
-		 WHERE user_id = $1
-		 ORDER BY created_at ASC, org_id ASC
-		 LIMIT 1
-	`, userUUID).Scan(&defaultOrg); oerr != nil && !errors.Is(oerr, sql.ErrNoRows) {
-		log.Printf("[auth] default org lookup for user %s: %v", userUUID, oerr)
+	// SKY-345: apply the configured join policy when the user has
+	// zero memberships. provisionUserOrgs is idempotent against retry
+	// (advisory lock + inside-tx zero-membership check), so a callback
+	// double-fire never produces duplicate personal orgs. Returns the
+	// active-org id the session should default to; uuid.NullUUID stays
+	// invalid when the policy is invite-only and no auto-join happened.
+	//
+	// Errors here fail the signup loudly — half-provisioned state would
+	// be worse than a single retry-able 500 (the next callback re-runs
+	// the dance cleanly).
+	provResult, err := s.provisionUserOrgs(r.Context(), userUUID, claims)
+	if err != nil {
+		log.Printf("[auth] provision orgs for user %s: %v", userUUID, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	defaultOrg := provResult.activeOrgID
 
 	// Trust the JWT's exp claim. The exchange response also carries
 	// expires_in, but the signed claim is authoritative and the
@@ -525,6 +524,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		JiraDisplayName string   `json:"jira_display_name,omitempty"`
 		Orgs            []orgRow `json:"orgs"`
 		ActiveOrgID     string   `json:"active_org_id,omitempty"`
+		// JoinPolicy surfaces the instance's TF_DEFAULT_JOIN_POLICY so
+		// the frontend's /no-orgs rare-state page can render the right
+		// copy (admin-gated vs catch-all) without a second round trip.
+		// SKY-345.
+		JoinPolicy string `json:"join_policy,omitempty"`
 	}
 
 	// Local-mode shim path: withSession injects a synthetic claim
@@ -553,6 +557,9 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 				Role: "owner",
 			}},
 			ActiveOrgID: runmode.LocalDefaultOrgID,
+			// Local mode never reads TF_DEFAULT_JOIN_POLICY; omit the
+			// field so the frontend doesn't reason about a policy that
+			// doesn't apply.
 		}
 		// s.users is wired by New(). The middleware-shim unit test
 		// constructs a bare &Server{} to exercise the sentinel path
@@ -571,6 +578,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	var resp response
 	resp.Orgs = []orgRow{}
 	resp.Email = claims.Email
+	resp.JoinPolicy = string(runmode.JoinPolicyCurrent())
 	if sess := SessionFrom(r.Context()); sess != nil && sess.ActiveOrgID.Valid {
 		resp.ActiveOrgID = sess.ActiveOrgID.UUID.String()
 	}

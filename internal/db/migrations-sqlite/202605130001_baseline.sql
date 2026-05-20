@@ -96,6 +96,11 @@ CREATE TABLE orgs (
     id         TEXT PRIMARY KEY,
     slug       TEXT NOT NULL UNIQUE,
     name       TEXT NOT NULL,
+    -- SKY-345 mirror of orgs.is_personal in the Postgres baseline.
+    -- Local mode only ever creates the single LocalDefaultOrg seed row
+    -- (is_personal=0); the column exists so any cross-backend SELECT
+    -- against orgs can reference it without dialect-specific branching.
+    is_personal INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

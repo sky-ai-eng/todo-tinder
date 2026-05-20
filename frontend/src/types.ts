@@ -336,6 +336,10 @@ export interface MeResponse {
    *  when the session has no active org (zero memberships, or the
    *  previously-selected org membership was revoked). */
   active_org_id?: string
+  /** Instance-level TF_DEFAULT_JOIN_POLICY (SKY-345). Drives the
+   *  /no-orgs rare-state copy when the user has zero memberships.
+   *  Absent in local mode, where signup-policy doesn't apply. */
+  join_policy?: 'personal-org-on-signup' | 'auto-join-default' | 'invite-only'
 }
 
 /** GET /api/team/members row. Backs Variant B's searchable multi-select.
