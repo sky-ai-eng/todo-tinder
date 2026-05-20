@@ -259,9 +259,8 @@
   <div class="step">
     <div class="step-num">1</div>
     <h3>Compose fixes applied</h3>
-    <p>Three bugs in the current <code>docker-compose.yml</code> need patching before multi-mode boots cleanly. All three are documented at the bottom of this doc; check that the local copy reflects them before continuing.</p>
+    <p>Two bugs in the current <code>docker-compose.yml</code> need patching before multi-mode boots cleanly. Both are documented at the bottom of this doc; check that the local copy reflects them before continuing.</p>
     <ul>
-      <li><code>TF_AUTO_JWK_INIT: "1"</code> on the <code>triagefactory</code> service</li>
       <li><code>$$</code> escapes on the two password vars in <code>postgres-postinit</code></li>
       <li><code>TF_DATABASE_URL</code> connects as <code>supabase_admin</code>, not <code>postgres</code></li>
     </ul>
@@ -269,7 +268,7 @@
   <div class="step">
     <div class="step-num">2</div>
     <h3><code>.env</code> populated</h3>
-    <p>All eight vars in <code>.env.example</code> filled in, plus the auto-appended JWT keys:</p>
+    <p>All eight vars in <code>.env.example</code> filled in, plus the two JWT keys appended by running <code>./triagefactory jwk-init --write-env .env</code> <strong>on the host before</strong> <code>docker compose up</code> (the container entrypoint deliberately doesn't generate these — GoTrue runs in a separate container and reads them from compose's interpolation of <code>.env</code>):</p>
     <pre><code>POSTGRES_PASSWORD
 SUPABASE_AUTH_ADMIN_PASSWORD
 TF_PUBLIC_URL
@@ -278,8 +277,8 @@ GH_CLIENT_SECRET        # ← real values from step 3
 TF_SESSION_ENCRYPTION_KEY
 TF_COOKIE_SECRET
 TF_AUTHENTICATOR_PASSWORD
-GOTRUE_JWT_KEYS         # auto via jwk-init
-GOTRUE_JWT_SECRET       # auto via jwk-init</code></pre>
+GOTRUE_JWT_KEYS         # via host-side `triagefactory jwk-init --write-env .env`
+GOTRUE_JWT_SECRET       # appended by the same command</code></pre>
   </div>
 </div>
 
@@ -337,7 +336,7 @@ curl -s http://localhost:3000/api/health
       <div class="title"><span class="pill host">TF</span> initiates the flow</div>
       <div class="url">GET /api/auth/oauth/github?return_to=/</div>
       <div class="note">
-        Server generates a PKCE code_verifier + CSRF state token, encrypts them into an HttpOnly cookie (<code>tf_oauth_state</code>, AES-GCM via <code>TF_COOKIE_SECRET</code>), then 302s the browser to GoTrue's <code>/auth/v1/authorize</code> with the matching <code>code_challenge</code>.
+        Server generates a PKCE code_verifier + CSRF state token, packs them into a short-lived HttpOnly cookie (<code>tf_oauth_state</code>) HMAC-SHA256-signed with <code>TF_COOKIE_SECRET</code> as the MAC key — integrity only, no confidentiality, so the cookie body is base64-encoded JSON the browser could read but not forge. Then 302s the browser to GoTrue's <code>/auth/v1/authorize</code> with the matching <code>code_challenge</code>.
       </div>
     </div>
   </div>
@@ -446,7 +445,7 @@ curl -s -b "sid=$SID" http://localhost:3000/api/me
       <td><code>tf_oauth_state</code> cookie<br/><span class="pill">HttpOnly, 10min</span></td>
       <td>browser</td>
       <td>TF, in <code>/api/auth/oauth/github</code></td>
-      <td>Carries PKCE code_verifier + CSRF state across the redirect bounce so the callback can validate origin.</td>
+      <td>Carries PKCE code_verifier + CSRF state across the redirect bounce so the callback can validate origin. HMAC-SHA256 signed with <code>TF_COOKIE_SECRET</code> — integrity, not confidentiality.</td>
     </tr>
     <tr>
       <td><code>sid</code> cookie<br/><span class="pill">HttpOnly, 30d</span></td>
@@ -524,19 +523,11 @@ curl -s -b "sid=$SID" http://localhost:3000/api/me
 
 <hr/>
 
-<h2>Appendix · The three compose fixes</h2>
+<h2>Appendix · The two compose fixes</h2>
 
-<p>These are the patches I applied locally during the Tier 1 + 2 smoke. Apply before bringing the stack up; otherwise the auth flow can't even begin.</p>
+<p>These are the patches surfaced during the Tier 1 + 2 smoke. Apply before bringing the stack up; otherwise the auth flow can't even begin.</p>
 
-<h3>1. Add <code>TF_AUTO_JWK_INIT</code> to the <code>triagefactory</code> service</h3>
-<pre>  triagefactory:
-    environment:
-      TF_MODE: multi
-+     TF_AUTO_JWK_INIT: "1"   # headless first-boot generates the keypair
-      TF_DATABASE_URL: ...</pre>
-<p class="note">Without this, the entrypoint hits the "no keypair, no TTY, no auto-init" branch and exits. The compose default is detach-mode (<code>up -d</code>) which has no TTY — needs the env-driven path.</p>
-
-<h3>2. Escape <code>$</code> in the postgres-postinit heredoc</h3>
+<h3>1. Escape <code>$</code> in the postgres-postinit heredoc</h3>
 <pre>  postgres-postinit:
     command:
       - |
@@ -551,7 +542,7 @@ curl -s -b "sid=$SID" http://localhost:3000/api/me
         SQL</pre>
 <p class="note">Without <code>$$</code>, compose substitutes <code>$AUTHENTICATOR_PASSWORD</code> from the <em>host</em> env at parse time. Host env doesn't have that name (we only set <code>TF_AUTHENTICATOR_PASSWORD</code>), so it interpolates to empty string and the <code>ALTER ROLE</code> sets an empty password.</p>
 
-<h3>3. Connect as <code>supabase_admin</code> for <code>TF_DATABASE_URL</code></h3>
+<h3>2. Connect as <code>supabase_admin</code> for <code>TF_DATABASE_URL</code></h3>
 <pre>  triagefactory:
     environment:
 -     TF_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?...}@postgres:5432/postgres

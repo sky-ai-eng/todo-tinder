@@ -186,12 +186,6 @@ services:
       postgres-postinit: { condition: service_completed_successfully }
     environment:
       TF_MODE: multi
-      # Headless first-boot: entrypoint.sh auto-generates the GoTrue
-      # keypair on volumes that don't yet have one. Operators wanting
-      # the interactive `[y/N]` prompt can run `docker run -it
-      # tf:image` once before `docker compose up -d`, but compose's
-      # default detach-mode boot needs the auto-init flag set.
-      TF_AUTO_JWK_INIT: "1"
       # supabase_admin is the real superuser in the supabase/postgres
       # image; the `postgres` role is demoted by the image's bundled
       # migrations and supautils blocks reserved-role ALTERs from it.
