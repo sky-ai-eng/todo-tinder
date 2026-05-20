@@ -37,12 +37,22 @@ services:
     #     (vault is what D5 / SKY-249 uses for per-org secrets)
     #   - the authenticator / anon / authenticated / service_role pattern
     #     for D9's RLS app pool to lean on
-    # Two distinct passwords by design:
-    #   POSTGRES_PASSWORD            -> `postgres` superuser (migrations, admin)
+    # Three distinct passwords by design:
+    #   POSTGRES_PASSWORD            -> shared by `postgres` AND
+    #                                   `supabase_admin` (image initdb
+    #                                   convention). `postgres` is
+    #                                   demoted to non-superuser by the
+    #                                   image's bundled migrations;
+    #                                   `supabase_admin` is the effective
+    #                                   superuser TF connects as for
+    #                                   migrations + admin pool.
     #   SUPABASE_AUTH_ADMIN_PASSWORD -> GoTrue's DB user (auth.* CRUD only)
-    # Keeping them separate means a GoTrue compromise doesn't surrender
-    # superuser credentials. D9 adds a third password for the `authenticator`
-    # role that TF's RLS app pool will use.
+    #   TF_AUTHENTICATOR_PASSWORD    -> `authenticator` role, which TF's
+    #                                   RLS-active app pool connects as
+    #                                   (sets LOCAL ROLE tf_app per-tx).
+    # Three separate roles mean a GoTrue compromise doesn't surrender
+    # superuser credentials, and a tenant-side prompt-injection in the
+    # tf_app pool can't escalate to admin.
     image: supabase/postgres:15.14.1.121
     environment:
       # `${VAR:?msg}` makes compose fail-fast if .env wasn't filled in,
