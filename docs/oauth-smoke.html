@@ -541,14 +541,14 @@ curl -s -b "sid=$SID" http://localhost:3000/api/me
         ALTER USER supabase_auth_admin WITH LOGIN PASSWORD :'auth_admin_password';
         ALTER USER authenticator WITH LOGIN PASSWORD :'authenticator_password';
         SQL</pre>
-<p class="note">Without <code>$$</code>, compose substitutes <code>$AUTHENTICATOR_PASSWORD</code> from the <em>host</em> env at parse time. Host env doesn't have that name (we only set <code>TF_AUTHENTICATOR_PASSWORD</code>), so it interpolates to empty string and the <code>ALTER ROLE</code> sets an empty password.</p>
+<p>Without <code>$$</code>, compose substitutes <code>$AUTHENTICATOR_PASSWORD</code> from the <em>host</em> env at parse time. Host env doesn't have that name (we only set <code>TF_AUTHENTICATOR_PASSWORD</code>), so it interpolates to empty string and the <code>ALTER ROLE</code> sets an empty password.</p>
 
 <h3>2. Connect as <code>supabase_admin</code> for <code>TF_DATABASE_URL</code></h3>
 <pre>  triagefactory:
     environment:
 -     TF_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?...}@postgres:5432/postgres
 +     TF_DATABASE_URL: postgres://supabase_admin:${POSTGRES_PASSWORD:?...}@postgres:5432/postgres</pre>
-<p class="note">The supabase/postgres image demotes <code>postgres</code> to non-superuser and supautils blocks reserved-role ALTERs from it. The migration baseline uses <code>ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin</code> which requires supabase_admin membership. Per <code>internal/db/postgres/store.go:20-26</code>, <code>TF_DATABASE_URL</code> is the admin pool DSN by design and should always be <code>supabase_admin</code>. Same password (POSTGRES_PASSWORD is shared by the supabase image's initdb convention).</p>
+<p>The supabase/postgres image demotes <code>postgres</code> to non-superuser and supautils blocks reserved-role ALTERs from it. The migration baseline uses <code>ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin</code> which requires supabase_admin membership. Per <code>internal/db/postgres/store.go:20-26</code>, <code>TF_DATABASE_URL</code> is the admin pool DSN by design and should always be <code>supabase_admin</code>. Same password (POSTGRES_PASSWORD is shared by the supabase image's initdb convention).</p>
 
 </div>
 </body>
