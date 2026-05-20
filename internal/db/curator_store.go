@@ -94,4 +94,32 @@ type CuratorStore interface {
 	// Used on terminal `cancelled` or `failed`. See the package-
 	// level helper for the merge semantics.
 	RevertPendingContext(ctx context.Context, orgID, requestID string) error
+
+	// InsertPendingContext queues a context-change delta for the
+	// next curator dispatch on (orgID, projectID, sessionID,
+	// changeType). Coalescing is enforced by the partial unique
+	// index on (project_id, curator_session_id, change_type)
+	// WHERE consumed_at IS NULL: a second PATCH between user
+	// messages hits ON CONFLICT DO NOTHING and the *earliest*
+	// baseline_value wins, which is the correct "snapshot before
+	// the first unconsumed change" anchor for diffing at consume
+	// time. baselineJSON must be a JSON-encoded representation of
+	// the value before the PATCH applied.
+	//
+	// Caller is responsible for ensuring sessionID is non-empty —
+	// there is no point queueing pending rows for a project whose
+	// Curator has never been spun up.
+	InsertPendingContext(ctx context.Context, orgID, projectID, sessionID, changeType, baselineJSON string) error
+
+	// ListPendingContext returns every row for a project regardless
+	// of consumed status, ordered by created_at. Used by the
+	// project-bundle export to inspect outstanding deltas.
+	ListPendingContext(ctx context.Context, orgID, projectID string) ([]domain.CuratorPendingContext, error)
+
+	// DeletePendingContextForSession removes every pending or
+	// consumed row for a (projectID, sessionID). Used when the
+	// session is reset so the new session's envelope renders
+	// current values directly without phantom deltas describing
+	// transitions the new agent never witnessed.
+	DeletePendingContextForSession(ctx context.Context, orgID, projectID, sessionID string) error
 }

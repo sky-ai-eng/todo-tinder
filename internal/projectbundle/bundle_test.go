@@ -130,7 +130,7 @@ func seedFixture(t *testing.T, database *sql.DB, projectName string) fixture {
 	if err != nil {
 		t.Fatalf("insert curator message: %v", err)
 	}
-	if err := db.InsertPendingContext(database, projectID, sessionID, domain.ChangeTypePinnedRepos, `["sky-ai-eng/triage-factory"]`); err != nil {
+	if err := sqlitestore.New(database).Curator.InsertPendingContext(t.Context(), runmode.LocalDefaultOrg, projectID, sessionID, domain.ChangeTypePinnedRepos, `["sky-ai-eng/triage-factory"]`); err != nil {
 		t.Fatalf("insert pending context: %v", err)
 	}
 
@@ -180,7 +180,7 @@ func seedFixture(t *testing.T, database *sql.DB, projectName string) fixture {
 
 func exportFixtureBundle(t *testing.T, database *sql.DB, projectID string) []byte {
 	t.Helper()
-	reader, err := Export(context.Background(), database, sqlitestore.New(database).Projects, runmode.LocalDefaultOrg, projectID)
+	reader, err := Export(context.Background(), database, sqlitestore.New(database).Projects, sqlitestore.New(database).Curator, runmode.LocalDefaultOrg, projectID)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestImport_RoundTripSessionTreeAndCompactions(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 imported message, got %d", len(msgs))
 	}
-	pending, err := db.ListPendingContext(targetDB, imported.ID)
+	pending, err := sqlitestore.New(targetDB).Curator.ListPendingContext(t.Context(), runmode.LocalDefaultOrg, imported.ID)
 	if err != nil {
 		t.Fatalf("list pending context: %v", err)
 	}

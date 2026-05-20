@@ -35,7 +35,7 @@ type exportState struct {
 	sessionInZip bool
 }
 
-func collectExportState(ctx context.Context, database *sql.DB, projects db.ProjectStore, orgID, projectID string) (*exportState, error) {
+func collectExportState(ctx context.Context, database *sql.DB, projects db.ProjectStore, curatorStore db.CuratorStore, orgID, projectID string) (*exportState, error) {
 	project, err := projects.Get(ctx, orgID, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("load project: %w", err)
@@ -84,7 +84,7 @@ func collectExportState(ctx context.Context, database *sql.DB, projects db.Proje
 		}
 	}
 
-	if err := appendCuratorArtifacts(database, project.ID, &state.artifacts); err != nil {
+	if err := appendCuratorArtifacts(ctx, database, curatorStore, orgID, project.ID, &state.artifacts); err != nil {
 		return nil, err
 	}
 
@@ -195,7 +195,7 @@ func appendSessionArtifacts(resolvedProjectRoot, curatorSessionID string, out *[
 	return true, nil
 }
 
-func appendCuratorArtifacts(database *sql.DB, projectID string, out *[]bundleArtifact) error {
+func appendCuratorArtifacts(ctx context.Context, database *sql.DB, curatorStore db.CuratorStore, orgID, projectID string, out *[]bundleArtifact) error {
 	requests, err := db.ListCuratorRequestsByProject(database, projectID)
 	if err != nil {
 		return fmt.Errorf("list curator requests: %w", err)
@@ -232,7 +232,7 @@ func appendCuratorArtifacts(database *sql.DB, projectID string, out *[]bundleArt
 		content:    messageBytes,
 	})
 
-	pending, err := db.ListPendingContext(database, projectID)
+	pending, err := curatorStore.ListPendingContext(ctx, orgID, projectID)
 	if err != nil {
 		return fmt.Errorf("list curator pending context: %w", err)
 	}

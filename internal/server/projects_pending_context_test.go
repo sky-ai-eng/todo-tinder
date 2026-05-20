@@ -42,7 +42,7 @@ func TestProjectPatch_QueuesPinnedRepoChange(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
 
-	rows, err := db.ListPendingContext(s.db, id)
+	rows, err := s.curatorStore.ListPendingContext(t.Context(), runmode.LocalDefaultOrg, id)
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestProjectPatch_NoQueueWithoutSession(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
-	rows, _ := db.ListPendingContext(s.db, id)
+	rows, _ := s.curatorStore.ListPendingContext(t.Context(), runmode.LocalDefaultOrg, id)
 	if len(rows) != 0 {
 		t.Errorf("expected 0 pending rows for session-less project, got %d (%+v)", len(rows), rows)
 	}
@@ -108,7 +108,7 @@ func TestProjectPatch_NoQueueWhenNothingChanged(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
-	rows, _ := db.ListPendingContext(s.db, id)
+	rows, _ := s.curatorStore.ListPendingContext(t.Context(), runmode.LocalDefaultOrg, id)
 	if len(rows) != 0 {
 		t.Errorf("no-op PATCH queued %d rows: %+v", len(rows), rows)
 	}
@@ -142,7 +142,7 @@ func TestProjectPatch_CoalescesRepeatedPATCHes(t *testing.T) {
 		t.Fatalf("second patch: %d %s", rec.Code, rec.Body.String())
 	}
 
-	rows, _ := db.ListPendingContext(s.db, id)
+	rows, _ := s.curatorStore.ListPendingContext(t.Context(), runmode.LocalDefaultOrg, id)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 coalesced row, got %d (%+v)", len(rows), rows)
 	}
@@ -214,7 +214,7 @@ func TestProjectPatch_NoQueueOnPureReorder(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
 
-	rows, _ := db.ListPendingContext(s.db, id)
+	rows, _ := s.curatorStore.ListPendingContext(t.Context(), runmode.LocalDefaultOrg, id)
 	if len(rows) != 0 {
 		t.Errorf("reorder PATCH queued %d rows (set semantics broken): %+v", len(rows), rows)
 	}
@@ -245,7 +245,7 @@ func TestProjectPatch_QueuesJiraChange(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
 
-	rows, _ := db.ListPendingContext(s.db, id)
+	rows, _ := s.curatorStore.ListPendingContext(t.Context(), runmode.LocalDefaultOrg, id)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 pending row, got %d", len(rows))
 	}

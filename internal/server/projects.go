@@ -219,7 +219,7 @@ func (s *Server) handleProjectExportPreview(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	id := r.PathValue("id")
-	preview, err := projectbundle.Preview(r.Context(), s.db, s.projects, orgID, id)
+	preview, err := projectbundle.Preview(r.Context(), s.db, s.projects, s.curatorStore, orgID, id)
 	if err != nil {
 		if errors.Is(err, projectbundle.ErrProjectNotFound) {
 			notFound(w, "project")
@@ -251,7 +251,7 @@ func (s *Server) handleProjectExport(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "project")
 		return
 	}
-	stream, err := projectbundle.Export(r.Context(), s.db, s.projects, orgID, id)
+	stream, err := projectbundle.Export(r.Context(), s.db, s.projects, s.curatorStore, orgID, id)
 	if err != nil {
 		if errors.Is(err, projectbundle.ErrProjectNotFound) {
 			notFound(w, "project")
@@ -532,7 +532,16 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 	// baseline_value, which is the correct anchor for diffing at
 	// consume time. SKY-224.
 	if existing.CuratorSessionID != "" {
-		queuePendingContextChanges(s.db, *existing, updated)
+		// Wrap under the request user's claims so the Postgres impl's
+		// InsertPendingContext sees tf.current_user_id() for the NOT
+		// NULL creator_user_id bind and for the curator_pending_context_modify
+		// RLS WITH CHECK predicate. SQLite ignores the claims.
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			queuePendingContextChanges(r.Context(), tx.Curator, orgID, *existing, updated)
+			return nil
+		}); err != nil {
+			log.Printf("[projects] queue pending context for %s: %v", id, err)
+		}
 	}
 	var fresh *domain.Project
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
@@ -782,7 +791,7 @@ func validateTrackerKeys(cfg config.Config, jiraKey, linearKey string) (string, 
 // strictly worse.
 //
 // SKY-224.
-func queuePendingContextChanges(database *sql.DB, before, after domain.Project) {
+func queuePendingContextChanges(ctx context.Context, curatorStore db.CuratorStore, orgID string, before, after domain.Project) {
 	sessionID := after.CuratorSessionID
 	if sessionID == "" {
 		return
@@ -791,7 +800,7 @@ func queuePendingContextChanges(database *sql.DB, before, after domain.Project) 
 		baseline, err := curator.EncodeStringSliceBaseline(before.PinnedRepos)
 		if err != nil {
 			log.Printf("[projects] encode pinned-repos baseline for %s: %v", before.ID, err)
-		} else if err := db.InsertPendingContext(database, before.ID, sessionID, domain.ChangeTypePinnedRepos, baseline); err != nil {
+		} else if err := curatorStore.InsertPendingContext(ctx, orgID, before.ID, sessionID, domain.ChangeTypePinnedRepos, baseline); err != nil {
 			log.Printf("[projects] queue pinned-repos pending context for %s: %v", before.ID, err)
 		}
 	}
@@ -799,7 +808,7 @@ func queuePendingContextChanges(database *sql.DB, before, after domain.Project) 
 		baseline, err := curator.EncodeNullableStringBaseline(before.JiraProjectKey)
 		if err != nil {
 			log.Printf("[projects] encode jira baseline for %s: %v", before.ID, err)
-		} else if err := db.InsertPendingContext(database, before.ID, sessionID, domain.ChangeTypeJiraProjectKey, baseline); err != nil {
+		} else if err := curatorStore.InsertPendingContext(ctx, orgID, before.ID, sessionID, domain.ChangeTypeJiraProjectKey, baseline); err != nil {
 			log.Printf("[projects] queue jira pending context for %s: %v", before.ID, err)
 		}
 	}
@@ -807,7 +816,7 @@ func queuePendingContextChanges(database *sql.DB, before, after domain.Project) 
 		baseline, err := curator.EncodeNullableStringBaseline(before.LinearProjectKey)
 		if err != nil {
 			log.Printf("[projects] encode linear baseline for %s: %v", before.ID, err)
-		} else if err := db.InsertPendingContext(database, before.ID, sessionID, domain.ChangeTypeLinearProjectKey, baseline); err != nil {
+		} else if err := curatorStore.InsertPendingContext(ctx, orgID, before.ID, sessionID, domain.ChangeTypeLinearProjectKey, baseline); err != nil {
 			log.Printf("[projects] queue linear pending context for %s: %v", before.ID, err)
 		}
 	}
