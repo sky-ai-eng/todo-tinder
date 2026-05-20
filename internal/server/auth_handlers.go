@@ -678,15 +678,23 @@ func upsertUserFromClaims(ctx context.Context, db *sql.DB, userID uuid.UUID, cla
 }
 
 // gotrueRefreshFunc — POST /token?grant_type=refresh_token.
+//
+// Body is JSON, matching the pkce grant — GoTrue's /token handler
+// uses the same JSON-only request parser across grant types.
 func (s *Server) gotrueRefreshFunc(cfg *authConfig) func(context.Context, string) (string, string, int64, error) {
 	return func(ctx context.Context, refreshToken string) (string, string, int64, error) {
-		body := strings.NewReader(url.Values{"refresh_token": {refreshToken}}.Encode())
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			cfg.gotrueURL+"/token?grant_type=refresh_token", body)
+		payload, err := json.Marshal(map[string]string{
+			"refresh_token": refreshToken,
+		})
 		if err != nil {
 			return "", "", 0, err
 		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			cfg.gotrueURL+"/token?grant_type=refresh_token", bytes.NewReader(payload))
+		if err != nil {
+			return "", "", 0, err
+		}
+		req.Header.Set("Content-Type", "application/json")
 		return decodeTokenResponse(req, "refresh")
 	}
 }
@@ -700,16 +708,22 @@ func (s *Server) gotrueRefreshFunc(cfg *authConfig) func(context.Context, string
 // success, the response body carries access_token + refresh_token.
 func (s *Server) gotrueExchangeFunc(cfg *authConfig) func(context.Context, string, string) (string, string, int64, error) {
 	return func(ctx context.Context, authCode, codeVerifier string) (string, string, int64, error) {
-		body := strings.NewReader(url.Values{
-			"auth_code":     {authCode},
-			"code_verifier": {codeVerifier},
-		}.Encode())
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			cfg.gotrueURL+"/token?grant_type=pkce", body)
+		// GoTrue's /token?grant_type=pkce expects a JSON body, not
+		// application/x-www-form-urlencoded — form bodies decode to
+		// an empty struct and the handler errors out with bad_json.
+		payload, err := json.Marshal(map[string]string{
+			"auth_code":     authCode,
+			"code_verifier": codeVerifier,
+		})
 		if err != nil {
 			return "", "", 0, err
 		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			cfg.gotrueURL+"/token?grant_type=pkce", bytes.NewReader(payload))
+		if err != nil {
+			return "", "", 0, err
+		}
+		req.Header.Set("Content-Type", "application/json")
 		return decodeTokenResponse(req, "exchange")
 	}
 }
