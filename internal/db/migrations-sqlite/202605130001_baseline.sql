@@ -269,9 +269,14 @@ CREATE TABLE org_github_app_installations (
     account_type     TEXT NOT NULL CHECK (account_type IN ('Organization','User')),
     account_login    TEXT NOT NULL,
     installed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    removed_at       TIMESTAMP,
-    UNIQUE (org_id, account_login)
+    removed_at       TIMESTAMP
 );
+-- Partial unique on active rows only: uninstall + reinstall cycles
+-- stamp removed_at on the old row and insert a new row with a fresh
+-- installation_id, preserving history without mutating the PK.
+CREATE UNIQUE INDEX org_github_app_installations_active_account_key
+    ON org_github_app_installations (org_id, account_login)
+    WHERE removed_at IS NULL;
 CREATE INDEX org_github_app_installations_org_idx
     ON org_github_app_installations (org_id);
 

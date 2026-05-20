@@ -4957,10 +4957,16 @@ ALTER TABLE ONLY public.org_github_app_installations
     ADD CONSTRAINT org_github_app_installations_pkey PRIMARY KEY (installation_id);
 
 ALTER TABLE ONLY public.org_github_app_installations
-    ADD CONSTRAINT org_github_app_installations_org_login_key UNIQUE (org_id, account_login);
-
-ALTER TABLE ONLY public.org_github_app_installations
     ADD CONSTRAINT org_github_app_installations_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;
+
+-- Partial unique on active rows only: uninstall + reinstall cycles
+-- stamp removed_at on the old row and insert a new row with a fresh
+-- installation_id. The "at most one active install per account" guard
+-- holds without overwriting historical rows (and without mutating the
+-- installation_id PK on a reinstall).
+CREATE UNIQUE INDEX org_github_app_installations_active_account_key
+    ON public.org_github_app_installations (org_id, account_login)
+    WHERE (removed_at IS NULL);
 
 CREATE INDEX org_github_app_installations_org_idx
     ON public.org_github_app_installations (org_id);
