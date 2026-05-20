@@ -35,7 +35,7 @@ func newAgentStore(q, _ queryer) db.AgentStore { return &agentStore{q: q} }
 var _ db.AgentStore = (*agentStore)(nil)
 
 const sqliteAgentColumns = `id, display_name, default_model, default_autonomy_suitability,
-       github_app_installation_id, github_pat_user_id, jira_service_account_id,
+       github_pat_user_id, jira_service_account_id,
        created_at, updated_at`
 
 func (s *agentStore) GetForOrgSystem(ctx context.Context, orgID string) (*domain.Agent, error) {
@@ -73,7 +73,7 @@ func (s *agentStore) Create(ctx context.Context, orgID string, a domain.Agent) (
 	// shape just keeps "the local bot has the local user's identity"
 	// true from the moment the row appears.
 	patUser := a.GitHubPATUserID
-	if patUser == "" && a.GitHubAppInstallationID == "" && orgID == runmode.LocalDefaultOrgID {
+	if patUser == "" && orgID == runmode.LocalDefaultOrgID {
 		patUser = runmode.LocalDefaultUserID
 	}
 	// INSERT OR IGNORE handles the idempotency case where the row
@@ -82,11 +82,11 @@ func (s *agentStore) Create(ctx context.Context, orgID string, a domain.Agent) (
 	_, err := s.q.ExecContext(ctx, `
 		INSERT OR IGNORE INTO agents
 			(id, org_id, display_name, default_model, default_autonomy_suitability,
-			 github_app_installation_id, github_pat_user_id, jira_service_account_id,
+			 github_pat_user_id, jira_service_account_id,
 			 created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, id, orgID, displayName, nullString(a.DefaultModel), a.DefaultAutonomySuitability,
-		nullString(a.GitHubAppInstallationID), nullString(patUser), nullString(a.JiraServiceAccountID),
+		nullString(patUser), nullString(a.JiraServiceAccountID),
 		now, now)
 	if err != nil {
 		return "", err
@@ -116,21 +116,6 @@ func (s *agentStore) Update(ctx context.Context, orgID string, a domain.Agent) e
 	return err
 }
 
-func (s *agentStore) SetGitHubAppInstallation(ctx context.Context, orgID, agentID, installationID string) error {
-	// Clear the PAT-borrow FK in the same statement so the "at most
-	// one credential source" invariant holds. Empty installationID is
-	// allowed (caller wiring an org out of App-mode back to PAT-borrow
-	// will use SetGitHubPATUser instead, but this stays defensive).
-	_, err := s.q.ExecContext(ctx, `
-		UPDATE agents
-		SET github_app_installation_id = ?,
-		    github_pat_user_id = NULL,
-		    updated_at = ?
-		WHERE org_id = ? AND id = ?
-	`, nullString(installationID), time.Now().UTC(), orgID, agentID)
-	return err
-}
-
 func (s *agentStore) SetGitHubPATUser(ctx context.Context, orgID, agentID, userID string) error {
 	// Match the Postgres impl's input contract: empty = intentional
 	// clear, valid UUID = intentional set, anything else is a caller
@@ -144,7 +129,6 @@ func (s *agentStore) SetGitHubPATUser(ctx context.Context, orgID, agentID, userI
 	_, err := s.q.ExecContext(ctx, `
 		UPDATE agents
 		SET github_pat_user_id = ?,
-		    github_app_installation_id = NULL,
 		    updated_at = ?
 		WHERE org_id = ? AND id = ?
 	`, nullString(userID), time.Now().UTC(), orgID, agentID)
@@ -171,10 +155,10 @@ func nullString(s string) any {
 
 func scanAgentRow(row *sql.Row) (domain.Agent, error) {
 	var a domain.Agent
-	var defaultModel, ghApp, ghPATUser, jiraSvc sql.NullString
+	var defaultModel, ghPATUser, jiraSvc sql.NullString
 	var defAutonomy sql.NullFloat64
 	if err := row.Scan(&a.ID, &a.DisplayName, &defaultModel, &defAutonomy,
-		&ghApp, &ghPATUser, &jiraSvc, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		&ghPATUser, &jiraSvc, &a.CreatedAt, &a.UpdatedAt); err != nil {
 		return a, err
 	}
 	a.DefaultModel = defaultModel.String
@@ -182,7 +166,6 @@ func scanAgentRow(row *sql.Row) (domain.Agent, error) {
 		v := defAutonomy.Float64
 		a.DefaultAutonomySuitability = &v
 	}
-	a.GitHubAppInstallationID = ghApp.String
 	a.GitHubPATUserID = ghPATUser.String
 	a.JiraServiceAccountID = jiraSvc.String
 	return a, nil

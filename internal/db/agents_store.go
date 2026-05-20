@@ -23,17 +23,21 @@ import (
 //     Create with admin-pool routing in Postgres because at org-create
 //     time no org_memberships row exists yet for the founder and the
 //     agents_insert RLS policy would refuse.
-//   - Future admin UI (SKY-257 / D14) — Update + SetGitHubAppInstallation
-//   - SetGitHubPATUser via the app pool, admin-gated by RLS.
-//   - D11 (GitHub App install flow, SKY-263) — SetGitHubAppInstallation
-//     after the OAuth dance completes.
+//   - Future admin UI (SKY-257 / D14) — Update + SetGitHubPATUser via
+//     the app pool, admin-gated by RLS.
 //   - D-Claims (SKY-261) + delegate spawner — GetForOrg on every run
 //     dispatch to pick the credential source.
 //
+// GitHub App identity is no longer modelled on agents — per-org
+// registration + installation tracking lives in the org_github_apps /
+// org_github_app_installations tables. A single text column on agents
+// couldn't model the 1:N installation fan-out per org. The credential
+// resolver reads those tables directly.
+//
 // # Pool split (Postgres)
 //
-//   - app pool — tf_app, RLS-active. GetForOrg, Update, SetGitHubApp*,
-//     SetGitHubPATUser. agents_select gates reads by org access;
+//   - app pool — tf_app, RLS-active. GetForOrg, Update, SetGitHubPATUser.
+//     agents_select gates reads by org access;
 //     agents_insert/agents_update/agents_delete each gate writes by
 //     tf.user_is_org_admin(org_id).
 //   - admin pool — supabase_admin, BYPASSRLS. Create only. Justified
@@ -67,22 +71,14 @@ type AgentStore interface {
 
 	// Update changes the agent's mutable metadata: display name,
 	// default model, default autonomy threshold, Jira service account.
-	// Credential FKs use SetGitHubAppInstallation / SetGitHubPATUser
-	// instead so the "exactly one credential source" invariant is
-	// enforced at a smaller surface. Admin-only in Postgres via RLS.
-	// No-op on invalid UUID in Postgres (matches SQLite TEXT-keyed
+	// The credential FK uses SetGitHubPATUser at a smaller surface
+	// rather than letting Update touch it. Admin-only in Postgres via
+	// RLS. No-op on invalid UUID in Postgres (matches SQLite TEXT-keyed
 	// semantics).
 	Update(ctx context.Context, orgID string, a domain.Agent) error
 
-	// SetGitHubAppInstallation writes the GitHub App install id and
-	// clears github_pat_user_id in the same statement so the "at most
-	// one credential source" invariant holds. Owned by D11 (SKY-263).
-	// Admin-only in Postgres.
-	SetGitHubAppInstallation(ctx context.Context, orgID, agentID, installationID string) error
-
-	// SetGitHubPATUser sets the fallback PAT-borrow user FK and
-	// clears github_app_installation_id. Used by local install (where
-	// userID is always "" because there's no users table) and by
+	// SetGitHubPATUser sets the PAT-borrow user FK. Used by local
+	// install (where userID is the sentinel local user) and by
 	// multi-mode small-org fallback. Admin-only in Postgres.
 	SetGitHubPATUser(ctx context.Context, orgID, agentID, userID string) error
 

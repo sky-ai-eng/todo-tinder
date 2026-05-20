@@ -235,7 +235,6 @@ CREATE TABLE agents (
     display_name                  TEXT NOT NULL DEFAULT 'Triage Factory Bot',
     default_model                 TEXT,
     default_autonomy_suitability  REAL,
-    github_app_installation_id    TEXT,
     github_pat_user_id            TEXT REFERENCES users(id) ON DELETE SET NULL,
     jira_service_account_id       TEXT,
     created_at                    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -243,6 +242,43 @@ CREATE TABLE agents (
     UNIQUE (org_id)
 );
 CREATE UNIQUE INDEX agents_id_org_unique ON agents (id, org_id);
+
+-- === Per-org GitHub App registration =====================================
+-- Mirrors public.org_github_apps + public.org_github_app_installations in
+-- the Postgres baseline (RLS-free; SQLite has one connection). Per-org
+-- App registration is the v1 multi-mode default — local mode never
+-- writes here (the credential resolver falls through to tier 3, PAT-
+-- borrow via agents.github_pat_user_id), but the tables exist so the
+-- cross-backend conformance tests can exercise the same schema.
+CREATE TABLE org_github_apps (
+    org_id                 TEXT PRIMARY KEY REFERENCES orgs(id) ON DELETE CASCADE,
+    app_id                 TEXT NOT NULL UNIQUE,
+    slug                   TEXT NOT NULL,
+    client_id              TEXT NOT NULL,
+    client_secret_ref      TEXT NOT NULL,
+    pem_ref                TEXT NOT NULL,
+    webhook_secret_ref     TEXT NOT NULL,
+    registered_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    registered_by_user_id  TEXT REFERENCES users(id) ON DELETE SET NULL,
+    active                 INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE org_github_app_installations (
+    installation_id  TEXT PRIMARY KEY,
+    org_id           TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    account_type     TEXT NOT NULL CHECK (account_type IN ('Organization','User')),
+    account_login    TEXT NOT NULL,
+    installed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    removed_at       TIMESTAMP
+);
+-- Partial unique on active rows only: uninstall + reinstall cycles
+-- stamp removed_at on the old row and insert a new row with a fresh
+-- installation_id, preserving history without mutating the PK.
+CREATE UNIQUE INDEX org_github_app_installations_active_account_key
+    ON org_github_app_installations (org_id, account_login)
+    WHERE removed_at IS NULL;
+CREATE INDEX org_github_app_installations_org_idx
+    ON org_github_app_installations (org_id);
 
 CREATE TABLE team_agents (
     team_id                        TEXT NOT NULL REFERENCES teams(id)  ON DELETE CASCADE,
