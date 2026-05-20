@@ -260,8 +260,14 @@ func TestAlpineRootfsForArch_UnsupportedErrors(t *testing.T) {
 // reuse the other arch's extracted rootfs — the binaries are wrong-arch
 // and the sandbox would fail at first exec.
 func TestRootfsCacheKey_PerArchSeparate(t *testing.T) {
-	_, shaAmd, _ := alpineRootfsForArch("amd64")
-	_, shaArm, _ := alpineRootfsForArch("arm64")
+	_, shaAmd, errAmd := alpineRootfsForArch("amd64")
+	if errAmd != nil {
+		t.Fatalf("amd64: %v", errAmd)
+	}
+	_, shaArm, errArm := alpineRootfsForArch("arm64")
+	if errArm != nil {
+		t.Fatalf("arm64: %v", errArm)
+	}
 	if rootfsCacheKeyFor(shaAmd, apkPackages) == rootfsCacheKeyFor(shaArm, apkPackages) {
 		t.Error("amd64 and arm64 cache keys collide; cross-arch cache pollution risk")
 	}

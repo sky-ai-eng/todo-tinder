@@ -25,11 +25,18 @@
 *.db-wal
 *.db-shm
 
-# Docs and scripts that aren't build inputs
+# Docs and scripts that aren't build inputs. Top-level *.md only —
+# do NOT use a recursive `*.md` exclude here because the Go binary
+# embeds prompt files under internal/**/prompts/*.md via go:embed
+# (e.g. internal/curator/skill.go). A recursive *.md drop would make
+# the go-builder stage fail with `pattern ...: no matching files`.
 /docs
 /scripts
-*.md
-!CLAUDE.md
+/README.md
+/CHANGELOG.md
+/CONTRIBUTING.md
+/CODEOWNERS
+/LICENSE
 
 # Test helpers that aren't needed for the image build
 **/testdata

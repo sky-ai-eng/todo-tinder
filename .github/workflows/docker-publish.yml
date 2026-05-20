@@ -65,12 +65,22 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/triage-factory
+          # Tag rules:
+          #   - sha-<short> on every build, for pin-by-commit consumers.
+          #   - edge on main pushes. type=raw is the right type for a
+          #     constant tag; type=ref derives from the ref name and
+          #     doesn't honor value=, so an earlier draft published
+          #     `:main` instead of `:edge`.
+          #   - v-prefixed semver tags on v* git pushes, matching the
+          #     git tag exactly (`git tag v1.2.3` → `:v1.2.3, :v1.2,
+          #     :v1, :latest`). prefix=v is what makes the docker tag
+          #     match the source-of-truth git tag.
           tags: |
             type=sha,prefix=sha-,format=short
-            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }},value=edge
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build + push multi-arch image

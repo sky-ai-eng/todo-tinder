@@ -46,15 +46,25 @@ FROM --platform=$BUILDPLATFORM node:20-alpine AS sdk-builder
 WORKDIR /sdk-install
 # package-lock.json is the source of truth for transitive deps.
 # wrapper.mjs is the runtime shim the host binary materializes.
+# install.go is consulted ONLY to extract the sdkVersion constant —
+# we don't want to hardcode the version here and let it drift from
+# the Go source. The grep below dies (and fails the build) if the
+# constant moves or changes shape, which is the right failure mode:
+# better a loud build break than a silent runtime SDK reinstall
+# attempt against a runtime layer that has no node/npm.
 COPY internal/agentproc/package-lock.json ./package-lock.json
 COPY internal/agentproc/wrapper.mjs ./wrapper.mjs
-# Inline package.json matching what writePackageJSON emits at runtime.
-# Keep the sdkVersion in sync with internal/agentproc/install.go's
-# sdkVersion constant — a mismatch will cause the runtime check
-# (sdkAlreadyInstalled) to re-trigger the install path.
-ARG SDK_VERSION=0.2.137
-RUN printf '{\n  "name": "triagefactory-sdk-runtime",\n  "private": true,\n  "type": "module",\n  "dependencies": {\n    "@anthropic-ai/claude-agent-sdk": "%s"\n  }\n}\n' "$SDK_VERSION" > package.json && \
-    npm ci --no-audit --no-fund --omit=dev
+COPY internal/agentproc/install.go /tmp/install.go
+RUN set -eu; \
+    SDK_VERSION=$(grep -E '^const sdkVersion = "[^"]+"' /tmp/install.go | sed -E 's/.*"([^"]+)".*/\1/'); \
+    if [ -z "$SDK_VERSION" ]; then \
+        echo "Could not extract sdkVersion from internal/agentproc/install.go" >&2; \
+        exit 1; \
+    fi; \
+    echo "Using sdkVersion=${SDK_VERSION} (from internal/agentproc/install.go)"; \
+    printf '{\n  "name": "triagefactory-sdk-runtime",\n  "private": true,\n  "type": "module",\n  "dependencies": {\n    "@anthropic-ai/claude-agent-sdk": "%s"\n  }\n}\n' "$SDK_VERSION" > package.json; \
+    npm ci --no-audit --no-fund --omit=dev; \
+    rm -f /tmp/install.go
 
 # --- stage 3: static Go binary ----------------------------------------------
 
