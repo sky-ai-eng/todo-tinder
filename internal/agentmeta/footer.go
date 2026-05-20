@@ -25,7 +25,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // Build returns the markdown footer to append to an agent-authored
@@ -53,7 +52,7 @@ import (
 // visibility benefit (the agent has already proven it can act as
 // this run via TRIAGE_FACTORY_RUN_ID → ResolveRunIdentity, and the
 // server path is system-driven).
-func Build(agentRuns db.AgentRunStore, runID, kind string) string {
+func Build(agentRuns db.AgentRunStore, orgID, runID, kind string) string {
 	if runID == "" {
 		return ""
 	}
@@ -65,14 +64,14 @@ func Build(agentRuns db.AgentRunStore, runID, kind string) string {
 	bare := "\n\n---\n" + disclaimer
 
 	ctx := context.Background()
-	run, err := agentRuns.GetSystem(ctx, runmode.LocalDefaultOrg, runID)
+	run, err := agentRuns.GetSystem(ctx, orgID, runID)
 	if err != nil || run == nil {
 		return bare
 	}
 
 	model := prettyModel(run.Model)
 	elapsed := elapsedFromRun(run)
-	cost, costPrefix := costFromRun(ctx, agentRuns, runID, run)
+	cost, costPrefix := costFromRun(ctx, agentRuns, orgID, runID, run)
 
 	return fmt.Sprintf(
 		"\n\n---\n%s\n\nTime: %s | Model: %s | Cost: %s$%.3f",
@@ -104,11 +103,11 @@ func elapsedFromRun(run *domain.AgentRun) string {
 // for the still-running CLI mode. The "~" prefix flags the
 // approximate-from-tokens estimate so a reader can tell apart the
 // settled cost from a live estimate.
-func costFromRun(ctx context.Context, agentRuns db.AgentRunStore, runID string, run *domain.AgentRun) (cost float64, prefix string) {
+func costFromRun(ctx context.Context, agentRuns db.AgentRunStore, orgID, runID string, run *domain.AgentRun) (cost float64, prefix string) {
 	if run.TotalCostUSD != nil {
 		return *run.TotalCostUSD, ""
 	}
-	totals, err := agentRuns.TokenTotalsSystem(ctx, runmode.LocalDefaultOrg, runID)
+	totals, err := agentRuns.TokenTotalsSystem(ctx, orgID, runID)
 	if err != nil {
 		return 0, ""
 	}

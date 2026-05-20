@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 
@@ -8,7 +9,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/domain/events"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -166,11 +166,21 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+	if err != nil {
+		internalError(w, "factory", fmt.Errorf("default team lookup: %w", err))
+		return
+	}
+	if teamID == "" {
+		internalError(w, "factory", fmt.Errorf("org %s has no default team", orgID))
+		return
+	}
+
 	var task *domain.Task
 	var created bool
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
-		task, created, e = tx.Tasks.FindOrCreate(r.Context(), orgID, runmode.LocalDefaultTeamID, req.EntityID, req.EventType, req.DedupKey, primaryEvent.ID, defaultPriority)
+		task, created, e = tx.Tasks.FindOrCreate(r.Context(), orgID, teamID, req.EntityID, req.EventType, req.DedupKey, primaryEvent.ID, defaultPriority)
 		if e != nil {
 			return e
 		}

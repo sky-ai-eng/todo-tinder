@@ -172,6 +172,14 @@ type Stores struct {
 	// a cross-org system-service read.
 	Orgs OrgsStore
 
+	// Teams owns the teams table — the membership unit inside an
+	// org. Request handlers synthesizing tasks / projects / prompts
+	// resolve `team_id` for the requesting org via
+	// GetDefaultForOrgSystem instead of hardcoding the local-mode
+	// sentinel team. Admin pool in Postgres — see the TeamsStore
+	// interface comment for the pool-split rationale.
+	Teams TeamsStore
+
 	// Curator owns the curator-runtime tables (curator_requests,
 	// curator_messages, curator_pending_context). App pool in
 	// Postgres — the per-project goroutine wraps each turn's
@@ -217,6 +225,7 @@ type TxStores struct {
 	TaskMemory     TaskMemoryStore
 	RunWorktrees   RunWorktreeStore
 	Orgs           OrgsStore
+	Teams          TeamsStore
 	Curator        CuratorStore
 }
 

@@ -229,7 +229,7 @@ func (c *LocalClient) GetChainRunForRun(ctx context.Context) (*domain.ChainRun, 
 }
 
 func (c *LocalClient) BuildAgentRunFooter(_ context.Context, kind string) (string, error) {
-	return agentmeta.Build(c.stores.AgentRuns, c.info.RunID, kind), nil
+	return agentmeta.Build(c.stores.AgentRuns, c.info.OrgID, c.info.RunID, kind), nil
 }
 
 func (c *LocalClient) InsertChainVerdict(ctx context.Context, payload string) error {

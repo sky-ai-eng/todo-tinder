@@ -23,7 +23,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	"github.com/sky-ai-eng/triage-factory/internal/projectbundle"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -114,6 +113,16 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+	if err != nil {
+		internalError(w, "projects", fmt.Errorf("default team lookup: %w", err))
+		return
+	}
+	if teamID == "" {
+		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
+		return
+	}
+
 	// Default the spec-authorship skill to the seeded system prompt
 	// when it exists. Doing this at the API layer (not in db.CreateProject)
 	// keeps the DB layer free of any "system prompt must exist" coupling
@@ -128,7 +137,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		} else if def != nil {
 			specPromptID = domain.SystemTicketSpecPromptID
 		}
-		id, createErr := tx.Projects.Create(r.Context(), orgID, runmode.LocalDefaultTeamID, domain.Project{
+		id, createErr := tx.Projects.Create(r.Context(), orgID, teamID, domain.Project{
 			Name:                   name,
 			Description:            req.Description,
 			PinnedRepos:            pinned,
@@ -270,6 +279,10 @@ func (s *Server) handleProjectExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, projectBundleMaxUploadBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "multipart parse: " + err.Error()})
@@ -298,10 +311,22 @@ func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+	if err != nil {
+		internalError(w, "projects", fmt.Errorf("default team lookup: %w", err))
+		return
+	}
+	if teamID == "" {
+		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
+		return
+	}
+
 	project, warnings, err := projectbundle.Import(
 		r.Context(),
 		s.db,
 		s.projects,
+		orgID,
+		teamID,
 		file,
 		size,
 		projectBundleGitHubProbe{client: s.ghClient},

@@ -184,6 +184,12 @@ func (s *Store) txStoresFromTx(tx *sql.Tx, pending *db.PendingEventHooks) db.TxS
 		// but composing it here keeps wiring drift impossible against
 		// the Stores bundle.
 		Orgs: newOrgsStore(tx),
+		// Teams: pinned to s.admin (not tx). GetDefaultForOrgSystem
+		// is an admin-pool read by design — see the TeamsStore
+		// interface comment. Routing the lookup outside the tx means
+		// it composes safely from any handler regardless of which
+		// pool the surrounding tx was bound to.
+		Teams: newTeamsStore(s.admin),
 		// Curator: tx-bound — every method runs under the outer
 		// SyntheticClaimsWithTx's claims, which is exactly what
 		// curator_requests_modify / curator_messages_modify /

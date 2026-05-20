@@ -84,6 +84,7 @@ func (s *Store) runTx(ctx context.Context, orgID, userID string, fn func(db.TxSt
 		TaskMemory:     newTaskMemoryStore(tx, tx),
 		RunWorktrees:   newRunWorktreeStore(tx, tx),
 		Orgs:           newOrgsStore(tx),
+		Teams:          newTeamsStore(tx),
 		Curator:        newCuratorStore(tx),
 	}
 	if err := fn(txStores); err != nil {

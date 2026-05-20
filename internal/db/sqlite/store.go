@@ -67,6 +67,10 @@ func New(conn *sql.DB) db.Stores {
 		// connection. Callers are background services iterating the
 		// active org set at the top of each cycle.
 		Orgs: newOrgsStore(conn),
+		// Teams is admin-pool in Postgres; SQLite collapses to the one
+		// connection. Callers are request handlers resolving the
+		// org's default team for newly-synthesized rows.
+		Teams: newTeamsStore(conn),
 		// Curator: the goroutine wraps each turn in
 		// Stores.Tx.SyntheticClaimsWithTx so the tx-bound variant
 		// (composed inside the tx.go runTx body) is what handles

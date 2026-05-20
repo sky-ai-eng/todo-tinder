@@ -21,7 +21,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -80,11 +79,14 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// Import reads a .tfproject ZIP and materializes it into a new local project.
+// Import reads a .tfproject ZIP and materializes it into a new project
+// owned by orgID + teamID. The caller resolves both from the request
+// context (orgID from JWT claims, teamID from TeamsStore.GetDefaultForOrg).
 func Import(
 	ctx context.Context,
 	database *sql.DB,
 	projects db.ProjectStore,
+	orgID, teamID string,
 	readerAt io.ReaderAt,
 	size int64,
 	probe GitHubProbe,
@@ -105,7 +107,7 @@ func Import(
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := ensureUniqueProjectName(ctx, projects, manifest.Project.Name); err != nil {
+	if err := ensureUniqueProjectName(ctx, projects, orgID, manifest.Project.Name); err != nil {
 		return nil, nil, err
 	}
 	cloneURLs, err := preflightPinnedRepos(ctx, manifest.Project.PinnedRepos, probe)
@@ -156,7 +158,7 @@ func Import(
 	}
 	defer tx.Rollback()
 
-	if err := insertImportedProject(tx, newProjectID, newSessionID, manifest.Project); err != nil {
+	if err := insertImportedProject(tx, newProjectID, newSessionID, teamID, manifest.Project); err != nil {
 		return nil, nil, err
 	}
 
@@ -194,7 +196,7 @@ func Import(
 	committed = true
 
 	warnings := clonePinnedRepos(ctx, manifest.Project.PinnedRepos, cloneURLs)
-	project, err := projects.Get(ctx, runmode.LocalDefaultOrg, newProjectID)
+	project, err := projects.Get(ctx, orgID, newProjectID)
 	if err != nil {
 		return nil, warnings, fmt.Errorf("load imported project: %w", err)
 	}
@@ -260,9 +262,9 @@ func readZipFileLimited(zf *zip.File, maxBytes int64) ([]byte, error) {
 	return body, nil
 }
 
-func ensureUniqueProjectName(ctx context.Context, projects db.ProjectStore, incoming string) error {
+func ensureUniqueProjectName(ctx context.Context, projects db.ProjectStore, orgID, incoming string) error {
 	incoming = strings.TrimSpace(incoming)
-	rows, err := projects.List(ctx, runmode.LocalDefaultOrg)
+	rows, err := projects.List(ctx, orgID)
 	if err != nil {
 		return fmt.Errorf("list projects: %w", err)
 	}
@@ -313,13 +315,10 @@ func preflightPinnedRepos(ctx context.Context, pinned []string, probe GitHubProb
 }
 
 // insertImportedProject inserts a row into projects from a bundle
-// manifest. Local-mode only: team_id is pinned to LocalDefaultTeamID.
-// When SKY-253 D9 lands the org-scoping pass, this should be
-// rewritten to route through a ProjectStore that derives team_id
-// from the session context — until then, calling this in multi mode
-// would silently bind every imported project to LocalDefaultTeamID.
-// Guarded only by main.go's log.Fatalf on TF_MODE=multi.
-func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID string, manifestProject ManifestProject) error {
+// manifest. teamID is the request org's default team (resolved by
+// the handler via TeamsStore.GetDefaultForOrgSystem) so the inserted
+// row's team_id FK lands on a real teams row in either dialect.
+func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID, teamID string, manifestProject ManifestProject) error {
 	pinned := cloneStrings(manifestProject.PinnedRepos)
 	if pinned == nil {
 		pinned = []string{}
@@ -343,7 +342,7 @@ func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID string, manif
 		string(pinnedJSON),
 		nullIfEmptyString(manifestProject.JiraProjectKey),
 		nullIfEmptyString(manifestProject.LinearProjectKey),
-		runmode.LocalDefaultTeamID,
+		teamID,
 		now,
 		now,
 	)

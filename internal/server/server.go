@@ -20,7 +20,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -47,6 +46,7 @@ type Server struct {
 	events        db.EventStore       // SKY-305: events audit log Record/Latest for stock carry-over + factory drag-to-delegate
 	taskMemory    db.TaskMemoryStore  // run_memory writes (human verdict capture on review/PR submit, swipe-discard cleanup)
 	secrets       db.SecretStore      // canonical credential read/write path — local-mode keychain, multi-mode vault
+	teams         db.TeamsStore       // resolves the request org's default team for handlers that synthesize team-scoped rows (tasks, projects, prompts)
 	// tx runs handler-cleanup write batches under the request user's
 	// claims even when the cleanup needs to outlive the request
 	// context. Each cleanup wraps in `s.tx.WithTx(cleanupCtx, orgID,
@@ -144,9 +144,12 @@ func (s *Server) projectMutex(id string) *sync.Mutex {
 // 409. Bootstrap is fatal at startup post-D-Claims so this is
 // belt-and-suspenders for tests / degraded states.
 //
-// Team-agent lookup keeps the local team sentinel — multi-mode team
-// semantics are a separate (post-D9) ticket; this helper sweeps the
-// org dimension only.
+// Team-agent lookup resolves the team_id by the requesting org's
+// default team via TeamsStore — single-team-per-org today, derived
+// from the oldest teams row. In local mode this collapses to the
+// seeded "default" team; in multi mode it picks the right team for
+// the requesting tenant so the team_agents read FK-matches a real
+// row.
 func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (*domain.Agent, bool, error) {
 	if s.agents == nil {
 		return nil, false, fmt.Errorf("agent store not configured")
@@ -176,7 +179,20 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 			enabled = true
 			return nil
 		}
-		ta, e := tx.TeamAgents.GetForTeam(ctx, orgID, runmode.LocalDefaultTeamID, a.ID)
+		teamID, e := tx.Teams.GetDefaultForOrgSystem(ctx, orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
+		}
+		if teamID == "" {
+			// No team in the org. Production installs always have
+			// the default team (multi-mode org provisioning; local-
+			// mode v1.11.0 baseline migration), so this is a
+			// bootstrap bug — surface as disabled rather than minting
+			// a wrong-team row.
+			teamMissing = true
+			return nil
+		}
+		ta, e := tx.TeamAgents.GetForTeam(ctx, orgID, teamID, a.ID)
 		if e != nil {
 			return fmt.Errorf("team_agents lookup: %w", e)
 		}
@@ -203,7 +219,7 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 // argument list grows one store at a time as their callers migrate;
 // raw *sql.DB stays available for handlers that haven't been ported
 // to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, tx db.TxRunner) *Server {
+func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, teams db.TeamsStore, tx db.TxRunner) *Server {
 	s := &Server{
 		db:            database,
 		prompts:       prompts,
@@ -226,6 +242,7 @@ func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboa
 		taskMemory:    taskMemory,
 		secrets:       secrets,
 		curatorStore:  curatorStore,
+		teams:         teams,
 		tx:            tx,
 		mux:           http.NewServeMux(),
 		ws:            websocket.NewHub(),

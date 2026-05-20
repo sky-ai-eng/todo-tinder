@@ -564,6 +564,15 @@ func (s *agentRunStore) GetSystem(ctx context.Context, orgID, runID string) (*do
 	return s.Get(ctx, orgID, runID)
 }
 
+func (s *agentRunStore) LookupOrgForRunSystem(ctx context.Context, runID string) (string, error) {
+	var orgID string
+	err := s.q.QueryRowContext(ctx, `SELECT org_id FROM runs WHERE id = ?`, runID).Scan(&orgID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return orgID, err
+}
+
 func (s *agentRunStore) CompleteSystem(ctx context.Context, orgID, runID, status string, costUSD float64, durationMs, numTurns int, stopReason, resultSummary string) error {
 	return s.Complete(ctx, orgID, runID, status, costUSD, durationMs, numTurns, stopReason, resultSummary)
 }

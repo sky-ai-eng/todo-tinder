@@ -485,7 +485,7 @@ func main() {
 		openBrowser(browserURL)
 	}
 
-	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Tx)
+	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Teams, stores.Tx)
 
 	// Multi-mode auth wiring. The verifier blocks on the initial JWKS
 	// fetch (see verify.NewVerifier docstring), so GoTrue must be

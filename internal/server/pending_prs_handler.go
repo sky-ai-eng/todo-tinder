@@ -272,7 +272,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build the final body with footer using actual run cost data.
-	finalBody := pr.Body + agentmeta.Build(s.agentRuns, pr.RunID, "PR")
+	finalBody := pr.Body + agentmeta.Build(s.agentRuns, orgID, pr.RunID, "PR")
 
 	// Default draft to the row's persisted value (agent's hint). The
 	// overlay's checkbox initializes from the same field, so a user
