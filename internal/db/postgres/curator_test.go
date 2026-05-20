@@ -279,6 +279,164 @@ func TestCuratorStore_Postgres_GetRequestRLS(t *testing.T) {
 	}
 }
 
+// TestCuratorStore_Postgres_InsertPendingContext_Coalesces pins the
+// ON CONFLICT DO NOTHING behavior against the partial-unique index on
+// (project_id, curator_session_id, change_type) WHERE consumed_at IS
+// NULL. A second insert against the same triple while the first row
+// is still unconsumed must be a no-op so the earliest baseline wins.
+func TestCuratorStore_Postgres_InsertPendingContext_Coalesces(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	stores := pgstore.New(h.AdminDB, h.AppDB)
+	ctx := context.Background()
+
+	orgID, alice, _ := seedPgProjectOrg(t, h)
+	projectID := seedPgEntityProject(t, h, orgID, alice, "coalesce")
+	setProjectSession(t, h, projectID, "sess-1")
+
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		if err := ts.Curator.InsertPendingContext(ctx, orgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["a/b"]`); err != nil {
+			return err
+		}
+		return ts.Curator.InsertPendingContext(ctx, orgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["c/d"]`)
+	}); err != nil {
+		t.Fatalf("inserts: %v", err)
+	}
+
+	var rows []domain.CuratorPendingContext
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		var e error
+		rows, e = ts.Curator.ListPendingContext(ctx, orgID, projectID)
+		return e
+	}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row after coalesce, got %d (%+v)", len(rows), rows)
+	}
+	if rows[0].BaselineValue != `["a/b"]` {
+		t.Errorf("baseline = %q, want %q (earliest wins)", rows[0].BaselineValue, `["a/b"]`)
+	}
+}
+
+// TestCuratorStore_Postgres_ListPendingContext_MixedConsumed verifies the
+// list returns both consumed and unconsumed rows ordered by created_at
+// — the project-bundle export relies on this to inspect outstanding
+// deltas regardless of dispatch state.
+func TestCuratorStore_Postgres_ListPendingContext_MixedConsumed(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	stores := pgstore.New(h.AdminDB, h.AppDB)
+	ctx := context.Background()
+
+	orgID, alice, _ := seedPgProjectOrg(t, h)
+	projectID := seedPgEntityProject(t, h, orgID, alice, "mixed")
+	setProjectSession(t, h, projectID, "sess-1")
+
+	// Seed pinned baseline + a request that will consume it.
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		return ts.Curator.InsertPendingContext(ctx, orgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["x"]`)
+	}); err != nil {
+		t.Fatalf("seed pinned: %v", err)
+	}
+	var requestID string
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		id, err := ts.Curator.CreateRequest(ctx, orgID, projectID, alice, "consume me")
+		if err != nil {
+			return err
+		}
+		requestID = id
+		_, _, err = ts.Curator.ConsumePendingContext(ctx, orgID, projectID, requestID)
+		return err
+	}); err != nil {
+		t.Fatalf("create+consume: %v", err)
+	}
+	// Insert a fresh unconsumed row for a different change_type — the
+	// partial unique index excludes the consumed row, so this is
+	// allowed even though the first one still exists.
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		return ts.Curator.InsertPendingContext(ctx, orgID, projectID, "sess-1", domain.ChangeTypeJiraProjectKey, `null`)
+	}); err != nil {
+		t.Fatalf("insert jira: %v", err)
+	}
+
+	var rows []domain.CuratorPendingContext
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		var e error
+		rows, e = ts.Curator.ListPendingContext(ctx, orgID, projectID)
+		return e
+	}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d (%+v)", len(rows), rows)
+	}
+	if rows[0].ConsumedAt == nil {
+		t.Errorf("first row should be consumed; got %+v", rows[0])
+	}
+	if rows[1].ConsumedAt != nil {
+		t.Errorf("second row should be unconsumed; got %+v", rows[1])
+	}
+}
+
+// TestCuratorStore_Postgres_DeletePendingContextForSession verifies
+// the session-scoped wipe leaves other-session rows untouched.
+func TestCuratorStore_Postgres_DeletePendingContextForSession(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	stores := pgstore.New(h.AdminDB, h.AppDB)
+	ctx := context.Background()
+
+	orgID, alice, _ := seedPgProjectOrg(t, h)
+	projectID := seedPgEntityProject(t, h, orgID, alice, "delete-by-session")
+	setProjectSession(t, h, projectID, "sess-1")
+
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		if err := ts.Curator.InsertPendingContext(ctx, orgID, projectID, "sess-1", domain.ChangeTypePinnedRepos, `["a"]`); err != nil {
+			return err
+		}
+		return ts.Curator.InsertPendingContext(ctx, orgID, projectID, "sess-2", domain.ChangeTypePinnedRepos, `["b"]`)
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		return ts.Curator.DeletePendingContextForSession(ctx, orgID, projectID, "sess-1")
+	}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	var rows []domain.CuratorPendingContext
+	if err := stores.Tx.SyntheticClaimsWithTx(ctx, orgID, alice, func(ts db.TxStores) error {
+		var e error
+		rows, e = ts.Curator.ListPendingContext(ctx, orgID, projectID)
+		return e
+	}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row (sess-2 survivor), got %d (%+v)", len(rows), rows)
+	}
+	if rows[0].CuratorSessionID != "sess-2" {
+		t.Errorf("wrong session survived: %q", rows[0].CuratorSessionID)
+	}
+}
+
+// setProjectSession bumps the project's curator_session_id via the
+// admin pool. The CuratorStore writes that follow are gated by the
+// partial-unique index on (project_id, curator_session_id, change_type)
+// WHERE consumed_at IS NULL — the project needs an active session
+// before any pending row makes sense.
+func setProjectSession(t *testing.T, h *pgtest.Harness, projectID, sessionID string) {
+	t.Helper()
+	if _, err := h.AdminDB.Exec(
+		`UPDATE projects SET curator_session_id = $1 WHERE id = $2`,
+		sessionID, projectID,
+	); err != nil {
+		t.Fatalf("set project session id: %v", err)
+	}
+}
+
 // runFullTurn replays the per-message write set the goroutine would
 // emit for one turn under (orgID, userID). Returns the request id and
 // the inserted message id so the caller can spot-check attribution.

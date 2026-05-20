@@ -278,6 +278,57 @@ func (s *curatorStore) RevertPendingContext(ctx context.Context, orgID, requestI
 	})
 }
 
+func (s *curatorStore) InsertPendingContext(ctx context.Context, orgID, projectID, sessionID, changeType, baselineJSON string) error {
+	if err := assertLocalOrg(orgID); err != nil {
+		return err
+	}
+	_, err := s.q.ExecContext(ctx, `
+		INSERT INTO curator_pending_context
+			(project_id, curator_session_id, change_type, baseline_value)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT DO NOTHING
+	`, projectID, sessionID, changeType, baselineJSON)
+	return err
+}
+
+func (s *curatorStore) ListPendingContext(ctx context.Context, orgID, projectID string) ([]domain.CuratorPendingContext, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.QueryContext(ctx, `
+		SELECT id, project_id, curator_session_id, change_type, baseline_value,
+		       consumed_at, consumed_by_request_id, created_at
+		  FROM curator_pending_context
+		 WHERE project_id = ?
+		 ORDER BY created_at ASC, id ASC
+	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []domain.CuratorPendingContext{}
+	for rows.Next() {
+		row, err := scanPendingContextRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (s *curatorStore) DeletePendingContextForSession(ctx context.Context, orgID, projectID, sessionID string) error {
+	if err := assertLocalOrg(orgID); err != nil {
+		return err
+	}
+	_, err := s.q.ExecContext(ctx, `
+		DELETE FROM curator_pending_context
+		 WHERE project_id = ? AND curator_session_id = ?
+	`, projectID, sessionID)
+	return err
+}
+
 // nullStrSqlite + nullIntSqlite mirror the package-level helpers used
 // by the legacy curator package-level INSERTs. Duplicated locally to
 // avoid an import cycle on the package-db helpers from inside a
