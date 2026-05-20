@@ -67,7 +67,7 @@ type Server struct {
 	// can't fire one org's poller restart with another org's PAT.
 	onGitHubChanged func(orgID string) // GitHub creds/repos changed — full restart + re-profile
 	onJiraChanged   func(orgID string) // Jira config changed — restart Jira poller only
-	scorerTrigger func(orgID string) // invoked after non-poll task creation (e.g. carry-over) to kick the per-org scorer immediately
+	scorerTrigger   func(orgID string) // invoked after non-poll task creation (e.g. carry-over) to kick the per-org scorer immediately
 
 	// authDeps groups the multi-mode-only auth stack (JWKS verifier +
 	// session store + gotrue HTTP client). Nil in local mode; checked

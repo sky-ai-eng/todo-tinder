@@ -185,7 +185,6 @@ func TestInFlightCuratorRequestForProject_NoneReturnsNil(t *testing.T) {
 	}
 }
 
-
 // TestCompleteCuratorRequest_DoesNotClobberCancelled is the load-
 // bearing race-protection test: a row that was cancelled (e.g. by
 // the user via the DELETE endpoint) while the goroutine was running
