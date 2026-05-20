@@ -81,7 +81,12 @@ func (r *countingReader) Read(p []byte) (int, error) {
 
 // Import reads a .tfproject ZIP and materializes it into a new project
 // owned by orgID + teamID. The caller resolves both from the request
-// context (orgID from JWT claims, teamID from TeamsStore.GetDefaultForOrg).
+// context (orgID from JWT claims, teamID from TeamsStore.GetDefaultForOrgSystem).
+//
+// SQLite-only today — the body opens its own *sql.Tx and writes via
+// raw `?`-placeholder INSERTs. handleProjectImport mode-gates the
+// endpoint to local-mode for that reason; porting to per-dialect store
+// methods is a follow-up.
 func Import(
 	ctx context.Context,
 	database *sql.DB,
@@ -316,8 +321,13 @@ func preflightPinnedRepos(ctx context.Context, pinned []string, probe GitHubProb
 
 // insertImportedProject inserts a row into projects from a bundle
 // manifest. teamID is the request org's default team (resolved by
-// the handler via TeamsStore.GetDefaultForOrgSystem) so the inserted
-// row's team_id FK lands on a real teams row in either dialect.
+// the handler via TeamsStore.GetDefaultForOrgSystem). org_id /
+// creator_user_id rely on SQLite column defaults (LocalDefaultOrgID /
+// LocalDefaultUserID) — the function only runs under the local-mode
+// gate in handleProjectImport, where those defaults are the correct
+// values. Porting to multi-mode requires (a) per-dialect SQL and
+// (b) explicit org_id + creator_user_id binds since Postgres has no
+// matching defaults.
 func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID, teamID string, manifestProject ManifestProject) error {
 	pinned := cloneStrings(manifestProject.PinnedRepos)
 	if pinned == nil {

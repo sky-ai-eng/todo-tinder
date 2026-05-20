@@ -23,6 +23,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	"github.com/sky-ai-eng/triage-factory/internal/projectbundle"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
@@ -281,6 +282,16 @@ func (s *Server) handleProjectExport(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
 	orgID, ok := s.requireOrg(w, r)
 	if !ok {
+		return
+	}
+	// projectbundle.Import is still SQLite-only — it opens its own
+	// *sql.Tx and writes via raw `?`-placeholder INSERTs that have no
+	// Postgres counterpart. Gate the endpoint until the bundle
+	// import/export path is ported to per-dialect store methods so a
+	// multi-mode tenant doesn't get a 500 the first time they try to
+	// import. Local-mode behavior is unchanged.
+	if runmode.Current() != runmode.ModeLocal {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "project import is not yet supported in multi-mode deployments"})
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, projectBundleMaxUploadBytes)

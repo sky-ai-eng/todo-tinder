@@ -7,9 +7,9 @@ import "context"
 // team_id FK; the request-handler sites that synthesize new rows need
 // a way to pick the right team for the requesting org. Single-team-
 // per-org is the assumption today (org bootstrap creates one
-// "default" team — see internal/db/pgtest/seed.go); GetDefaultForOrg
-// codifies that without forcing every handler to inline the lookup
-// SQL.
+// "default" team — see internal/db/pgtest/seed.go);
+// GetDefaultForOrgSystem codifies that without forcing every handler
+// to inline the lookup SQL.
 //
 // # Pool split (Postgres)
 //
