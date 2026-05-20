@@ -18,12 +18,16 @@ import (
 	"time"
 )
 
-// alpineCommunityRepo is the community repository for the same alpine
+// alpineCommunityRepo is the community repository URL for the alpine
 // version pinned in rootfs.go. Some toolchain packages (ripgrep, go)
-// live in community rather than main, so the cache build enables this
-// repo before invoking apk-add. Linux-only — referenced exclusively
-// from the chroot+apk path in this file.
-const alpineCommunityRepo = "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
+// live in community rather than main, so the cache build enables
+// this repo before invoking apk-add. Linux-only — referenced
+// exclusively from the chroot+apk path in this file.
+//
+// Derived from majorMinor(alpineVersion) rather than hardcoded so a
+// future alpineVersion bump can't leave the community repo URL
+// pointing at the wrong release-tree.
+var alpineCommunityRepo = "https://dl-cdn.alpinelinux.org/alpine/v" + majorMinor(alpineVersion) + "/community"
 
 // rootfsCacheMu serializes ensureRootfs across concurrent Wrap calls.
 // We use a mutex rather than sync.Once because sync.Once permanently
@@ -61,9 +65,13 @@ func doEnsureRootfs(ctx context.Context) (string, error) {
 	// Cache key hashes (alpine sha, package set). Adding a package to
 	// apkPackages changes the key and forces a fresh extraction so we
 	// never serve a cached rootfs whose toolchain doesn't match the
-	// current build's expectations.
-	cacheDir := filepath.Join(home, ".triagefactory", "sandbox",
-		"rootfs-"+rootfsCacheKey())
+	// current build's expectations. Errors on unsupported GOARCH —
+	// surfaced through the normal error path rather than panicking.
+	cacheKey, err := rootfsCacheKey()
+	if err != nil {
+		return "", fmt.Errorf("rootfs: %w", err)
+	}
+	cacheDir := filepath.Join(home, ".triagefactory", "sandbox", "rootfs-"+cacheKey)
 
 	// Sentinel file marking a successful extraction + toolchain
 	// install. Distinguishes "fully populated cache" from "crashed
@@ -89,13 +97,19 @@ func doEnsureRootfs(ctx context.Context) (string, error) {
 	// Download to a temp file, sha256-verify, then extract. Failing
 	// the verify means upstream alpine got tampered with or our pin
 	// is stale — refuse loudly rather than silently extract.
+	// rootfsCacheKey already proved currentArchRootfs is resolvable
+	// above; the second call here cannot fail.
+	url, sha, err := currentArchRootfs()
+	if err != nil {
+		return "", fmt.Errorf("rootfs: %w", err)
+	}
 	tmpTarball := filepath.Join(cacheDir, ".alpine.tgz.partial")
-	if err := downloadFile(ctx, alpineRootfsURL, tmpTarball); err != nil {
+	if err := downloadFile(ctx, url, tmpTarball); err != nil {
 		return "", fmt.Errorf("rootfs: download: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpTarball) }()
 
-	if err := verifySHA256(tmpTarball, alpineRootfsSHA256); err != nil {
+	if err := verifySHA256(tmpTarball, sha); err != nil {
 		return "", fmt.Errorf("rootfs: verify sha256: %w", err)
 	}
 

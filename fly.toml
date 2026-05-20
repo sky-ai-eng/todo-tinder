@@ -1,0 +1,76 @@
+# Triage Factory — Fly.io Machines deployment.
+#
+# Build:    docker image at ./docker/Dockerfile (same artifact the GHCR
+#           workflow publishes).
+# Deploy:   fly deploy --remote-only
+# Region:   iad — low-latency to GitHub + Anthropic API endpoints.
+# Sandbox:  the in-container gVisor runner needs SYS_ADMIN + NET_ADMIN
+#           and unconfined seccomp; Fly Machines grant these by default
+#           (validated against the SKY-254 runsc probe — see the parent
+#           epic for the platform-compatibility log).
+#
+# Per-deployment secrets the TF process consumes — set via flyctl,
+# NOT committed here:
+#   fly secrets set TF_DATABASE_URL='postgresql://...'
+#   fly secrets set TF_GOTRUE_URL='https://gotrue.example.com'
+#   fly secrets set TF_GOTRUE_JWKS_URL='https://gotrue.example.com/.well-known/jwks.json'
+#   fly secrets set TF_GOTRUE_ISSUER='https://triagefactory.example.com/auth/v1'
+#   fly secrets set TF_SESSION_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+#   fly secrets set TF_COOKIE_SECRET="$(openssl rand -hex 32)"
+#   fly secrets set TF_GITHUB_APP_PRIVATE_KEY="$(cat github-app.pem)"
+#   fly secrets set TF_GITHUB_APP_ID='123456'
+#
+# NOT here: the GoTrue RS256 keypair (GOTRUE_JWT_KEYS /
+# GOTRUE_JWT_SECRET). Those live on the GoTrue deployment's secrets,
+# not TF's — TF only verifies tokens against the public JWKS URL,
+# the signing material stays on the issuer. Generate the pair once
+# with `triagefactory jwk-init`, copy the GoTrue half to the GoTrue
+# app's secrets, then forget about it here.
+#
+# Per-org credentials (ANTHROPIC_API_KEY, AWS bedrock creds, etc.) are
+# NOT Fly secrets — those land in the per-org SecretStore (SKY-249)
+# via the admin UI (SKY-257) or direct SQL.
+
+app = "triagefactory"
+primary_region = "iad"
+
+[build]
+  dockerfile = "docker/Dockerfile"
+
+[env]
+  TF_MODE = "multi"
+
+[deploy]
+  # Idempotent forward migrations. Runs in a one-shot Machine before
+  # rolling new Machines, so a schema-breaking release is caught
+  # before any traffic lands on the new code.
+  release_command = "triagefactory migrate up"
+  strategy = "rolling"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "off"   # long-lived pollers; don't suspend
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 100
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+  processes = ["app"]
+
+[checks]
+  [checks.health]
+    grace_period = "30s"
+    interval = "15s"
+    method = "GET"
+    path = "/api/health"
+    port = 3000
+    timeout = "5s"
+    type = "http"

@@ -23,6 +23,7 @@ var preAuthAllowlist = []string{
 	"GET /api/auth/callback",         // completes OAuth + creates session
 	"POST /api/auth/logout",          // reads sid cookie directly so stale-session logout works
 	"GET /api/config",                // AuthGate reads deployment_mode pre-login
+	"GET /api/health",                // liveness probe for platform healthchecks (Fly, compose, k8s)
 	"/auth/v1/",                      // GoTrue reverse proxy; auth happens upstream
 	"/",                              // SPA fallback; no identity dependency
 }

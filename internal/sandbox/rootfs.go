@@ -9,19 +9,61 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
 
-// alpineRootfsURL pins the alpine minirootfs the sandbox uses. Same
-// tarball as the validation probe (probe.sh line 64) so the runtime
-// behavior matches what was tested. Bumping requires re-running the
-// probe to verify nothing changed in alpine's syscall surface that
-// the SDK depends on.
-const (
-	alpineRootfsURL    = "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz"
-	alpineRootfsSHA256 = "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c"
-)
+// alpineVersion pins the alpine minirootfs release. Same release as the
+// validation probe (probe.sh line 64) so the runtime behavior matches
+// what was tested. Bumping requires re-running the probe to verify
+// nothing changed in alpine's syscall surface that the SDK depends on
+// and re-pinning both per-arch sha256s in alpineRootfsForArch.
+const alpineVersion = "3.20.3"
+
+// alpineRootfsForArch returns the URL + sha256 for the alpine
+// minirootfs tarball matching the current GOARCH. Pinned per-arch
+// because the tarball content differs even at the same alpine
+// version. Errors out cleanly on unsupported architectures (ppc64le,
+// s390x, riscv64, ...) so a future user gets an actionable message
+// instead of a sha mismatch on download.
+//
+// The cache key (rootfsCacheKey) hashes the sha so per-arch caches
+// stay separate by construction — switching between amd64 and arm64
+// builds on the same host (cross-compile workflows) does not clobber
+// the other arch's cached extraction.
+func alpineRootfsForArch(arch string) (url, sha string, err error) {
+	switch arch {
+	case "amd64":
+		return "https://dl-cdn.alpinelinux.org/alpine/v" + majorMinor(alpineVersion) +
+				"/releases/x86_64/alpine-minirootfs-" + alpineVersion + "-x86_64.tar.gz",
+			"d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c", nil
+	case "arm64":
+		return "https://dl-cdn.alpinelinux.org/alpine/v" + majorMinor(alpineVersion) +
+				"/releases/aarch64/alpine-minirootfs-" + alpineVersion + "-aarch64.tar.gz",
+			"041fa34a81788242df9e78fa69b97ab45b8ec47ddbf88864755610414a7bf3de", nil
+	default:
+		return "", "", fmt.Errorf("sandbox: unsupported GOARCH %q (only amd64 and arm64 are pinned; add a case to alpineRootfsForArch to support more)", arch)
+	}
+}
+
+// majorMinor strips the patch suffix off a semver-ish version string —
+// "3.20.3" → "3.20" — for use in the alpine release-tree URL.
+func majorMinor(version string) string {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return version
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// currentArchRootfs is the URL + sha for the host's GOARCH. Returns
+// an error on unsupported arch so callers (ensureRootfs, the cache-
+// key wrapper) can surface a clean diagnostic via their normal error
+// path instead of crashing the whole process via panic.
+func currentArchRootfs() (url, sha string, err error) {
+	return alpineRootfsForArch(runtime.GOARCH)
+}
 
 // apkPackages is the toolchain installed into the cached alpine
 // rootfs after extraction. Any change here invalidates the rootfs
@@ -52,9 +94,16 @@ var apkPackages = []string{
 }
 
 // rootfsCacheKey returns the 12-hex-char cache key for the current
-// rootfs build inputs.
-func rootfsCacheKey() string {
-	return rootfsCacheKeyFor(alpineRootfsSHA256, apkPackages)
+// rootfs build inputs, or an error if the host's GOARCH is not
+// supported. Error-returning rather than panicking so a misconfigured
+// arch surfaces through the same error log as any other startup
+// failure rather than crashing the whole process.
+func rootfsCacheKey() (string, error) {
+	_, sha, err := currentArchRootfs()
+	if err != nil {
+		return "", err
+	}
+	return rootfsCacheKeyFor(sha, apkPackages), nil
 }
 
 // rootfsCacheKeyFor hashes (alpine_sha, sorted-package-set) and
