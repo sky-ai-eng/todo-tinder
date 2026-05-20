@@ -18,13 +18,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/tracker"
 )
 
-// localGitHubUserID is the per-org GitHub-identity userID resolution
-// used by the poller. In local mode that's the synthetic sentinel; in
-// multi mode this needs to become a per-org lookup against the
-// org's owner/operator user (deferred — credential-per-org resolution
-// is outside D9c scope, which owns only the outer per-org loop).
-var localGitHubUserID = runmode.LocalDefaultUserID
-
 // Manager manages the lifecycle of polling loops, allowing them to be
 // stopped and restarted when credentials or config change.
 type Manager struct {
@@ -170,6 +163,16 @@ func (m *Manager) stopAll() {
 // org). Bounded per-org concurrency is a future optimization —
 // sequential is fine given the poll period (≥1 minute baseline).
 func (m *Manager) startGitHub(cfg config.Config, creds auth.Credentials) {
+	// The GitHub poll loop reads a single users.github_username
+	// keyed by the local synthetic user — in multi mode that row
+	// has no FK target and every per-org iteration would silently
+	// skip. Per-org GitHub App polling (D11) is the multi-mode
+	// path; until then, this loop has no useful work to do outside
+	// local mode. Gating at the outer Start boundary keeps the
+	// no-op loop out of multi-mode logs entirely.
+	if runmode.Current() != runmode.ModeLocal {
+		return
+	}
 	if !cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) {
 		log.Println("[github] credentials not configured, skipping tracker")
 		return
@@ -250,22 +253,13 @@ func (m *Manager) runGitHubCycle(client *ghclient.Client, userTeams []string) {
 		//
 		// Local-mode bridge: the poller acts as the lone local user,
 		// so we read their github_username to drive predicates like
-		// "PR review requested from me". The localGitHubUserID
-		// sentinel resolves to that one user.
-		//
-		// TODO: future multi-mode work replaces this read in two
-		// stages:
-		//   - SKY-263 (D11): per-org GitHub App; the bot acts as the
-		//     App's installation identity, not a borrowed user PAT.
-		//     The "username" the poller threads downstream becomes
-		//     the App's bot username, resolved via GitHubClientFor
-		//     (ctx, orgID) rather than this users-table read.
-		//   - SKY-265 (D15): webhooks shrink polling pressure; the
-		//     comprehensive per-repo fetch + predicate-match-against-
-		//     org-members shape only works if push-style delivery
-		//     replaces the constant poll. One-bot-per-team is the
-		//     other escape hatch.
-		username, err := m.users.GetGitHubUsernameSystem(ctx, localGitHubUserID)
+		// "PR review requested from me". This whole loop is gated
+		// to local mode at startGitHub, so the LocalDefaultUserID
+		// sentinel here resolves to that one user — multi-mode
+		// per-org GitHub App polling (D11) will replace the
+		// username read with a GitHubClientFor(ctx, orgID) call
+		// against the App's installation identity.
+		username, err := m.users.GetGitHubUsernameSystem(ctx, runmode.LocalDefaultUserID)
 		if err != nil {
 			log.Printf("[github] org %s: read users.github_username: %v", orgID, err)
 			continue
