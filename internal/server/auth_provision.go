@@ -58,6 +58,17 @@ type provisionResult struct {
 // Errors here are fatal to the signup callback — better to fail
 // loudly than to ship a half-provisioned user.
 func (s *Server) provisionUserOrgs(ctx context.Context, userID uuid.UUID, claims *verify.Claims) (provisionResult, error) {
+	// Fast path: every repeat login lands here with the user already
+	// having memberships. Doing this lookup outside the tx + advisory
+	// lock keeps the common path to a single round-trip with no lock
+	// contention. The locked re-check below preserves race safety for
+	// the genuinely-first-signup case.
+	if existing, err := s.lookupEarliestMembership(ctx, s.db, userID); err != nil {
+		return provisionResult{}, fmt.Errorf("membership pre-check: %w", err)
+	} else if existing.Valid {
+		return provisionResult{activeOrgID: existing}, nil
+	}
+
 	policy := runmode.JoinPolicyCurrent()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -76,23 +87,17 @@ func (s *Server) provisionUserOrgs(ctx context.Context, userID uuid.UUID, claims
 		return provisionResult{}, fmt.Errorf("acquire advisory lock: %w", err)
 	}
 
-	// Re-check inside the lock: did a concurrent tx already provision
-	// for this user? If so, surface their earliest org as the active
-	// one and short-circuit.
-	var existing uuid.NullUUID
-	if err := tx.QueryRowContext(ctx, `
-		SELECT org_id
-		  FROM public.org_memberships
-		 WHERE user_id = $1
-		 ORDER BY created_at ASC, org_id ASC
-		 LIMIT 1
-	`, userID).Scan(&existing); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	// Re-check inside the lock. The fast path above may have observed
+	// zero memberships against a snapshot taken before a concurrent
+	// provisioning tx committed; this read sees that tx's writes once
+	// we hold the lock.
+	existing, err := s.lookupEarliestMembership(ctx, tx, userID)
+	if err != nil {
 		return provisionResult{}, fmt.Errorf("membership re-check: %w", err)
 	}
 	if existing.Valid {
-		// Either a prior signup callback (retry) or a concurrent
-		// callback won the race — commit the lock release and return
-		// without provisioning.
+		// Concurrent callback won the race — commit the lock release
+		// and return without provisioning.
 		if err := tx.Commit(); err != nil {
 			return provisionResult{}, fmt.Errorf("commit: %w", err)
 		}
@@ -125,6 +130,34 @@ func (s *Server) provisionUserOrgs(ctx context.Context, userID uuid.UUID, claims
 		return provisionResult{}, fmt.Errorf("commit: %w", err)
 	}
 	return provisionResult{activeOrgID: activeOrg}, nil
+}
+
+// membershipQueryer is the slice of *sql.DB / *sql.Tx that
+// lookupEarliestMembership needs. Defined locally so the helper can
+// run against either the connection pool (fast-path pre-check) or
+// the locked transaction (race-safe re-check).
+type membershipQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// lookupEarliestMembership returns the user's earliest org membership
+// (created_at ASC, org_id ASC as deterministic tiebreak), or
+// uuid.NullUUID{Valid: false} if the user has zero memberships.
+// sql.ErrNoRows is folded into the Valid=false return so callers
+// only branch on Valid.
+func (s *Server) lookupEarliestMembership(ctx context.Context, q membershipQueryer, userID uuid.UUID) (uuid.NullUUID, error) {
+	var existing uuid.NullUUID
+	err := q.QueryRowContext(ctx, `
+		SELECT org_id
+		  FROM public.org_memberships
+		 WHERE user_id = $1
+		 ORDER BY created_at ASC, org_id ASC
+		 LIMIT 1
+	`, userID).Scan(&existing)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return uuid.NullUUID{}, err
+	}
+	return existing, nil
 }
 
 // provisionPersonalOrg creates the user's personal org + default team
