@@ -80,8 +80,9 @@ func (r *countingReader) Read(p []byte) (int, error) {
 }
 
 // Import reads a .tfproject ZIP and materializes it into a new project
-// owned by orgID + teamID. The caller resolves both from the request
-// context (orgID from JWT claims, teamID from TeamsStore.GetDefaultForOrgSystem).
+// owned by orgID + teamID, with userID stamped as the creator. The
+// caller resolves all three from the request context (orgID + userID
+// from JWT claims, teamID from TeamsStore.GetDefaultForOrgSystem).
 //
 // SQLite-only today — the body opens its own *sql.Tx and writes via
 // raw `?`-placeholder INSERTs. handleProjectImport mode-gates the
@@ -91,7 +92,7 @@ func Import(
 	ctx context.Context,
 	database *sql.DB,
 	projects db.ProjectStore,
-	orgID, teamID string,
+	orgID, teamID, userID string,
 	readerAt io.ReaderAt,
 	size int64,
 	probe GitHubProbe,
@@ -163,7 +164,7 @@ func Import(
 	}
 	defer tx.Rollback()
 
-	if err := insertImportedProject(tx, newProjectID, newSessionID, teamID, manifest.Project); err != nil {
+	if err := insertImportedProject(tx, newProjectID, newSessionID, orgID, teamID, userID, manifest.Project); err != nil {
 		return nil, nil, err
 	}
 
@@ -320,15 +321,14 @@ func preflightPinnedRepos(ctx context.Context, pinned []string, probe GitHubProb
 }
 
 // insertImportedProject inserts a row into projects from a bundle
-// manifest. teamID is the request org's default team (resolved by
-// the handler via TeamsStore.GetDefaultForOrgSystem). org_id /
-// creator_user_id rely on SQLite column defaults (LocalDefaultOrgID /
-// LocalDefaultUserID) — the function only runs under the local-mode
-// gate in handleProjectImport, where those defaults are the correct
-// values. Porting to multi-mode requires (a) per-dialect SQL and
-// (b) explicit org_id + creator_user_id binds since Postgres has no
-// matching defaults.
-func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID, teamID string, manifestProject ManifestProject) error {
+// manifest. org_id, team_id, and creator_user_id are bound from the
+// request handler's resolved identity (orgID + userID from JWT claims;
+// teamID from TeamsStore.GetDefaultForOrgSystem) rather than left to
+// SQLite column defaults — that way `projects.List(ctx, orgID)` and
+// `Import(..., orgID, ...)` agree on the row's owning tenant even if
+// the caller ever passes a non-default value. SQLite-only SQL today;
+// see Import's docstring for the porting note.
+func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID, orgID, teamID, userID string, manifestProject ManifestProject) error {
 	pinned := cloneStrings(manifestProject.PinnedRepos)
 	if pinned == nil {
 		pinned = []string{}
@@ -342,8 +342,9 @@ func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID, teamID strin
 		INSERT INTO projects (
 			id, name, description,
 			curator_session_id, pinned_repos, jira_project_key,
-			linear_project_key, team_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			linear_project_key, org_id, team_id, creator_user_id,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		projectID,
 		strings.TrimSpace(manifestProject.Name),
@@ -352,7 +353,9 @@ func insertImportedProject(tx *sql.Tx, projectID, curatorSessionID, teamID strin
 		string(pinnedJSON),
 		nullIfEmptyString(manifestProject.JiraProjectKey),
 		nullIfEmptyString(manifestProject.LinearProjectKey),
+		orgID,
 		teamID,
+		userID,
 		now,
 		now,
 	)

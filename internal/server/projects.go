@@ -331,6 +331,7 @@ func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
 		return
 	}
+	userID := ClaimsFrom(r.Context()).Subject
 
 	project, warnings, err := projectbundle.Import(
 		r.Context(),
@@ -338,6 +339,7 @@ func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
 		s.projects,
 		orgID,
 		teamID,
+		userID,
 		file,
 		size,
 		projectBundleGitHubProbe{client: s.ghClient},
