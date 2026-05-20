@@ -66,3 +66,11 @@ Similarly, [docs/usage.md](docs/usage.md) details CLI flags, configuration refer
 ## License
 
 [Business Source License 1.1](LICENSE) — free for internal use, converts to Apache 2.0 on 2030-03-31. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution terms.
+
+## Disclaimer
+
+Triage Factory is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, non-infringement, and title. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software.
+
+Triage Factory delegates work to autonomous agents that read and write to your source repositories, ticket trackers, and local filesystem. You are solely responsible for reviewing what agents do on your behalf, for the credentials you configure, and for any consequences of automated actions taken against your systems or third-party services.
+
+**Self-hosted multi-tenant deployments.** Triage Factory can be self-hosted in multi-tenant mode (e.g., via the provided Docker Compose configuration) to serve multiple organizations from a single deployment. Multi-tenant isolation in that configuration depends on the operator's infrastructure, configuration, network topology, secrets management, and patching cadence, as well as on the correctness of the upstream software itself — which, like all software, may contain isolation, sandboxing, or row-level-security defects, known or unknown. Operators who choose to host Triage Factory for third parties do so at their own risk and are solely responsible for the security, privacy, compliance, and tenant isolation of their deployment. The authors and copyright holders make no warranty that any release is free of multi-tenant isolation defects and accept no liability for cross-tenant data exposure, sandbox escape, or any other isolation failure in self-hosted deployments.
