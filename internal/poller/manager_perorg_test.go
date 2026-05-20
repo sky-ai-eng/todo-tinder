@@ -4,9 +4,13 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
+	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // TestManager_RunGitHubCycle_IteratesActiveOrgs pins the outer-loop
@@ -81,6 +85,31 @@ func TestManager_RunGitHubCycle_OrgsStoreErrorAbortsCycle(t *testing.T) {
 	defer repos.mu.Unlock()
 	if len(repos.visited) != 0 {
 		t.Errorf("ListConfiguredNamesSystem called %d times despite ListActiveSystem error; want 0", len(repos.visited))
+	}
+}
+
+// TestManager_StartGitHub_MultiModeGatesOut pins the multi-mode gate
+// on startGitHub: in multi mode the GitHub poll loop is a no-op (the
+// users.github_username read is keyed by a sentinel user that has no
+// real-tenant analog; per-org GitHub App polling (D11) is the
+// multi-mode path). The contract is "no goroutine spawned, no ghStop
+// channel set" — if the gate regresses, m.ghStop would be non-nil
+// after startGitHub returns with a valid config.
+func TestManager_StartGitHub_MultiModeGatesOut(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	m := &Manager{}
+	cfg := config.Config{GitHub: config.GitHubConfig{
+		BaseURL:      "https://github.example.com",
+		PollInterval: time.Minute,
+	}}
+	creds := auth.Credentials{GitHubPAT: "ghp_test", GitHubURL: "https://github.example.com"}
+
+	m.startGitHub(cfg, creds)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ghStop != nil {
+		t.Errorf("multi-mode startGitHub spawned a poll goroutine (ghStop != nil); want no-op")
 	}
 }
 

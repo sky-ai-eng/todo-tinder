@@ -110,9 +110,7 @@ func New(admin, app *sql.DB) db.Stores {
 		Tasks: newTaskStore(app, admin),
 		// Factory wires admin — the snapshot is a system-level view
 		// (no per-user identity, must see every in-flight run
-		// regardless of creator) and the LifetimeDistinctCounter
-		// Hydrate path runs at server startup before any JWT claims
-		// are in scope.
+		// regardless of creator).
 		Factory: newFactoryReadStore(admin),
 		// AgentRuns wires app — every consumer is request-
 		// equivalent (server agent handler, delegate spawner
@@ -217,7 +215,12 @@ func New(admin, app *sql.DB) db.Stores {
 		// CreateRequest / GetRequest reads (where the request has
 		// a user identity but not yet via the D9 context plumb)
 		// also route through this app-pool wiring.
-		Curator: newCuratorStore(app),
+		// Curator holds both pools: app for per-turn writes (claims-
+		// bound via SyntheticClaimsWithTx, RLS gates on the
+		// (org_id, creator_user_id) pair), admin for the boot-time
+		// CancelOrphanedNonTerminalRequests sweep that runs before
+		// any JWT-claims context exists.
+		Curator: newCuratorStore(app, admin),
 		Tx:      s,
 	}
 	return s.stores
@@ -277,6 +280,6 @@ func NewForTx(tx *sql.Tx) db.TxStores {
 		RunWorktrees:   newRunWorktreeStore(tx, tx),
 		Orgs:           newOrgsStore(tx),
 		Teams:          newTeamsStore(tx),
-		Curator:        newCuratorStore(tx),
+		Curator:        newCuratorStore(tx, tx),
 	}
 }

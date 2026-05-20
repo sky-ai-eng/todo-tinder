@@ -10,17 +10,14 @@ import (
 //go:generate go run github.com/vektra/mockery/v2 --name=FactoryReadStore --output=./mocks --case=underscore --with-expecter
 
 // FactoryReadStore is the read-only projection that backs the
-// /api/factory/snapshot handler and the LifetimeDistinctCounter
-// reconciliation path. Every method is scoped to one org; in local
-// mode callers pass runmode.LocalDefaultOrg.
+// /api/factory/snapshot handler. Every method is scoped to one org;
+// in local mode callers pass runmode.LocalDefaultOrg.
 //
 // Wired against the admin pool in Postgres: the factory snapshot is
-// a system-level view (no per-user identity required), the
-// LifetimeDistinctCounter is hydrated at server startup before any
-// JWT claims could be in scope, and the snapshot needs to see every
-// in-flight run regardless of which user kicked it off. SQLite is
-// single-tenant so the pool distinction collapses to "the one
-// connection."
+// a system-level view (no per-user identity required) and needs to
+// see every in-flight run regardless of which user kicked it off.
+// SQLite is single-tenant so the pool distinction collapses to "the
+// one connection."
 //
 // "All scoped to active state" is the contract: closed entities ride
 // the snapshot for FactoryClosedGracePeriod after closure so the
@@ -31,13 +28,19 @@ type FactoryReadStore interface {
 	// counts are absent.
 	EventCountsSince(ctx context.Context, orgID string, since time.Time) (map[string]int, error)
 
-	// DistinctEntityCountsLifetime counts the distinct entities that
-	// have ever produced an event of each event_type, from catalog
-	// start. Production reads go through the in-memory
-	// LifetimeDistinctCounter; this is the canonical SQL aggregate
-	// behind that counter — pinned by tests, available for one-shot
-	// reconciliation if cache drift is ever suspected.
-	DistinctEntityCountsLifetime(ctx context.Context, orgID string) (map[string]int, error)
+	// LifetimeDistinctByEventType counts the distinct entities that
+	// have ever produced an event of each event_type, scoped to the
+	// given org. Read per snapshot request — the factory endpoint is
+	// not a hot path. In Postgres the partial index
+	// idx_events_org_type_entity (org_id, event_type, entity_id) WHERE
+	// entity_id IS NOT NULL is an index-only scan: each org's groups
+	// are contiguous and per-group entity_ids are adjacent, so
+	// DISTINCT collapses to adjacency dedup with no temp B-tree.
+	// SQLite's existing idx_events_type_entity (event_type, entity_id)
+	// WHERE entity_id IS NOT NULL covers the single-tenant query
+	// equivalently. Replaces the prior in-memory cross-process counter
+	// that folded every tenant's events into one map.
+	LifetimeDistinctByEventType(ctx context.Context, orgID string) (map[string]int, error)
 
 	// TaskCountsSince counts tasks per event_type created after
 	// `since`. Combined with EventCountsSince to compute the

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
-	"sync"
 	"testing"
 	"time"
 
@@ -62,8 +61,6 @@ type EventStoreSeeder struct {
 //   - Record + read-back round-trips: caller-supplied IDs stay,
 //     generated IDs are non-empty, OccurredAt and EntityID flow
 //     through.
-//   - Record fires the SetOnEventRecorded hook on success.
-//   - RecordSystem fires the hook too (admin-pool path).
 //   - LatestForEntityTypeAndDedupKey returns the most recent
 //     matching row and discriminates correctly on dedup_key.
 //   - LatestForEntityTypeAndDedupKey returns (nil, nil) on miss.
@@ -159,40 +156,6 @@ func RunEventStoreConformance(t *testing.T, mk EventStoreFactory) {
 		}
 		if !latest.OccurredAt.Equal(when) {
 			t.Errorf("OccurredAt = %v, want %v", latest.OccurredAt, when)
-		}
-	})
-
-	t.Run("Record_fires_SetOnEventRecorded_hook", func(t *testing.T) {
-		s, orgID, seed := mk(t)
-		entityID := seed.Entity(t, "record-fires-hook")
-		eid := entityID
-
-		var mu sync.Mutex
-		var observed []domain.Event
-		db.SetOnEventRecorded(func(evt domain.Event) {
-			mu.Lock()
-			defer mu.Unlock()
-			observed = append(observed, evt)
-		})
-		t.Cleanup(func() { db.SetOnEventRecorded(nil) })
-
-		got, err := s.Record(ctx, orgID, domain.Event{
-			EntityID:  &eid,
-			EventType: domain.EventGitHubPROpened,
-		})
-		if err != nil {
-			t.Fatalf("Record: %v", err)
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if len(observed) != 1 {
-			t.Fatalf("hook fired %d times, want 1", len(observed))
-		}
-		if observed[0].ID != got {
-			t.Errorf("hook saw id=%q, Record returned id=%q", observed[0].ID, got)
-		}
-		if observed[0].EntityID == nil || *observed[0].EntityID != entityID {
-			t.Errorf("hook saw EntityID=%v, want %q", observed[0].EntityID, entityID)
 		}
 	})
 

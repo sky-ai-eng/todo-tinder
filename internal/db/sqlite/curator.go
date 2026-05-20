@@ -329,6 +329,24 @@ func (s *curatorStore) DeletePendingContextForSession(ctx context.Context, orgID
 	return err
 }
 
+func (s *curatorStore) CancelOrphanedNonTerminalRequests(ctx context.Context) (int, error) {
+	res, err := s.q.ExecContext(ctx, `
+		UPDATE curator_requests
+		SET status = 'cancelled',
+		    error_msg = COALESCE(error_msg, 'process restarted'),
+		    finished_at = COALESCE(finished_at, ?)
+		WHERE status IN ('queued', 'running')
+	`, time.Now().UTC())
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
 // nullStrSqlite + nullIntSqlite mirror the package-level helpers used
 // by the legacy curator package-level INSERTs. Duplicated locally to
 // avoid an import cycle on the package-db helpers from inside a

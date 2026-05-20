@@ -37,7 +37,7 @@ type FactorySeeder struct {
 	Event func(t *testing.T, entityID, eventType, dedupKey string, createdAt, occurredAt time.Time) string
 
 	// EventNullEntity inserts a system event (entity_id IS NULL).
-	// Used to pin that DistinctEntityCountsLifetime ignores
+	// Used to pin that LifetimeDistinctByEventType ignores
 	// system-tagged rows. Returns the event ID.
 	EventNullEntity func(t *testing.T, eventType string, createdAt time.Time) string
 
@@ -75,7 +75,7 @@ const nullSentinel = "<NULL>"
 //
 //   - Time-window counters (EventCountsSince, TaskCountsSince) clip
 //     correctly across the cutoff.
-//   - DistinctEntityCountsLifetime collapses re-entries from one
+//   - LifetimeDistinctByEventType collapses re-entries from one
 //     entity to one count and ignores system events.
 //   - ActiveRuns filters by status, JOINs through tasks+entities,
 //     and derives memory_missing from run_memory across all four
@@ -116,7 +116,7 @@ func RunFactoryReadStoreConformance(t *testing.T, mk FactoryStoreFactory) {
 		}
 	})
 
-	t.Run("DistinctEntityCountsLifetime_CollapsesReentries", func(t *testing.T) {
+	t.Run("LifetimeDistinctByEventType_CollapsesReentries", func(t *testing.T) {
 		store, orgID, seed := mk(t)
 		ctx := context.Background()
 		now := time.Now().UTC()
@@ -137,9 +137,9 @@ func RunFactoryReadStoreConformance(t *testing.T, mk FactoryStoreFactory) {
 		seed.Event(t, c, domain.EventGitHubPROpened, "", now, time.Time{})
 		seed.Event(t, c, domain.EventGitHubPRMerged, "", now, time.Time{})
 
-		counts, err := store.DistinctEntityCountsLifetime(ctx, orgID)
+		counts, err := store.LifetimeDistinctByEventType(ctx, orgID)
 		if err != nil {
-			t.Fatalf("DistinctEntityCountsLifetime: %v", err)
+			t.Fatalf("LifetimeDistinctByEventType: %v", err)
 		}
 		want := map[string]int{
 			domain.EventGitHubPROpened:        3, // A, B, C
@@ -154,7 +154,7 @@ func RunFactoryReadStoreConformance(t *testing.T, mk FactoryStoreFactory) {
 		}
 	})
 
-	t.Run("DistinctEntityCountsLifetime_IgnoresSystemEvents", func(t *testing.T) {
+	t.Run("LifetimeDistinctByEventType_IgnoresSystemEvents", func(t *testing.T) {
 		store, orgID, seed := mk(t)
 		ctx := context.Background()
 		now := time.Now().UTC()
@@ -164,9 +164,9 @@ func RunFactoryReadStoreConformance(t *testing.T, mk FactoryStoreFactory) {
 		// entity_id IS NULL — system-tagged row, must not contribute.
 		seed.EventNullEntity(t, domain.EventGitHubPROpened, now)
 
-		counts, err := store.DistinctEntityCountsLifetime(ctx, orgID)
+		counts, err := store.LifetimeDistinctByEventType(ctx, orgID)
 		if err != nil {
-			t.Fatalf("DistinctEntityCountsLifetime: %v", err)
+			t.Fatalf("LifetimeDistinctByEventType: %v", err)
 		}
 		if counts[domain.EventGitHubPROpened] != 1 {
 			t.Errorf("opened count = %d, want 1 (NULL entity_id row must not count)",

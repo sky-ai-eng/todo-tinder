@@ -63,7 +63,7 @@ func (s *factoryReadStore) EventCountsSince(ctx context.Context, orgID string, s
 	return out, rows.Err()
 }
 
-func (s *factoryReadStore) DistinctEntityCountsLifetime(ctx context.Context, orgID string) (map[string]int, error) {
+func (s *factoryReadStore) LifetimeDistinctByEventType(ctx context.Context, orgID string) (map[string]int, error) {
 	if err := assertLocalOrg(orgID); err != nil {
 		return nil, err
 	}

@@ -98,23 +98,10 @@ func (s *Store) runClaimsBoundTx(ctx context.Context, orgID, userID string, fn f
 		return err
 	}
 
-	// pending accumulates SetOnEventRecorded fires for events
-	// recorded inside this tx's app-pool path. Fired post-commit
-	// (below) so a rolled-back outer fn never inflates the
-	// LifetimeDistinctCounter with a row the DB never persisted.
-	// RecordSystem inside WithTx routes to s.admin (autonomous
-	// pool, commits independent of this tx) — its hook fires
-	// immediately on a successful INSERT, so we pass nil for the
-	// admin-side pending below.
-	pending := db.NewPendingEventHooks()
-	if err := fn(s.txStoresFromTx(tx, pending)); err != nil {
+	if err := fn(s.txStoresFromTx(tx)); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	pending.Fire()
-	return nil
+	return tx.Commit()
 }
 
 // txStoresFromTx returns the TxStores bundle wired against a single
@@ -123,7 +110,7 @@ func (s *Store) runClaimsBoundTx(ctx context.Context, orgID, userID string, fn f
 // exact same set of tx-bound stores, with the same admin-pool
 // retention for AgentRuns (event-triggered Create routes around RLS
 // even from inside a claims-set tx — see the Create comment).
-func (s *Store) txStoresFromTx(tx *sql.Tx, pending *db.PendingEventHooks) db.TxStores {
+func (s *Store) txStoresFromTx(tx *sql.Tx) db.TxStores {
 	return db.TxStores{
 		Scores:        newScoreStore(tx),
 		Prompts:       newTxPromptStore(tx),
@@ -158,13 +145,12 @@ func (s *Store) txStoresFromTx(tx *sql.Tx, pending *db.PendingEventHooks) db.TxS
 		// half pinned to s.admin lets the classifier read each org's
 		// project set even when composed inside a claims-set tx.
 		Projects: newProjectStore(tx, s.admin),
-		// Events: app-side write defers hook firing via pending.Add
-		// (drained post-commit by runClaimsBoundTx). Admin half
+		// Events: app-side write routes through the tx; admin half
 		// stays pinned to the real admin pool so RecordSystem /
 		// GetMetadataSystem inside WithTx routes outside the tx —
-		// those writes commit autonomously and fire their hook
-		// immediately via db.NotifyEventRecorded.
-		Events: newTxEventStore(tx, s.admin, pending.Add, db.NotifyEventRecorded),
+		// those writes commit autonomously, same shape AgentRuns /
+		// TaskMemory use for their admin-pool halves.
+		Events: newEventStore(tx, s.admin),
 		// TaskMemory: app-side write routes through the tx; admin
 		// half stays pinned to the real admin pool so
 		// UpsertAgentMemorySystem / GetMemoriesForEntitySystem inside
@@ -190,11 +176,14 @@ func (s *Store) txStoresFromTx(tx *sql.Tx, pending *db.PendingEventHooks) db.TxS
 		// it composes safely from any handler regardless of which
 		// pool the surrounding tx was bound to.
 		Teams: newTeamsStore(s.admin),
-		// Curator: tx-bound — every method runs under the outer
-		// SyntheticClaimsWithTx's claims, which is exactly what
-		// curator_requests_modify / curator_messages_modify /
-		// curator_pending_context_modify need on the (org_id,
-		// creator_user_id) pair.
-		Curator: newCuratorStore(tx),
+		// Curator: app-side write routes through the tx; admin half
+		// stays pinned to the real admin pool so
+		// CancelOrphanedNonTerminalRequests inside WithTx routes
+		// outside the tx (cross-tenant sweep that bypasses RLS).
+		// Per-turn writes all run under the outer
+		// SyntheticClaimsWithTx claims via curator_requests_modify /
+		// curator_messages_modify / curator_pending_context_modify
+		// on (org_id, creator_user_id).
+		Curator: newCuratorStore(tx, s.admin),
 	}
 }

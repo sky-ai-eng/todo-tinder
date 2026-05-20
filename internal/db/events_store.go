@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"sync"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
@@ -26,10 +25,6 @@ import (
 // SQLite collapses both pools onto the single connection. The
 // `...System` methods are thin wrappers around their non-System
 // counterparts; assertLocalOrg gates every entry point.
-//
-// SetOnEventRecorded keeps the load-bearing in-memory hook for the
-// LifetimeDistinctCounter: both Record and RecordSystem fire it
-// after a successful INSERT. See the singleton notes below.
 type EventStore interface {
 	// Record inserts evt into the events audit log and returns its
 	// UUID. Empty evt.ID is generated as a v4; non-empty ID is bound
@@ -72,99 +67,4 @@ type EventStore interface {
 	// services. No handler caller exists, so the speculative app-
 	// pool variant is omitted per the SKY-296 convention.
 	GetMetadataSystem(ctx context.Context, orgID, eventID string) (string, error)
-}
-
-// onEventRecorded is the package-level hook fired after every
-// successful event insert by both Record and RecordSystem. The
-// LifetimeDistinctCounter (internal/db/lifetime_counter.go) consumes
-// this to keep its in-memory cache aligned with the DB regardless of
-// which code path wrote the row — including direct callers (tracker
-// backfill, Jira carry-over) that deliberately skip the eventbus.
-//
-// One global hook because there's one counter per process; promote
-// to a slice if a second consumer ever needs the same signal. Set at
-// startup, never reset; tests that don't wire it in see nil and
-// skip.
-var onEventRecorded func(domain.Event)
-
-// SetOnEventRecorded registers a hook called after each successful
-// event insert. Pass nil to unregister. Public surface preserved
-// from the pre-store internal/db/events.go shape so main.go's
-// startup wiring is unchanged.
-func SetOnEventRecorded(fn func(domain.Event)) {
-	onEventRecorded = fn
-}
-
-// EventHook is the callback backend impls fire after a successful
-// event INSERT. Non-tx writes pass NotifyEventRecorded (immediate
-// fan-out). Tx-bound writes pass PendingEventHooks.Add so the
-// global SetOnEventRecorded subscriber waits for the surrounding
-// commit. Same shape either way — the store doesn't branch on
-// "am I in a tx," the constructor wires the right function.
-//
-// PendingEventHooks.Add has signature `func(domain.Event)` so its
-// method value satisfies this type directly. NotifyEventRecorded is
-// also `func(domain.Event)` for the same reason.
-type EventHook func(domain.Event)
-
-// NotifyEventRecorded fires the global SetOnEventRecorded hook with
-// evt. evt.ID must be populated (the generated or caller-supplied
-// UUID) so consumers see the persisted identity.
-//
-// Non-tx writes pass this as their EventHook because the INSERT is
-// durable the moment ExecContext returns nil. Tx-bound writes route
-// through PendingEventHooks.Add instead so the hook waits for the
-// surrounding commit.
-func NotifyEventRecorded(evt domain.Event) {
-	if onEventRecorded != nil {
-		onEventRecorded(evt)
-	}
-}
-
-// PendingEventHooks accumulates events recorded inside a tx-bound
-// Record / RecordSystem call so the SetOnEventRecorded hook fires
-// only after the surrounding transaction commits. The TxRunner
-// allocates one per WithTx call, hands it to the tx-bound EventStore
-// constructor, and invokes Fire() after Commit() returns nil. On
-// rollback the buffered events are dropped — the LifetimeDistinctCounter
-// never observes a row the DB never persisted.
-//
-// Concurrency: WithTx callbacks routinely fan out work into
-// goroutines that all hold the same tx-bound store, so Add must
-// be safe for concurrent use even though the transaction itself
-// serializes the underlying INSERTs.
-type PendingEventHooks struct {
-	mu     sync.Mutex
-	events []domain.Event
-}
-
-// NewPendingEventHooks allocates an empty buffer. The TxRunner
-// allocates one per WithTx invocation; non-tx wiring doesn't use
-// this at all and passes nil to the store constructor instead.
-func NewPendingEventHooks() *PendingEventHooks {
-	return &PendingEventHooks{}
-}
-
-// Add enqueues an event for post-commit hook firing.
-func (p *PendingEventHooks) Add(evt domain.Event) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.events = append(p.events, evt)
-}
-
-// Fire drains the buffer and invokes the global hook for each
-// queued event in the order they were Add'd. Called by the
-// TxRunner after Commit returns nil. Safe to call on a nil
-// receiver — non-tx paths bypass this entirely.
-func (p *PendingEventHooks) Fire() {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	events := p.events
-	p.events = nil
-	p.mu.Unlock()
-	for _, evt := range events {
-		NotifyEventRecorded(evt)
-	}
 }

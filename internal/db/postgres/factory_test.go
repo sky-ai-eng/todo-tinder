@@ -224,9 +224,9 @@ func TestFactoryReadStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	ctx := context.Background()
 
 	// Org A's snapshot must NOT include org B's event.
-	countsA, err := stores.Factory.DistinctEntityCountsLifetime(ctx, orgA)
+	countsA, err := stores.Factory.LifetimeDistinctByEventType(ctx, orgA)
 	if err != nil {
-		t.Fatalf("DistinctEntityCountsLifetime orgA: %v", err)
+		t.Fatalf("LifetimeDistinctByEventType orgA: %v", err)
 	}
 	if countsA["github:pr:merged"] != 0 {
 		t.Errorf("orgA saw orgB's merged event — org_id filter leaked")
@@ -236,9 +236,9 @@ func TestFactoryReadStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	}
 
 	// Symmetric.
-	countsB, err := stores.Factory.DistinctEntityCountsLifetime(ctx, orgB)
+	countsB, err := stores.Factory.LifetimeDistinctByEventType(ctx, orgB)
 	if err != nil {
-		t.Fatalf("DistinctEntityCountsLifetime orgB: %v", err)
+		t.Fatalf("LifetimeDistinctByEventType orgB: %v", err)
 	}
 	if countsB["github:pr:opened"] != 0 {
 		t.Errorf("orgB saw orgA's opened event — org_id filter leaked")

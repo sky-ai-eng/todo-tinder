@@ -436,10 +436,8 @@ func main() {
 		// would leak the pool's idle connections through any non-fatal
 		// exit (signal-driven shutdown once that lands).
 		defer appDB.Close()
-		// Legacy *sql.DB consumers (lifetimeCounter.Hydrate,
-		// SetOnEventRecorded) get the admin pool — their queries are
-		// system-service reads (no JWT-claims context) that the
-		// admin-pool bypasses-RLS path serves correctly.
+		// Legacy *sql.DB consumers route to the admin pool for
+		// system-service reads (no JWT-claims context).
 		database = adminDB
 		stores = pgstore.New(adminDB, appDB)
 
@@ -556,16 +554,29 @@ func main() {
 	// distinguish a taken-over run's session JSONL from a regular
 	// orphan, and silently nuking a JSONL would break the user's ability
 	// to resume.
-	preserveIDs, err := stores.AgentRuns.ListTakenOverIDsSystem(context.Background(), runmode.LocalDefaultOrg)
-	if err != nil {
-		log.Printf("[server] WARNING: failed to load taken_over run ids — sweeping worktree dirs but skipping ~/.claude/projects cleanup to avoid clobbering active takeover sessions: %v", err)
-		worktree.CleanupWithOptions(worktree.CleanupOptions{SkipClaudeProjectCleanup: true})
-	} else {
-		preserveSet := make(map[string]bool, len(preserveIDs))
-		for _, id := range preserveIDs {
-			preserveSet[id] = true
+	//
+	// Local mode only: the preserve set is keyed by the synthetic
+	// sentinel org, which has no real-tenant rows in multi mode — and
+	// the `triagefactory resume` UX itself is local-only. In multi
+	// mode we still want the worktree-dir + bare-repo sweep (those
+	// leaks are not mode-specific), but we skip ~/.claude/projects
+	// cleanup entirely so we don't clobber any real-tenant takeover
+	// JSONLs we'd be unable to identify without a meaningful preserve
+	// set.
+	if runmode.Current() == runmode.ModeLocal {
+		preserveIDs, err := stores.AgentRuns.ListTakenOverIDsSystem(context.Background(), runmode.LocalDefaultOrgID)
+		if err != nil {
+			log.Printf("[server] WARNING: failed to load taken_over run ids — sweeping worktree dirs but skipping ~/.claude/projects cleanup to avoid clobbering active takeover sessions: %v", err)
+			worktree.CleanupWithOptions(worktree.CleanupOptions{SkipClaudeProjectCleanup: true})
+		} else {
+			preserveSet := make(map[string]bool, len(preserveIDs))
+			for _, id := range preserveIDs {
+				preserveSet[id] = true
+			}
+			worktree.CleanupWithOptions(worktree.CleanupOptions{PreserveClaudeProjectFor: preserveSet})
 		}
-		worktree.CleanupWithOptions(worktree.CleanupOptions{PreserveClaudeProjectFor: preserveSet})
+	} else {
+		worktree.CleanupWithOptions(worktree.CleanupOptions{SkipClaudeProjectCleanup: true})
 	}
 
 	// events_catalog is seeded by the v1.11.0 baseline migration in both
@@ -583,7 +594,15 @@ func main() {
 	if err := bootstrapLocalJiraIdentity(stores.Users, stores.Secrets); err != nil {
 		log.Printf("[bootstrap] users.jira_identity: %v (continuing — Settings will capture on next save)", err)
 	}
-	seedDefaultPrompts(stores.Prompts, stores.EventHandlers)
+	// Local mode only: shipped prompts + handlers materialize against
+	// the synthetic (LocalDefaultOrg, LocalDefaultTeamID) pair, neither
+	// of which has a real row in multi-mode Postgres — the event_handlers
+	// insert would FK-fail on first boot. Multi-mode tenants get the
+	// shipped content seeded by the org-create / team-create flows
+	// (D14), which run against real orgs and teams.
+	if runmode.Current() == runmode.ModeLocal {
+		seedDefaultPrompts(stores.Prompts, stores.EventHandlers)
+	}
 
 	// Bootstrap the local-mode agent identity (SKY-260 D-Agent). One
 	// agents row + one team_agents row for the synthetic LocalDefaultOrg
@@ -700,21 +719,6 @@ func main() {
 			})
 		})
 	}
-
-	// Lifetime distinct-entity counter for the factory snapshot. Hydrate
-	// once from the events table so we don't pay a full-table scan per
-	// /api/factory/snapshot request, then keep it warm via the
-	// db.SetOnEventRecorded hook — which fires inside RecordEvent itself
-	// so direct callers (tracker backfill, Jira carry-over) that skip
-	// the eventbus still update the cache. Hydrate must complete before
-	// the hook is wired so a fresh event can't land in the dedupe set
-	// ahead of the historical scan.
-	lifetimeCounter := db.NewLifetimeDistinctCounter()
-	if err := lifetimeCounter.Hydrate(database); err != nil {
-		log.Fatalf("hydrate lifetime counter: %v", err)
-	}
-	srv.SetLifetimeCounter(lifetimeCounter)
-	db.SetOnEventRecorded(lifetimeCounter.Record)
 
 	// Subscriber: WS broadcaster — forwards ALL events to the frontend.
 	//
@@ -871,20 +875,23 @@ func main() {
 		projectclassify.WaitFor(ctx, database, classifier, entityID, projectclassify.DefaultWaitTimeout)
 	})
 
-	// Curator runtime (SKY-216) — per-project chat sessions. Any
-	// rows left non-terminal from a previous process are stranded:
-	// running rows lost their goroutine + agentproc subprocess,
-	// queued rows lost the goroutine that was supposed to pick them
-	// up. Cancel both classes so the user can re-send if they
-	// actually wanted that message processed. Auto-replaying a
-	// stale queued message after a restart would surprise the user
-	// more than dropping it. The model arg is empty until config
-	// loads; curator.UpdateCredentials hot-swaps the same way
-	// Spawner does.
-	if n, err := db.CancelOrphanedNonTerminalCuratorRequests(database); err != nil {
-		log.Printf("[curator] startup recovery failed: %v", err)
+	// Curator runtime (SKY-216) — per-project chat sessions. Sweep
+	// stranded curator turns from a previous process. A binary
+	// restart kills every per-project curator goroutine + agentproc
+	// subprocess in this process, so any `queued` or `running` row
+	// is by definition stranded — cancelling it makes the user
+	// re-send rather than wait for a delayed mystery reply. In
+	// multi mode this affects every tenant whose chat was in-flight
+	// at restart time; documented as intentional. Multi-pod per-org
+	// sharding would let us scope this per-pod, but pod sharding
+	// doesn't exist (single-pod multi-mode in v1).
+	//
+	// The model arg below is empty until config loads;
+	// curator.UpdateCredentials hot-swaps the same way Spawner does.
+	if n, err := stores.Curator.CancelOrphanedNonTerminalRequests(context.Background()); err != nil {
+		log.Printf("[curator] sweep stranded turns: %v", err)
 	} else if n > 0 {
-		log.Printf("[curator] cancelled %d orphaned non-terminal curator requests from prior process", n)
+		log.Printf("[curator] cancelled %d stranded turn(s) from prior process", n)
 	}
 	curatorRuntime := curator.New(database, stores, wsHub, "")
 	srv.SetCurator(curatorRuntime)
@@ -1011,7 +1018,14 @@ func main() {
 				profileGate.Signal()
 				pollerMgr.RestartAll(context.Background(), orgID)
 				scorer.Trigger(orgID)
-				bootstrapBareClones(database, stores.Repos)
+				// Bare-clone bootstrap is best-effort and local-mode-shaped:
+				// it reads repos under the synthetic sentinel org, which
+				// has no rows in multi mode. The lazy-clone path inside
+				// CreateForPR / CreateForBranch handles multi mode on
+				// first delegation per repo per org.
+				if runmode.Current() == runmode.ModeLocal {
+					bootstrapBareClones(database, stores.Repos)
+				}
 			}()
 		} else {
 			spawner.UpdateCredentials(nil, "")
@@ -1100,38 +1114,43 @@ func main() {
 	// Initial start with current credentials. Local mode by design — multi-mode
 	// users get GitHub identity per-org via the D14 admin UI, not via this
 	// keychain-driven boot path. Hard-gating on the runmode lets us keep using
-	// the local sentinel here without it leaking into multi-mode startup.
-	cfg, _ := config.Load()
-	ctx := context.Background()
-	orgID := runmode.LocalDefaultOrgID
-	creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
-	repoCount, _ := stores.Repos.CountConfiguredSystem(ctx, orgID)
+	// the local sentinel here without it leaking into multi-mode startup:
+	// reading the synthetic sentinel org's secrets in multi mode would
+	// return zero values and we'd hand an unauthenticated GitHub client to
+	// every downstream subsystem, then quietly log per-cycle 401s.
+	if runmode.Current() == runmode.ModeLocal {
+		cfg, _ := config.Load()
+		ctx := context.Background()
+		orgID := runmode.LocalDefaultOrgID
+		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
+		repoCount, _ := stores.Repos.CountConfiguredSystem(ctx, orgID)
 
-	if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) && repoCount > 0 {
-		ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
-		spawner.UpdateCredentials(ghClient, cfg.AI.Model)
-		curatorRuntime.UpdateCredentials(cfg.AI.Model)
-		srv.SetGitHubClient(ghClient)
-		log.Printf("[delegate] spawner ready (%d repos configured)", repoCount)
+		if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) && repoCount > 0 {
+			ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
+			spawner.UpdateCredentials(ghClient, cfg.AI.Model)
+			curatorRuntime.UpdateCredentials(cfg.AI.Model)
+			srv.SetGitHubClient(ghClient)
+			log.Printf("[delegate] spawner ready (%d repos configured)", repoCount)
 
-		// Profile repos, then signal ready, start pollers, and trigger scoring
-		go func() {
-			profiler := repoprofile.NewProfiler(ghClient, database, stores.Repos, stores.Orgs, wsHub)
-			if err := profiler.Run(context.Background(), false); err != nil {
-				log.Printf("[repoprofile] initial profiling failed: %v", err)
-			}
-			profileGate.Signal()
-			pollerMgr.RestartAll(context.Background(), orgID)
-			scorer.Trigger(orgID)
-			bootstrapBareClones(database, stores.Repos)
-		}()
-	} else {
-		// Not fully configured — start pollers immediately (may be empty)
-		pollerMgr.RestartAll(ctx, orgID)
-	}
+			// Profile repos, then signal ready, start pollers, and trigger scoring
+			go func() {
+				profiler := repoprofile.NewProfiler(ghClient, database, stores.Repos, stores.Orgs, wsHub)
+				if err := profiler.Run(context.Background(), false); err != nil {
+					log.Printf("[repoprofile] initial profiling failed: %v", err)
+				}
+				profileGate.Signal()
+				pollerMgr.RestartAll(context.Background(), orgID)
+				scorer.Trigger(orgID)
+				bootstrapBareClones(database, stores.Repos)
+			}()
+		} else {
+			// Not fully configured — start pollers immediately (may be empty)
+			pollerMgr.RestartAll(ctx, orgID)
+		}
 
-	if creds.JiraPAT != "" && creds.JiraURL != "" {
-		srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT))
+		if creds.JiraPAT != "" && creds.JiraURL != "" {
+			srv.SetJiraClient(jira.NewClient(creds.JiraURL, creds.JiraPAT))
+		}
 	}
 
 	if err := srv.ListenAndServe(addr); err != nil {

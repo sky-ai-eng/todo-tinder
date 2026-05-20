@@ -51,13 +51,9 @@ func makeEntity(t *testing.T, database *sql.DB, i int) *domain.Entity {
 // recordEvent inserts a real entity-attached event for tests. Returns
 // the event's UUID. After SKY-305 the events.go top-level RecordEvent
 // is gone (lifted into the per-backend EventStore impls); this helper
-// does the seed-only raw INSERT plus fires the SetOnEventRecorded
-// hook so lifetime_counter and similar internal-package tests that
-// rely on the hook observe the same fan-out the real store impls
-// provide.
-//
-// Lives in package db (not sqlite) so it doesn't import the sqlite
-// store and form a cycle — sqlite imports db, not the other way.
+// does the seed-only raw INSERT for package-internal tests that need
+// rows in the events table without dragging in the SQLite store
+// (which imports db, not the other way).
 func recordEvent(t *testing.T, database *sql.DB, entityID, eventType string) string {
 	t.Helper()
 	id := uuid.New().String()
@@ -67,6 +63,5 @@ func recordEvent(t *testing.T, database *sql.DB, entityID, eventType string) str
 	`, id, entityID, eventType); err != nil {
 		t.Fatalf("recordEvent(%s, %s): %v", entityID, eventType, err)
 	}
-	NotifyEventRecorded(domain.Event{ID: id, EntityID: &entityID, EventType: eventType})
 	return id
 }
