@@ -1261,3 +1261,58 @@ func TestGoTrueHTTPClient_EnforcesTimeout(t *testing.T) {
 		t.Errorf("request took %v, expected timeout near 50ms (timeout not enforced)", elapsed)
 	}
 }
+
+// TestGoTrueTokenRequests_AreJSON asserts both the PKCE exchange and
+// refresh-token requests send a JSON body with Content-Type:
+// application/json. GoTrue's /token handler parses every grant_type
+// as JSON; a form-encoded body decodes to an empty struct and the
+// handler errors out with 400 bad_json. Regression for the latent
+// "OAuth login dies at token exchange" bug.
+func TestGoTrueTokenRequests_AreJSON(t *testing.T) {
+	type captured struct {
+		path        string
+		contentType string
+		body        map[string]string
+	}
+	var got []captured
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		got = append(got, captured{
+			path:        r.URL.Path + "?" + r.URL.RawQuery,
+			contentType: r.Header.Get("Content-Type"),
+			body:        body,
+		})
+		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","expires_at":0}`))
+	}))
+	defer upstream.Close()
+
+	srv := &Server{}
+	cfg := &authConfig{gotrueURL: upstream.URL}
+
+	if _, _, _, err := srv.gotrueExchangeFunc(cfg)(context.Background(), "code-x", "verifier-y"); err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	if _, _, _, err := srv.gotrueRefreshFunc(cfg)(context.Background(), "refresh-z"); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", len(got))
+	}
+	for _, c := range got {
+		if c.contentType != "application/json" {
+			t.Errorf("Content-Type=%q want application/json (path=%s)", c.contentType, c.path)
+		}
+		if len(c.body) == 0 {
+			t.Errorf("body did not parse as JSON or was empty (path=%s)", c.path)
+		}
+	}
+	if got[0].body["auth_code"] != "code-x" || got[0].body["code_verifier"] != "verifier-y" {
+		t.Errorf("pkce body fields: %v", got[0].body)
+	}
+	if got[1].body["refresh_token"] != "refresh-z" {
+		t.Errorf("refresh body fields: %v", got[1].body)
+	}
+}
