@@ -27,11 +27,13 @@ import (
 //	garbage value   — cookie present but value isn't a UUID
 //	unknown sid     — well-formed UUID with no matching session row
 //
-// All three exit at writeUnauth in withSession before any handler or DB
-// query runs, so the test is fast (~ms per route) and the variants don't
-// need session-row fixtures. The path-param substitutions don't have to
-// resolve to real entities because middleware fires before path-param
-// parsing.
+// All three short-circuit at auth middleware and never reach the route
+// handler. The no-cookie and garbage-value variants reject before any DB
+// access; the unknown-sid variant still performs a session lookup against
+// the sessions table to confirm the row doesn't exist, but it still
+// returns 401 without needing session-row fixtures. The path-param
+// substitutions don't have to resolve to real entities because
+// middleware fires before path-param parsing.
 //
 // What this test does NOT cover:
 //
