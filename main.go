@@ -74,6 +74,24 @@ func pluralize(n int, singular, plural string) string {
 	return plural
 }
 
+// applyPGPoolDefaults sets connection-pool ceilings on a Postgres
+// *sql.DB. database/sql's default MaxOpenConns is unlimited, which can
+// exhaust Postgres' max_connections (default 100) under load — and
+// multi-mode opens two pools (admin + app) against the same server, so
+// the budget per pool needs to leave room for the other.
+//
+// The numbers below are conservative defaults that fit comfortably
+// within a default supabase/postgres install (max_connections=100,
+// with ~30 reserved for the image's own roles). Operators tuning a
+// production deployment should raise these along with Postgres'
+// max_connections; until that knob is wired, fixed defaults are
+// safer than leaving the pools uncapped.
+func applyPGPoolDefaults(db *sql.DB) {
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
+}
+
 // bootstrapBareClones reads the configured repos from the DB and asks
 // the worktree package to ensure each one is materialized on disk
 // as a bare clone with the right origin URL.
@@ -370,6 +388,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("open admin DB: %v", err)
 		}
+		applyPGPoolDefaults(adminDB)
 		if err := adminDB.Ping(); err != nil {
 			log.Fatalf("ping admin DB: %v", err)
 		}
@@ -381,9 +400,16 @@ func main() {
 		if err != nil {
 			log.Fatalf("open app DB: %v", err)
 		}
+		applyPGPoolDefaults(appDB)
 		if err := appDB.Ping(); err != nil {
 			log.Fatalf("ping app DB: %v", err)
 		}
+		// Close the app pool on shutdown — the admin pool is deferred
+		// via the shared `database` handle below. database/sql pools
+		// don't auto-close on process exit, so leaving this unbound
+		// would leak the pool's idle connections through any non-fatal
+		// exit (signal-driven shutdown once that lands).
+		defer appDB.Close()
 		// Legacy *sql.DB consumers (lifetimeCounter.Hydrate,
 		// SetOnEventRecorded) get the admin pool — their queries are
 		// system-service reads (no JWT-claims context) that the

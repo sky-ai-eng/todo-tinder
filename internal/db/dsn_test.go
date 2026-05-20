@@ -88,15 +88,29 @@ func TestRewriteDSNCreds_Errors(t *testing.T) {
 		{"empty", ""},
 		{"no scheme", "postgres:5432/postgres"},
 		{"keyword form", "host=postgres user=postgres password=secret"},
+		{"non-postgres scheme", "mysql://root:pw@host:3306/db"},
+		{"http scheme", "http://host:5432/postgres"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := RewriteDSNCreds(tc.dsn, "authenticator", "pw")
 			if err == nil {
 				t.Errorf("want error on dsn=%q, got nil", tc.dsn)
-			} else if !strings.Contains(err.Error(), "dsn") && !strings.Contains(err.Error(), "parse") {
+			} else if !strings.Contains(err.Error(), "dsn") && !strings.Contains(err.Error(), "parse") && !strings.Contains(err.Error(), "scheme") {
 				t.Errorf("error %q lacks expected context", err)
 			}
 		})
+	}
+}
+
+func TestRewriteDSNCreds_PostgresqlScheme(t *testing.T) {
+	// The `postgresql://` scheme is the long-form synonym for
+	// `postgres://`; both should be accepted.
+	got, err := RewriteDSNCreds("postgresql://postgres:secret@postgres:5432/postgres", "authenticator", "pw")
+	if err != nil {
+		t.Fatalf("RewriteDSNCreds: %v", err)
+	}
+	if !strings.HasPrefix(got, "postgresql://authenticator:pw@") {
+		t.Errorf("unexpected output: %q", got)
 	}
 }

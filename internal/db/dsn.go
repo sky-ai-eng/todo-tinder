@@ -25,6 +25,13 @@ func RewriteDSNCreds(dsn, user, password string) (string, error) {
 	if u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("dsn missing scheme or host (not URL form?)")
 	}
+	// Refuse non-Postgres schemes early. The only caller today is the
+	// multi-mode boot deriving the app DSN from TF_DATABASE_URL; if
+	// that env points at, say, a mysql:// URL the failure would
+	// otherwise surface much later as a confusing pgx connect error.
+	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
+		return "", fmt.Errorf("dsn scheme %q is not postgres/postgresql", u.Scheme)
+	}
 	u.User = url.UserPassword(user, password)
 	return u.String(), nil
 }
