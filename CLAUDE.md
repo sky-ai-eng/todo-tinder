@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository. This is a public repository. Under no circumstances should you commit sensitive information or custom configuration files related to specific deployments to git.
 
 ## Build, lint, test
 
@@ -38,7 +38,7 @@ Triage Factory is a **single Go binary** (HTTP server + pollers + delegated-agen
 `main.go` dispatches on `os.Args[1]`:
 
 - **Server mode** (default) — HTTP API + websocket hub + pollers + scorer + event router + delegation spawner.
-- **CLI mode** (`exec`, `status`) — invoked *by delegated Claude Code agents* inside a worktree. `cmd/exec/` provides scoped GitHub/Jira subcommands the agent uses instead of calling those APIs directly, so credentials stay in the keychain and activity is auditable via `runs` / `run_artifacts`.
+- **CLI mode** (`exec`, `status`) — invoked _by delegated Claude Code agents_ inside a worktree. `cmd/exec/` provides scoped GitHub/Jira subcommands the agent uses instead of calling those APIs directly, so credentials stay in the keychain and activity is auditable via `runs` / `run_artifacts`.
 
 ### Core data model (target state)
 
@@ -58,7 +58,7 @@ Key invariants:
 
 - **Entities are durable, events are immutable, tasks are ephemeral, runs are the work.** Memory is written per-run but materialized per-entity via `entity_links`.
 - **Dedup:** at most one active task per `(entity_id, event_type, dedup_key)` — enforced by a partial unique index in `tasks`. `dedup_key` is usually empty; open-set discriminators (label name, status name) use it to get separate tasks per value.
-- **No retroactive task creation.** A new task_rule or trigger applies to events *going forward*. Historical events in the log are not re-evaluated.
+- **No retroactive task creation.** A new task_rule or trigger applies to events _going forward_. Historical events in the log are not re-evaluated.
 - **Events split on discriminators that change whether the situation needs attention** (`ci_check_failed` ≠ `ci_check_passed`, `review_approved` ≠ `review_changes_requested`). Attributes that just narrow the same situation (reviewer, check name, repo, label) stay as predicate-filterable metadata. Don't proliferate event types for Cartesian products.
 
 ### Event bus is the central pub/sub
@@ -74,7 +74,7 @@ Pollers publish events to the bus rather than invoking callbacks directly. This 
 
 ### Poller / tracker
 
-`internal/poller` manages GitHub + Jira pollers. `internal/tracker` does the diff logic: snapshot → refresh → diff against prior snapshot → emit typed events only on transitions. The snapshot-diff is the *sole* source of truth for re-emit prevention — a check-run ID seen last cycle doesn't fire again. See `docs/tracked-events.md` for the taxonomy.
+`internal/poller` manages GitHub + Jira pollers. `internal/tracker` does the diff logic: snapshot → refresh → diff against prior snapshot → emit typed events only on transitions. The snapshot-diff is the _sole_ source of truth for re-emit prevention — a check-run ID seen last cycle doesn't fire again. See `docs/tracked-events.md` for the taxonomy.
 
 ### Delegation (the "Agent" column)
 
@@ -95,7 +95,7 @@ React 19 + Vite + TypeScript + Tailwind v4. Router routes live in `frontend/src/
 ## Conventions to know before editing
 
 - **Schema: goose-managed forward migrations, fresh installs only.** v1.11.0 is a hard reset — pre-v1.11.0 DBs are refused at boot via the brick check in `internal/db/migrations.go`. Operators run `triagefactory uninstall` (or `./scripts/clean-slate.sh` if working from source) and reinstall. New migrations land as `internal/db/migrations-sqlite/NNNNNNNNNNNN_description.sql` (12-digit `YYYYMMDDNNNN` version) with `-- +goose Up` / `-- +goose Down` markers. Down blocks are `SELECT 'down not supported';` no-ops. The brick check (`assertFreshOrCurrent`) gates entry to `goose.Up`: empty DB → proceed; `goose_db_version` contains the v1.11.0 baseline (202605130001) → proceed; anything else → `ErrPreV1110Install`. Postgres migrations live in `internal/db/migrations-postgres/`; `db.Migrate(db, dialect)` routes to the matching tree. Postgres tests use the `internal/db/pgtest` harness — testcontainer with two connections (AdminDB superuser, AppDB authenticator+tf_app) — and skip cleanly when Docker isn't available. See `docs/specs/sky-247-d3-multi-tenant-postgres-schema.html`.
-- **Events catalog** is a read-only system registry seeded from `domain.AllEventTypes()` via `db.SeedEventTypes`. New event types must be added there *and* the events_catalog table will reject emissions of unregistered types (FK from `events.event_type`).
+- **Events catalog** is a read-only system registry seeded from `domain.AllEventTypes()` via `db.SeedEventTypes`. New event types must be added there _and_ the events_catalog table will reject emissions of unregistered types (FK from `events.event_type`).
 - **System triggers ship disabled.** They're reference examples — users opt in or replace them. See `seed.go`.
 - **Go module path:** `github.com/sky-ai-eng/triage-factory`. The GitHub org is `sky-ai-eng`.
 - **Go version:** `go.mod` says 1.26.1, README says 1.23+; keep the floor modern but don't bump without reason.
