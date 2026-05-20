@@ -1,15 +1,7 @@
 # Triage Factory — multi-mode compose stack.
 #
-# Brings up Postgres + GoTrue. Local-mode (SQLite) doesn't need any of this.
-# The triagefactory container image is a D13 (SKY-256) concern — until then
-# the TF binary runs from the host against this stack:
-#
-#   TF_MODE=multi \
-#   TF_GOTRUE_URL=http://localhost:9999 \
-#   TF_GOTRUE_JWKS_URL=http://localhost:9999/.well-known/jwks.json \
-#   TF_GOTRUE_ISSUER=${TF_PUBLIC_URL}/auth/v1 \
-#   TF_SESSION_ENCRYPTION_KEY=<from .env> \
-#   TF_COOKIE_SECRET=<from .env>  ./triagefactory
+# Brings up Postgres + GoTrue + the TF binary as a service. Local-mode
+# (SQLite, the default) doesn't need any of this.
 #
 # Prerequisites — see docs/self-host-setup.md:
 #   1. Create a GitHub OAuth app with callback ${TF_PUBLIC_URL}/auth/v1/callback
@@ -81,18 +73,25 @@ services:
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD (see .env.example)}
       SUPABASE_AUTH_ADMIN_PASSWORD: ${SUPABASE_AUTH_ADMIN_PASSWORD:?missing SUPABASE_AUTH_ADMIN_PASSWORD (see .env.example)}
+      AUTHENTICATOR_PASSWORD: ${TF_AUTHENTICATOR_PASSWORD:?missing TF_AUTHENTICATOR_PASSWORD (see .env.example)}
     entrypoint: ["sh", "-c"]
     # The heredoc with a quoted delimiter ('SQL') skips outer-shell
     # expansion; psql sees the raw \set + backtick-echo, runs the echo
     # in its own sub-shell against the container env (where we placed
-    # SUPABASE_AUTH_ADMIN_PASSWORD), and :'auth_admin_password' applies
-    # SQL-safe quoting. Equivalent to the official supabase roles.sql.
+    # the role passwords), and :'<var>' applies SQL-safe quoting.
+    # Equivalent to the official supabase roles.sql.
+    #
+    # Both ALTERs run as supabase_admin (the real superuser per the
+    # supabase image's role-demotion init); supautils only blocks
+    # reserved-role ALTERs from non-supers. Idempotent on re-run.
     command:
       - |
         set -eu
         psql -h postgres -U supabase_admin -d postgres -v ON_ERROR_STOP=1 <<-'SQL'
         \set auth_admin_password `echo "$SUPABASE_AUTH_ADMIN_PASSWORD"`
+        \set authenticator_password `echo "$AUTHENTICATOR_PASSWORD"`
         ALTER USER supabase_auth_admin WITH LOGIN PASSWORD :'auth_admin_password';
+        ALTER USER authenticator WITH LOGIN PASSWORD :'authenticator_password';
         SQL
     restart: "no"
 
@@ -188,6 +187,7 @@ services:
     environment:
       TF_MODE: multi
       TF_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD (see .env.example)}@postgres:5432/postgres
+      TF_AUTHENTICATOR_PASSWORD: ${TF_AUTHENTICATOR_PASSWORD:?missing TF_AUTHENTICATOR_PASSWORD (see .env.example)}
       TF_GOTRUE_URL: http://gotrue:9999
       TF_GOTRUE_JWKS_URL: http://gotrue:9999/.well-known/jwks.json
       TF_GOTRUE_ISSUER: ${TF_PUBLIC_URL}/auth/v1

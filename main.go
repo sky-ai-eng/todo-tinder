@@ -13,9 +13,11 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
+	"github.com/sky-ai-eng/triage-factory/internal/auth/verify"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	pgstore "github.com/sky-ai-eng/triage-factory/internal/db/postgres"
 	sqlitestore "github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -28,11 +30,15 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/repoprofile"
 	"github.com/sky-ai-eng/triage-factory/internal/routing"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
+	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
 	"github.com/sky-ai-eng/triage-factory/internal/server"
+	"github.com/sky-ai-eng/triage-factory/internal/sessions"
 	"github.com/sky-ai-eng/triage-factory/internal/skills"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/sky-ai-eng/triage-factory/cmd/exec"
 	"github.com/sky-ai-eng/triage-factory/cmd/install"
@@ -343,17 +349,56 @@ func main() {
 		}
 		stores = sqlitestore.New(database)
 	case runmode.ModeMulti:
-		// When SKY-242's multi-mode boot wiring lands, add this call
-		// near the top of the multi-mode init (before the agentproc
-		// callers spawn anything):
-		//
-		//   if err := sandbox.ReapOrphans(ctx); err != nil {
-		//       log.Printf("sandbox: reap orphans at boot: %v", err)
-		//   }
-		//
-		// Reaps netns + bundle dirs leaked by a hard-crashed
-		// previous TF process. Best-effort; never fatal.
-		log.Fatalf("TF_MODE=multi: multi-tenant mode is not yet wired end-to-end; see SKY-242 (v1 multi-tenant epic). Unset TF_MODE to run in local mode.")
+		// Multi-mode boot wires two Postgres pools against the same
+		// server. admin (superuser) handles migrations + system-service
+		// reads + tenant bootstrap; app (authenticator → tf_app)
+		// handles RLS-active request handlers. The admin DSN comes in
+		// whole via TF_DATABASE_URL; the app DSN reuses host/db/options
+		// but swaps userinfo to authenticator + its own password (set
+		// out-of-band by the postgres-postinit sidecar). Two passwords
+		// by design — see CLAUDE.md and the postgres-postinit service
+		// in docker-compose.yml.
+		adminDSN := os.Getenv("TF_DATABASE_URL")
+		if adminDSN == "" {
+			log.Fatalf("TF_MODE=multi requires TF_DATABASE_URL")
+		}
+		authPassword := os.Getenv("TF_AUTHENTICATOR_PASSWORD")
+		if authPassword == "" {
+			log.Fatalf("TF_MODE=multi requires TF_AUTHENTICATOR_PASSWORD")
+		}
+		adminDB, err := sql.Open("pgx", adminDSN)
+		if err != nil {
+			log.Fatalf("open admin DB: %v", err)
+		}
+		if err := adminDB.Ping(); err != nil {
+			log.Fatalf("ping admin DB: %v", err)
+		}
+		appDSN, err := db.RewriteDSNCreds(adminDSN, "authenticator", authPassword)
+		if err != nil {
+			log.Fatalf("derive app DSN: %v", err)
+		}
+		appDB, err := sql.Open("pgx", appDSN)
+		if err != nil {
+			log.Fatalf("open app DB: %v", err)
+		}
+		if err := appDB.Ping(); err != nil {
+			log.Fatalf("ping app DB: %v", err)
+		}
+		// Legacy *sql.DB consumers (lifetimeCounter.Hydrate,
+		// SetOnEventRecorded) get the admin pool — their queries are
+		// system-service reads (no JWT-claims context) that the
+		// admin-pool bypasses-RLS path serves correctly.
+		database = adminDB
+		stores = pgstore.New(adminDB, appDB)
+
+		// Best-effort startup cleanup of orphaned sandboxes from a
+		// prior hard-crashed TF process. Sweeps /var/run/netns and
+		// $TMPDIR for tf-* netns + bundle dirs. Never fatal — failure
+		// here just means orphaned resources stick around until the
+		// next boot or a manual cleanup.
+		if err := sandbox.ReapOrphans(context.Background()); err != nil {
+			log.Printf("sandbox: reap orphans at boot: %v", err)
+		}
 	default:
 		log.Fatalf("unknown runmode: %v", runmode.Current())
 	}
@@ -389,6 +434,47 @@ func main() {
 	}
 
 	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Tx)
+
+	// Multi-mode auth wiring. The verifier blocks on the initial JWKS
+	// fetch (see verify.NewVerifier docstring), so GoTrue must be
+	// reachable before TF boots — docker-compose handles this via
+	// `depends_on: gotrue: { condition: service_healthy }`. The
+	// session reaper goroutine spawned inside SetAuthDeps inherits
+	// ctxBoot; it lives for the binary's lifetime (the binary has no
+	// top-level cancel today).
+	if runmode.Current() == runmode.ModeMulti {
+		ctxBoot := context.Background()
+		verifier, err := verify.NewVerifier(
+			ctxBoot,
+			os.Getenv("TF_GOTRUE_JWKS_URL"),
+			os.Getenv("TF_GOTRUE_ISSUER"),
+			"authenticated", // GoTrue's standard audience claim
+		)
+		if err != nil {
+			log.Fatalf("build verifier: %v", err)
+		}
+
+		sessionKey, err := sessions.LoadKeyFromEnv(sessions.EnvSessionEncryptionKey)
+		if err != nil {
+			log.Fatalf("load session encryption key: %v", err)
+		}
+		cookieKey, err := sessions.LoadKeyFromEnv(sessions.EnvCookieSecret)
+		if err != nil {
+			log.Fatalf("load cookie secret: %v", err)
+		}
+
+		sessionStore := sessions.NewStore(database, sessionKey)
+		if err := srv.SetAuthDeps(
+			ctxBoot,
+			verifier,
+			sessionStore,
+			os.Getenv("TF_GOTRUE_URL"),
+			os.Getenv("TF_PUBLIC_URL"),
+			cookieKey,
+		); err != nil {
+			log.Fatalf("wire auth deps: %v", err)
+		}
+	}
 
 	distFS, err := frontendDist()
 	if err != nil {
@@ -450,8 +536,14 @@ func main() {
 	// broken auto-delegation state where the user wouldn't see an
 	// error, just notice things never fire. Better to surface the
 	// failure at startup.
-	if err := db.BootstrapLocalAgent(context.Background(), stores); err != nil {
-		log.Fatalf("[bootstrap] local agent: %v (auto-delegation depends on this; refusing to start)", err)
+	//
+	// Local mode only: multi-mode bootstraps a real agents row per org
+	// via the admin org-create flow (SKY-257). There is no synthetic
+	// org in multi mode for this row to attach to.
+	if runmode.Current() == runmode.ModeLocal {
+		if err := db.BootstrapLocalAgent(context.Background(), stores); err != nil {
+			log.Fatalf("[bootstrap] local agent: %v (auto-delegation depends on this; refusing to start)", err)
+		}
 	}
 
 	// Auto-import Claude Code skill files as prompts. Local mode
@@ -479,62 +571,71 @@ func main() {
 	// live. Failures get an SSH preflight to classify whether the SSH
 	// side is the cause — that drives the per-row CTA on the frontend
 	// ("Fix in Settings" for SSH issues, raw stderr otherwise).
-	worktree.SetOnCloneResult(func(owner, repo string, cloneErr error) {
-		if cloneErr == nil {
-			if err := stores.Repos.UpdateCloneStatusSystem(context.Background(), runmode.LocalDefaultOrgID, owner, repo, "ok", "", ""); err != nil {
-				log.Printf("[clone-status] update %s/%s ok: %v", owner, repo, err)
+	//
+	// Local mode only: the callback body hardcodes LocalDefaultOrgID
+	// for the row-stamp + WS broadcast. Multi-mode clone-status fan-out
+	// requires per-request orgID threading through worktree's callback
+	// surface; that's a follow-up. For now multi-mode just doesn't
+	// surface live clone-status updates — the underlying clone still
+	// happens, only the UI feedback is missing.
+	if runmode.Current() == runmode.ModeLocal {
+		worktree.SetOnCloneResult(func(owner, repo string, cloneErr error) {
+			if cloneErr == nil {
+				if err := stores.Repos.UpdateCloneStatusSystem(context.Background(), runmode.LocalDefaultOrgID, owner, repo, "ok", "", ""); err != nil {
+					log.Printf("[clone-status] update %s/%s ok: %v", owner, repo, err)
+				}
+				// Scoped to the local sentinel org — the upstream UpdateCloneStatusSystem
+				// call above stamps the same org id, so the broadcast surface matches
+				// the row's owning tenant. Multi-mode clone-status fan-out is a
+				// separate concern (the callback today only fires from local-mode
+				// paths).
+				wsHub.Broadcast(websocket.Event{
+					Type:  "repo_profile_updated",
+					OrgID: runmode.LocalDefaultOrgID,
+					Data: map[string]any{
+						"id":           owner + "/" + repo,
+						"clone_status": "ok",
+					},
+				})
+				return
 			}
-			// Scoped to the local sentinel org — the upstream UpdateCloneStatusSystem
-			// call above stamps the same org id, so the broadcast surface matches
-			// the row's owning tenant. Multi-mode clone-status fan-out is a
-			// separate concern (the callback today only fires from local-mode
-			// paths).
+
+			log.Printf("[clone-status] %s/%s clone failed: %v", owner, repo, cloneErr)
+
+			kind := "other"
+			if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+				// Use the configured GitHub host so GHE installs probe
+				// the right SSH endpoint, not github.com. Falls back to
+				// git@github.com when the URL is empty/unparseable.
+				creds, _ := integrations.Load(context.Background(), stores.Secrets, runmode.LocalDefaultOrgID)
+				sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				if perr := worktree.CachedPreflightSSH(ctx, sshHost); perr != nil {
+					kind = "ssh"
+					log.Printf("[clone-status] %s/%s SSH preflight against %s also failed → kind=ssh: %v", owner, repo, sshHost, perr)
+				} else {
+					log.Printf("[clone-status] %s/%s SSH preflight against %s passed → kind=other (clone error is on the git side)", owner, repo, sshHost)
+				}
+				cancel()
+			} else if cErr != nil {
+				log.Printf("[clone-status] %s/%s load config to classify: %v (defaulting to kind=other)", owner, repo, cErr)
+			}
+
+			if err := stores.Repos.UpdateCloneStatusSystem(context.Background(), runmode.LocalDefaultOrgID, owner, repo, "failed", cloneErr.Error(), kind); err != nil {
+				log.Printf("[clone-status] update %s/%s failed: %v", owner, repo, err)
+			}
 			wsHub.Broadcast(websocket.Event{
 				Type:  "repo_profile_updated",
 				OrgID: runmode.LocalDefaultOrgID,
 				Data: map[string]any{
-					"id":           owner + "/" + repo,
-					"clone_status": "ok",
+					"id":               owner + "/" + repo,
+					"clone_status":     "failed",
+					"clone_error":      cloneErr.Error(),
+					"clone_error_kind": kind,
 				},
 			})
-			return
-		}
-
-		log.Printf("[clone-status] %s/%s clone failed: %v", owner, repo, cloneErr)
-
-		kind := "other"
-		if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
-			// Use the configured GitHub host so GHE installs probe
-			// the right SSH endpoint, not github.com. Falls back to
-			// git@github.com when the URL is empty/unparseable.
-			creds, _ := integrations.Load(context.Background(), stores.Secrets, runmode.LocalDefaultOrgID)
-			sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			if perr := worktree.CachedPreflightSSH(ctx, sshHost); perr != nil {
-				kind = "ssh"
-				log.Printf("[clone-status] %s/%s SSH preflight against %s also failed → kind=ssh: %v", owner, repo, sshHost, perr)
-			} else {
-				log.Printf("[clone-status] %s/%s SSH preflight against %s passed → kind=other (clone error is on the git side)", owner, repo, sshHost)
-			}
-			cancel()
-		} else if cErr != nil {
-			log.Printf("[clone-status] %s/%s load config to classify: %v (defaulting to kind=other)", owner, repo, cErr)
-		}
-
-		if err := stores.Repos.UpdateCloneStatusSystem(context.Background(), runmode.LocalDefaultOrgID, owner, repo, "failed", cloneErr.Error(), kind); err != nil {
-			log.Printf("[clone-status] update %s/%s failed: %v", owner, repo, err)
-		}
-		wsHub.Broadcast(websocket.Event{
-			Type:  "repo_profile_updated",
-			OrgID: runmode.LocalDefaultOrgID,
-			Data: map[string]any{
-				"id":               owner + "/" + repo,
-				"clone_status":     "failed",
-				"clone_error":      cloneErr.Error(),
-				"clone_error_kind": kind,
-			},
 		})
-	})
+	}
 
 	// Lifetime distinct-entity counter for the factory snapshot. Hydrate
 	// once from the events table so we don't pay a full-table scan per

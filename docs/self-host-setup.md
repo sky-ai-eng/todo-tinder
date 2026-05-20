@@ -22,12 +22,13 @@ cp .env.example .env
 Fill in:
 - `POSTGRES_PASSWORD` — superuser password. Used for migrations and admin tasks. Generate with `openssl rand -base64 32`.
 - `SUPABASE_AUTH_ADMIN_PASSWORD` — distinct password for the role GoTrue connects as. Keeping it separate from the superuser means a GoTrue compromise doesn't surrender full DB access. **Generate with `openssl rand -hex 32`** — GoTrue's DB library only accepts URL-form connection strings, so the password is interpolated into a `postgres://user:pass@host/...` URL. Plain hex avoids every URL-reserved character (`/`, `?`, `#`, `@`, `+`, `=`) by construction. Do *not* use `openssl rand -base64 32` — base64 includes `/` and `+` which break URL parsing.
+- `TF_AUTHENTICATOR_PASSWORD` — password for the `authenticator` role TF's app pool connects as for RLS-active request handling. Kept distinct from the other two so a compromise of one pool doesn't surrender the others. **Generate with `openssl rand -hex 32`** — same URL-form constraint as `SUPABASE_AUTH_ADMIN_PASSWORD` (the TF binary builds a `postgres://authenticator:<pw>@...` DSN at boot). The `postgres-postinit` sidecar reapplies this on every `docker compose up`, same as the auth-admin password.
 - `TF_PUBLIC_URL` — your public URL (no trailing slash)
 - `GH_CLIENT_ID` / `GH_CLIENT_SECRET` — from step 1
 - `TF_SESSION_ENCRYPTION_KEY` — 32 random bytes; AES-GCM master key for the access/refresh tokens stored at rest in `public.sessions`. **Generate with `openssl rand -hex 32`.** Rotating this key invalidates every existing session (ciphertext can't be decrypted) — plan it as a forced re-auth event.
 - `TF_COOKIE_SECRET` — 32 random bytes; HMAC-SHA256 key for the short-lived OAuth state cookie (carries PKCE verifier + CSRF token). **Generate with `openssl rand -hex 32`.** Kept distinct from `TF_SESSION_ENCRYPTION_KEY` so the two rotate independently — rotating only this one invalidates in-flight OAuth handshakes (10-minute window), not active sessions.
 
-> **Rotating passwords:** edit `.env` and re-run `docker compose up -d`. A short-lived `postgres-postinit` sidecar runs on every boot and reapplies `ALTER USER` for the non-superuser roles, so password changes propagate without wiping the data volume. Rotating `POSTGRES_PASSWORD` itself requires more care — that's the superuser's password and Postgres only honors the env var on first init, so changing it means `ALTER USER postgres WITH PASSWORD '...'` by hand inside the running container.
+> **Rotating passwords:** edit `.env` and re-run `docker compose up -d`. A short-lived `postgres-postinit` sidecar runs on every boot and reapplies `ALTER USER` for the non-superuser roles (`supabase_auth_admin`, `authenticator`), so password changes propagate without wiping the data volume. Rotating `POSTGRES_PASSWORD` itself requires more care — that's the superuser's password and Postgres only honors the env var on first init, so changing it means `ALTER USER postgres WITH PASSWORD '...'` by hand inside the running container.
 
 ## 3. Generate the JWT signing key
 
@@ -45,28 +46,24 @@ Re-running `jwk-init --write-env .env` appends a *second* line, which works (GoT
 docker compose up -d
 ```
 
-This starts Postgres + GoTrue. The Postgres image is `supabase/postgres`, which pre-provisions the `auth` schema, the `supabase_auth_admin` role GoTrue connects as, and the vault / pgsodium / pgvector extensions D5+ will use.
+This brings up the full stack: Postgres, GoTrue, and the `triagefactory` service running the TF binary in a container. The Postgres image is `supabase/postgres`, which pre-provisions the `auth` schema, the `supabase_auth_admin` role GoTrue connects as, the `authenticator` role TF's app pool uses, and the vault / pgsodium / pgvector extensions for per-org secret storage.
 
-The Triage Factory binary itself runs from the host (D13 will package it as a container image; D9 will wire its own DB connection):
+On first boot, the `postgres-postinit` sidecar reconciles the `supabase_auth_admin` and `authenticator` role passwords, then the `triagefactory` container's entrypoint runs `triagefactory migrate up` against the admin DSN before starting the server.
+
+Smoke-check the stack came up:
 
 ```sh
-set -a; source .env; set +a   # exports TF_SESSION_ENCRYPTION_KEY + TF_COOKIE_SECRET + the rest
-TF_MODE=multi \
-  TF_GOTRUE_URL=http://localhost:9999 \
-  TF_GOTRUE_JWKS_URL=http://localhost:9999/.well-known/jwks.json \
-  TF_GOTRUE_ISSUER=https://triagefactory.yourcompany.com/auth/v1 \
-  TF_PUBLIC_URL=https://triagefactory.yourcompany.com \
-  ./triagefactory
+docker compose ps                         # all services should be "running"/"healthy" (postgres-postinit shows "exited(0)")
+curl -fsS http://localhost:3000/api/health   # 200 OK
+curl -s http://localhost:9999/.well-known/jwks.json | jq .   # JWKS with one public RSA key
 ```
 
-(End-to-end multi-mode boot is not yet stitched into the `main.go` server start — see SKY-242 for the v1 epic. D6 brought up the auth substrate; D7 ships the handlers + middleware + sessions, exercised via integration tests. D9 will let the binary boot multi-mode end-to-end once every existing handler picks up `WithTx` + RLS claims.)
+## 5. Verify the GitHub OAuth flow
 
-## Verifying the auth flow (post-D7)
-
-Once the binary can boot multi-mode (post-D9), the GitHub OAuth roundtrip can be smoke-tested manually:
+Drive the full OAuth roundtrip end-to-end in a browser:
 
 ```sh
-# 1. Open the browser at /api/auth/oauth/github
+# 1. Open the browser at /api/auth/oauth/github (substitute your TF_PUBLIC_URL)
 open "https://triagefactory.yourcompany.com/api/auth/oauth/github?return_to=/"
 # 2. Authorize in the GitHub UI
 # 3. Browser lands back on / with an `sid` HttpOnly cookie
@@ -76,19 +73,11 @@ curl -b "sid=<value>" https://triagefactory.yourcompany.com/api/me
 curl -b "sid=<value>" -X POST https://triagefactory.yourcompany.com/api/auth/logout
 ```
 
-Until then, the same flow is covered by the integration test suite (`go test ./internal/server/ -run TestAuthFlow`), which drives the callback handler directly against a testcontainer postgres + in-process JWKS. Real-GitHub coverage waits for D9's full-binary boot path.
+The same flow is also covered by the integration test suite (`go test ./internal/server/ -run TestAuthFlow`), which drives the callback handler against a testcontainer Postgres + in-process JWKS — handy for diagnosing whether a problem is in the auth wiring or in the GitHub OAuth app config.
 
-## 5. Verify JWKS is reachable
+## 6. (Optional) Smoke-test the Verifier directly
 
-```sh
-curl -s http://localhost:9999/.well-known/jwks.json | jq .
-```
-
-You should see a JWKS containing **one RSA key, public side only** (`n` + `e`; no `d`, `p`, `q`). The `kid` matches what `jwk-init` produced.
-
-## 6. Smoke-test the Verifier
-
-Mint a test token via GoTrue's signup endpoint (no GitHub dance required):
+Useful when diagnosing whether the issue is in the Verifier wiring vs. GoTrue itself. Mint a test token via GoTrue's signup endpoint (no GitHub dance required):
 
 ```sh
 TOKEN=$(curl -s -X POST http://localhost:9999/signup \
@@ -105,7 +94,7 @@ echo "$TOKEN" | TF_GOTRUE_JWKS_URL=http://localhost:9999/.well-known/jwks.json \
   ./triagefactory jwk-init --verify
 ```
 
-You should see the parsed claims printed as JSON (`Subject`, `Email`, `Provider`, etc.).
+You should see the parsed claims printed as JSON (`Subject`, `Email`, `Provider`, etc.). This requires a local TF binary on the host — useful when the in-container TF service is misbehaving and you want to isolate the Verifier path from the rest of the server.
 
 ## Rotating the signing key
 
