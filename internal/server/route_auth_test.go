@@ -93,6 +93,68 @@ func TestAllProtectedRoutes_RejectUnauthenticated(t *testing.T) {
 	}
 }
 
+// TestAllMutatingRoutes_RejectCrossOrigin asserts that every route
+// registered via s.apiMutating returns 403 when the Origin header
+// points at a foreign site, regardless of cookie state. This proves
+// withCSRFOriginCheck is wired in front of every mutating handler —
+// the runtime complement to routes_coverage_test.go's static guarantee
+// that mutating routes go through apiMutating.
+//
+// Without this test, a future change that strips the CSRF wrap from
+// any individual route would slip through: the unauth test would
+// still pass (auth still 401s on no cookie), and routes_coverage_test
+// would still pass (the route is still registered via apiMutating).
+// The misconfig is only detectable by actually firing a cross-origin
+// request and watching for the rejection.
+//
+// We use Origin: https://evil.example and no cookie. CSRF fires
+// outside the auth wrap, so the no-cookie case still produces a 403
+// (not a 401) — that's the assertion. Path-param substitutions reuse
+// the unauth-test helper since CSRF, like auth, rejects before any
+// path-param parsing or DB query.
+func TestAllMutatingRoutes_RejectCrossOrigin(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	rig := newAuthRig(t)
+
+	all := discoverProtectedRoutes(t)
+	var mutating []protectedRoute
+	for _, r := range all {
+		if r.via == "apiMutating" {
+			mutating = append(mutating, r)
+		}
+	}
+	if len(mutating) == 0 {
+		t.Fatalf("AST discovered 0 apiMutating routes — parser broken")
+	}
+
+	for _, route := range mutating {
+		method, pattern := splitMethodAndPath(route.pattern)
+		// withCSRFOriginCheck pre-passes GET/HEAD/OPTIONS. Mutating
+		// routes are mounted with POST/PUT/PATCH/DELETE today, but a
+		// future apiMutating-on-GET would be a footgun — skip with a
+		// clear marker rather than asserting on a request the check
+		// intentionally ignores.
+		switch method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			t.Run(method+" "+pattern+"/skipped-safe-method", func(t *testing.T) {
+				t.Skipf("apiMutating mounted on safe method %s — CSRF check passes through", method)
+			})
+			continue
+		}
+		concrete := substitutePathParams(pattern)
+		t.Run(method+" "+pattern, func(t *testing.T) {
+			req := httptest.NewRequest(method, concrete, nil)
+			req.Header.Set("Origin", "https://evil.example")
+			rec := httptest.NewRecorder()
+			rig.srv.mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("status=%d body=%q, want 403 (route registered via apiMutating but CSRF didn't fire)",
+					rec.Code, strings.TrimSpace(rec.Body.String()))
+			}
+		})
+	}
+}
+
 // protectedRoute is one route discovered by AST inspection of
 // (s *Server).routes().
 type protectedRoute struct {
