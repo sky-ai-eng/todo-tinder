@@ -435,26 +435,24 @@ func TestProvisionUserOrgs_SlugCollision(t *testing.T) {
 		t.Fatalf("second provision: %v", err)
 	}
 
-	slugs := []string{}
-	rows, err := r.h.AdminDB.Query(`SELECT slug FROM public.orgs ORDER BY created_at`)
-	if err != nil {
-		t.Fatalf("read slugs: %v", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			t.Fatalf("scan: %v", err)
+	// Assert per-user slug via owner_user_id so the test doesn't
+	// depend on created_at ordering (two inserts a millisecond apart
+	// could share a timestamp). owner_user_id is the deterministic
+	// per-row key.
+	slugFor := func(userID uuid.UUID) string {
+		t.Helper()
+		var slug string
+		if err := r.h.AdminDB.QueryRow(
+			`SELECT slug FROM public.orgs WHERE owner_user_id = $1`, userID,
+		).Scan(&slug); err != nil {
+			t.Fatalf("read slug for owner %s: %v", userID, err)
 		}
-		slugs = append(slugs, s)
+		return slug
 	}
-	if len(slugs) != 2 {
-		t.Fatalf("expected 2 org rows, got %d: %v", len(slugs), slugs)
+	if got := slugFor(a); got != "aidan" {
+		t.Errorf("user a's slug = %q, want %q", got, "aidan")
 	}
-	if slugs[0] != "aidan" {
-		t.Errorf("first slug = %q, want %q", slugs[0], "aidan")
-	}
-	if slugs[1] != "aidan-2" {
-		t.Errorf("second slug = %q, want %q", slugs[1], "aidan-2")
+	if got := slugFor(b); got != "aidan-2" {
+		t.Errorf("user b's slug = %q, want %q", got, "aidan-2")
 	}
 }

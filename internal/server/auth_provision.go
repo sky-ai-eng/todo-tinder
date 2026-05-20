@@ -277,8 +277,11 @@ func provisionAutoJoinDefault(ctx context.Context, tx *sql.Tx, userID uuid.UUID)
 	`, defaultOrgID).Scan(&teamID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Default org exists but has no team — bootstrap bug, but
-			// recoverable: create the default team and add the user as
-			// admin (member of the team's first row gets a leg up).
+			// recoverable: create the default team. The user then falls
+			// through to the same role='member' inserts below — the
+			// existing-Default-org branch is by definition a non-first
+			// signup, so 'member' is the correct role regardless of
+			// whether we had to backfill the missing team here.
 			if err := tx.QueryRowContext(ctx, `
 				INSERT INTO public.teams (org_id, slug, name, created_by_user_id)
 				VALUES ($1, 'default', 'Default', $2)
@@ -311,9 +314,11 @@ func provisionAutoJoinDefault(ctx context.Context, tx *sql.Tx, userID uuid.UUID)
 // userLockKey hashes a user UUID into a 64-bit signed integer for
 // pg_advisory_xact_lock. The hash is stable per-process — Go's hash/fnv
 // is deterministic on the same input — so two concurrent callbacks for
-// the same user serialize on the same key. Different users get
-// different keys with overwhelming probability (FNV-1a on a 36-char
-// UUID has ample entropy).
+// the same user serialize on the same key. We hash the raw 16-byte
+// UUID array (`userID[:]`), not the string form, so the keying is
+// independent of any future change in how we render UUIDs at call
+// sites. Different users get different keys with overwhelming
+// probability (FNV-1a on 16 bytes has ample entropy).
 func userLockKey(userID uuid.UUID) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write(userID[:])
