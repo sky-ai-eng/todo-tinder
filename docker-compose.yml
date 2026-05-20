@@ -88,8 +88,8 @@ services:
       - |
         set -eu
         psql -h postgres -U supabase_admin -d postgres -v ON_ERROR_STOP=1 <<-'SQL'
-        \set auth_admin_password `echo "$SUPABASE_AUTH_ADMIN_PASSWORD"`
-        \set authenticator_password `echo "$AUTHENTICATOR_PASSWORD"`
+        \set auth_admin_password `echo "$$SUPABASE_AUTH_ADMIN_PASSWORD"`
+        \set authenticator_password `echo "$$AUTHENTICATOR_PASSWORD"`
         ALTER USER supabase_auth_admin WITH LOGIN PASSWORD :'auth_admin_password';
         ALTER USER authenticator WITH LOGIN PASSWORD :'authenticator_password';
         SQL
@@ -186,7 +186,20 @@ services:
       postgres-postinit: { condition: service_completed_successfully }
     environment:
       TF_MODE: multi
-      TF_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD (see .env.example)}@postgres:5432/postgres
+      # Headless first-boot: entrypoint.sh auto-generates the GoTrue
+      # keypair on volumes that don't yet have one. Operators wanting
+      # the interactive `[y/N]` prompt can run `docker run -it
+      # tf:image` once before `docker compose up -d`, but compose's
+      # default detach-mode boot needs the auto-init flag set.
+      TF_AUTO_JWK_INIT: "1"
+      # supabase_admin is the real superuser in the supabase/postgres
+      # image; the `postgres` role is demoted by the image's bundled
+      # migrations and supautils blocks reserved-role ALTERs from it.
+      # The migration baseline uses ALTER DEFAULT PRIVILEGES FOR ROLE
+      # supabase_admin, which requires supabase_admin role membership.
+      # POSTGRES_PASSWORD is shared between `postgres` and
+      # `supabase_admin` by the image's initdb convention.
+      TF_DATABASE_URL: postgres://supabase_admin:${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD (see .env.example)}@postgres:5432/postgres
       TF_AUTHENTICATOR_PASSWORD: ${TF_AUTHENTICATOR_PASSWORD:?missing TF_AUTHENTICATOR_PASSWORD (see .env.example)}
       TF_GOTRUE_URL: http://gotrue:9999
       TF_GOTRUE_JWKS_URL: http://gotrue:9999/.well-known/jwks.json
