@@ -57,16 +57,12 @@ func majorMinor(version string) string {
 	return parts[0] + "." + parts[1]
 }
 
-// currentArchRootfs is the URL + sha for the host's GOARCH. Panics
-// on unsupported arch because every caller of ensureRootfs depends
-// on this being resolvable — a missing arch is an unrecoverable
-// configuration error, not a runtime branch.
-func currentArchRootfs() (url, sha string) {
-	url, sha, err := alpineRootfsForArch(runtime.GOARCH)
-	if err != nil {
-		panic(err)
-	}
-	return url, sha
+// currentArchRootfs is the URL + sha for the host's GOARCH. Returns
+// an error on unsupported arch so callers (ensureRootfs, the cache-
+// key wrapper) can surface a clean diagnostic via their normal error
+// path instead of crashing the whole process via panic.
+func currentArchRootfs() (url, sha string, err error) {
+	return alpineRootfsForArch(runtime.GOARCH)
 }
 
 // apkPackages is the toolchain installed into the cached alpine
@@ -98,10 +94,16 @@ var apkPackages = []string{
 }
 
 // rootfsCacheKey returns the 12-hex-char cache key for the current
-// rootfs build inputs.
-func rootfsCacheKey() string {
-	_, sha := currentArchRootfs()
-	return rootfsCacheKeyFor(sha, apkPackages)
+// rootfs build inputs, or an error if the host's GOARCH is not
+// supported. Error-returning rather than panicking so a misconfigured
+// arch surfaces through the same error log as any other startup
+// failure rather than crashing the whole process.
+func rootfsCacheKey() (string, error) {
+	_, sha, err := currentArchRootfs()
+	if err != nil {
+		return "", err
+	}
+	return rootfsCacheKeyFor(sha, apkPackages), nil
 }
 
 // rootfsCacheKeyFor hashes (alpine_sha, sorted-package-set) and

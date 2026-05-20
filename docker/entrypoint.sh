@@ -28,17 +28,17 @@
 set -eu
 
 TF_HOME="${TF_HOME:-/root/.triagefactory}"
-ENV_FILE="${TF_ENV_FILE:-$TF_HOME/.env}"
 
 mkdir -p "$TF_HOME"
 
-# Source the env file so any DB / app vars the operator stashed there
-# are visible to migrate + the server. Optional — both Fly secrets
-# and compose env: blocks set these directly in the process env.
-if [ -f "$ENV_FILE" ]; then
-    # shellcheck disable=SC1090
-    set -a; . "$ENV_FILE"; set +a
-fi
+# Note: we deliberately do NOT source any .env file inside the
+# container. `. "$ENV_FILE"` executes arbitrary shell, so a writable
+# .env (via a separate vulnerability or a sloppy bind-mount) becomes
+# a code-exec-on-restart path. Both supported deploy modes inject
+# env vars directly into the process: docker-compose via the
+# `environment:` block, Fly via `flyctl secrets set`. The TF binary
+# reads everything from os.Getenv, so there's nothing for the shell
+# to source.
 
 # --- 1. Migrations (with bounded retry) ------------------------------------
 #

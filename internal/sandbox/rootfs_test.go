@@ -133,8 +133,14 @@ func TestExtractTarGz_NormalEntries(t *testing.T) {
 // 30-second download + apk-add chain instead of reusing the cached
 // extraction.
 func TestRootfsCacheKey_StableAcrossRuns(t *testing.T) {
-	a := rootfsCacheKey()
-	b := rootfsCacheKey()
+	a, err := rootfsCacheKey()
+	if err != nil {
+		t.Fatalf("rootfsCacheKey: %v", err)
+	}
+	b, err := rootfsCacheKey()
+	if err != nil {
+		t.Fatalf("rootfsCacheKey: %v", err)
+	}
 	if a != b {
 		t.Errorf("rootfsCacheKey not stable across calls: got %q then %q", a, b)
 	}
@@ -243,8 +249,9 @@ func assertConcreteSHA256(t *testing.T, arch, sha string) {
 // TestAlpineRootfsForArch_UnsupportedErrors pins the actionable-error
 // contract: an unknown GOARCH (ppc64le, s390x, ...) returns an error
 // naming the arch instead of a sha mismatch six minutes into the
-// download. The fatal path through currentArchRootfs depends on this
-// error being non-nil for the panic to fire on misconfiguration.
+// download. currentArchRootfs and rootfsCacheKey propagate this
+// error so an unsupported-arch install fails with a clean diagnostic
+// rather than a sha verification mismatch.
 func TestAlpineRootfsForArch_UnsupportedErrors(t *testing.T) {
 	_, _, err := alpineRootfsForArch("ppc64le")
 	if err == nil {
