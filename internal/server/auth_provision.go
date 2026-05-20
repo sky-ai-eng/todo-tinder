@@ -138,26 +138,52 @@ func (s *Server) provisionUserOrgs(ctx context.Context, userID uuid.UUID, claims
 // of the name, with a counter suffix on collision.
 func provisionPersonalOrg(ctx context.Context, tx *sql.Tx, userID uuid.UUID, claims *verify.Claims) (uuid.UUID, error) {
 	name, slugBase := personalOrgNameAndSlug(claims)
-	slug, err := allocateSlug(ctx, tx, slugBase)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("allocate slug: %w", err)
-	}
 
-	// The orgs INSERT triggers an RLS check `owner_user_id =
-	// tf.current_user_id()` (see baseline). The auth callback path
-	// uses the admin pool which sets request.jwt.claims via the
-	// transaction's local SET — but we're operating on the admin pool
-	// without claims context here. Admin pool is BYPASSRLS-equivalent
-	// for tf_app's policies because we connect as supabase_admin, so
-	// the policy check is moot. The orgs.owner_user_id FK to users(id)
-	// is the load-bearing invariant; we set it explicitly to userID.
+	// Insert with `ON CONFLICT (slug) DO NOTHING RETURNING id`,
+	// retrying on a no-rows return (= slug already taken). This
+	// closes the cross-user race that a separate "SELECT EXISTS
+	// then INSERT" pair leaves open: two concurrent signups for
+	// users sharing a display name would both see EXISTS=false on
+	// the same candidate, then one's INSERT blocks until the
+	// other commits and crashes with unique_violation. With ON
+	// CONFLICT DO NOTHING, the loser cleanly observes zero rows
+	// affected and we advance to the next candidate.
+	//
+	// The orgs INSERT itself is RLS-checked (`owner_user_id =
+	// tf.current_user_id()`), but the auth callback runs against
+	// the admin pool which is BYPASSRLS for tf_app's policies —
+	// so we rely on the owner_user_id FK invariant by setting it
+	// explicitly here.
 	var orgID uuid.UUID
-	if err := tx.QueryRowContext(ctx, `
-		INSERT INTO public.orgs (slug, name, owner_user_id, is_personal)
-		VALUES ($1, $2, $3, true)
-		RETURNING id
-	`, slug, name, userID).Scan(&orgID); err != nil {
-		return uuid.Nil, fmt.Errorf("insert orgs: %w", err)
+	var chosenSlug string
+	for i := 0; i < 64; i++ {
+		candidate := slugBase
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d", slugBase, i+1)
+		}
+		var got uuid.NullUUID
+		err := tx.QueryRowContext(ctx, `
+			INSERT INTO public.orgs (slug, name, owner_user_id, is_personal)
+			VALUES ($1, $2, $3, true)
+			ON CONFLICT (slug) DO NOTHING
+			RETURNING id
+		`, candidate, name, userID).Scan(&got)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Slug taken by a concurrent or prior signup — try next.
+			continue
+		}
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("insert orgs: %w", err)
+		}
+		if !got.Valid {
+			continue
+		}
+		orgID = got.UUID
+		chosenSlug = candidate
+		break
+	}
+	if orgID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("could not allocate slug starting from %q after 64 tries", slugBase)
 	}
 
 	var teamID uuid.UUID
@@ -183,7 +209,7 @@ func provisionPersonalOrg(ctx context.Context, tx *sql.Tx, userID uuid.UUID, cla
 		return uuid.Nil, fmt.Errorf("insert memberships: %w", err)
 	}
 
-	log.Printf("[auth] provisioned personal org=%s team=%s user=%s slug=%s", orgID, teamID, userID, slug)
+	log.Printf("[auth] provisioned personal org=%s team=%s user=%s slug=%s", orgID, teamID, userID, chosenSlug)
 	return orgID, nil
 }
 
@@ -316,9 +342,6 @@ func personalOrgNameAndSlug(claims *verify.Claims) (name, slugSeed string) {
 	}
 
 	if display != "" {
-		// Strip a trailing "'s" or "s" if present in the display
-		// (rare; defensive against weird OAuth payloads), then
-		// suffix with "'s Personal" for the human label.
 		name = display + "'s Personal"
 		slugSeed = slugify(display)
 		if slugSeed != "" {
@@ -352,7 +375,7 @@ func personalOrgNameAndSlug(claims *verify.Claims) (name, slugSeed string) {
 	return
 }
 
-// slugifyKeep is the closed set of bytes allowed in a slug:
+// slugifyAllowed matches the closed set of bytes allowed in a slug:
 // ASCII lowercase letters, digits, and hyphens. Everything else
 // becomes a hyphen; runs of hyphens collapse; leading/trailing
 // hyphens get trimmed.
@@ -377,35 +400,3 @@ func slugify(in string) string {
 	return out
 }
 
-// allocateSlug returns a slug that doesn't collide with any existing
-// orgs.slug, starting from seed and appending "-2", "-3", ... as
-// needed. Runs inside the caller's transaction; the orgs.slug UNIQUE
-// constraint prevents two callers from racing to the same slug at
-// COMMIT time (the second would fail with a unique violation).
-//
-// We try up to 64 candidates before giving up — far beyond any
-// plausible user-name collision rate. After that, callers should
-// consider it a misconfiguration (the seed is too generic) and the
-// error propagates as a signup-callback failure.
-func allocateSlug(ctx context.Context, tx *sql.Tx, seed string) (string, error) {
-	if seed == "" {
-		seed = "personal"
-	}
-	for i := 0; i < 64; i++ {
-		candidate := seed
-		if i > 0 {
-			candidate = fmt.Sprintf("%s-%d", seed, i+1)
-		}
-		var exists bool
-		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM public.orgs WHERE slug = $1)`,
-			candidate,
-		).Scan(&exists); err != nil {
-			return "", fmt.Errorf("check slug %q: %w", candidate, err)
-		}
-		if !exists {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("could not allocate slug starting from %q after 64 tries", seed)
-}
