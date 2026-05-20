@@ -18,5 +18,6 @@ _scratch/
 .claude/*
 !.claude/settings.json
 docs/triagefactory-spec.md
+docs/oauth-smoke.html
 .env
 triage-factory

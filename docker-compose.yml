@@ -37,12 +37,22 @@ services:
     #     (vault is what D5 / SKY-249 uses for per-org secrets)
     #   - the authenticator / anon / authenticated / service_role pattern
     #     for D9's RLS app pool to lean on
-    # Two distinct passwords by design:
-    #   POSTGRES_PASSWORD            -> `postgres` superuser (migrations, admin)
+    # Three distinct passwords by design:
+    #   POSTGRES_PASSWORD            -> shared by `postgres` AND
+    #                                   `supabase_admin` (image initdb
+    #                                   convention). `postgres` is
+    #                                   demoted to non-superuser by the
+    #                                   image's bundled migrations;
+    #                                   `supabase_admin` is the effective
+    #                                   superuser TF connects as for
+    #                                   migrations + admin pool.
     #   SUPABASE_AUTH_ADMIN_PASSWORD -> GoTrue's DB user (auth.* CRUD only)
-    # Keeping them separate means a GoTrue compromise doesn't surrender
-    # superuser credentials. D9 adds a third password for the `authenticator`
-    # role that TF's RLS app pool will use.
+    #   TF_AUTHENTICATOR_PASSWORD    -> `authenticator` role, which TF's
+    #                                   RLS-active app pool connects as
+    #                                   (sets LOCAL ROLE tf_app per-tx).
+    # Three separate roles mean a GoTrue compromise doesn't surrender
+    # superuser credentials, and a tenant-side prompt-injection in the
+    # tf_app pool can't escalate to admin.
     image: supabase/postgres:15.14.1.121
     environment:
       # `${VAR:?msg}` makes compose fail-fast if .env wasn't filled in,
@@ -88,8 +98,8 @@ services:
       - |
         set -eu
         psql -h postgres -U supabase_admin -d postgres -v ON_ERROR_STOP=1 <<-'SQL'
-        \set auth_admin_password `echo "$SUPABASE_AUTH_ADMIN_PASSWORD"`
-        \set authenticator_password `echo "$AUTHENTICATOR_PASSWORD"`
+        \set auth_admin_password `echo "$$SUPABASE_AUTH_ADMIN_PASSWORD"`
+        \set authenticator_password `echo "$$AUTHENTICATOR_PASSWORD"`
         ALTER USER supabase_auth_admin WITH LOGIN PASSWORD :'auth_admin_password';
         ALTER USER authenticator WITH LOGIN PASSWORD :'authenticator_password';
         SQL
@@ -186,7 +196,14 @@ services:
       postgres-postinit: { condition: service_completed_successfully }
     environment:
       TF_MODE: multi
-      TF_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD (see .env.example)}@postgres:5432/postgres
+      # supabase_admin is the real superuser in the supabase/postgres
+      # image; the `postgres` role is demoted by the image's bundled
+      # migrations and supautils blocks reserved-role ALTERs from it.
+      # The migration baseline uses ALTER DEFAULT PRIVILEGES FOR ROLE
+      # supabase_admin, which requires supabase_admin role membership.
+      # POSTGRES_PASSWORD is shared between `postgres` and
+      # `supabase_admin` by the image's initdb convention.
+      TF_DATABASE_URL: postgres://supabase_admin:${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD (see .env.example)}@postgres:5432/postgres
       TF_AUTHENTICATOR_PASSWORD: ${TF_AUTHENTICATOR_PASSWORD:?missing TF_AUTHENTICATOR_PASSWORD (see .env.example)}
       TF_GOTRUE_URL: http://gotrue:9999
       TF_GOTRUE_JWKS_URL: http://gotrue:9999/.well-known/jwks.json
