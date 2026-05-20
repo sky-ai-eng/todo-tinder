@@ -245,6 +245,77 @@ func TestBaseline_JiraStatusRulesPopulated_CHECKsFire(t *testing.T) {
 	}
 }
 
+// TestBaseline_OrgSettingsMaxLLMTier_CHECKFires pins the
+// org_settings_max_llm_model_tier_check CHECK constraint added with the
+// org-scope cost-control fields. NULL ("no cap") and the three valid
+// tiers must succeed; anything else must error with SQLSTATE 23514.
+// The SQLite mirror is covered in internal/config — this is the
+// authoritative Postgres test the ticket's acceptance asks for.
+func TestBaseline_OrgSettingsMaxLLMTier_CHECKFires(t *testing.T) {
+	h := Shared(t)
+	h.Reset(t)
+
+	owner := SeedUser(t, h, "tier-owner")
+	orgID := SeedOrg(t, h, "tier-org", owner)
+
+	// Happy paths: NULL + each of the three valid tiers round-trip.
+	for _, tier := range []sql.NullString{
+		{Valid: false},
+		{String: "haiku", Valid: true},
+		{String: "sonnet", Valid: true},
+		{String: "opus", Valid: true},
+	} {
+		name := "null"
+		if tier.Valid {
+			name = tier.String
+		}
+		t.Run("allowed/"+name, func(t *testing.T) {
+			if _, err := h.AdminDB.Exec(
+				`DELETE FROM org_settings WHERE org_id = $1`, orgID,
+			); err != nil {
+				t.Fatalf("reset org_settings: %v", err)
+			}
+			var arg any
+			if tier.Valid {
+				arg = tier.String
+			}
+			if _, err := h.AdminDB.Exec(
+				`INSERT INTO org_settings (org_id, max_llm_model_tier) VALUES ($1, $2)`,
+				orgID, arg,
+			); err != nil {
+				t.Errorf("INSERT max_llm_model_tier=%v: %v (want allowed by CHECK)", arg, err)
+			}
+		})
+	}
+
+	t.Run("rejected/invalid", func(t *testing.T) {
+		if _, err := h.AdminDB.Exec(
+			`DELETE FROM org_settings WHERE org_id = $1`, orgID,
+		); err != nil {
+			t.Fatalf("reset org_settings: %v", err)
+		}
+		_, err := h.AdminDB.Exec(
+			`INSERT INTO org_settings (org_id, max_llm_model_tier) VALUES ($1, 'invalid')`,
+			orgID,
+		)
+		if err == nil {
+			t.Fatalf("INSERT with max_llm_model_tier='invalid' succeeded; want CHECK failure")
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Fatalf("expected pg error, got %T: %v", err, err)
+		}
+		if pgErr.Code != "23514" {
+			t.Errorf("expected SQLSTATE 23514 (check_violation), got %s: %v", pgErr.Code, err)
+		}
+		if !strings.Contains(pgErr.ConstraintName, "max_llm_model_tier") &&
+			!strings.Contains(pgErr.Message, "max_llm_model_tier") {
+			t.Errorf("expected constraint name to mention max_llm_model_tier, got constraint=%q msg=%q",
+				pgErr.ConstraintName, pgErr.Message)
+		}
+	})
+}
+
 // TestRLS_AdminConnectionBypassesRLS pins the harness contract: tests
 // run through AdminDB see all rows regardless of RLS policies. If
 // this ever fails, it means tf_app or some other role's BYPASSRLS bit

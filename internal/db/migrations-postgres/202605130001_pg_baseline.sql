@@ -758,8 +758,20 @@ CREATE TABLE public.org_settings (
     github_clone_protocol text DEFAULT 'ssh'::text NOT NULL,
     jira_base_url text,
     jira_poll_interval interval DEFAULT '00:05:00'::interval NOT NULL,
+    -- Vault refs (not raw secrets) for Anthropic / Bedrock credentials.
+    -- NULL means "use deployment default" on hosted SaaS or "not configured
+    -- yet" on self-host. The SecretStore API resolves the ref to a live
+    -- token at request time; rotation replaces the secret behind the ref
+    -- without touching this row.
+    anthropic_api_key_ref text,
+    bedrock_credentials_ref text,
+    -- Max Claude tier the org permits teams/users to pick. NULL means no
+    -- cap (any tier allowed). The inheritance helper (sibling ticket) reads
+    -- this to clamp team_settings.default_model and per-prompt overrides.
+    max_llm_model_tier text,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT org_settings_github_clone_protocol_check CHECK ((github_clone_protocol = ANY (ARRAY['https'::text, 'ssh'::text])))
+    CONSTRAINT org_settings_github_clone_protocol_check CHECK ((github_clone_protocol = ANY (ARRAY['https'::text, 'ssh'::text]))),
+    CONSTRAINT org_settings_max_llm_model_tier_check CHECK ((max_llm_model_tier IS NULL OR max_llm_model_tier = ANY (ARRAY['haiku'::text, 'sonnet'::text, 'opus'::text])))
 );
 
 
@@ -1279,6 +1291,13 @@ CREATE TABLE public.team_settings (
     jira_projects text[] DEFAULT '{}'::text[] NOT NULL,
     ai_reprioritize_threshold integer DEFAULT 5 NOT NULL,
     ai_preference_update_interval integer DEFAULT 20 NOT NULL,
+    -- Team-scope AI behavior policy. Moved off user_settings: in v1 the
+    -- team owns the Claude tier used for scoring + agent runs (clamped by
+    -- org_settings.max_llm_model_tier when set) and the master toggle for
+    -- auto-delegation. auto_delegate_enabled defaults FALSE so new teams
+    -- don't auto-spawn agents until explicitly opted in.
+    default_model text DEFAULT 'sonnet'::text NOT NULL,
+    auto_delegate_enabled boolean DEFAULT false NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
@@ -1303,10 +1322,12 @@ CREATE TABLE public.teams (
 -- Name: user_settings; Type: TABLE; Schema: public; Owner: -
 --
 
+-- Reserved for future per-user prefs (theme, notification destinations,
+-- swipe sensitivity, onboarding state). The ai_model + ai_auto_delegate_enabled
+-- columns that used to live here moved to team_settings — the team owns
+-- the AI behavior policy, users don't override in v1.
 CREATE TABLE public.user_settings (
     user_id uuid NOT NULL,
-    ai_model text DEFAULT 'sonnet'::text NOT NULL,
-    ai_auto_delegate_enabled boolean DEFAULT true NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 

@@ -160,14 +160,26 @@ CREATE TABLE memberships (
 -- — there is no SQLite interval type, and storing as TEXT keeps the
 -- parse logic in the application layer the same in both backends.
 CREATE TABLE org_settings (
-    org_id                TEXT PRIMARY KEY REFERENCES orgs(id) ON DELETE CASCADE,
-    github_base_url       TEXT,
-    github_poll_interval  TEXT NOT NULL DEFAULT '5m0s',
-    github_clone_protocol TEXT NOT NULL DEFAULT 'ssh'
-                              CHECK (github_clone_protocol IN ('https', 'ssh')),
-    jira_base_url         TEXT,
-    jira_poll_interval    TEXT NOT NULL DEFAULT '5m0s',
-    updated_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    org_id                  TEXT PRIMARY KEY REFERENCES orgs(id) ON DELETE CASCADE,
+    github_base_url         TEXT,
+    github_poll_interval    TEXT NOT NULL DEFAULT '5m0s',
+    github_clone_protocol   TEXT NOT NULL DEFAULT 'ssh'
+                                CHECK (github_clone_protocol IN ('https', 'ssh')),
+    jira_base_url           TEXT,
+    jira_poll_interval      TEXT NOT NULL DEFAULT '5m0s',
+    -- Vault refs (not raw secrets) for Anthropic / Bedrock credentials.
+    -- NULL means "use deployment default" on hosted SaaS or "not configured
+    -- yet" on self-host. Self-host single-tenant deployments typically leave
+    -- both NULL and supply ANTHROPIC_API_KEY via env to the spawner.
+    anthropic_api_key_ref   TEXT,
+    bedrock_credentials_ref TEXT,
+    -- Max Claude tier the org permits teams/users to pick. NULL means no
+    -- cap (any tier allowed). The inheritance helper (sibling ticket) reads
+    -- this to clamp team_settings.default_model and per-prompt overrides.
+    max_llm_model_tier      TEXT
+                                CHECK (max_llm_model_tier IS NULL
+                                       OR max_llm_model_tier IN ('haiku', 'sonnet', 'opus')),
+    updated_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE team_settings (
@@ -181,14 +193,25 @@ CREATE TABLE team_settings (
     -- Go-side defaults in config.Default().
     ai_reprioritize_threshold     INTEGER NOT NULL DEFAULT 5,
     ai_preference_update_interval INTEGER NOT NULL DEFAULT 20,
+    -- Team-scope AI behavior policy. Moved off user_settings: in v1 the
+    -- team owns the model + auto-delegate toggle, users do not override.
+    -- default_model is the Claude tier used for scoring + agent runs
+    -- (clamped by org_settings.max_llm_model_tier when set).
+    -- auto_delegate_enabled defaults FALSE — new teams don't auto-spawn
+    -- agents until explicitly opted in. Local mode flips this true via
+    -- the explicit value config.Default() writes on first Save().
+    default_model                 TEXT NOT NULL DEFAULT 'sonnet',
+    auto_delegate_enabled         INTEGER NOT NULL DEFAULT 0,
     updated_at                    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Reserved for future per-user prefs (theme, notification destinations,
+-- swipe sensitivity, onboarding state). The AI model + auto-delegate
+-- toggle that used to live here moved to team_settings — the team owns
+-- the policy, users don't override in v1.
 CREATE TABLE user_settings (
-    user_id                  TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    ai_model                 TEXT NOT NULL DEFAULT 'sonnet',
-    ai_auto_delegate_enabled INTEGER NOT NULL DEFAULT 1,
-    updated_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- One row per (team, jira_project). Team-keyed (not org-keyed) so
