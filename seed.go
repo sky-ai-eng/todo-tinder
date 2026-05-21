@@ -79,6 +79,11 @@ func seedDefaultPrompts(prompts db.PromptStore, handlers db.EventHandlerStore) {
 		// start pointing at this one. Users override per-project via
 		// the Projects page.
 		{ID: domain.SystemTicketSpecPromptID, Name: "Curator: Ticket as a Spec", Body: ai.TicketSpecPromptTemplate, Source: "system"},
+
+		// PR review posting step — receives findings from a prior chain
+		// step via handoff.md and stages + submits the GitHub review.
+		// Designed as the terminal step in any review chain.
+		{ID: "system-pr-post", Name: "PR Review Post", Body: ai.PRPostPromptTemplate, Source: "system"},
 	}
 
 	for _, ot := range orgs {

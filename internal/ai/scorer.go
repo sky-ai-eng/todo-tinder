@@ -49,6 +49,9 @@ var FixReviewFeedbackPromptTemplate string
 //go:embed prompts/ticket-spec.txt
 var TicketSpecPromptTemplate string
 
+//go:embed prompts/pr-post.txt
+var PRPostPromptTemplate string
+
 const batchSize = 10
 
 // TaskInput is the minimal info we send to the LLM for scoring.
