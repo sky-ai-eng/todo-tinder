@@ -78,11 +78,17 @@ func listJiraStatusRules(ctx context.Context, q queryer, teamID string) ([]domai
 }
 
 func (s *jiraStatusRulesStore) ReplaceForTeam(ctx context.Context, teamID string, rules []domain.JiraProjectStatusRules) error {
+	// Refuse empty ProjectKey up front — see the Postgres impl's
+	// matching guard. Clear-all semantics stay exclusively gated on
+	// rules being nil/empty so an all-empty input doesn't silently
+	// wipe the team's rows.
+	for i, r := range rules {
+		if r.ProjectKey == "" {
+			return fmt.Errorf("ReplaceForTeam: rules[%d] has empty ProjectKey", i)
+		}
+	}
 	return inTx(ctx, s.q, func(tx queryer) error {
 		for _, r := range rules {
-			if r.ProjectKey == "" {
-				continue
-			}
 			pickupJSON, err := marshalJSONArray(r.PickupMembers)
 			if err != nil {
 				return fmt.Errorf("marshal pickup_members for %s: %w", r.ProjectKey, err)
@@ -119,11 +125,11 @@ func (s *jiraStatusRulesStore) ReplaceForTeam(ctx context.Context, teamID string
 
 		// Prune rows for project keys no longer in the input. SQLite
 		// has no array binding; build the placeholder list dynamically.
+		// Empty ProjectKey entries can't reach here — the pre-loop
+		// validation refuses them.
 		keys := make([]string, 0, len(rules))
 		for _, r := range rules {
-			if r.ProjectKey != "" {
-				keys = append(keys, r.ProjectKey)
-			}
+			keys = append(keys, r.ProjectKey)
 		}
 		if len(keys) == 0 {
 			if _, err := tx.ExecContext(ctx,

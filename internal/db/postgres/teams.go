@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -53,17 +54,22 @@ func (s *teamsStore) GetSettingsSystem(ctx context.Context, teamID string) (doma
 
 func getTeamSettings(ctx context.Context, q queryer, teamID string) (domain.TeamSettings, error) {
 	var (
-		projects                []string
+		projectsJSON            string
 		aiThreshold, aiInterval int
 		defaultModel            string
 		autoDelegate            bool
 	)
+	// array_to_json(...)::text round-trips text[] as a JSON literal.
+	// database/sql + pgx stdlib doesn't ship a scanner for *[]string,
+	// so the JSON detour is the portable shape — matches what the
+	// jira_project_status_rules reader does for its array columns.
 	err := q.QueryRowContext(ctx, `
-		SELECT jira_projects, ai_reprioritize_threshold, ai_preference_update_interval,
+		SELECT array_to_json(jira_projects)::text,
+		       ai_reprioritize_threshold, ai_preference_update_interval,
 		       default_model, auto_delegate_enabled
 		FROM team_settings WHERE team_id = $1
 	`, teamID).Scan(
-		&projects, &aiThreshold, &aiInterval,
+		&projectsJSON, &aiThreshold, &aiInterval,
 		&defaultModel, &autoDelegate,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -72,8 +78,14 @@ func getTeamSettings(ctx context.Context, q queryer, teamID string) (domain.Team
 	if err != nil {
 		return domain.TeamSettings{}, fmt.Errorf("read team_settings: %w", err)
 	}
-	if projects == nil {
-		projects = []string{}
+	projects := []string{}
+	if projectsJSON != "" {
+		if err := json.Unmarshal([]byte(projectsJSON), &projects); err != nil {
+			return domain.TeamSettings{}, fmt.Errorf("unmarshal team_settings.jira_projects: %w", err)
+		}
+		if projects == nil {
+			projects = []string{}
+		}
 	}
 	return domain.TeamSettings{
 		JiraProjects:               projects,

@@ -111,31 +111,28 @@ func TestOrgsStore_Postgres_UpdateSettings_AdminGated(t *testing.T) {
 		t.Fatalf("owner seed UpdateSettings: %v", err)
 	}
 
-	// Member attempt: the upsert's UPDATE side filters every row out
-	// (RLS USING fails). No row exists for an INSERT side to attempt;
-	// ON CONFLICT DO UPDATE just no-ops.
+	// Member attempt: INSERT ... ON CONFLICT DO UPDATE always runs the
+	// INSERT-side WITH CHECK first, and org_settings_insert gates on
+	// tf.user_is_org_admin(). A non-admin trips the gate with a
+	// SQLSTATE 42501 RLS violation. The error aborts the tx, so we
+	// have to return it (not swallow it) — h.WithUser then rolls back
+	// cleanly and surfaces the error to the test for assertion.
 	wantPoll := 5 * time.Minute
-	err := h.WithUser(t, member, orgID, func(tx *sql.Tx) error {
+	memberErr := h.WithUser(t, member, orgID, func(tx *sql.Tx) error {
 		stores := pgstore.NewForTx(tx)
-		err := stores.Orgs.UpdateSettings(context.Background(), orgID, domain.OrgSettings{
+		return stores.Orgs.UpdateSettings(context.Background(), orgID, domain.OrgSettings{
 			GitHubBaseURL:       "https://member-overwrite.example.com",
 			GitHubPollInterval:  9 * time.Minute,
 			GitHubCloneProtocol: "ssh",
 			JiraPollInterval:    9 * time.Minute,
 		})
-		// We tolerate either: a hard RLS error (42501 on the INSERT
-		// side WITH CHECK) OR a silent no-op (UPDATE side filtered).
-		// Both shapes preserve the owner's row; we assert that below.
-		if err != nil {
-			var pgErr *pgconn.PgError
-			if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
-				return err
-			}
-		}
-		return nil
 	})
-	if err != nil {
-		t.Fatalf("member UpdateSettings: %v", err)
+	if memberErr == nil {
+		t.Fatal("member UpdateSettings succeeded; admin gate broken")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(memberErr, &pgErr) || pgErr.Code != "42501" {
+		t.Fatalf("expected 42501 RLS error, got %v", memberErr)
 	}
 
 	// Owner's row must still be intact.

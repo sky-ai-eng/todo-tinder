@@ -331,6 +331,43 @@ func RunSettingsStoresConformance(t *testing.T, factory SettingsStoresFactory) {
 		}
 	})
 
+	t.Run("JiraStatusRules_ReplaceForTeam_EmptyProjectKeyRefused", func(t *testing.T) {
+		// Regression guard: a rules slice carrying an empty ProjectKey
+		// must be refused outright. Silently skipping the row in the
+		// upsert loop AND filtering it out of the prune list would
+		// turn an all-empty input into a stealth clear-all, sharply
+		// different behavior from the "nil/empty clears" contract
+		// callers actually mean. Pre-validation also short-circuits
+		// before any tx work, so partial writes can't happen.
+		stores, ids := factory(t)
+		// Seed a baseline rule so we can prove it survives the
+		// refused call.
+		seed := []domain.JiraProjectStatusRules{{
+			ProjectKey: "SKY", PickupMembers: []string{"To Do"},
+			InProgressMembers: []string{"In Progress"}, InProgressCanonical: "In Progress",
+			DoneMembers: []string{"Done"}, DoneCanonical: "Done",
+		}}
+		if err := stores.JiraStatusRules.ReplaceForTeam(ctx, ids.TeamID, seed); err != nil {
+			t.Fatalf("seed ReplaceForTeam: %v", err)
+		}
+		bad := []domain.JiraProjectStatusRules{{
+			ProjectKey: "", PickupMembers: []string{"x"},
+			InProgressMembers: []string{"y"}, InProgressCanonical: "y",
+			DoneMembers: []string{"z"}, DoneCanonical: "z",
+		}}
+		if err := stores.JiraStatusRules.ReplaceForTeam(ctx, ids.TeamID, bad); err == nil {
+			t.Error("ReplaceForTeam accepted empty ProjectKey; expected error")
+		}
+		// Original row survives — no partial writes / stealth clear.
+		got, err := stores.JiraStatusRules.ListForTeamSystem(ctx, ids.TeamID)
+		if err != nil {
+			t.Fatalf("ListForTeamSystem: %v", err)
+		}
+		if len(got) != 1 || got[0].ProjectKey != "SKY" {
+			t.Errorf("after refused call, rules=%+v; want one SKY row preserved", got)
+		}
+	})
+
 	t.Run("JiraStatusRules_EmptyTeam_ReturnsEmptySlice", func(t *testing.T) {
 		stores, ids := factory(t)
 		got, err := stores.JiraStatusRules.ListForTeamSystem(ctx, ids.TeamID)

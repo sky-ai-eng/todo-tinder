@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -39,10 +40,16 @@ func (s *jiraStatusRulesStore) ListForTeamSystem(ctx context.Context, teamID str
 }
 
 func listJiraStatusRules(ctx context.Context, q queryer, teamID string) ([]domain.JiraProjectStatusRules, error) {
+	// array_to_json(...)::text round-trips text[] as a JSON literal.
+	// database/sql + pgx stdlib doesn't ship a scanner for *[]string,
+	// so the JSON detour is the portable shape.
 	rows, err := q.QueryContext(ctx, `
 		SELECT project_key,
-		       pickup_members, in_progress_members, in_progress_canonical,
-		       done_members, done_canonical
+		       array_to_json(pickup_members)::text,
+		       array_to_json(in_progress_members)::text,
+		       in_progress_canonical,
+		       array_to_json(done_members)::text,
+		       done_canonical
 		FROM jira_project_status_rules
 		WHERE team_id = $1
 		ORDER BY project_key ASC
@@ -54,29 +61,63 @@ func listJiraStatusRules(ctx context.Context, q queryer, teamID string) ([]domai
 	out := []domain.JiraProjectStatusRules{}
 	for rows.Next() {
 		var (
-			r                          domain.JiraProjectStatusRules
-			pickup, inProgress, done   []string
-			inProgressCanon, doneCanon sql.NullString
+			r                                    domain.JiraProjectStatusRules
+			pickupJSON, inProgressJSON, doneJSON string
+			inProgressCanon, doneCanon           sql.NullString
 		)
-		if err := rows.Scan(&r.ProjectKey, &pickup, &inProgress, &inProgressCanon, &done, &doneCanon); err != nil {
+		if err := rows.Scan(&r.ProjectKey, &pickupJSON, &inProgressJSON, &inProgressCanon, &doneJSON, &doneCanon); err != nil {
 			return nil, fmt.Errorf("scan jira_project_status_rules: %w", err)
 		}
-		r.PickupMembers = orEmptyStrings(pickup)
-		r.InProgressMembers = orEmptyStrings(inProgress)
+		pickup, err := unmarshalJSONStringSlice(pickupJSON)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal pickup_members for %s: %w", r.ProjectKey, err)
+		}
+		inProgress, err := unmarshalJSONStringSlice(inProgressJSON)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal in_progress_members for %s: %w", r.ProjectKey, err)
+		}
+		done, err := unmarshalJSONStringSlice(doneJSON)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal done_members for %s: %w", r.ProjectKey, err)
+		}
+		r.PickupMembers = pickup
+		r.InProgressMembers = inProgress
 		r.InProgressCanonical = inProgressCanon.String
-		r.DoneMembers = orEmptyStrings(done)
+		r.DoneMembers = done
 		r.DoneCanonical = doneCanon.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
 }
 
+func unmarshalJSONStringSlice(s string) ([]string, error) {
+	if s == "" {
+		return []string{}, nil
+	}
+	out := []string{}
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out, nil
+}
+
 func (s *jiraStatusRulesStore) ReplaceForTeam(ctx context.Context, teamID string, rules []domain.JiraProjectStatusRules) error {
+	// Refuse empty ProjectKey up front. Silently skipping the row in
+	// the upsert loop would also drop the key from the prune list, so
+	// a slice of all-empty entries would clear the team — sharply
+	// different behavior from "rules is nil/empty, clear all" that the
+	// caller almost certainly didn't ask for. Clear-all semantics
+	// stay exclusively gated on rules being nil/empty.
+	for i, r := range rules {
+		if r.ProjectKey == "" {
+			return fmt.Errorf("ReplaceForTeam: rules[%d] has empty ProjectKey", i)
+		}
+	}
 	return inTx(ctx, s.app, func(tx queryer) error {
 		for _, r := range rules {
-			if r.ProjectKey == "" {
-				continue
-			}
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO jira_project_status_rules (
 					team_id, project_key,
@@ -102,7 +143,9 @@ func (s *jiraStatusRulesStore) ReplaceForTeam(ctx context.Context, teamID string
 
 		// Prune rows for project keys no longer in the input. NOT IN
 		// against an empty list trivially keeps every row, so the
-		// "no keys left" case takes the simpler unconditional DELETE.
+		// "rules is nil/empty, clear all" case takes the simpler
+		// unconditional DELETE. Empty ProjectKey entries can't reach
+		// here — the pre-loop validation refuses them.
 		keys := projectKeys(rules)
 		if len(keys) == 0 {
 			if _, err := tx.ExecContext(ctx,
@@ -127,9 +170,7 @@ func (s *jiraStatusRulesStore) ReplaceForTeam(ctx context.Context, teamID string
 func projectKeys(rules []domain.JiraProjectStatusRules) []string {
 	out := make([]string, 0, len(rules))
 	for _, r := range rules {
-		if r.ProjectKey != "" {
-			out = append(out, r.ProjectKey)
-		}
+		out = append(out, r.ProjectKey)
 	}
 	return out
 }

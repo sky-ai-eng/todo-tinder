@@ -3,17 +3,21 @@ package domain
 import "time"
 
 // OrgSettings is the org-scope settings row (org_settings table).
-// All fields except *Ref / MaxLLMModelTier ship with NOT NULL defaults
-// so a freshly-inserted row has every field populated. The Ref fields
-// and MaxLLMModelTier are nullable — empty string means "use deployment
-// default" (Anthropic/Bedrock refs) or "no cap" (max tier).
 //
-// GitHubBaseURL and JiraBaseURL likewise round-trip "" ↔ NULL: empty
-// means "not configured yet" rather than "the empty string is the URL".
+// Field nullability:
+//   - GitHubPollInterval / JiraPollInterval / GitHubCloneProtocol ship
+//     NOT NULL with defaults; a freshly-inserted row always carries
+//     them populated.
+//   - GitHubBaseURL / JiraBaseURL / AnthropicAPIKeyRef /
+//     BedrockCredentialsRef / MaxLLMModelTier are nullable columns.
+//     Empty string round-trips "" ↔ NULL: "not configured yet" (base
+//     URLs), "use deployment default" (vault refs), or "no cap" (max
+//     tier). Callers never need to distinguish "" from NULL.
 //
-// CloneProtocol is "ssh" or "https" only — enforced by a CHECK on both
-// backends. An empty string from a caller is treated as "leave the
-// default in place" by UpdateSettings, never written to the column.
+// GitHubCloneProtocol is "ssh" or "https" only — enforced by a CHECK
+// on both backends. An empty string from a caller is treated as
+// "leave the default in place" by UpdateSettings (substitutes "ssh"),
+// never written to the column.
 type OrgSettings struct {
 	GitHubBaseURL       string
 	GitHubPollInterval  time.Duration
