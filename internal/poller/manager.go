@@ -96,7 +96,7 @@ func (m *Manager) reportError(source, orgID string, err error) {
 func (m *Manager) RestartAll(ctx context.Context, orgID string) {
 	m.stopAll()
 
-	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
+	orgSet := m.loadOrgSettings(ctx, orgID)
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 
 	m.startGitHub(orgSet, creds)
@@ -117,7 +117,7 @@ func (m *Manager) RestartGitHub(ctx context.Context, orgID string) {
 	}
 	m.mu.Unlock()
 
-	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
+	orgSet := m.loadOrgSettings(ctx, orgID)
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 	m.startGitHub(orgSet, creds)
 }
@@ -132,8 +132,26 @@ func (m *Manager) RestartJira(ctx context.Context, orgID string) {
 	}
 	m.mu.Unlock()
 
-	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
+	orgSet := m.loadOrgSettings(ctx, orgID)
 	m.startJira(orgSet.JiraPollInterval)
+}
+
+// loadOrgSettings reads the org's settings or falls back to
+// domain.DefaultOrgSettings() on any error. The store already
+// returns DefaultOrgSettings() on sql.ErrNoRows; this wrapper covers
+// real read errors (transient DB hiccup, RLS in unexpected contexts)
+// that would otherwise silently leave orgSet as the Go zero value —
+// PollInterval=0 would then trip the `< 10s → 1m` clamp inside start*
+// and quietly change the poll cadence to a different value than the
+// schema default. Logging + explicit fallback makes the failure
+// observable and the behavior deterministic.
+func (m *Manager) loadOrgSettings(ctx context.Context, orgID string) domain.OrgSettings {
+	orgSet, err := m.orgs.GetSettingsSystem(ctx, orgID)
+	if err != nil {
+		log.Printf("[poller] load org settings for %s: %v (falling back to defaults)", orgID, err)
+		return domain.DefaultOrgSettings()
+	}
+	return orgSet
 }
 
 // loadJiraRules pulls the per-team Jira status rules for the org's
