@@ -101,11 +101,16 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Mirror the PATCH path's lazy-load policy: only read team Jira
 	// rules when the Jira side actually needs validation. Linear is
-	// rejected regardless of stored rules.
+	// rejected regardless of stored rules. Read goes through the app
+	// pool inside WithTx so jira_rules_select RLS is enforced under
+	// the user's claims.
 	var teamJiraRules []domain.JiraProjectStatusRules
 	if jiraKey != "" {
-		teamJiraRules, err = s.jiraRules.ListForTeamSystem(r.Context(), teamID)
-		if err != nil {
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var rerr error
+			teamJiraRules, rerr = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+			return rerr
+		}); err != nil {
 			log.Printf("handleProjectCreate: failed to load Jira rules: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira rules"})
 			return
@@ -485,17 +490,23 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		if jiraInput == "" {
 			updated.JiraProjectKey = ""
 		} else {
-			teamID, terr := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-			if terr != nil || teamID == "" {
+			// Default-team + rule lookup inside WithTx so the rule
+			// read goes through tx.JiraStatusRules.ListForTeam (app
+			// pool, jira_rules_select RLS gates by team membership).
+			var teamRules []domain.JiraProjectStatusRules
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				teamID, terr := tx.Teams.GetDefaultForOrgSystem(r.Context(), orgID)
 				if terr != nil {
-					log.Printf("[projects] patch: default team lookup: %v", terr)
+					return fmt.Errorf("default team lookup: %w", terr)
 				}
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to resolve default team"})
-				return
-			}
-			teamRules, rerr := s.jiraRules.ListForTeamSystem(r.Context(), teamID)
-			if rerr != nil {
-				log.Printf("[projects] patch: jira rules load: %v", rerr)
+				if teamID == "" {
+					return fmt.Errorf("org %s has no default team", orgID)
+				}
+				var rerr error
+				teamRules, rerr = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+				return rerr
+			}); err != nil {
+				log.Printf("[projects] patch: jira rules load: %v", err)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira rules"})
 				return
 			}

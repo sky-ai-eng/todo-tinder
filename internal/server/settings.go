@@ -269,38 +269,70 @@ type aiSettings struct {
 // requesting tenant and folds them into the legacy combined view the
 // handler exposes. SKY-357 will split this into per-scope endpoints;
 // until then the single-endpoint shape is preserved.
-func (s *Server) loadSettingsView(ctx context.Context, orgID string) (orgSet domain.OrgSettings, teamSet domain.TeamSettings, projects []jiraProjectConfig, teamID string, err error) {
-	orgSet, err = s.orgs.GetSettingsSystem(ctx, orgID)
+//
+// Runs inside the caller's WithTx and uses the app-pool variants
+// (GetSettings / ListForTeam) so org_settings_select / team_settings_
+// select / jira_rules_select RLS gates fire under the user's claims.
+// Returns an error when the org has no default team — that's a
+// bootstrap bug elsewhere in the codebase (provisioning always seeds
+// one), and silently falling back to zero values would let the
+// Settings UI display empty model + 0 thresholds.
+func loadSettingsView(ctx context.Context, tx db.TxStores, orgID string) (orgSet domain.OrgSettings, teamSet domain.TeamSettings, projects []jiraProjectConfig, teamID string, err error) {
+	orgSet, err = tx.Orgs.GetSettings(ctx, orgID)
 	if err != nil {
 		return
 	}
-	teamID, err = s.teams.GetDefaultForOrgSystem(ctx, orgID)
+	teamID, err = tx.Teams.GetDefaultForOrgSystem(ctx, orgID)
 	if err != nil {
 		return
 	}
-	if teamID != "" {
-		teamSet, err = s.teams.GetSettingsSystem(ctx, teamID)
-		if err != nil {
-			return
-		}
-		var rules []domain.JiraProjectStatusRules
-		rules, err = s.jiraRules.ListForTeamSystem(ctx, teamID)
-		if err != nil {
-			return
-		}
-		projects = rulesToProjectConfigs(rules)
+	if teamID == "" {
+		err = fmt.Errorf("org %s has no default team", orgID)
+		return
 	}
+	teamSet, err = tx.Teams.GetSettings(ctx, teamID)
+	if err != nil {
+		return
+	}
+	var rules []domain.JiraProjectStatusRules
+	rules, err = tx.JiraStatusRules.ListForTeam(ctx, teamID)
+	if err != nil {
+		return
+	}
+	projects = rulesToProjectConfigs(rules)
 	return
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	orgID := OrgIDFrom(r.Context())
-	orgSet, teamSet, projects, _, err := s.loadSettingsView(r.Context(), orgID)
-	if err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	// Wrap the whole read in WithTx so the per-scope reads + the
+	// integrations.Load (vault) call go through the app pool under
+	// the user's claims. Multi-mode RLS gates org_settings_select /
+	// team_settings_select / jira_rules_select on membership, and
+	// SecretStore's Postgres impl needs request.jwt.claims set for
+	// vault_decrypt — none of those work outside WithTx.
+	var (
+		orgSet   domain.OrgSettings
+		teamSet  domain.TeamSettings
+		projects []jiraProjectConfig
+		creds    auth.Credentials
+	)
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var lerr error
+		orgSet, teamSet, projects, _, lerr = loadSettingsView(r.Context(), tx, orgID)
+		if lerr != nil {
+			return lerr
+		}
+		// SecretStore errors are non-fatal — the keychain may be
+		// empty on a fresh install. Suppressed here so a missing
+		// row doesn't 500 the whole Settings page.
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
+		return nil
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load settings: " + err.Error()})
 		return
 	}
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID) // store errors are non-fatal (keychain may be empty)
 
 	resp := settingsResponse{
 		GitHub: githubSettings{
@@ -408,17 +440,31 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load existing state — snapshot for change detection
-	orgSet, teamSet, projects, teamID, err := s.loadSettingsView(r.Context(), orgID)
-	if err != nil {
+	// Load existing state — snapshot for change detection. Reads go
+	// through the app pool under the user's claims so RLS gates fire
+	// (and so the Postgres SecretStore's vault_decrypt sees claims).
+	var (
+		orgSet   domain.OrgSettings
+		teamSet  domain.TeamSettings
+		projects []jiraProjectConfig
+		teamID   string
+		creds    auth.Credentials
+	)
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var lerr error
+		orgSet, teamSet, projects, teamID, lerr = loadSettingsView(r.Context(), tx, orgID)
+		if lerr != nil {
+			return lerr
+		}
+		// Credential errors are non-fatal — first-time setup arrives
+		// with an empty keychain, and we still need to land the rest
+		// of the settings POST.
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
+		return nil
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load settings: " + err.Error()})
 		return
 	}
-	if teamID == "" {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "org has no default team"})
-		return
-	}
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID) // store errors are non-fatal
 
 	// Track which disconnects hit the env-overlay no-op so we can surface
 	// a single user-facing warning in the success response. The FE renders
@@ -706,21 +752,26 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Persist
-	if err := integrations.Save(r.Context(), s.secrets, orgID, creds); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
-		return
-	}
-	if err := s.orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save org settings: " + err.Error()})
-		return
-	}
-	if err := s.teams.UpdateSettings(r.Context(), teamID, teamSet); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save team settings: " + err.Error()})
-		return
-	}
-	if err := s.jiraRules.ReplaceForTeam(r.Context(), teamID, projectConfigsToRules(projects)); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save Jira rules: " + err.Error()})
+	// Persist everything in one WithTx so credentials + org/team/jira
+	// rules either all commit or all roll back, and so the Postgres
+	// vault writes + RLS-gated UPDATEs see request.jwt.claims set.
+	// Local mode collapses to a single SQLite tx with the same shape.
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		if err := integrations.Save(r.Context(), tx.Secrets, orgID, creds); err != nil {
+			return fmt.Errorf("store credentials: %w", err)
+		}
+		if err := tx.Orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
+			return fmt.Errorf("save org settings: %w", err)
+		}
+		if err := tx.Teams.UpdateSettings(r.Context(), teamID, teamSet); err != nil {
+			return fmt.Errorf("save team settings: %w", err)
+		}
+		if err := tx.JiraStatusRules.ReplaceForTeam(r.Context(), teamID, projectConfigsToRules(projects)); err != nil {
+			return fmt.Errorf("save Jira rules: %w", err)
+		}
+		return nil
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save settings: " + err.Error()})
 		return
 	}
 
@@ -803,44 +854,41 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load existing state before writing anything (fail early)
-	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load credentials: " + err.Error()})
-		return
-	}
-	orgSet, err := s.orgs.GetSettingsSystem(r.Context(), orgID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load org settings: " + err.Error()})
-		return
-	}
-
-	// Persist credentials and org settings
-	creds.JiraURL = req.URL
-	creds.JiraPAT = req.PAT
-	orgSet.JiraBaseURL = req.URL
-
-	if err := integrations.Save(r.Context(), s.secrets, orgID, creds); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
-		return
-	}
-	if err := s.orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
-		// Roll back keychain to avoid creds/settings desync. Use Delete
-		// rather than rewriting with empty strings — integrations.Save
-		// skips empty values, so the rollback has to issue an explicit
-		// clear.
-		_ = integrations.ClearJira(r.Context(), s.secrets, orgID)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save org settings: " + err.Error()})
-		return
-	}
-
-	// SKY-270: persist the captured Jira identity on the users row.
-	// Failure is logged but non-fatal; the next save (or the boot-time
-	// bootstrap) retries.
+	// One WithTx for the whole read + write window: credentials go
+	// through tx.Secrets (Postgres vault writes need claims set),
+	// org_settings goes through tx.Orgs (org_settings_update RLS
+	// gates on admin), and SKY-270's Jira identity write goes through
+	// tx.Users. All-or-nothing so creds + settings + identity can't
+	// land in a partial state. The earlier "manual rollback via
+	// ClearJira" pattern collapses to plain tx rollback semantics.
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-		return tx.Users.SetJiraIdentity(r.Context(), userID, jiraUser.StableID(), jiraUser.DisplayName)
+		creds, err := integrations.Load(r.Context(), tx.Secrets, orgID)
+		if err != nil {
+			return fmt.Errorf("load credentials: %w", err)
+		}
+		orgSet, err := tx.Orgs.GetSettings(r.Context(), orgID)
+		if err != nil {
+			return fmt.Errorf("load org settings: %w", err)
+		}
+		creds.JiraURL = req.URL
+		creds.JiraPAT = req.PAT
+		orgSet.JiraBaseURL = req.URL
+		if err := integrations.Save(r.Context(), tx.Secrets, orgID, creds); err != nil {
+			return fmt.Errorf("store credentials: %w", err)
+		}
+		if err := tx.Orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
+			return fmt.Errorf("save org settings: %w", err)
+		}
+		// SKY-270: persist the captured Jira identity on the users
+		// row. Bundled in the same tx so the connect either fully
+		// lands (creds + URL + identity) or fully rolls back.
+		if err := tx.Users.SetJiraIdentity(r.Context(), userID, jiraUser.StableID(), jiraUser.DisplayName); err != nil {
+			return fmt.Errorf("persist users.jira_identity: %w", err)
+		}
+		return nil
 	}); err != nil {
-		log.Printf("[settings] failed to persist users.jira_identity: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{

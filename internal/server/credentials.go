@@ -9,7 +9,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
-	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
@@ -101,49 +100,56 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 		resp.Jira = jiraUser
 	}
 
-	// Store credentials via SecretStore (PATs only — github_username lives on
-	// the users row per SKY-264, written separately below). Local mode hits
-	// the keychain; multi mode hits the Postgres vault wrapper.
-	if err := integrations.Save(r.Context(), s.secrets, orgID, auth.Credentials{
-		GitHubURL: req.GitHubURL,
-		GitHubPAT: req.GitHubPAT,
-		JiraURL:   req.JiraURL,
-		JiraPAT:   req.JiraPAT,
-	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
-		return
-	}
-
-	// Capture the GitHub login on the users row when we validated GitHub.
-	// Skip when GitHub wasn't validated (Jira-only setup) — the dashboard /
-	// poller short-circuit on empty username and Settings can re-capture
-	// later. userID is extracted from the request context — sentinel in
-	// local mode (via the shim), real user UUID in multi mode.
-	if resp.GitHub != nil && resp.GitHub.Login != "" {
-		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-			return tx.Users.SetGitHubUsername(r.Context(), userID, resp.GitHub.Login)
+	// One WithTx for the full persist: SecretStore (Postgres vault
+	// writes need claims), org_settings (org_settings_update RLS),
+	// and users.github_username (users_update RLS) all share the
+	// same claims tx so they either all commit or all roll back.
+	// Local mode collapses to one SQLite tx with the same shape.
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		if err := integrations.Save(r.Context(), tx.Secrets, orgID, auth.Credentials{
+			GitHubURL: req.GitHubURL,
+			GitHubPAT: req.GitHubPAT,
+			JiraURL:   req.JiraURL,
+			JiraPAT:   req.JiraPAT,
 		}); err != nil {
-			log.Printf("[setup] failed to persist users.github_username: %v", err)
+			return fmt.Errorf("store credentials: %w", err)
 		}
-	}
 
-	// Persist base URLs in org_settings so they survive without keychain access.
-	orgSet, oerr := s.orgs.GetSettingsSystem(r.Context(), orgID)
-	if oerr != nil {
-		log.Printf("[auth] warning: failed to load org settings before save: %v", oerr)
-		orgSet = domain.OrgSettings{}
-	}
-	if req.GitHubURL != "" {
-		orgSet.GitHubBaseURL = req.GitHubURL
-	}
-	if req.JiraURL != "" {
-		orgSet.JiraBaseURL = req.JiraURL
-	}
-	if req.CloneProtocol == "ssh" || req.CloneProtocol == "https" {
-		orgSet.GitHubCloneProtocol = req.CloneProtocol
-	}
-	if err := s.orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
-		log.Printf("[auth] warning: failed to save org settings: %v", err)
+		// Capture the GitHub login on the users row when we validated
+		// GitHub. Skip when GitHub wasn't validated (Jira-only setup)
+		// — the dashboard / poller short-circuit on empty username and
+		// Settings can re-capture later.
+		if resp.GitHub != nil && resp.GitHub.Login != "" {
+			if err := tx.Users.SetGitHubUsername(r.Context(), userID, resp.GitHub.Login); err != nil {
+				return fmt.Errorf("persist users.github_username: %w", err)
+			}
+		}
+
+		// Persist base URLs + clone protocol in org_settings so they
+		// survive without keychain access. Read-modify-write inside
+		// the same tx; the store returns DefaultOrgSettings() on a
+		// missing row, so first-time setup lands a fully-populated
+		// upsert rather than a partially-filled one.
+		orgSet, err := tx.Orgs.GetSettings(r.Context(), orgID)
+		if err != nil {
+			return fmt.Errorf("load org settings: %w", err)
+		}
+		if req.GitHubURL != "" {
+			orgSet.GitHubBaseURL = req.GitHubURL
+		}
+		if req.JiraURL != "" {
+			orgSet.JiraBaseURL = req.JiraURL
+		}
+		if req.CloneProtocol == "ssh" || req.CloneProtocol == "https" {
+			orgSet.GitHubCloneProtocol = req.CloneProtocol
+		}
+		if err := tx.Orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
+			return fmt.Errorf("save org settings: %w", err)
+		}
+		return nil
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 
 	// Setup always includes GitHub — trigger full restart. Mark Jira restarted
