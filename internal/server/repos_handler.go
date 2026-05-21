@@ -30,7 +30,7 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 		orgSet, lerr = tx.Orgs.GetSettings(r.Context(), orgID)
 		return lerr
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load settings: " + err.Error()})
+		internalError(w, "repos", err)
 		return
 	}
 	if creds.GitHubPAT == "" || creds.GitHubURL == "" {

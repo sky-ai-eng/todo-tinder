@@ -161,35 +161,7 @@ func jiraProjectsEqual(a, b []jiraProjectConfig) bool {
 	return true
 }
 
-// rulesToProjectConfigs converts the domain shape returned by the
-// JiraStatusRulesStore into the wire shape used by the settings
-// handler. Empty input yields a nil slice so the caller can treat
-// "no rules" as the natural zero value.
-func rulesToProjectConfigs(rules []domain.JiraProjectStatusRules) []jiraProjectConfig {
-	if len(rules) == 0 {
-		return nil
-	}
-	out := make([]jiraProjectConfig, 0, len(rules))
-	for _, r := range rules {
-		out = append(out, jiraProjectConfig{
-			Key: r.ProjectKey,
-			Pickup: jiraStatusRule{
-				Members: slices.Clone(r.PickupMembers),
-			},
-			InProgress: jiraStatusRule{
-				Members:   slices.Clone(r.InProgressMembers),
-				Canonical: r.InProgressCanonical,
-			},
-			Done: jiraStatusRule{
-				Members:   slices.Clone(r.DoneMembers),
-				Canonical: r.DoneCanonical,
-			},
-		})
-	}
-	return out
-}
-
-// projectConfigsToRules is the inverse of rulesToProjectConfigs. Used
+// projectConfigsToRules is the inverse of rulesToProjectConfigsOrdered. Used
 // by handleSettingsPost when persisting the team's project list back
 // to jira_project_status_rules via JiraStatusRulesStore.ReplaceForTeam.
 func projectConfigsToRules(projects []jiraProjectConfig) []domain.JiraProjectStatusRules {
@@ -299,8 +271,65 @@ func loadSettingsView(ctx context.Context, tx db.TxStores, orgID string) (orgSet
 	if err != nil {
 		return
 	}
-	projects = rulesToProjectConfigs(rules)
+	// JiraStatusRulesStore.ListForTeam returns rules in project_key
+	// ASC; team_settings.jira_projects holds the denormalized ordered
+	// list the user actually set in Settings. Reorder the rule slice
+	// to match teamSet.JiraProjects so the wire response reflects
+	// user-set order and jiraProjectsEqual's change detection
+	// doesn't spuriously fire just because the store sorted them.
+	projects = rulesToProjectConfigsOrdered(rules, teamSet.JiraProjects)
 	return
+}
+
+// rulesToProjectConfigsOrdered converts the domain rules into the
+// wire shape and reorders them to match order. Keys present in
+// order but missing from rules are skipped (the store is the source
+// of truth for rule existence); keys in rules but not in order get
+// appended after the ordered set in their store-returned (ASC)
+// position so a manual DB poke that adds a row without updating
+// team_settings.jira_projects still surfaces.
+func rulesToProjectConfigsOrdered(rules []domain.JiraProjectStatusRules, order []string) []jiraProjectConfig {
+	if len(rules) == 0 {
+		return nil
+	}
+	byKey := make(map[string]domain.JiraProjectStatusRules, len(rules))
+	for _, r := range rules {
+		byKey[r.ProjectKey] = r
+	}
+	out := make([]jiraProjectConfig, 0, len(rules))
+	seen := make(map[string]bool, len(rules))
+	for _, k := range order {
+		r, ok := byKey[k]
+		if !ok {
+			continue
+		}
+		out = append(out, ruleToProjectConfig(r))
+		seen[k] = true
+	}
+	for _, r := range rules {
+		if seen[r.ProjectKey] {
+			continue
+		}
+		out = append(out, ruleToProjectConfig(r))
+	}
+	return out
+}
+
+func ruleToProjectConfig(r domain.JiraProjectStatusRules) jiraProjectConfig {
+	return jiraProjectConfig{
+		Key: r.ProjectKey,
+		Pickup: jiraStatusRule{
+			Members: slices.Clone(r.PickupMembers),
+		},
+		InProgress: jiraStatusRule{
+			Members:   slices.Clone(r.InProgressMembers),
+			Canonical: r.InProgressCanonical,
+		},
+		Done: jiraStatusRule{
+			Members:   slices.Clone(r.DoneMembers),
+			Canonical: r.DoneCanonical,
+		},
+	}
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +359,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		return nil
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load settings: " + err.Error()})
+		internalError(w, "settings", err)
 		return
 	}
 
@@ -462,7 +491,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		return nil
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load settings: " + err.Error()})
+		internalError(w, "settings", err)
 		return
 	}
 
@@ -814,7 +843,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save settings: " + err.Error()})
+		internalError(w, "settings", err)
 		return
 	}
 
@@ -974,7 +1003,7 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 		projects = append(projects, teamSet.JiraProjects...)
 		return nil
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira config: " + err.Error()})
+		internalError(w, "settings", err)
 		return
 	}
 	if creds.JiraPAT == "" || creds.JiraURL == "" {
@@ -1053,7 +1082,7 @@ func (s *Server) handleGitHubPreflightSSH(w http.ResponseWriter, r *http.Request
 		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		return nil
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load credentials: " + err.Error()})
+		internalError(w, "settings", err)
 		return
 	}
 	sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)

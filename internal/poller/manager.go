@@ -317,18 +317,19 @@ func (m *Manager) runGitHubCycle(client *ghclient.Client, userTeams []string) {
 // request.jwt.claims (vault_* enforces org_id ==
 // tf.current_org_id()), and the poller goroutine has no claims
 // context. Multi-mode Jira polling needs either a SystemGet-style
-// SecretStore variant or per-org SyntheticClaimsWithTx routing —
-// follow-up work alongside per-org GitHub App polling (D11) and
-// Jira OAuth (SKY-347). Until then, multi-mode tenants don't get
-// background polling; their data refreshes on the next interactive
-// flow.
+// SecretStore variant or per-org SyntheticClaimsWithTx routing.
+// Until then, multi-mode tenants don't get background polling;
+// their data refreshes on the next interactive flow.
 //
 // interval is process-global (per-org cadence is future work); in
 // local mode N=1 so the triggering org's interval IS the global
 // interval.
+//
+// TODO: multi-mode Jira polling — add system-mode SecretStore
+// access path (SKY-347 / D11 follow-up) then drop the gate below.
 func (m *Manager) startJira(interval time.Duration) {
 	if runmode.Current() != runmode.ModeLocal {
-		log.Println("[jira] tracker not started — multi-mode Jira polling requires per-org system credentials (SKY-347 / D11 follow-up)")
+		log.Println("[jira] tracker not started — multi-mode Jira polling requires per-org system credentials (see TODO in startJira)")
 		return
 	}
 	if interval < 10*time.Second {

@@ -131,7 +131,10 @@ func (s *Server) handleDashboardPRStatus(w http.ResponseWriter, r *http.Request)
 		orgSet, lerr = tx.Orgs.GetSettings(r.Context(), orgID)
 		return lerr
 	}); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub not configured"})
+		// Real DB/vault/RLS failure — distinct from the "not
+		// configured" case below, which is a normal user state.
+		// internalError redacts in multi-mode + logs detail.
+		internalError(w, "dashboard", err)
 		return
 	}
 	if creds.GitHubPAT == "" {

@@ -1054,10 +1054,12 @@ func main() {
 	// below would fail in Postgres without request.jwt.claims set
 	// (SecretStore vault_* enforces org_id == tf.current_org_id()),
 	// and the callback fires from a goroutine with no claims
-	// context. Multi-mode per-tenant credential refresh requires
-	// either a SystemGet-style SecretStore variant or plumbing
-	// userID through the callback for SyntheticClaimsWithTx —
-	// follow-up work alongside per-org GitHub App polling (D11).
+	// context.
+	//
+	// TODO: multi-mode per-tenant credential refresh — add a
+	// SystemGet-style SecretStore variant or plumb userID through
+	// the callback for SyntheticClaimsWithTx. Same follow-up as the
+	// startJira TODO in internal/poller/manager.go.
 	srv.SetOnGitHubChanged(func(orgID string) {
 		log.Println("[server] GitHub config changed, full restart...")
 		setAnnouncePending("github")

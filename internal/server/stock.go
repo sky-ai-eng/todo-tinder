@@ -101,7 +101,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira state: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
 
@@ -133,7 +133,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		taskedEntityIDs, e = tx.Tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list entities: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
 
@@ -358,7 +358,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira state: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
 	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" || localDisplayName == "" {
@@ -376,7 +376,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		taskedEntityIDs, e = tx.Tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check active tasks: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
 
