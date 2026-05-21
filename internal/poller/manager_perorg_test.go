@@ -62,7 +62,7 @@ func TestManager_RunGitHubCycle_IteratesActiveOrgs(t *testing.T) {
 func TestManager_RunJiraCycle_OrgsStoreError(t *testing.T) {
 	orgs := &fakeOrgsStore{err: errOrgsDown}
 	m := &Manager{orgs: orgs}
-	m.runJiraCycle(nil, "", nil)
+	m.runJiraCycle()
 
 	if orgs.calls != 1 {
 		t.Errorf("ListActiveSystem called %d times; want 1 even on error", orgs.calls)

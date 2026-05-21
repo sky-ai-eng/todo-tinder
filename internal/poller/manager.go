@@ -98,10 +98,13 @@ func (m *Manager) RestartAll(ctx context.Context, orgID string) {
 
 	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
-	rules := m.loadJiraRules(ctx, orgID)
 
 	m.startGitHub(orgSet, creds)
-	m.startJira(orgSet, creds, rules)
+	// Jira polling resolves per-org settings/creds/rules inside each
+	// cycle, so the only thing startJira needs from the trigger org
+	// is the tick interval — orgSet.JiraPollInterval is the process-
+	// global cadence (per-org poll cadence is future work).
+	m.startJira(orgSet.JiraPollInterval)
 }
 
 // RestartGitHub stops and restarts only the GitHub polling loop.
@@ -130,9 +133,7 @@ func (m *Manager) RestartJira(ctx context.Context, orgID string) {
 	m.mu.Unlock()
 
 	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
-	creds, _ := integrations.Load(ctx, m.secrets, orgID)
-	rules := m.loadJiraRules(ctx, orgID)
-	m.startJira(orgSet, creds, rules)
+	m.startJira(orgSet.JiraPollInterval)
 }
 
 // loadJiraRules pulls the per-team Jira status rules for the org's
@@ -303,58 +304,51 @@ func (m *Manager) runGitHubCycle(client *ghclient.Client, userTeams []string) {
 	}
 }
 
-// startJira launches the Jira tracking loop. Each tick iterates
-// active orgs and dispatches a per-org RefreshJira. Jira project
-// rules are still process-global today (sourced from cfg.Jira), so
-// the per-org loop is effectively a fan-out of the same project set
-// across orgs — that matches local-mode behavior (N=1, the synthetic
-// sentinel org) and keeps the multi-mode outer-loop shape symmetric
-// with the GitHub path. Per-org Jira project configuration is a
-// future concern.
-func (m *Manager) startJira(orgSet domain.OrgSettings, creds auth.Credentials, rules []domain.JiraProjectStatusRules) {
-	if creds.JiraPAT == "" || creds.JiraURL == "" || len(rules) == 0 {
-		log.Println("[jira] not fully configured, skipping tracker")
-		return
-	}
-
-	interval := orgSet.JiraPollInterval
+// startJira launches the Jira tracking loop. The outer goroutine
+// just drives the tick; runJiraCycle resolves per-org Jira creds +
+// project rules + base URL inside the per-org loop so each tenant
+// is polled with its own configuration. Orgs without a connected
+// Jira integration (no PAT, no URL, no rules) are silently skipped
+// each cycle so adding/removing tenants doesn't need a poller
+// restart. interval is process-global (per-org cadence is future
+// work); a single shared tick rate is acceptable so long as the
+// per-org work itself doesn't leak across tenants.
+func (m *Manager) startJira(interval time.Duration) {
 	if interval < 10*time.Second {
 		interval = time.Minute
 	}
 
-	client := jiraclient.NewClient(creds.JiraURL, creds.JiraPAT)
 	stop := make(chan struct{})
-
 	m.mu.Lock()
 	m.jiraStop = stop
 	m.mu.Unlock()
 
-	projects := toTrackerJiraRules(rules)
-	projectKeys := domain.JiraProjectKeys(rules)
-
 	go func() {
 		// Initial poll
-		m.runJiraCycle(client, creds.JiraURL, projects)
+		m.runJiraCycle()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				m.runJiraCycle(client, creds.JiraURL, projects)
+				m.runJiraCycle()
 			case <-stop:
 				return
 			}
 		}
 	}()
 
-	log.Printf("[jira] tracker started (interval: %s, projects: %v)", interval, projectKeys)
+	log.Printf("[jira] tracker started (interval: %s, per-org config resolved each cycle)", interval)
 }
 
 // runJiraCycle enumerates active orgs and dispatches a per-org
-// RefreshJira. Per-org failures are logged and reported via
+// RefreshJira. Each org's creds + rules + base URL are resolved
+// inside the loop so two tenants with different Jira PATs / project
+// configurations don't share state. Orgs not configured for Jira
+// are skipped silently; per-org failures are logged + reported via
 // OnError but do not abort the remaining orgs in the cycle.
-func (m *Manager) runJiraCycle(client *jiraclient.Client, baseURL string, projects tracker.JiraRules) {
+func (m *Manager) runJiraCycle() {
 	ctx := context.Background()
 	orgIDs, err := m.orgs.ListActiveSystem(ctx)
 	if err != nil {
@@ -363,6 +357,31 @@ func (m *Manager) runJiraCycle(client *jiraclient.Client, baseURL string, projec
 		return
 	}
 	for _, orgID := range orgIDs {
+		orgSet, oerr := m.orgs.GetSettingsSystem(ctx, orgID)
+		if oerr != nil {
+			log.Printf("[jira] org %s: load settings: %v", orgID, oerr)
+			m.reportError("jira", orgID, oerr)
+			continue
+		}
+		creds, lerr := integrations.Load(ctx, m.secrets, orgID)
+		if lerr != nil {
+			log.Printf("[jira] org %s: load creds: %v", orgID, lerr)
+			m.reportError("jira", orgID, lerr)
+			continue
+		}
+		rules := m.loadJiraRules(ctx, orgID)
+		if creds.JiraPAT == "" || creds.JiraURL == "" || len(rules) == 0 {
+			// Not configured for Jira (or rules missing). Skip
+			// silently — adding/removing a tenant's Jira config
+			// doesn't need a poller restart this way.
+			continue
+		}
+		baseURL := orgSet.JiraBaseURL
+		if baseURL == "" {
+			baseURL = creds.JiraURL
+		}
+		client := jiraclient.NewClient(creds.JiraURL, creds.JiraPAT)
+		projects := toTrackerJiraRules(rules)
 		if _, err := m.trackerForOrg(orgID).RefreshJira(client, baseURL, projects); err != nil {
 			log.Printf("[jira] org %s: tracker error: %v", orgID, err)
 			m.reportError("jira", orgID, err)

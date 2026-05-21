@@ -723,10 +723,18 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	if req.AIAutoDelegate != nil {
 		teamSet.AutoDelegateEnabled = *req.AIAutoDelegate
 	}
-	// req.ServerPort is accepted but ignored: server port is deployment
-	// scope (instance_config), read once at boot in main.go and not
-	// editable through this handler. SKY-357's settings split makes the
-	// boundary explicit; until then we just drop the field.
+	// req.ServerPort is accepted for backwards compat but ignored:
+	// server port is deployment scope (instance_config), read once
+	// at boot in main.go and not editable through this handler.
+	// SKY-357's settings split makes the boundary explicit; until
+	// then we drop the field but surface a warning when the client
+	// sent a non-zero value that differs from the stored port, so
+	// older frontends or curl users get visible feedback instead of
+	// a silent 200 OK.
+	var serverPortIgnored bool
+	if req.ServerPort > 0 && req.ServerPort != s.serverPort {
+		serverPortIgnored = true
+	}
 
 	// JiraProjects is also denormalized onto team_settings.jira_projects
 	// as the fast path "which projects to poll" without joining.
@@ -833,6 +841,10 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		resp["warning"] = "env vars still supply credentials for the disconnected integration(s) — unset them in your shell to fully disconnect"
 		resp["env_overlay_blocks_disconnect"] = envOverlayWarn
 	}
+	if serverPortIgnored {
+		resp["server_port_ignored"] = true
+		resp["server_port_warning"] = fmt.Sprintf("server_port=%d was accepted but not persisted — port is deployment-scope and stays at %d. Set via --port at boot.", req.ServerPort, s.serverPort)
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -911,7 +923,11 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		// Log the underlying wrap-chain (SQL / vault / FK errors) for
+		// operator debugging, but return a stable user-facing message
+		// so we don't leak Postgres internals to API clients.
+		log.Printf("[settings] handleJiraConnect persist failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to connect Jira"})
 		return
 	}
 
