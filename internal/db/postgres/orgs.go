@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
@@ -92,10 +93,10 @@ func getOrgSettings(ctx context.Context, q queryer, orgID string) (domain.OrgSet
 	}
 	return domain.OrgSettings{
 		GitHubBaseURL:         ghURL.String,
-		GitHubPollInterval:    time.Duration(ghSecs * float64(time.Second)),
+		GitHubPollInterval:    secondsToDuration(ghSecs),
 		GitHubCloneProtocol:   cloneProto,
 		JiraBaseURL:           jiraURL.String,
-		JiraPollInterval:      time.Duration(jiraSecs * float64(time.Second)),
+		JiraPollInterval:      secondsToDuration(jiraSecs),
 		AnthropicAPIKeyRef:    anthRef.String,
 		BedrockCredentialsRef: bedRef.String,
 		MaxLLMModelTier:       maxTier.String,
@@ -147,4 +148,15 @@ func (s *orgsStore) UpdateSettings(ctx context.Context, orgID string, u domain.O
 		return fmt.Errorf("upsert org_settings: %w", err)
 	}
 	return nil
+}
+
+// secondsToDuration converts a Postgres EXTRACT(EPOCH FROM interval)
+// reading (seconds, double precision) to time.Duration. The naive
+// time.Duration(secs * float64(time.Second)) truncates the float-to-int
+// conversion, drifting by up to a nanosecond per round-trip. Rounding
+// to the nearest nanosecond pins the value at the precision Go's
+// Duration actually represents — and stays exact for the
+// minute-granularity poll intervals we round-trip in practice.
+func secondsToDuration(secs float64) time.Duration {
+	return time.Duration(math.Round(secs * float64(time.Second)))
 }
