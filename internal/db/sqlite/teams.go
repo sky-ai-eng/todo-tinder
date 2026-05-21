@@ -66,7 +66,11 @@ func getTeamSettings(ctx context.Context, q queryer, teamID string) (domain.Team
 		&defaultModel, &autoDelegate,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return domain.TeamSettings{}, nil
+		// See OrgsStore for the rationale: defaults here are the
+		// belt-and-suspenders fallback for test fixtures or any
+		// caller that beats the provisioning path. Matches the
+		// schema DEFAULT clauses on team_settings.
+		return domain.DefaultTeamSettings(), nil
 	}
 	if err != nil {
 		return domain.TeamSettings{}, fmt.Errorf("read team_settings: %w", err)

@@ -53,6 +53,11 @@ type Server struct {
 	// live under. Read once at boot from instance_config.
 	// server_takeover_dir, expanded via delegate.ResolveTakeoverDir.
 	takeoverDir string
+	// serverPort is the stored instance_config.server_port value
+	// surfaced to the settings GET response. The actual bind port
+	// comes from --port at boot, not this field — the Settings page
+	// reads it to populate its server_port input.
+	serverPort int
 	// tx runs handler-cleanup write batches under the request user's
 	// claims even when the cleanup needs to outlive the request
 	// context. Each cleanup wraps in `s.tx.WithTx(cleanupCtx, orgID,
@@ -224,7 +229,7 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 // argument list grows one store at a time as their callers migrate;
 // raw *sql.DB stays available for handlers that haven't been ported
 // to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, teams db.TeamsStore, orgs db.OrgsStore, jiraRules db.JiraStatusRulesStore, tx db.TxRunner, takeoverDir string) *Server {
+func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, teams db.TeamsStore, orgs db.OrgsStore, jiraRules db.JiraStatusRulesStore, tx db.TxRunner, takeoverDir string, serverPort int) *Server {
 	s := &Server{
 		db:            database,
 		prompts:       prompts,
@@ -252,6 +257,7 @@ func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboa
 		jiraRules:     jiraRules,
 		tx:            tx,
 		takeoverDir:   takeoverDir,
+		serverPort:    serverPort,
 		mux:           http.NewServeMux(),
 		ws:            websocket.NewHub(),
 	}

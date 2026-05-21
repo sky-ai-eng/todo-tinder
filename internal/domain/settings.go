@@ -31,6 +31,27 @@ type OrgSettings struct {
 	MaxLLMModelTier       string // "haiku" | "sonnet" | "opus" | ""
 }
 
+// DefaultOrgSettings returns the NOT NULL DEFAULT values from the
+// org_settings schema as a Go struct. Used by:
+//
+//   - OrgsStore.GetSettings / GetSettingsSystem as the fallback when
+//     no row exists yet (test fixtures that bypass provisioning, or
+//     reads on a fresh DB before the first auth flow has run).
+//   - Provisioning paths (server/auth_provision.go, baseline migration
+//     seed rows) that want to materialize the schema defaults
+//     explicitly in Go.
+//
+// Nullable fields (base URLs, vault refs, max tier) stay empty —
+// "not configured yet" semantics are preserved. Keep this in sync
+// with the schema DEFAULT clauses in baseline migration.
+func DefaultOrgSettings() OrgSettings {
+	return OrgSettings{
+		GitHubPollInterval:  5 * time.Minute,
+		GitHubCloneProtocol: "ssh",
+		JiraPollInterval:    5 * time.Minute,
+	}
+}
+
 // TeamSettings is the team-scope settings row (team_settings table).
 // JiraProjects holds the team's tracked Jira project keys — the full
 // per-project rule rows live in jira_project_status_rules and are
@@ -47,6 +68,25 @@ type TeamSettings struct {
 	AIPreferenceUpdateInterval int
 	DefaultModel               string // "haiku" | "sonnet" | "opus"
 	AutoDelegateEnabled        bool
+}
+
+// DefaultTeamSettings returns the NOT NULL DEFAULT values from the
+// team_settings schema as a Go struct. Same pattern as
+// DefaultOrgSettings — read-side fallback for missing rows, plus an
+// explicit Go-side baseline for provisioning paths.
+//
+// AutoDelegateEnabled defaults false here (matching the schema
+// DEFAULT and the multi-mode "new teams require explicit opt-in"
+// rule). The local-mode sentinel team flips this to true via its
+// baseline seed row so the local-first happy path keeps auto-
+// delegation on out of the box.
+func DefaultTeamSettings() TeamSettings {
+	return TeamSettings{
+		AIReprioritizeThreshold:    5,
+		AIPreferenceUpdateInterval: 20,
+		DefaultModel:               "sonnet",
+		AutoDelegateEnabled:        false,
+	}
 }
 
 // UserSettings is the user-scope settings row (user_settings table).

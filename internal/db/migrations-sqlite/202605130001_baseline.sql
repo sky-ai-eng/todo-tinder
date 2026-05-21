@@ -872,6 +872,30 @@ INSERT OR IGNORE INTO memberships (user_id, team_id, role) VALUES
      '00000000-0000-0000-0000-000000000010',
      'admin');
 
+-- Settings rows for the local sentinel org + team. Listing only the
+-- PK lets every other column take its NOT NULL DEFAULT from above —
+-- a tiny formal restatement of the schema defaults, so the application
+-- never has to special-case "row exists but it's a row of defaults" vs
+-- "no row at all." The team_settings seed flips auto_delegate_enabled
+-- to 1: the schema default is 0 (multi-mode's "new teams require
+-- explicit opt-in" rule), but local mode is the auto-delegate happy
+-- path and the deleted internal/config.Default() always reported
+-- AutoDelegateEnabled=true in this scope. Keeping the schema default
+-- conservative (false) for multi-mode is the right call; local mode
+-- overrides on the way in via this seed.
+--
+-- instance_config is a singleton (id=1 enforced by CHECK). The seed
+-- below materializes the row so the boot-time read in main.go always
+-- finds it instead of degrading to sql.ErrNoRows; column DEFAULTs
+-- supply server_port and server_takeover_dir.
+INSERT OR IGNORE INTO instance_config (id) VALUES (1);
+
+INSERT OR IGNORE INTO org_settings (org_id) VALUES
+    ('00000000-0000-0000-0000-000000000001');
+
+INSERT OR IGNORE INTO team_settings (team_id, auto_delegate_enabled) VALUES
+    ('00000000-0000-0000-0000-000000000010', 1);
+
 -- events_catalog seed (system-managed event type registry). Mirrors the
 -- equivalent INSERT block in the Postgres baseline; both must stay in
 -- sync with domain.AllEventTypes(). New event types ship as a new

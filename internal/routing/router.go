@@ -113,17 +113,22 @@ func NewRouter(prompts dbpkg.PromptStore, handlers dbpkg.EventHandlerStore, agen
 }
 
 // autoDelegateEnabledForTeam returns the team's auto_delegate_enabled
-// kill switch. Nil teams store (test wiring) or store error degrades to
-// "enabled" — matches the legacy `cfg.AI.AutoDelegateEnabled` read which
-// returned the Default() value (true) on any DB error.
+// kill switch. TeamsStore.GetSettingsSystem returns
+// domain.DefaultTeamSettings() on missing rows, so a missing team
+// settings row reads as false (the schema default; multi-mode's "new
+// teams require explicit opt-in" rule). The local-mode sentinel team's
+// baseline seed flips this to true, preserving the local-first
+// happy-path behavior. Nil teams store (test wiring) or store error
+// degrades to false — safer than the prior "fail open and silently
+// auto-delegate" behavior the deleted internal/config had.
 func (r *Router) autoDelegateEnabledForTeam(ctx context.Context, teamID string) bool {
 	if r.teams == nil || teamID == "" {
-		return true
+		return false
 	}
 	settings, err := r.teams.GetSettingsSystem(ctx, teamID)
 	if err != nil {
-		log.Printf("[router] auto_delegate gate: team %s settings read: %v (defaulting to enabled)", teamID, err)
-		return true
+		log.Printf("[router] auto_delegate gate: team %s settings read: %v (defaulting to disabled)", teamID, err)
+		return false
 	}
 	return settings.AutoDelegateEnabled
 }

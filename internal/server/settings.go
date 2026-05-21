@@ -318,7 +318,11 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 			Projects:     toJiraProjectSettings(projects),
 		},
 		Server: serverSettings{
-			Port: 0, // deployment-scope; read directly from instance_config at boot — not surfaced per-request anymore
+			// Read once at boot from instance_config.server_port and
+			// stashed on the Server struct. The actual bind port wins
+			// from --port; this is the stored override the frontend's
+			// Settings input renders.
+			Port: s.serverPort,
 		},
 		AI: aiSettings{
 			Model:                    teamSet.DefaultModel,

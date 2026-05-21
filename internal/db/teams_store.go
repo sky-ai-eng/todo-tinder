@@ -43,8 +43,12 @@ type TeamsStore interface {
 	// and a teamless org is a bootstrap bug.
 	GetDefaultForOrgSystem(ctx context.Context, orgID string) (string, error)
 
-	// GetSettings returns the team's settings row, or a zero-value
-	// TeamSettings with nil error when no row exists yet. JiraProjects
+	// GetSettings returns the team's settings row. On sql.ErrNoRows
+	// it falls back to domain.DefaultTeamSettings() (matching the
+	// schema DEFAULT clauses) so callers see a populated struct
+	// rather than the Go zero value with empty model + zero thresholds
+	// + auto_delegate=false. Row-missing is a test-fixture-only case;
+	// production paths seed a row at team-create time. JiraProjects
 	// is a denormalized fast path keyed `(team_id, project_key)`;
 	// the per-project status rules live on JiraStatusRulesStore.
 	// Postgres routes through the app pool (team_settings_select RLS
@@ -54,7 +58,7 @@ type TeamsStore interface {
 	// GetSettingsSystem mirrors GetSettings but routes through the
 	// admin pool in Postgres for callers without a JWT-claims context
 	// (poller manager, scorer, delegation spawner). SQLite collapses
-	// to the same impl.
+	// to the same impl. Same defaults-on-ErrNoRows contract.
 	GetSettingsSystem(ctx context.Context, teamID string) (domain.TeamSettings, error)
 
 	// UpdateSettings upserts the team's settings row. JiraProjects is

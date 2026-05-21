@@ -242,6 +242,10 @@ func provisionPersonalOrg(ctx context.Context, tx *sql.Tx, userID uuid.UUID, cla
 		return uuid.Nil, fmt.Errorf("insert memberships: %w", err)
 	}
 
+	if err := seedSettingsRows(ctx, tx, orgID, teamID); err != nil {
+		return uuid.Nil, err
+	}
+
 	log.Printf("[auth] provisioned personal org=%s team=%s user=%s slug=%s", orgID, teamID, userID, chosenSlug)
 	return orgID, nil
 }
@@ -293,6 +297,9 @@ func provisionAutoJoinDefault(ctx context.Context, tx *sql.Tx, userID uuid.UUID)
 		`, userID, uuid.MustParse(runmode.LocalDefaultTeamID)); err != nil {
 			return uuid.Nil, fmt.Errorf("insert memberships: %w", err)
 		}
+		if err := seedSettingsRows(ctx, tx, defaultOrgID, uuid.MustParse(runmode.LocalDefaultTeamID)); err != nil {
+			return uuid.Nil, err
+		}
 		log.Printf("[auth] auto-join-default: created Default org for first user=%s", userID)
 		return defaultOrgID, nil
 	}
@@ -322,6 +329,15 @@ func provisionAutoJoinDefault(ctx context.Context, tx *sql.Tx, userID uuid.UUID)
 			`, defaultOrgID, userID).Scan(&teamID); err != nil {
 				return uuid.Nil, fmt.Errorf("create missing default team: %w", err)
 			}
+			// Backfilled team gets its team_settings row too. The org
+			// already has its org_settings from when it was first
+			// created (either via the first-signup branch above or an
+			// external admin seed), so org_settings INSERT goes through
+			// ON CONFLICT DO NOTHING here as a safety belt for the rare
+			// case where the org pre-existed without one.
+			if err := seedSettingsRows(ctx, tx, defaultOrgID, teamID); err != nil {
+				return uuid.Nil, err
+			}
 		} else {
 			return uuid.Nil, fmt.Errorf("read default team: %w", err)
 		}
@@ -342,6 +358,37 @@ func provisionAutoJoinDefault(ctx context.Context, tx *sql.Tx, userID uuid.UUID)
 
 	log.Printf("[auth] auto-join-default: added user=%s to Default org team=%s", userID, teamID)
 	return defaultOrgID, nil
+}
+
+// seedSettingsRows inserts the org_settings + team_settings rows that
+// every org+team needs at provisioning time. Both rows take their
+// values entirely from the schema DEFAULT clauses — listing only the
+// foreign-key column lets the NOT NULL DEFAULTs (5m poll intervals,
+// 'ssh' clone protocol, 'sonnet' model, auto_delegate_enabled=false)
+// populate every other column. ON CONFLICT DO NOTHING because in
+// rare backfill paths (e.g. recovering from a partial provisioning)
+// the rows may already exist; we don't want to clobber an admin's
+// edits.
+//
+// This keeps the "row missing on GetSettings" case unreachable in
+// production. The stores' GetSettings* methods still return
+// domain.DefaultOrgSettings() / DefaultTeamSettings() on ErrNoRows as
+// a belt-and-suspenders fallback for test fixtures that build raw
+// DBs without going through provisioning.
+func seedSettingsRows(ctx context.Context, tx *sql.Tx, orgID, teamID uuid.UUID) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO public.org_settings (org_id) VALUES ($1)
+		ON CONFLICT (org_id) DO NOTHING
+	`, orgID); err != nil {
+		return fmt.Errorf("insert org_settings: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO public.team_settings (team_id) VALUES ($1)
+		ON CONFLICT (team_id) DO NOTHING
+	`, teamID); err != nil {
+		return fmt.Errorf("insert team_settings: %w", err)
+	}
+	return nil
 }
 
 // userLockKey hashes a user UUID into a 64-bit signed integer for

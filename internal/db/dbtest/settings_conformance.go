@@ -74,15 +74,21 @@ func RunSettingsStoresConformance(t *testing.T, factory SettingsStoresFactory) {
 		}
 	})
 
-	t.Run("OrgSettings_EmptyRow_ReturnsZeroValue", func(t *testing.T) {
+	t.Run("OrgSettings_EmptyRow_ReturnsDefaults", func(t *testing.T) {
+		// Provisioning seeds org_settings at org-create time; tests
+		// that build raw DBs without going through provisioning hit
+		// the GetSettings* fallback, which materializes
+		// domain.DefaultOrgSettings() (matching the schema DEFAULT
+		// clauses). Pins that contract so the wire shape doesn't
+		// regress to "0s" poll intervals on a missing-row read.
 		stores, ids := factory(t)
 		got, err := stores.Orgs.GetSettingsSystem(ctx, ids.OrgID)
 		if err != nil {
 			t.Fatalf("GetSettingsSystem on empty row: %v", err)
 		}
-		var zero domain.OrgSettings
-		if !reflect.DeepEqual(got, zero) {
-			t.Errorf("GetSettingsSystem on empty row = %+v; want zero value", got)
+		want := domain.DefaultOrgSettings()
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("GetSettingsSystem on empty row = %+v; want %+v", got, want)
 		}
 	})
 
@@ -180,15 +186,19 @@ func RunSettingsStoresConformance(t *testing.T, factory SettingsStoresFactory) {
 		}
 	})
 
-	t.Run("TeamSettings_EmptyRow_ReturnsZeroValue", func(t *testing.T) {
+	t.Run("TeamSettings_EmptyRow_ReturnsDefaults", func(t *testing.T) {
+		// Same fallback contract as OrgSettings — provisioning seeds
+		// the row in production, but tests that bypass it should
+		// still see populated defaults (sonnet model, 5/20 thresholds,
+		// auto_delegate=false) rather than the Go zero value.
 		stores, ids := factory(t)
 		got, err := stores.Teams.GetSettingsSystem(ctx, ids.TeamID)
 		if err != nil {
 			t.Fatalf("GetSettingsSystem on empty row: %v", err)
 		}
-		var zero domain.TeamSettings
-		if !reflect.DeepEqual(got, zero) {
-			t.Errorf("GetSettingsSystem on empty row = %+v; want zero value", got)
+		want := domain.DefaultTeamSettings()
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("GetSettingsSystem on empty row = %+v; want %+v", got, want)
 		}
 	})
 

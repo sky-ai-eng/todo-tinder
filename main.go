@@ -119,10 +119,11 @@ func applyPGPoolDefaults(db *sql.DB) {
 }
 
 // resolveAIModelForOrg looks up the default model the org's default
-// team uses. Local mode collapses to the synthetic sentinel team; multi-
-// mode resolves per-org. Returns "" when no team / no settings exist —
-// matches the prior Default().AI.Model degrade-to-empty path; the
-// spawner+curator both nil-safe their UpdateCredentials handlers.
+// team uses. Returns "" only when default-team lookup fails — the
+// store's GetSettingsSystem returns domain.DefaultTeamSettings() on
+// missing rows, so "team exists but no settings row" naturally yields
+// "sonnet" from the schema default. The spawner+curator nil-safe
+// empty model values in their UpdateCredentials handlers.
 func resolveAIModelForOrg(ctx context.Context, stores db.Stores, orgID string) string {
 	teamID, err := stores.Teams.GetDefaultForOrgSystem(ctx, orgID)
 	if err != nil || teamID == "" {
@@ -476,21 +477,24 @@ func main() {
 	defer database.Close()
 
 	// Boot-time deployment settings: instance_config holds the small
-	// remainder of process-wide state (server port override, takeover
-	// dir). The server port flag wins for the actual bind; the stored
-	// port is informational. The takeover dir is plumbed to the
-	// Server and Spawner constructors so neither has to read settings
-	// on every handler call.
+	// remainder of process-wide state (server port, takeover dir).
+	// Local-mode only — the table doesn't exist in the Postgres
+	// baseline because hosted multi-mode uses env vars for these.
+	// The takeover dir is plumbed to the Server and Spawner
+	// constructors so neither has to read settings on every handler
+	// call. The stored port is surfaced to the settings GET response
+	// (the actual bind still wins from --port at boot).
 	var (
 		storedPort        int
 		storedTakeoverDir string
 	)
-	if err := database.QueryRowContext(context.Background(),
-		`SELECT server_port, server_takeover_dir FROM instance_config WHERE id = 1`,
-	).Scan(&storedPort, &storedTakeoverDir); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		log.Fatalf("read instance_config: %v", err)
+	if runmode.Current() == runmode.ModeLocal {
+		if err := database.QueryRowContext(context.Background(),
+			`SELECT server_port, server_takeover_dir FROM instance_config WHERE id = 1`,
+		).Scan(&storedPort, &storedTakeoverDir); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			log.Fatalf("read instance_config: %v", err)
+		}
 	}
-	_ = storedPort // intentionally unused — operators override via --port
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	// Display host: keep "localhost" in the browser-facing URL when bound
@@ -513,7 +517,7 @@ func main() {
 		openBrowser(browserURL)
 	}
 
-	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Teams, stores.Orgs, stores.JiraStatusRules, stores.Tx, storedTakeoverDir)
+	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Teams, stores.Orgs, stores.JiraStatusRules, stores.Tx, storedTakeoverDir, storedPort)
 
 	// Multi-mode auth wiring. The verifier blocks on the initial JWKS
 	// fetch (see verify.NewVerifier docstring), so GoTrue must be

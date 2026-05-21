@@ -39,18 +39,22 @@ type OrgsStore interface {
 	// in cycle N+1 unless rows changed.
 	ListActiveSystem(ctx context.Context) ([]string, error)
 
-	// GetSettings returns the org's settings row, or a zero-value
-	// OrgSettings with nil error when no row exists yet. Empty
-	// GitHubBaseURL / JiraBaseURL / vault refs / MaxLLMModelTier
-	// reflect NULL columns ("not configured yet" / "use deployment
-	// default" / "no cap"). Postgres routes through the app pool
-	// (org_settings_select RLS gates by org membership).
+	// GetSettings returns the org's settings row. On sql.ErrNoRows
+	// it falls back to domain.DefaultOrgSettings() (matching the
+	// schema DEFAULT clauses) so callers see a populated struct
+	// rather than the Go zero value with "0s" poll intervals — the
+	// row-missing case happens for test fixtures that bypass
+	// provisioning; production paths always seed a row at org-create
+	// time. Empty GitHubBaseURL / JiraBaseURL / vault refs /
+	// MaxLLMModelTier reflect NULL columns ("not configured yet" /
+	// "use deployment default" / "no cap"). Postgres routes through
+	// the app pool (org_settings_select RLS gates by org membership).
 	GetSettings(ctx context.Context, orgID string) (domain.OrgSettings, error)
 
 	// GetSettingsSystem mirrors GetSettings but routes through the
 	// admin pool in Postgres for callers without a JWT-claims context
 	// (pollers, scorer, delegation spawner). SQLite collapses to the
-	// same impl.
+	// same impl. Same defaults-on-ErrNoRows contract.
 	GetSettingsSystem(ctx context.Context, orgID string) (domain.OrgSettings, error)
 
 	// UpdateSettings upserts the org's settings row. An empty
