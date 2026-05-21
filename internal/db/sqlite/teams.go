@@ -28,9 +28,17 @@ func newTeamsStore(q, _ queryer) db.TeamsStore { return &teamsStore{q: q} }
 
 var _ db.TeamsStore = (*teamsStore)(nil)
 
+func (s *teamsStore) GetDefaultForOrg(ctx context.Context, orgID string) (string, error) {
+	return getDefaultTeamForOrg(ctx, s.q, orgID)
+}
+
 func (s *teamsStore) GetDefaultForOrgSystem(ctx context.Context, orgID string) (string, error) {
+	return getDefaultTeamForOrg(ctx, s.q, orgID)
+}
+
+func getDefaultTeamForOrg(ctx context.Context, q queryer, orgID string) (string, error) {
 	var id string
-	err := s.q.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT id FROM teams
 		WHERE org_id = ?
 		ORDER BY created_at ASC, id ASC
@@ -66,7 +74,11 @@ func getTeamSettings(ctx context.Context, q queryer, teamID string) (domain.Team
 		&defaultModel, &autoDelegate,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return domain.TeamSettings{}, nil
+		// See OrgsStore for the rationale: defaults here are the
+		// belt-and-suspenders fallback for test fixtures or any
+		// caller that beats the provisioning path. Matches the
+		// schema DEFAULT clauses on team_settings.
+		return domain.DefaultTeamSettings(), nil
 	}
 	if err != nil {
 		return domain.TeamSettings{}, fmt.Errorf("read team_settings: %w", err)

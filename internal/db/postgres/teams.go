@@ -30,9 +30,17 @@ func newTeamsStore(app, admin queryer) db.TeamsStore {
 
 var _ db.TeamsStore = (*teamsStore)(nil)
 
+func (s *teamsStore) GetDefaultForOrg(ctx context.Context, orgID string) (string, error) {
+	return queryDefaultTeam(ctx, s.app, orgID)
+}
+
 func (s *teamsStore) GetDefaultForOrgSystem(ctx context.Context, orgID string) (string, error) {
+	return queryDefaultTeam(ctx, s.admin, orgID)
+}
+
+func queryDefaultTeam(ctx context.Context, q queryer, orgID string) (string, error) {
 	var id string
-	err := s.admin.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT id::text FROM teams
 		WHERE org_id = $1
 		ORDER BY created_at ASC, id ASC
@@ -73,7 +81,9 @@ func getTeamSettings(ctx context.Context, q queryer, teamID string) (domain.Team
 		&defaultModel, &autoDelegate,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return domain.TeamSettings{}, nil
+		// See OrgsStore for the rationale. Matches team_settings'
+		// schema DEFAULT clauses.
+		return domain.DefaultTeamSettings(), nil
 	}
 	if err != nil {
 		return domain.TeamSettings{}, fmt.Errorf("read team_settings: %w", err)

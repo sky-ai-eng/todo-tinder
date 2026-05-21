@@ -86,7 +86,12 @@ func getOrgSettings(ctx context.Context, q queryer, orgID string) (domain.OrgSet
 		&anthRef, &bedRef, &maxTier,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return domain.OrgSettings{}, nil
+		// Provisioning seeds org_settings rows at org-create time
+		// (auth provisioning); this fallback covers the narrow window
+		// before the first signup runs (or test fixtures that build a
+		// DB without going through provisioning). Matches the schema
+		// DEFAULT clauses.
+		return domain.DefaultOrgSettings(), nil
 	}
 	if err != nil {
 		return domain.OrgSettings{}, fmt.Errorf("read org_settings: %w", err)

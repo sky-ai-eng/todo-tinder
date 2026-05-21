@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 )
 
@@ -33,8 +32,9 @@ func TestResolvedTakeoversDir_ConfigOverride(t *testing.T) {
 
 	dataDir := filepath.Join(home, ".triagefactory")
 
-	// Settings live in the DB now — open + migrate + Init, then Save the
-	// override so resolvedTakeoversDir's downstream config.Load() sees it.
+	// Settings live in the DB now — open + migrate, then write the
+	// instance_config override directly so resolvedTakeoversDir's
+	// downstream read sees it.
 	conn, err := db.Open()
 	if err != nil {
 		t.Fatalf("db.Open(): %v", err)
@@ -43,15 +43,13 @@ func TestResolvedTakeoversDir_ConfigOverride(t *testing.T) {
 		conn.Close()
 		t.Fatalf("db.Migrate(): %v", err)
 	}
-	if err := config.Init(conn); err != nil {
+	if _, err := conn.Exec(`
+		INSERT INTO instance_config (id, server_port, server_takeover_dir, updated_at)
+		VALUES (1, 3000, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET server_takeover_dir = excluded.server_takeover_dir
+	`, "~/custom-takeovers"); err != nil {
 		conn.Close()
-		t.Fatalf("config.Init(): %v", err)
-	}
-	cfg := config.Default()
-	cfg.Server.TakeoverDir = "~/custom-takeovers"
-	if err := config.Save(cfg); err != nil {
-		conn.Close()
-		t.Fatalf("config.Save(): %v", err)
+		t.Fatalf("write instance_config: %v", err)
 	}
 	if err := conn.Close(); err != nil {
 		t.Fatalf("conn.Close(): %v", err)

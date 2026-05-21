@@ -29,6 +29,15 @@ import (
 // SQLite collapses the pool split to one connection; the `...System`
 // variants delegate to their non-System counterparts.
 type TeamsStore interface {
+	// GetDefaultForOrg returns the ID of the org's default team —
+	// defined as the oldest team row by created_at. Same shape as
+	// GetDefaultForOrgSystem but routes through the app pool in
+	// Postgres so teams_select RLS (org_id = current_org_id() AND
+	// user_has_org_access) fires under the caller's claims. Use
+	// this from request handlers; use the System variant from
+	// background services with no claims context.
+	GetDefaultForOrg(ctx context.Context, orgID string) (string, error)
+
 	// GetDefaultForOrgSystem returns the ID of the org's default
 	// team — defined as the oldest team row by created_at. The
 	// single-team-per-org assumption means there's only one row to
@@ -43,8 +52,12 @@ type TeamsStore interface {
 	// and a teamless org is a bootstrap bug.
 	GetDefaultForOrgSystem(ctx context.Context, orgID string) (string, error)
 
-	// GetSettings returns the team's settings row, or a zero-value
-	// TeamSettings with nil error when no row exists yet. JiraProjects
+	// GetSettings returns the team's settings row. On sql.ErrNoRows
+	// it falls back to domain.DefaultTeamSettings() (matching the
+	// schema DEFAULT clauses) so callers see a populated struct
+	// rather than the Go zero value with empty model + zero thresholds
+	// + auto_delegate=false. Row-missing is a test-fixture-only case;
+	// production paths seed a row at team-create time. JiraProjects
 	// is a denormalized fast path keyed `(team_id, project_key)`;
 	// the per-project status rules live on JiraStatusRulesStore.
 	// Postgres routes through the app pool (team_settings_select RLS
@@ -54,7 +67,7 @@ type TeamsStore interface {
 	// GetSettingsSystem mirrors GetSettings but routes through the
 	// admin pool in Postgres for callers without a JWT-claims context
 	// (poller manager, scorer, delegation spawner). SQLite collapses
-	// to the same impl.
+	// to the same impl. Same defaults-on-ErrNoRows contract.
 	GetSettingsSystem(ctx context.Context, teamID string) (domain.TeamSettings, error)
 
 	// UpdateSettings upserts the team's settings row. JiraProjects is

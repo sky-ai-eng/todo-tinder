@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	jiraevents "github.com/sky-ai-eng/triage-factory/internal/domain/events"
@@ -61,26 +61,47 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	cfg, err := config.Load()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
-		return
-	}
-
-	// SKY-270: identity facts live on the users row, not the keychain.
-	// Account ID drives "is this assigned to me" (stable, predicate-grade);
-	// display name drives the optimistic post-claim snapshot update so the
-	// synthesized event metadata reads correctly. Both come from the same
-	// auth.ValidateJira response at PAT setup; missing either means the
-	// bootstrap hasn't run yet or Jira isn't connected.
-	var localAccountID, localDisplayName string
+	// Everything this handler reads from per-tenant state — creds,
+	// org settings, default team, Jira rules, the user's Jira
+	// identity — runs through tx-bound stores under the user's
+	// claims so RLS (org_settings_select / team_settings_select /
+	// jira_rules_select / users_select) gates every read.
+	// SKY-270: identity facts live on the users row, not the
+	// keychain. Account ID drives "is this assigned to me" (stable,
+	// predicate-grade); display name drives the optimistic post-
+	// claim snapshot update so the synthesized event metadata reads
+	// correctly. Both come from the same auth.ValidateJira response
+	// at PAT setup; missing either means the bootstrap hasn't run
+	// yet or Jira isn't connected.
+	var (
+		creds                            auth.Credentials
+		orgSet                           domain.OrgSettings
+		teamID                           string
+		jiraRules                        []domain.JiraProjectStatusRules
+		localAccountID, localDisplayName string
+	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		var e error
+		orgSet, e = tx.Orgs.GetSettings(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("load org settings: %w", e)
+		}
+		teamID, e = tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
+		}
+		if teamID == "" {
+			return fmt.Errorf("org %s has no default team", orgID)
+		}
+		jiraRules, e = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+		if e != nil {
+			return fmt.Errorf("list jira rules: %w", e)
+		}
 		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
 
@@ -88,7 +109,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 	// a stored identity so we can match the assignee field. Partial config
 	// would silently stall on "polling" forever because the poller never has
 	// anything to do.
-	if !cfg.Jira.Ready(creds.JiraPAT, creds.JiraURL) || localAccountID == "" || localDisplayName == "" {
+	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" || localDisplayName == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Jira not configured"})
 		return
 	}
@@ -112,7 +133,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		taskedEntityIDs, e = tx.Tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list entities: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
 
@@ -145,8 +166,12 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var parentURL string
-		if snap.ParentKey != "" && cfg.Jira.BaseURL != "" {
-			parentURL = strings.TrimRight(cfg.Jira.BaseURL, "/") + "/browse/" + snap.ParentKey
+		jiraBase := orgSet.JiraBaseURL
+		if jiraBase == "" {
+			jiraBase = creds.JiraURL
+		}
+		if snap.ParentKey != "" && jiraBase != "" {
+			parentURL = strings.TrimRight(jiraBase, "/") + "/browse/" + snap.ParentKey
 		}
 
 		projectKey := projectFromKey(snap.Key)
@@ -166,7 +191,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		// has no row — degrade like "no rules configured": skip the
 		// available bucket entirely (we can't classify pickup status)
 		// and leave prefilled actions empty for assigned tickets.
-		projectRule := cfg.Jira.RuleForProject(projectKey)
+		projectRule := domain.RuleForProject(jiraRules, projectKey)
 
 		// SKY-270: "is this assigned to me?" uses the Atlassian account ID
 		// — the stable identifier — rather than display name. Display name
@@ -183,7 +208,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 			baseTicket.PrefilledAction = prefillForAssigned(projectRule, snap.Status)
 			assigned = append(assigned, scored{baseTicket, snap.CreatedAt, e.CreatedAt.Format("2006-01-02T15:04:05Z07:00")})
 
-		case isUnassigned && projectRule != nil && projectRule.Pickup.Contains(snap.Status):
+		case isUnassigned && projectRule != nil && projectRule.PickupContains(snap.Status):
 			baseTicket.Bucket = "available"
 			baseTicket.PrefilledAction = "" // user decides
 			available = append(available, scored{baseTicket, snap.CreatedAt, e.CreatedAt.Format("2006-01-02T15:04:05Z07:00")})
@@ -252,16 +277,16 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 // A nil project rule (the ticket's project_key has no configured rules)
 // returns "" — user picks the action manually, matching the "no rules
 // configured" degrade-cleanly contract.
-func prefillForAssigned(rule *config.JiraProjectConfig, status string) string {
+func prefillForAssigned(rule *domain.JiraProjectStatusRules, status string) string {
 	if rule == nil {
 		return ""
 	}
 	switch {
-	case rule.Done.Contains(status):
+	case rule.DoneContains(status):
 		return "done"
-	case rule.InProgress.Contains(status):
+	case rule.InProgressContains(status):
 		return "claim"
-	case rule.Pickup.Contains(status):
+	case rule.PickupContains(status):
 		return "queue"
 	default:
 		return ""
@@ -308,33 +333,36 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := config.Load()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
-		return
-	}
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	var localAccountID, localDisplayName string
+	// All per-tenant state goes through tx-bound stores so RLS gates
+	// fire under the user's claims — mirrors handleJiraStockGet.
+	var (
+		creds                            auth.Credentials
+		teamID                           string
+		jiraRules                        []domain.JiraProjectStatusRules
+		localAccountID, localDisplayName string
+	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		var e error
+		teamID, e = tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
+		}
+		if teamID == "" {
+			return fmt.Errorf("org %s has no default team", orgID)
+		}
+		jiraRules, e = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+		if e != nil {
+			return fmt.Errorf("list jira rules: %w", e)
+		}
 		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
-	if !cfg.Jira.Ready(creds.JiraPAT, creds.JiraURL) || localAccountID == "" || localDisplayName == "" {
+	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" || localDisplayName == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Jira not configured"})
-		return
-	}
-
-	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-	if err != nil {
-		internalError(w, "stock", fmt.Errorf("default team lookup: %w", err))
-		return
-	}
-	if teamID == "" {
-		internalError(w, "stock", fmt.Errorf("org %s has no default team", orgID))
 		return
 	}
 
@@ -348,7 +376,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		taskedEntityIDs, e = tx.Tasks.EntityIDsWithActiveTasks(r.Context(), orgID, "jira")
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check active tasks: " + err.Error()})
+		internalError(w, "stock", err)
 		return
 	}
 
@@ -404,12 +432,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		// no terminal check, no available bucket — so the only action
 		// they support is "queue" on an assigned ticket (the
 		// synthesized event doesn't depend on status rules).
-		projectRule := cfg.Jira.RuleForProject(projectFromKey(snap.Key))
+		projectRule := domain.RuleForProject(jiraRules, projectFromKey(snap.Key))
 
 		isSelf := (snap.AssigneeAccountID != "" && snap.AssigneeAccountID == localAccountID) ||
 			(snap.AssigneeAccountID == "" && snap.Assignee == localDisplayName)
 		isUnassigned := snap.Assignee == ""
-		isAvailable := isUnassigned && projectRule != nil && projectRule.Pickup.Contains(snap.Status)
+		isAvailable := isUnassigned && projectRule != nil && projectRule.PickupContains(snap.Status)
 
 		if !isSelf && !isAvailable {
 			failed = append(failed, stockFailure{a.IssueKey, a.Action, "ticket is not assigned to you and not in the available pickup queue"})
@@ -441,7 +469,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		// the "done" action (no-op guard skips the Jira transition when the
 		// status is already a Done member); queue/claim on an already-done
 		// ticket is pointless, so reject those outright.
-		if isSelf && projectRule != nil && projectRule.Done.Contains(snap.Status) && a.Action != "done" {
+		if isSelf && projectRule != nil && projectRule.DoneContains(snap.Status) && a.Action != "done" {
 			failed = append(failed, stockFailure{a.IssueKey, a.Action, "ticket is already in a done status — only the done action is valid"})
 			continue
 		}
@@ -479,7 +507,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			queued++
 
 		case "claim":
-			if projectRule == nil || projectRule.InProgress.Canonical == "" {
+			if projectRule == nil || projectRule.InProgressCanonical == "" {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, "in_progress canonical status not configured for this project"})
 				continue
 			}
@@ -500,12 +528,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			if state == nil || !projectRule.InProgress.Contains(state.StatusName) {
-				if err := client.TransitionTo(a.IssueKey, projectRule.InProgress.Canonical); err != nil {
+			if state == nil || !projectRule.InProgressContains(state.StatusName) {
+				if err := client.TransitionTo(a.IssueKey, projectRule.InProgressCanonical); err != nil {
 					failed = append(failed, stockFailure{a.IssueKey, a.Action, "transition: " + err.Error()})
 					continue
 				}
-				snap.Status = projectRule.InProgress.Canonical
+				snap.Status = projectRule.InProgressCanonical
 			} else {
 				snap.Status = state.StatusName
 			}
@@ -553,7 +581,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			claimed++
 
 		case "done":
-			if projectRule == nil || projectRule.Done.Canonical == "" {
+			if projectRule == nil || projectRule.DoneCanonical == "" {
 				failed = append(failed, stockFailure{a.IssueKey, a.Action, "done canonical status not configured for this project"})
 				continue
 			}
@@ -563,8 +591,8 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 			// perspective; transitioning to Resolved would be a no-op at best
 			// and a workflow violation at worst.
 			state := client.GetClaimState(a.IssueKey)
-			if state == nil || !projectRule.Done.Contains(state.StatusName) {
-				if err := client.TransitionTo(a.IssueKey, projectRule.Done.Canonical); err != nil {
+			if state == nil || !projectRule.DoneContains(state.StatusName) {
+				if err := client.TransitionTo(a.IssueKey, projectRule.DoneCanonical); err != nil {
 					failed = append(failed, stockFailure{a.IssueKey, a.Action, "transition: " + err.Error()})
 					continue
 				}

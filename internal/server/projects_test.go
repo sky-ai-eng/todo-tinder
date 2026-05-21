@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
@@ -600,13 +599,12 @@ func TestProjectPatch_PaddedSlugsStoredTrimmed(t *testing.T) {
 }
 
 // TestValidateTrackerKeys_AcceptsConfigured verifies that a Jira
-// project key already in cfg.Jira.Projects is accepted as-is. This
+// project key already in the team's rules is accepted as-is. This
 // is the happy path the create modal hits when a user picks a
 // project from the Settings-curated list.
 func TestValidateTrackerKeys_AcceptsConfigured(t *testing.T) {
-	cfg := config.Default()
-	cfg.Jira.Projects = []config.JiraProjectConfig{{Key: "SKY"}, {Key: "OPS"}}
-	jira, linear, errMsg := validateTrackerKeys(cfg, "SKY", "")
+	rules := []domain.JiraProjectStatusRules{{ProjectKey: "SKY"}, {ProjectKey: "OPS"}}
+	jira, linear, errMsg := validateTrackerKeys(rules, "SKY", "")
 	if errMsg != "" {
 		t.Fatalf("expected no error, got %q", errMsg)
 	}
@@ -619,13 +617,12 @@ func TestValidateTrackerKeys_AcceptsConfigured(t *testing.T) {
 }
 
 // TestValidateTrackerKeys_RejectsUnconfigured exercises the SKY-217
-// contract: a Jira key not in config gets rejected with a message
-// pointing at Settings. Stale clients (project removed from config
-// after pinning) and curl users both hit this path.
+// contract: a Jira key not in the team's rules gets rejected with a
+// message pointing at Settings. Stale clients (project removed from
+// config after pinning) and curl users both hit this path.
 func TestValidateTrackerKeys_RejectsUnconfigured(t *testing.T) {
-	cfg := config.Default()
-	cfg.Jira.Projects = []config.JiraProjectConfig{{Key: "SKY"}}
-	_, _, errMsg := validateTrackerKeys(cfg, "OPS", "")
+	rules := []domain.JiraProjectStatusRules{{ProjectKey: "SKY"}}
+	_, _, errMsg := validateTrackerKeys(rules, "OPS", "")
 	if errMsg == "" {
 		t.Fatal("expected error for unconfigured Jira key")
 	}
@@ -641,8 +638,7 @@ func TestValidateTrackerKeys_RejectsUnconfigured(t *testing.T) {
 // work" decision: any non-empty Linear key is rejected outright.
 // Once Linear integration ships this assertion will need to flip.
 func TestValidateTrackerKeys_RejectsLinear(t *testing.T) {
-	cfg := config.Default()
-	_, _, errMsg := validateTrackerKeys(cfg, "", "TF")
+	_, _, errMsg := validateTrackerKeys(nil, "", "TF")
 	if errMsg == "" {
 		t.Fatal("expected error for non-empty Linear key")
 	}
@@ -655,8 +651,7 @@ func TestValidateTrackerKeys_RejectsLinear(t *testing.T) {
 // case — the user creates a project without picking either tracker.
 // Validation should pass with empty normalized values.
 func TestValidateTrackerKeys_EmptyAcceptsBoth(t *testing.T) {
-	cfg := config.Default()
-	jira, linear, errMsg := validateTrackerKeys(cfg, "", "")
+	jira, linear, errMsg := validateTrackerKeys(nil, "", "")
 	if errMsg != "" {
 		t.Fatalf("empty input should pass, got %q", errMsg)
 	}
@@ -669,9 +664,8 @@ func TestValidateTrackerKeys_EmptyAcceptsBoth(t *testing.T) {
 // whitespace handling: stray padding from a client passes validation
 // in normalized form rather than getting stored padded.
 func TestValidateTrackerKeys_TrimsWhitespace(t *testing.T) {
-	cfg := config.Default()
-	cfg.Jira.Projects = []config.JiraProjectConfig{{Key: "SKY"}}
-	jira, _, errMsg := validateTrackerKeys(cfg, "  SKY  ", "")
+	rules := []domain.JiraProjectStatusRules{{ProjectKey: "SKY"}}
+	jira, _, errMsg := validateTrackerKeys(rules, "  SKY  ", "")
 	if errMsg != "" {
 		t.Fatalf("padded input should validate, got %q", errMsg)
 	}
@@ -1225,16 +1219,16 @@ func TestProjectKnowledgeDelete_RemovesFile(t *testing.T) {
 }
 
 // TestProjectCreate_AcceptsTrackerKeys verifies the create handler's
-// tracker validation is wired up. We point HOME at a temp dir,
-// write a config.yaml with a Jira project, and confirm the create
-// flow stores the key and read-back returns it.
+// tracker validation is wired up. We seed a configured Jira project
+// rule via the store and confirm the create flow stores the key and
+// read-back returns it.
 func TestProjectCreate_AcceptsTrackerKeys(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s := newTestServer(t)
-	cfg := config.Default()
-	cfg.Jira.Projects = []config.JiraProjectConfig{validProject("SKY")}
-	if err := config.Save(cfg); err != nil {
-		t.Fatalf("save config: %v", err)
+	if err := s.jiraRules.ReplaceForTeam(t.Context(), runmode.LocalDefaultTeamID, []domain.JiraProjectStatusRules{
+		validProjectRule("SKY"),
+	}); err != nil {
+		t.Fatalf("save jira rules: %v", err)
 	}
 
 	rec := doJSON(t, s, http.MethodPost, "/api/projects", map[string]any{

@@ -67,16 +67,24 @@ func TestOrgsStore_Postgres_GetSettings_IsolatesPerOrg(t *testing.T) {
 		t.Fatalf("seed orgB settings: %v", err)
 	}
 
-	// userA, scoped to orgA, must not see orgB's row.
+	// userA, scoped to orgA, must not see orgB's row. The store
+	// returns domain.DefaultOrgSettings() on the underlying
+	// sql.ErrNoRows that RLS filtering produces — that's the
+	// "no row visible" signal post-SKY-355. The cross-tenant
+	// concern is "did userA observe orgB's actual configured
+	// state?", so probe against orgB's distinctive seeded
+	// BaseURL rather than the (default-or-zero) struct shape.
+	// If RLS were broken, got.GitHubBaseURL would equal
+	// "https://b.example.com"; under correctly-functioning RLS
+	// it stays empty (the default fallback's nullable empty).
 	err := h.WithUser(t, userA, orgA, func(tx *sql.Tx) error {
 		stores := pgstore.NewForTx(tx)
 		got, err := stores.Orgs.GetSettings(context.Background(), orgB)
 		if err != nil {
 			return err
 		}
-		var zero domain.OrgSettings
-		if got != zero {
-			t.Errorf("cross-tenant read returned %+v; want zero value (RLS gate broken)", got)
+		if got.GitHubBaseURL == "https://b.example.com" {
+			t.Errorf("cross-tenant read leaked orgB's GitHubBaseURL: got %+v (RLS gate broken)", got)
 		}
 		return nil
 	})

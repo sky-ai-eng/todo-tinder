@@ -106,6 +106,7 @@ func buildSchemaBundle() (string, error) {
 		"goose_db_version", "events_catalog",
 		"orgs", "teams", "users", "org_memberships", "memberships",
 		"agents", "team_agents",
+		"instance_config", "org_settings", "team_settings",
 	} {
 		if err := dumpTableInserts(template, table, &b); err != nil {
 			return "", err

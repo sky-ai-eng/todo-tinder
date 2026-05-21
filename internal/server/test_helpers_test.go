@@ -10,7 +10,6 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	sqlitestore "github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -39,12 +38,6 @@ func newTestServer(t *testing.T) *Server {
 	if err := db.BootstrapSchemaForTest(database); err != nil {
 		t.Fatalf("bootstrap schema: %v", err)
 	}
-	// Settings handlers go through config.Load/Save, which require an
-	// initialized package handle. We deliberately skip MigrateLegacyYAML
-	// so tests don't read or delete the developer's real config.yaml.
-	if err := config.Init(database); err != nil {
-		t.Fatalf("config init: %v", err)
-	}
 	// SKY-261 B+: swipe-delegate and factory_delegate both call
 	// Agents.GetForOrg to stamp claim. Without an agents row, those
 	// paths return 500 with "no agent bootstrapped." Seed the local
@@ -67,7 +60,11 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("seed local team_agents: %v", err)
 	}
 	stores := sqlitestore.New(database)
-	return New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Teams, stores.Tx)
+	// Pass the production default port so handler tests that read
+	// settings GET see a realistic Server.Port (3000) — keeps test
+	// behavior aligned with production and lets future assertions
+	// on server_port pass through to the schema-mirroring path.
+	return New(database, stores, "", 3000)
 }
 
 // doJSON performs a JSON request against the server's mux and returns

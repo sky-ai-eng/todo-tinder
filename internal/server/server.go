@@ -34,19 +34,33 @@ type Server struct {
 	teamAgents    db.TeamAgentStore // SKY-261 D-Claims: re-checks team_agents.enabled on swipe-delegate / factory-delegate
 	users         db.UsersStore     // SKY-264: github_username + display_name on the synthetic local user row
 	chains        db.ChainStore
-	tasks         db.TaskStore        // SKY-283: task lifecycle, claim, queue + factory snapshot reads
-	factory       db.FactoryReadStore // SKY-292: factory snapshot reads
-	agentRuns     db.AgentRunStore    // SKY-285: agent run lifecycle + transcript + yields
-	entities      db.EntityStore      // SKY-284: entity reads/writes for dashboard, factory_handler, stock, backfill, project_entities
-	reviews       db.ReviewStore      // SKY-286: pending_reviews CRUD for reviews handler, swipe-discard, agent status payload
-	pendingPRs    db.PendingPRStore   // SKY-287: pending_prs CRUD for pending_prs handler, agent status payload, drag-back-to-queue cleanup
-	repos         db.RepoStore        // SKY-288: repo_profiles CRUD for repos/settings/projects handlers and curator pinned-repo materialization
-	projects      db.ProjectStore     // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
-	curatorStore  db.CuratorStore     // curator-runtime CRUD (curator_requests / curator_messages / curator_pending_context) — handler-side writes go through here so Postgres mode honors RLS and uses the right placeholder syntax
-	events        db.EventStore       // SKY-305: events audit log Record/Latest for stock carry-over + factory drag-to-delegate
-	taskMemory    db.TaskMemoryStore  // run_memory writes (human verdict capture on review/PR submit, swipe-discard cleanup)
-	secrets       db.SecretStore      // canonical credential read/write path — local-mode keychain, multi-mode vault
-	teams         db.TeamsStore       // resolves the request org's default team for handlers that synthesize team-scoped rows (tasks, projects, prompts)
+	tasks         db.TaskStore            // SKY-283: task lifecycle, claim, queue + factory snapshot reads
+	factory       db.FactoryReadStore     // SKY-292: factory snapshot reads
+	agentRuns     db.AgentRunStore        // SKY-285: agent run lifecycle + transcript + yields
+	entities      db.EntityStore          // SKY-284: entity reads/writes for dashboard, factory_handler, stock, backfill, project_entities
+	reviews       db.ReviewStore          // SKY-286: pending_reviews CRUD for reviews handler, swipe-discard, agent status payload
+	pendingPRs    db.PendingPRStore       // SKY-287: pending_prs CRUD for pending_prs handler, agent status payload, drag-back-to-queue cleanup
+	repos         db.RepoStore            // SKY-288: repo_profiles CRUD for repos/settings/projects handlers and curator pinned-repo materialization
+	projects      db.ProjectStore         // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
+	curatorStore  db.CuratorStore         // curator-runtime CRUD (curator_requests / curator_messages / curator_pending_context) — handler-side writes go through here so Postgres mode honors RLS and uses the right placeholder syntax
+	events        db.EventStore           // SKY-305: events audit log Record/Latest for stock carry-over + factory drag-to-delegate
+	taskMemory    db.TaskMemoryStore      // run_memory writes (human verdict capture on review/PR submit, swipe-discard cleanup)
+	secrets       db.SecretStore          // canonical credential read/write path — local-mode keychain, multi-mode vault
+	teams         db.TeamsStore           // resolves the request org's default team for handlers that synthesize team-scoped rows (tasks, projects, prompts)
+	orgs          db.OrgsStore            // per-org settings (GitHub/Jira base URLs, poll intervals, clone protocol) post-internal/config deletion
+	jiraRules     db.JiraStatusRulesStore // per-team Jira status rules (replaces the deleted config.Jira.Projects view)
+	// takeoverDir is the raw instance_config.server_takeover_dir
+	// value read once at boot — may be empty, "~/..." or an
+	// absolute path. Call sites (handleAgentTakeover, Spawner's
+	// Release path) run it through delegate.ResolveTakeoverDir to
+	// produce the actual filesystem path; the value held here is
+	// the unresolved input that helper takes.
+	takeoverDir string
+	// serverPort is the stored instance_config.server_port value
+	// surfaced to the settings GET response. The actual bind port
+	// comes from --port at boot, not this field — the Settings page
+	// reads it to populate its server_port input.
+	serverPort int
 	// tx runs handler-cleanup write batches under the request user's
 	// claims even when the cleanup needs to outlive the request
 	// context. Each cleanup wraps in `s.tx.WithTx(cleanupCtx, orgID,
@@ -178,7 +192,7 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 			enabled = true
 			return nil
 		}
-		teamID, e := tx.Teams.GetDefaultForOrgSystem(ctx, orgID)
+		teamID, e := tx.Teams.GetDefaultForOrg(ctx, orgID)
 		if e != nil {
 			return fmt.Errorf("default team lookup: %w", e)
 		}
@@ -213,36 +227,45 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 	return a, enabled, nil
 }
 
-// New creates a new server with the given database + the per-resource
-// stores migrated under SKY-246, and registers all routes. The
-// argument list grows one store at a time as their callers migrate;
-// raw *sql.DB stays available for handlers that haven't been ported
-// to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, teams db.TeamsStore, tx db.TxRunner) *Server {
+// New creates a new server with the given database + the full
+// per-resource store bundle + the boot-time deployment scalars
+// (takeover dir, stored server port), and registers all routes.
+// The Server retains individual store fields rather than a single
+// db.Stores struct so existing handler code keeps working — the
+// constructor just unpacks the bundle once instead of forcing every
+// caller to enumerate 20+ stores positionally.
+//
+// raw *sql.DB stays available for handlers that haven't been
+// ported to a store yet.
+func New(database *sql.DB, stores db.Stores, takeoverDir string, serverPort int) *Server {
 	s := &Server{
 		db:            database,
-		prompts:       prompts,
-		swipes:        swipes,
-		dashboard:     dashboard,
-		eventHandlers: eventHandlers,
-		agents:        agents,
-		teamAgents:    teamAgents,
-		users:         users,
-		chains:        chains,
-		tasks:         tasks,
-		factory:       factory,
-		agentRuns:     agentRuns,
-		entities:      entities,
-		reviews:       reviews,
-		pendingPRs:    pendingPRs,
-		repos:         repos,
-		projects:      projects,
-		events:        events,
-		taskMemory:    taskMemory,
-		secrets:       secrets,
-		curatorStore:  curatorStore,
-		teams:         teams,
-		tx:            tx,
+		prompts:       stores.Prompts,
+		swipes:        stores.Swipes,
+		dashboard:     stores.Dashboard,
+		eventHandlers: stores.EventHandlers,
+		agents:        stores.Agents,
+		teamAgents:    stores.TeamAgents,
+		users:         stores.Users,
+		chains:        stores.Chains,
+		tasks:         stores.Tasks,
+		factory:       stores.Factory,
+		agentRuns:     stores.AgentRuns,
+		entities:      stores.Entities,
+		reviews:       stores.Reviews,
+		pendingPRs:    stores.PendingPRs,
+		repos:         stores.Repos,
+		projects:      stores.Projects,
+		events:        stores.Events,
+		taskMemory:    stores.TaskMemory,
+		secrets:       stores.Secrets,
+		curatorStore:  stores.Curator,
+		teams:         stores.Teams,
+		orgs:          stores.Orgs,
+		jiraRules:     stores.JiraStatusRules,
+		tx:            stores.Tx,
+		takeoverDir:   takeoverDir,
+		serverPort:    serverPort,
 		mux:           http.NewServeMux(),
 		ws:            websocket.NewHub(),
 	}

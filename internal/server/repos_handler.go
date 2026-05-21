@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -15,14 +15,29 @@ import (
 // handleGitHubRepos returns all repositories the authenticated user has access to.
 func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 	orgID := OrgIDFrom(r.Context())
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
+	userID := ClaimsFrom(r.Context()).Subject
+	// Credentials + per-org base URL read through the app pool inside
+	// WithTx so SecretStore decrypts under the user's claims and
+	// org_settings_select RLS is enforced — same shape the rest of
+	// the post-SKY-355 settings surface uses.
+	var (
+		creds  auth.Credentials
+		orgSet domain.OrgSettings
+	)
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
+		var lerr error
+		orgSet, lerr = tx.Orgs.GetSettings(r.Context(), orgID)
+		return lerr
+	}); err != nil {
+		internalError(w, "repos", err)
+		return
+	}
 	if creds.GitHubPAT == "" || creds.GitHubURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GitHub not configured"})
 		return
 	}
-
-	cfg, _ := config.Load()
-	baseURL := cfg.GitHub.BaseURL
+	baseURL := orgSet.GitHubBaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL
 	}

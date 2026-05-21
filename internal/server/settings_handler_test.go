@@ -6,7 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // --- Unit tests: validateProjectRules --------------------------------------
@@ -18,12 +19,26 @@ import (
 //   - Pickup: members required, canonical must be empty (TF never writes).
 //   - InProgress/Done: members + canonical required, canonical ∈ members.
 
-func validProject(key string) config.JiraProjectConfig {
-	return config.JiraProjectConfig{
+func validProject(key string) jiraProjectConfig {
+	return jiraProjectConfig{
 		Key:        key,
-		Pickup:     config.JiraStatusRule{Members: []string{"To Do"}},
-		InProgress: config.JiraStatusRule{Members: []string{"In Progress"}, Canonical: "In Progress"},
-		Done:       config.JiraStatusRule{Members: []string{"Done"}, Canonical: "Done"},
+		Pickup:     jiraStatusRule{Members: []string{"To Do"}},
+		InProgress: jiraStatusRule{Members: []string{"In Progress"}, Canonical: "In Progress"},
+		Done:       jiraStatusRule{Members: []string{"Done"}, Canonical: "Done"},
+	}
+}
+
+// validProjectRule returns the same project as validProject but in
+// the domain shape stored by JiraStatusRulesStore. Used by tests that
+// seed rules directly through the store (rather than the handler).
+func validProjectRule(key string) domain.JiraProjectStatusRules {
+	return domain.JiraProjectStatusRules{
+		ProjectKey:          key,
+		PickupMembers:       []string{"To Do"},
+		InProgressMembers:   []string{"In Progress"},
+		InProgressCanonical: "In Progress",
+		DoneMembers:         []string{"Done"},
+		DoneCanonical:       "Done",
 	}
 }
 
@@ -130,7 +145,7 @@ func TestJiraProjectKeyRe(t *testing.T) {
 //
 // These confirm the wire-up — validation errors on any of the three rules
 // propagate to a 400 before any persistence fires. Happy-path round-trip
-// isn't tested here because it'd write to the real keychain/config.yaml;
+// isn't tested here because it'd write to the real keychain;
 // those invariants are covered by the unit tests above.
 //
 // All of these bodies set *_enabled: true with empty URL/PAT so the handler
@@ -141,7 +156,7 @@ func TestJiraProjectKeyRe(t *testing.T) {
 // settingsPostBodyWithProject builds a request that exercises validation
 // of a single project's rules. The SKY-272 wire shape collapses Pickup,
 // InProgress, and Done into the per-project array.
-func settingsPostBodyWithProject(key string, pickup, inProgress, done config.JiraStatusRule) map[string]any {
+func settingsPostBodyWithProject(key string, pickup, inProgress, done jiraStatusRule) map[string]any {
 	return map[string]any{
 		"github_enabled": true,
 		"jira_enabled":   true,
@@ -156,22 +171,22 @@ func settingsPostBodyWithProject(key string, pickup, inProgress, done config.Jir
 	}
 }
 
-func validInProgress() config.JiraStatusRule {
-	return config.JiraStatusRule{Members: []string{"In Progress"}, Canonical: "In Progress"}
+func validInProgress() jiraStatusRule {
+	return jiraStatusRule{Members: []string{"In Progress"}, Canonical: "In Progress"}
 }
 
-func validDone() config.JiraStatusRule {
-	return config.JiraStatusRule{Members: []string{"Done"}, Canonical: "Done"}
+func validDone() jiraStatusRule {
+	return jiraStatusRule{Members: []string{"Done"}, Canonical: "Done"}
 }
 
-func validPickup() config.JiraStatusRule {
-	return config.JiraStatusRule{Members: []string{"To Do"}}
+func validPickup() jiraStatusRule {
+	return jiraStatusRule{Members: []string{"To Do"}}
 }
 
 func TestSettingsPost_PickupCanonical_Rejected(t *testing.T) {
 	s := newTestServer(t)
 	body := settingsPostBodyWithProject("SKY",
-		config.JiraStatusRule{Members: []string{"To Do"}, Canonical: "To Do"}, // invalid pickup
+		jiraStatusRule{Members: []string{"To Do"}, Canonical: "To Do"}, // invalid pickup
 		validInProgress(),
 		validDone(),
 	)
@@ -193,7 +208,7 @@ func TestSettingsPost_InProgressCanonicalNotInMembers_Rejected(t *testing.T) {
 	s := newTestServer(t)
 	body := settingsPostBodyWithProject("SKY",
 		validPickup(),
-		config.JiraStatusRule{Members: []string{"In Progress"}, Canonical: "Doing"}, // invalid
+		jiraStatusRule{Members: []string{"In Progress"}, Canonical: "Doing"}, // invalid
 		validDone(),
 	)
 	rec := doJSON(t, s, "POST", "/api/settings", body)
@@ -212,7 +227,7 @@ func TestSettingsPost_InProgressMembersWithoutCanonical_Rejected(t *testing.T) {
 	s := newTestServer(t)
 	body := settingsPostBodyWithProject("SKY",
 		validPickup(),
-		config.JiraStatusRule{Members: []string{"In Progress"}}, // invalid: missing canonical
+		jiraStatusRule{Members: []string{"In Progress"}}, // invalid: missing canonical
 		validDone(),
 	)
 	rec := doJSON(t, s, "POST", "/api/settings", body)
@@ -232,7 +247,7 @@ func TestSettingsPost_DoneCanonicalNotInMembers_Rejected(t *testing.T) {
 	body := settingsPostBodyWithProject("SKY",
 		validPickup(),
 		validInProgress(),
-		config.JiraStatusRule{Members: []string{"Resolved", "Verified"}, Canonical: "Done"}, // invalid
+		jiraStatusRule{Members: []string{"Resolved", "Verified"}, Canonical: "Done"}, // invalid
 	)
 	rec := doJSON(t, s, "POST", "/api/settings", body)
 
@@ -248,81 +263,84 @@ func TestSettingsPost_DoneCanonicalNotInMembers_Rejected(t *testing.T) {
 
 // TestSettingsPost_PerProjectRules_RoundTrip verifies the core SKY-272
 // contract: two projects in the same team can carry different rules,
-// and Save → Load preserves each project's rules independently. Exercises
-// the config layer directly (the HTTP handler's keychain write isn't
-// available in the test env).
+// and saving → loading preserves each project's rules independently.
+// Exercises the JiraStatusRulesStore directly (the HTTP handler's
+// keychain write isn't available in the test env).
 func TestSettingsPost_PerProjectRules_RoundTrip(t *testing.T) {
-	_ = newTestServer(t) // sets up config.Init against an in-memory DB
-	cfg := config.Default()
-	cfg.Jira.Projects = []config.JiraProjectConfig{
+	s := newTestServer(t)
+	ctx := t.Context()
+	teamID := runmode.LocalDefaultTeamID
+
+	rules := []domain.JiraProjectStatusRules{
 		{
-			Key:        "SKY",
-			Pickup:     config.JiraStatusRule{Members: []string{"Backlog", "Selected"}},
-			InProgress: config.JiraStatusRule{Members: []string{"In Progress"}, Canonical: "In Progress"},
-			Done:       config.JiraStatusRule{Members: []string{"Done"}, Canonical: "Done"},
+			ProjectKey:          "SKY",
+			PickupMembers:       []string{"Backlog", "Selected"},
+			InProgressMembers:   []string{"In Progress"},
+			InProgressCanonical: "In Progress",
+			DoneMembers:         []string{"Done"},
+			DoneCanonical:       "Done",
 		},
 		{
-			Key:        "OPS",
-			Pickup:     config.JiraStatusRule{Members: []string{"New", "Triage"}},
-			InProgress: config.JiraStatusRule{Members: []string{"Active"}, Canonical: "Active"},
-			Done:       config.JiraStatusRule{Members: []string{"Resolved", "Verified"}, Canonical: "Resolved"},
+			ProjectKey:          "OPS",
+			PickupMembers:       []string{"New", "Triage"},
+			InProgressMembers:   []string{"Active"},
+			InProgressCanonical: "Active",
+			DoneMembers:         []string{"Resolved", "Verified"},
+			DoneCanonical:       "Resolved",
 		},
 	}
-	if err := config.Save(cfg); err != nil {
-		t.Fatalf("config.Save: %v", err)
+	if err := s.jiraRules.ReplaceForTeam(ctx, teamID, rules); err != nil {
+		t.Fatalf("ReplaceForTeam: %v", err)
 	}
-	got, err := config.Load()
+	got, err := s.jiraRules.ListForTeamSystem(ctx, teamID)
 	if err != nil {
-		t.Fatalf("config.Load: %v", err)
+		t.Fatalf("ListForTeamSystem: %v", err)
 	}
-	if r := got.Jira.RuleForProject("SKY"); r == nil || r.InProgress.Canonical != "In Progress" || !r.Pickup.Contains("Backlog") {
+	if r := domain.RuleForProject(got, "SKY"); r == nil || r.InProgressCanonical != "In Progress" || !r.PickupContains("Backlog") {
 		t.Errorf("SKY rules round-trip: %+v", r)
 	}
-	if r := got.Jira.RuleForProject("OPS"); r == nil || r.Done.Canonical != "Resolved" || !r.Pickup.Contains("Triage") {
+	if r := domain.RuleForProject(got, "OPS"); r == nil || r.DoneCanonical != "Resolved" || !r.PickupContains("Triage") {
 		t.Errorf("OPS rules round-trip: %+v", r)
 	}
 
 	// Edit only SKY's rules; OPS must stay untouched.
-	cfg = got
-	for i, p := range cfg.Jira.Projects {
-		if p.Key == "SKY" {
-			cfg.Jira.Projects[i].Pickup = config.JiraStatusRule{Members: []string{"Ready"}}
+	for i, p := range rules {
+		if p.ProjectKey == "SKY" {
+			rules[i].PickupMembers = []string{"Ready"}
 		}
 	}
-	if err := config.Save(cfg); err != nil {
-		t.Fatalf("config.Save (edit SKY): %v", err)
+	if err := s.jiraRules.ReplaceForTeam(ctx, teamID, rules); err != nil {
+		t.Fatalf("ReplaceForTeam (edit SKY): %v", err)
 	}
-	got, err = config.Load()
+	got, err = s.jiraRules.ListForTeamSystem(ctx, teamID)
 	if err != nil {
-		t.Fatalf("config.Load: %v", err)
+		t.Fatalf("ListForTeamSystem: %v", err)
 	}
-	if r := got.Jira.RuleForProject("SKY"); r == nil || !r.Pickup.Contains("Ready") || r.Pickup.Contains("Backlog") {
+	if r := domain.RuleForProject(got, "SKY"); r == nil || !r.PickupContains("Ready") || r.PickupContains("Backlog") {
 		t.Errorf("SKY edit didn't apply: %+v", r)
 	}
-	if r := got.Jira.RuleForProject("OPS"); r == nil || !r.Pickup.Contains("Triage") || r.Done.Canonical != "Resolved" {
+	if r := domain.RuleForProject(got, "OPS"); r == nil || !r.PickupContains("Triage") || r.DoneCanonical != "Resolved" {
 		t.Errorf("OPS untouched check failed: %+v", r)
 	}
 
-	// Drop SKY from the config — the rules row for SKY should vanish
-	// while OPS persists.
-	kept := make([]config.JiraProjectConfig, 0, len(cfg.Jira.Projects))
-	for _, p := range cfg.Jira.Projects {
-		if p.Key != "SKY" {
+	// Drop SKY — the rules row for SKY should vanish while OPS persists.
+	kept := make([]domain.JiraProjectStatusRules, 0, len(rules))
+	for _, p := range rules {
+		if p.ProjectKey != "SKY" {
 			kept = append(kept, p)
 		}
 	}
-	cfg.Jira.Projects = kept
-	if err := config.Save(cfg); err != nil {
-		t.Fatalf("config.Save (drop SKY): %v", err)
+	if err := s.jiraRules.ReplaceForTeam(ctx, teamID, kept); err != nil {
+		t.Fatalf("ReplaceForTeam (drop SKY): %v", err)
 	}
-	got, err = config.Load()
+	got, err = s.jiraRules.ListForTeamSystem(ctx, teamID)
 	if err != nil {
-		t.Fatalf("config.Load: %v", err)
+		t.Fatalf("ListForTeamSystem: %v", err)
 	}
-	if r := got.Jira.RuleForProject("SKY"); r != nil {
+	if r := domain.RuleForProject(got, "SKY"); r != nil {
 		t.Errorf("SKY rules should be gone after drop, got: %+v", r)
 	}
-	if r := got.Jira.RuleForProject("OPS"); r == nil || r.Done.Canonical != "Resolved" {
+	if r := domain.RuleForProject(got, "OPS"); r == nil || r.DoneCanonical != "Resolved" {
 		t.Errorf("OPS rules should persist after dropping SKY: %+v", r)
 	}
 }

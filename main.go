@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -15,7 +16,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/auth/verify"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	pgstore "github.com/sky-ai-eng/triage-factory/internal/db/postgres"
@@ -116,6 +116,33 @@ func applyPGPoolDefaults(db *sql.DB) {
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
+}
+
+// resolveAIModelForOrg looks up the default model the org's default
+// team uses. Falls back to domain.DefaultTeamSettings().DefaultModel
+// on any error so a transient DB hiccup doesn't silently clear the
+// spawner+curator credentials. The store's GetSettingsSystem already
+// returns DefaultTeamSettings() on missing rows; the explicit fallback
+// here covers the other failure modes (team-lookup error, settings-
+// read error, no default team at all).
+func resolveAIModelForOrg(ctx context.Context, stores db.Stores, orgID string) string {
+	fallback := domain.DefaultTeamSettings().DefaultModel
+	teamID, err := stores.Teams.GetDefaultForOrgSystem(ctx, orgID)
+	if err != nil || teamID == "" {
+		if err != nil {
+			log.Printf("[main] resolve default team for org %s: %v (using default model %q)", orgID, err, fallback)
+		}
+		return fallback
+	}
+	teamSet, err := stores.Teams.GetSettingsSystem(ctx, teamID)
+	if err != nil {
+		log.Printf("[main] read team settings %s: %v (using default model %q)", teamID, err, fallback)
+		return fallback
+	}
+	if teamSet.DefaultModel == "" {
+		return fallback
+	}
+	return teamSet.DefaultModel
 }
 
 // bootstrapBareClones reads the configured repos from the DB and asks
@@ -454,12 +481,32 @@ func main() {
 	}
 	defer database.Close()
 
-	// Wire the config package against the DB. Must run after Migrate
-	// (settings table is created there) and before any config.Load /
-	// Save call. Fresh installs land at Default() on first Load() and
-	// write to the settings row on first Save().
-	if err := config.Init(database); err != nil {
-		log.Fatalf("failed to initialize config: %v", err)
+	// Boot-time deployment settings: instance_config holds the small
+	// remainder of process-wide state (server port, takeover dir).
+	// Local-mode only — the table doesn't exist in the Postgres
+	// baseline because hosted multi-mode uses env vars for these.
+	// The takeover dir is plumbed to the Server and Spawner
+	// constructors so neither has to read settings on every handler
+	// call. The stored port is surfaced to the settings GET response
+	// (the actual bind still wins from --port at boot).
+	var (
+		storedPort        int
+		storedTakeoverDir string
+	)
+	if runmode.Current() == runmode.ModeLocal {
+		if err := database.QueryRowContext(context.Background(),
+			`SELECT server_port, server_takeover_dir FROM instance_config WHERE id = 1`,
+		).Scan(&storedPort, &storedTakeoverDir); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			log.Fatalf("read instance_config: %v", err)
+		}
+	}
+	// Default storedPort to the binary's defaultPort when the row is
+	// missing or holds the zero value — that's what the Settings GET
+	// response should render in its server_port input. Belt-and-
+	// suspenders for pre-seed DBs and the multi-mode branch that
+	// skips the read entirely.
+	if storedPort == 0 {
+		storedPort = defaultPort
 	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
@@ -483,7 +530,7 @@ func main() {
 		openBrowser(browserURL)
 	}
 
-	srv := server.New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Teams, stores.Tx)
+	srv := server.New(database, stores, storedTakeoverDir, storedPort)
 
 	// Multi-mode auth wiring. The verifier blocks on the initial JWKS
 	// fetch (see verify.NewVerifier docstring), so GoTrue must be
@@ -696,7 +743,10 @@ func main() {
 			log.Printf("[clone-status] %s/%s clone failed: %v", owner, repo, cloneErr)
 
 			kind := "other"
-			if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+			orgSet, oErr := stores.Orgs.GetSettingsSystem(context.Background(), runmode.LocalDefaultOrgID)
+			if oErr != nil {
+				log.Printf("[clone-status] %s/%s load org settings to classify: %v (defaulting to kind=other)", owner, repo, oErr)
+			} else if orgSet.GitHubCloneProtocol == "ssh" {
 				// Use the configured GitHub host so GHE installs probe
 				// the right SSH endpoint, not github.com. Falls back to
 				// git@github.com when the URL is empty/unparseable.
@@ -710,8 +760,6 @@ func main() {
 					log.Printf("[clone-status] %s/%s SSH preflight against %s passed → kind=other (clone error is on the git side)", owner, repo, sshHost)
 				}
 				cancel()
-			} else if cErr != nil {
-				log.Printf("[clone-status] %s/%s load config to classify: %v (defaulting to kind=other)", owner, repo, cErr)
 			}
 
 			if err := stores.Repos.UpdateCloneStatusSystem(context.Background(), runmode.LocalDefaultOrgID, owner, repo, "failed", cloneErr.Error(), kind); err != nil {
@@ -844,7 +892,7 @@ func main() {
 		errorThrottleMu sync.Mutex
 		lastErrorToast  = map[string]time.Time{}
 	)
-	pollerMgr := poller.NewManager(database, bus, stores.Users, stores.Tasks, stores.Entities, stores.Repos, stores.Orgs, stores.Secrets)
+	pollerMgr := poller.NewManager(database, bus, stores.Users, stores.Tasks, stores.Entities, stores.Repos, stores.Orgs, stores.Teams, stores.JiraStatusRules, stores.Secrets)
 	pollerMgr.OnError = func(source, orgID string, err error) {
 		// Throttle key includes orgID so a chronic failure on one tenant
 		// doesn't suppress a fresh failure on another. Process-level
@@ -868,7 +916,7 @@ func main() {
 	}
 
 	// Create spawner once — credentials are hot-swapped in place
-	spawner := delegate.NewSpawner(database, stores.Prompts, stores.Agents, stores.Chains, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, stores.Tx, nil, wsHub, "")
+	spawner := delegate.NewSpawner(database, stores, nil, wsHub, "", storedTakeoverDir)
 	// Hand the full Stores bundle so the sandbox-branch agenthost
 	// daemon can serve every routing-sensitive RPC the agent's
 	// `triagefactory exec` invocations send. Local-mode + non-sandbox
@@ -946,7 +994,7 @@ func main() {
 	// Event router — records events, creates/bumps tasks, auto-delegates on
 	// matching triggers, runs inline close checks. Also handles post-scoring
 	// re-derive via the scorer callback wired above.
-	eventRouter = routing.NewRouter(stores.Prompts, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Tasks, stores.AgentRuns, stores.Entities, stores.PendingFirings, stores.Events, stores.Orgs, spawner, scorer, wsHub)
+	eventRouter = routing.NewRouter(stores.Prompts, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Tasks, stores.AgentRuns, stores.Entities, stores.PendingFirings, stores.Events, stores.Orgs, stores.Teams, spawner, scorer, wsHub)
 	// System-service profile (D9a): the router branches on evt.OrgID
 	// itself when persisting and fanning out — every event flows here
 	// regardless of tenant. Multi-mode handlers thread the orgID into
@@ -996,7 +1044,22 @@ func main() {
 		return false
 	}
 
-	// GitHub changed: invalidate profiles → stop all → re-profile → restart all
+	// GitHub changed: invalidate profiles → stop all → re-profile → restart all.
+	//
+	// Gated to local mode. The callback wires process-global state
+	// (ghClient, curator credentials, profiler) shaped for a
+	// single-tenant binary; in multi-mode the same work happens
+	// per-tenant inside the request handlers and on first
+	// delegation per repo. Additionally, the integrations.Load call
+	// below would fail in Postgres without request.jwt.claims set
+	// (SecretStore vault_* enforces org_id == tf.current_org_id()),
+	// and the callback fires from a goroutine with no claims
+	// context.
+	//
+	// TODO: multi-mode per-tenant credential refresh — add a
+	// SystemGet-style SecretStore variant or plumb userID through
+	// the callback for SyntheticClaimsWithTx. Same follow-up as the
+	// startJira TODO in internal/poller/manager.go.
 	srv.SetOnGitHubChanged(func(orgID string) {
 		log.Println("[server] GitHub config changed, full restart...")
 		setAnnouncePending("github")
@@ -1009,14 +1072,19 @@ func main() {
 		// Signal again — would silently freeze scoring forever.
 		pollerMgr.StopAll()
 
-		ctx := context.Background()
-		cfg, _ := config.Load()
-		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
+		if runmode.Current() != runmode.ModeLocal {
+			log.Println("[server] GitHub changed: multi-mode skips process-global refresh (per-tenant work happens in request handlers)")
+			return
+		}
 
-		if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) {
+		ctx := context.Background()
+		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
+		model := resolveAIModelForOrg(ctx, stores, orgID)
+
+		if creds.GitHubPAT != "" && creds.GitHubURL != "" {
 			ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
-			spawner.UpdateCredentials(ghClient, cfg.AI.Model)
-			curatorRuntime.UpdateCredentials(cfg.AI.Model)
+			spawner.UpdateCredentials(ghClient, model)
+			curatorRuntime.UpdateCredentials(model)
 			srv.SetGitHubClient(ghClient)
 
 			// Re-profile, then signal ready and restart all pollers
@@ -1052,10 +1120,17 @@ func main() {
 		}
 	})
 
-	// Jira changed: restart only the Jira poller
+	// Jira changed: restart only the Jira poller. Same local-mode
+	// gate as onGitHubChanged — process-global Jira client + the
+	// SecretStore claims requirement make this a local-only path.
 	srv.SetOnJiraChanged(func(orgID string) {
 		log.Println("[server] Jira config changed, restarting Jira poller...")
 		setAnnouncePending("jira")
+
+		if runmode.Current() != runmode.ModeLocal {
+			log.Println("[server] Jira changed: multi-mode skips process-global refresh")
+			return
+		}
 
 		ctx := context.Background()
 		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
@@ -1129,16 +1204,16 @@ func main() {
 	// return zero values and we'd hand an unauthenticated GitHub client to
 	// every downstream subsystem, then quietly log per-cycle 401s.
 	if runmode.Current() == runmode.ModeLocal {
-		cfg, _ := config.Load()
 		ctx := context.Background()
 		orgID := runmode.LocalDefaultOrgID
 		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
 		repoCount, _ := stores.Repos.CountConfiguredSystem(ctx, orgID)
+		model := resolveAIModelForOrg(ctx, stores, orgID)
 
-		if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) && repoCount > 0 {
+		if creds.GitHubPAT != "" && creds.GitHubURL != "" && repoCount > 0 {
 			ghClient := ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT)
-			spawner.UpdateCredentials(ghClient, cfg.AI.Model)
-			curatorRuntime.UpdateCredentials(cfg.AI.Model)
+			spawner.UpdateCredentials(ghClient, model)
+			curatorRuntime.UpdateCredentials(model)
 			srv.SetGitHubClient(ghClient)
 			log.Printf("[delegate] spawner ready (%d repos configured)", repoCount)
 

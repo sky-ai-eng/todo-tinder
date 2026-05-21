@@ -71,7 +71,14 @@ func getOrgSettings(ctx context.Context, q queryer, orgID string) (domain.OrgSet
 		&anthRef, &bedRef, &maxTier,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return domain.OrgSettings{}, nil
+		// Provisioning is meant to seed an org_settings row at org-
+		// create time (baseline migration for the local sentinel,
+		// auth provisioning for multi-mode tenants). The defaults
+		// here are a belt-and-suspenders fallback so test fixtures
+		// that build a raw DB without going through provisioning
+		// still see sensible values (5m poll intervals, ssh clone
+		// protocol). Matches the schema DEFAULT clauses.
+		return domain.DefaultOrgSettings(), nil
 	}
 	if err != nil {
 		return domain.OrgSettings{}, fmt.Errorf("read org_settings: %w", err)

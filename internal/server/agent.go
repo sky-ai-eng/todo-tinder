@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -143,12 +142,7 @@ func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := config.Load()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("load config: %v", err)})
-		return
-	}
-	baseDir, err := cfg.Server.ResolvedTakeoverDir()
+	baseDir, err := delegate.ResolveTakeoverDir(s.takeoverDir)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("resolve takeover dir: %v", err)})
 		return

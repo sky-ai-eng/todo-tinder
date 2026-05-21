@@ -17,6 +17,19 @@ func TestSettingsStores_SQLite(t *testing.T) {
 	dbtest.RunSettingsStoresConformance(t, func(t *testing.T) (dbtest.SettingsStores, dbtest.SettingsIDs) {
 		t.Helper()
 		conn := openSQLiteForTest(t)
+		// Conformance subtests assert behavior against an *unseeded*
+		// settings row — the v1.11.0 baseline migration seeds rows
+		// for the local sentinel org/team to keep production paths
+		// honest, but those defaults collide with the round-trip
+		// + "empty row returns store defaults" assertions. Drop the
+		// seeded rows here so the conformance suite sees the same
+		// pristine state both backends present to it.
+		if _, err := conn.Exec(`DELETE FROM org_settings`); err != nil {
+			t.Fatalf("drop seeded org_settings: %v", err)
+		}
+		if _, err := conn.Exec(`DELETE FROM team_settings`); err != nil {
+			t.Fatalf("drop seeded team_settings: %v", err)
+		}
 		stores := sqlitestore.New(conn)
 		return dbtest.SettingsStores{
 				Orgs:            stores.Orgs,

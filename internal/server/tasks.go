@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -543,26 +543,30 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 	// "In Review" while canonical is "In Progress", transitioning back to the
 	// canonical would be a spurious status change that would confuse watchers.
 	if req.Action == "claim" && s.jiraClient != nil {
+		// Fetch the task and (if Jira-backed) its team's status rules
+		// inside a single WithTx so the rule read goes through the
+		// app-pool ListForTeam — jira_rules_select RLS gates by team
+		// membership, matching the user's claim path. Per-team rule
+		// lookup on the swipe hot path is O(projects) and paced by
+		// human swipe rate; sub-millisecond cost in practice.
 		var task *domain.Task
+		var rule *domain.JiraProjectStatusRules
 		err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 			var e error
 			task, e = tx.Tasks.Get(r.Context(), orgID, id)
-			return e
+			if e != nil {
+				return e
+			}
+			rule = lookupJiraRuleForTask(r.Context(), tx, task)
+			return nil
 		})
 		if err == nil && task != nil && task.EntitySource == "jira" {
-			// config.Load() on the swipe hot path: bounded by O(projects)
-			// settings rows, paced by human swipe rate — sub-millisecond
-			// cost in practice. If profiling ever shows this as a real
-			// hot spot, cache the per-project rules on Server (refreshed
-			// from onJiraChanged where the poller already restarts).
-			cfg, _ := config.Load()
-			rule := cfg.Jira.RuleForProject(projectFromKey(task.EntitySourceID))
-			if rule != nil && rule.InProgress.Canonical != "" {
-				go func(issueKey string, ipRule config.JiraStatusRule) {
+			if rule != nil && rule.InProgressCanonical != "" {
+				go func(issueKey string, ipMembers []string, ipCanonical string) {
 					state := s.jiraClient.GetClaimState(issueKey)
 
 					needAssign := state == nil || !state.AssignedToSelf
-					needTransition := state == nil || !ipRule.Contains(state.StatusName)
+					needTransition := state == nil || !slices.Contains(ipMembers, state.StatusName)
 
 					if !needAssign && !needTransition {
 						log.Printf("[jira] claim guard: %s already assigned to self and already in in-progress (%q), skipping", issueKey, state.StatusName)
@@ -576,11 +580,11 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					if needTransition {
-						if err := s.jiraClient.TransitionTo(issueKey, ipRule.Canonical); err != nil {
-							log.Printf("[jira] failed to transition %s to %q: %v", issueKey, ipRule.Canonical, err)
+						if err := s.jiraClient.TransitionTo(issueKey, ipCanonical); err != nil {
+							log.Printf("[jira] failed to transition %s to %q: %v", issueKey, ipCanonical, err)
 						}
 					}
-				}(task.EntitySourceID, rule.InProgress)
+				}(task.EntitySourceID, rule.InProgressMembers, rule.InProgressCanonical)
 			} else {
 				log.Printf("[jira] claim guard: no in_progress rule configured for project of %s, skipping transition", task.EntitySourceID)
 			}
@@ -975,7 +979,7 @@ func (s *Server) finalizeRequeue(r *http.Request, orgID, userID, taskID string, 
 	// the cancel chain.
 	cleanupCtx := context.WithoutCancel(r.Context())
 	s.cleanupPendingApprovalRun(cleanupCtx, orgID, userID, taskID, discardOutcomeRequeued)
-	s.revertJiraStateIfApplicable(task)
+	s.revertJiraStateIfApplicable(cleanupCtx, orgID, userID, task)
 	// SKY-330: requeue clears both claim cols and flips status to
 	// 'queued'. Peer Board sessions need a task_updated event to
 	// pull the card back into the Queued column; without this they
@@ -1178,18 +1182,27 @@ func buildDiscardHumanContent(outcome discardOutcome, kind string) string {
 // against external mutations (someone else claimed it, status has
 // progressed out of the in-progress rule) apply equally to both
 // entry points.
-func (s *Server) revertJiraStateIfApplicable(task *domain.Task) {
+func (s *Server) revertJiraStateIfApplicable(ctx context.Context, orgID, userID string, task *domain.Task) {
 	if task == nil || task.EntitySource != "jira" || task.SourceStatus == "" || s.jiraClient == nil {
 		return
 	}
-	// Same hot-path note as handleSwipe: requeue/undo is human-paced and
-	// Load is O(projects). If a future profile shows real cost, cache
-	// the per-project rules on Server and refresh from onJiraChanged.
-	cfg, _ := config.Load()
-	rule := cfg.Jira.RuleForProject(projectFromKey(task.EntitySourceID))
+	// Same hot-path note as handleSwipe: requeue/undo is human-paced
+	// and rule lookup is O(projects). The rule read goes through the
+	// app-pool ListForTeam inside a WithTx so jira_rules_select RLS
+	// is enforced — matching the user's requeue claim path. If a
+	// future profile shows real cost, cache the per-team rules on
+	// Server and refresh from onJiraChanged.
+	var rule *domain.JiraProjectStatusRules
+	if err := s.tx.WithTx(ctx, orgID, userID, func(tx db.TxStores) error {
+		rule = lookupJiraRuleForTask(ctx, tx, task)
+		return nil
+	}); err != nil {
+		log.Printf("[jira] requeue rule lookup: %v (skipping revert)", err)
+		return
+	}
 	var inProgressMembers []string
 	if rule != nil {
-		inProgressMembers = rule.InProgress.Members
+		inProgressMembers = rule.InProgressMembers
 	}
 	go func(issueKey, originalStatus string, ipMembers []string) {
 		state := s.jiraClient.GetClaimState(issueKey)

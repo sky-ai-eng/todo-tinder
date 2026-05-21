@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 // OrgSettings is the org-scope settings row (org_settings table).
 //
@@ -31,6 +34,27 @@ type OrgSettings struct {
 	MaxLLMModelTier       string // "haiku" | "sonnet" | "opus" | ""
 }
 
+// DefaultOrgSettings returns the NOT NULL DEFAULT values from the
+// org_settings schema as a Go struct. Used by:
+//
+//   - OrgsStore.GetSettings / GetSettingsSystem as the fallback when
+//     no row exists yet (test fixtures that bypass provisioning, or
+//     reads on a fresh DB before the first auth flow has run).
+//   - Provisioning paths (server/auth_provision.go, baseline migration
+//     seed rows) that want to materialize the schema defaults
+//     explicitly in Go.
+//
+// Nullable fields (base URLs, vault refs, max tier) stay empty —
+// "not configured yet" semantics are preserved. Keep this in sync
+// with the schema DEFAULT clauses in baseline migration.
+func DefaultOrgSettings() OrgSettings {
+	return OrgSettings{
+		GitHubPollInterval:  5 * time.Minute,
+		GitHubCloneProtocol: "ssh",
+		JiraPollInterval:    5 * time.Minute,
+	}
+}
+
 // TeamSettings is the team-scope settings row (team_settings table).
 // JiraProjects holds the team's tracked Jira project keys — the full
 // per-project rule rows live in jira_project_status_rules and are
@@ -47,6 +71,25 @@ type TeamSettings struct {
 	AIPreferenceUpdateInterval int
 	DefaultModel               string // "haiku" | "sonnet" | "opus"
 	AutoDelegateEnabled        bool
+}
+
+// DefaultTeamSettings returns the NOT NULL DEFAULT values from the
+// team_settings schema as a Go struct. Same pattern as
+// DefaultOrgSettings — read-side fallback for missing rows, plus an
+// explicit Go-side baseline for provisioning paths.
+//
+// AutoDelegateEnabled defaults false here (matching the schema
+// DEFAULT and the multi-mode "new teams require explicit opt-in"
+// rule). The local-mode sentinel team flips this to true via its
+// baseline seed row so the local-first happy path keeps auto-
+// delegation on out of the box.
+func DefaultTeamSettings() TeamSettings {
+	return TeamSettings{
+		AIReprioritizeThreshold:    5,
+		AIPreferenceUpdateInterval: 20,
+		DefaultModel:               "sonnet",
+		AutoDelegateEnabled:        false,
+	}
 }
 
 // UserSettings is the user-scope settings row (user_settings table).
@@ -70,4 +113,73 @@ type JiraProjectStatusRules struct {
 	InProgressCanonical string
 	DoneMembers         []string
 	DoneCanonical       string
+}
+
+// PickupContains reports whether status is a member of the Pickup rule.
+func (r JiraProjectStatusRules) PickupContains(status string) bool {
+	return slices.Contains(r.PickupMembers, status)
+}
+
+// InProgressContains reports whether status is a member of the InProgress rule.
+func (r JiraProjectStatusRules) InProgressContains(status string) bool {
+	return slices.Contains(r.InProgressMembers, status)
+}
+
+// DoneContains reports whether status is a member of the Done rule.
+func (r JiraProjectStatusRules) DoneContains(status string) bool {
+	return slices.Contains(r.DoneMembers, status)
+}
+
+// RuleForProject returns the per-project rule for the given key, or
+// nil when no rule with that key is in the slice. Callers degrade
+// gracefully on nil ("no rules configured" — no terminal check, no
+// transitions).
+func RuleForProject(rules []JiraProjectStatusRules, key string) *JiraProjectStatusRules {
+	for i := range rules {
+		if rules[i].ProjectKey == key {
+			return &rules[i]
+		}
+	}
+	return nil
+}
+
+// JiraProjectKeys returns the ordered list of project keys with empty
+// entries filtered out. Mirrors the helper the deleted config package
+// exposed for poller dispatch and JQL queries.
+func JiraProjectKeys(rules []JiraProjectStatusRules) []string {
+	keys := make([]string, 0, len(rules))
+	for _, p := range rules {
+		if p.ProjectKey != "" {
+			keys = append(keys, p.ProjectKey)
+		}
+	}
+	return keys
+}
+
+// JiraAllPickupMembers returns the union of every project's pickup
+// members, in first-seen order, each member deduped. Used by JQL
+// queries that span every project a team tracks.
+func JiraAllPickupMembers(rules []JiraProjectStatusRules) []string {
+	return jiraUnionMembers(rules, func(p JiraProjectStatusRules) []string { return p.PickupMembers })
+}
+
+// JiraAllDoneMembers returns the union of every project's done members.
+// Used by JQL queries that exclude terminal tickets across the team's
+// full project list.
+func JiraAllDoneMembers(rules []JiraProjectStatusRules) []string {
+	return jiraUnionMembers(rules, func(p JiraProjectStatusRules) []string { return p.DoneMembers })
+}
+
+func jiraUnionMembers(rules []JiraProjectStatusRules, pick func(JiraProjectStatusRules) []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0)
+	for _, p := range rules {
+		for _, m := range pick(p) {
+			if !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
+	}
+	return out
 }
