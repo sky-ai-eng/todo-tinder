@@ -282,7 +282,7 @@ func loadSettingsView(ctx context.Context, tx db.TxStores, orgID string) (orgSet
 	if err != nil {
 		return
 	}
-	teamID, err = tx.Teams.GetDefaultForOrgSystem(ctx, orgID)
+	teamID, err = tx.Teams.GetDefaultForOrg(ctx, orgID)
 	if err != nil {
 		return
 	}
@@ -473,6 +473,16 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	// the SecretStore sweep.
 	envOverlayWarn := []string{}
 
+	// Disconnect flags drive the persist WithTx below — clearing
+	// keychain entries happens inside the same tx as the settings
+	// writes so a mid-flight failure can't leave the SecretStore
+	// emptied while the settings UI still claims the integration is
+	// configured.
+	var (
+		clearGitHubSecrets bool
+		clearJiraSecrets   bool
+	)
+
 	// Snapshot pre-change values for diffing
 	prevGHURL := creds.GitHubURL
 	prevGHPAT := creds.GitHubPAT
@@ -560,9 +570,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		creds.GitHubURL = ""
 		creds.GitHubPAT = ""
 		orgSet.GitHubBaseURL = ""
-		if err := integrations.ClearGitHub(r.Context(), s.secrets, orgID); err != nil {
-			log.Printf("[settings] failed to clear GitHub keychain entry: %v", err)
-		}
+		clearGitHubSecrets = true
 		// Env-overlay note: when a TRIAGE_FACTORY_GITHUB_* env var supplies
 		// the credential, the SecretStore Delete is a no-op and the value
 		// will still surface on the next Get — record it so the response
@@ -624,9 +632,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		creds.JiraURL = ""
 		creds.JiraPAT = ""
 		orgSet.JiraBaseURL = ""
-		if err := integrations.ClearJira(r.Context(), s.secrets, orgID); err != nil {
-			log.Printf("[settings] failed to clear Jira keychain entry: %v", err)
-		}
+		clearJiraSecrets = true
 		if runmode.Current() == runmode.ModeLocal {
 			for _, e := range auth.EnvProvided() {
 				if e == "jira" {
@@ -753,10 +759,28 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Persist everything in one WithTx so credentials + org/team/jira
-	// rules either all commit or all roll back, and so the Postgres
-	// vault writes + RLS-gated UPDATEs see request.jwt.claims set.
-	// Local mode collapses to a single SQLite tx with the same shape.
+	// rules + per-integration clears either all commit or all roll back,
+	// and so the Postgres vault writes + RLS-gated UPDATEs see
+	// request.jwt.claims set. Local mode collapses to a single SQLite
+	// tx with the same shape.
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		// Process disconnect clears first so a same-request reconnect
+		// (e.g. switch from GitHub PAT A to PAT B by setting
+		// github_enabled=false then immediately =true in a separate
+		// request would never happen, but a disconnect-and-reapply via
+		// integrations.Save below stays valid because Save skips empty
+		// values). In practice the two paths are mutually exclusive
+		// per integration — disconnect zeros creds, save skips empties.
+		if clearGitHubSecrets {
+			if err := integrations.ClearGitHub(r.Context(), tx.Secrets, orgID); err != nil {
+				return fmt.Errorf("clear GitHub keychain entry: %w", err)
+			}
+		}
+		if clearJiraSecrets {
+			if err := integrations.ClearJira(r.Context(), tx.Secrets, orgID); err != nil {
+				return fmt.Errorf("clear Jira keychain entry: %w", err)
+			}
+		}
 		if err := integrations.Save(r.Context(), tx.Secrets, orgID, creds); err != nil {
 			return fmt.Errorf("store credentials: %w", err)
 		}
@@ -901,21 +925,34 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 // Query params: ?project=PROJ1&project=PROJ2 (or uses configured projects if omitted).
 func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 	orgID := OrgIDFrom(r.Context())
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
+	userID := ClaimsFrom(r.Context()).Subject
+	projects := r.URL.Query()["project"]
+	// Read creds + (if needed) the team's tracked-projects fallback
+	// through the app pool inside WithTx so vault_decrypt and
+	// team_settings_select run under the user's claims.
+	var creds auth.Credentials
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
+		if len(projects) > 0 {
+			return nil
+		}
+		teamID, e := tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil || teamID == "" {
+			return nil
+		}
+		teamSet, te := tx.Teams.GetSettings(r.Context(), teamID)
+		if te != nil {
+			return nil
+		}
+		projects = append(projects, teamSet.JiraProjects...)
+		return nil
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira config: " + err.Error()})
+		return
+	}
 	if creds.JiraPAT == "" || creds.JiraURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Jira not configured"})
 		return
-	}
-
-	projects := r.URL.Query()["project"]
-	if len(projects) == 0 {
-		teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-		if err == nil && teamID != "" {
-			teamSet, terr := s.teams.GetSettingsSystem(r.Context(), teamID)
-			if terr == nil {
-				projects = append(projects, teamSet.JiraProjects...)
-			}
-		}
 	}
 	if len(projects) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no projects specified"})
@@ -980,7 +1017,18 @@ func (s *Server) handleGitHubPreflightSSH(w http.ResponseWriter, r *http.Request
 	// load creds (not settings) because creds.GitHubURL is the URL the
 	// user actually authenticates against; org_settings.github_base_url
 	// mirrors it but the SecretStore copy is the source of truth.
-	creds, _ := integrations.Load(r.Context(), s.secrets, OrgIDFrom(r.Context()))
+	// Wrapped in WithTx so vault_decrypt sees claims and the read
+	// matches the rest of the post-SKY-355 settings surface.
+	orgID := OrgIDFrom(r.Context())
+	userID := ClaimsFrom(r.Context()).Subject
+	var creds auth.Credentials
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
+		return nil
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load credentials: " + err.Error()})
+		return
+	}
 	sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)

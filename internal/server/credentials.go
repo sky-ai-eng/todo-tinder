@@ -169,21 +169,34 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
-	if err != nil {
+	// SecretStore.Load + repo count both inside the same WithTx so
+	// vault_decrypt sees request.jwt.claims and repos_select RLS runs
+	// under the user's identity. Local mode collapses to one SQLite
+	// tx with the same shape.
+	var (
+		creds     auth.Credentials
+		credsErr  error
+		repoCount int
+	)
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, credsErr = integrations.Load(r.Context(), tx.Secrets, orgID)
+		var e error
+		repoCount, e = tx.Repos.CountConfigured(r.Context(), orgID)
+		return e
+	}); err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"configured": false,
 			"error":      err.Error(),
 		})
 		return
 	}
-
-	var repoCount int
-	_ = s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-		var e error
-		repoCount, e = tx.Repos.CountConfigured(r.Context(), orgID)
-		return e
-	})
+	if credsErr != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"configured": false,
+			"error":      credsErr.Error(),
+		})
+		return
+	}
 
 	// GitHub is mandatory — configured requires GitHub creds + at least one repo
 	result := map[string]any{
@@ -219,7 +232,10 @@ func (s *Server) handleIntegrationsClear(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	if err := integrations.Clear(r.Context(), s.secrets, orgID); err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return integrations.Clear(r.Context(), tx.Secrets, orgID)
+	}); err != nil {
 		internalError(w, "auth", err)
 		return
 	}
@@ -242,7 +258,10 @@ func (s *Server) handleIntegrationsDeleteJira(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	if err := integrations.ClearJira(r.Context(), s.secrets, orgID); err != nil {
+	userID := ClaimsFrom(r.Context()).Subject
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		return integrations.ClearJira(r.Context(), tx.Secrets, orgID)
+	}); err != nil {
 		internalError(w, "auth", err)
 		return
 	}

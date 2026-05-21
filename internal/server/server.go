@@ -189,7 +189,7 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 			enabled = true
 			return nil
 		}
-		teamID, e := tx.Teams.GetDefaultForOrgSystem(ctx, orgID)
+		teamID, e := tx.Teams.GetDefaultForOrg(ctx, orgID)
 		if e != nil {
 			return fmt.Errorf("default team lookup: %w", e)
 		}

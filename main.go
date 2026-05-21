@@ -119,23 +119,28 @@ func applyPGPoolDefaults(db *sql.DB) {
 }
 
 // resolveAIModelForOrg looks up the default model the org's default
-// team uses. Returns "" only when default-team lookup fails — the
-// store's GetSettingsSystem returns domain.DefaultTeamSettings() on
-// missing rows, so "team exists but no settings row" naturally yields
-// "sonnet" from the schema default. The spawner+curator nil-safe
-// empty model values in their UpdateCredentials handlers.
+// team uses. Falls back to domain.DefaultTeamSettings().DefaultModel
+// on any error so a transient DB hiccup doesn't silently clear the
+// spawner+curator credentials. The store's GetSettingsSystem already
+// returns DefaultTeamSettings() on missing rows; the explicit fallback
+// here covers the other failure modes (team-lookup error, settings-
+// read error, no default team at all).
 func resolveAIModelForOrg(ctx context.Context, stores db.Stores, orgID string) string {
+	fallback := domain.DefaultTeamSettings().DefaultModel
 	teamID, err := stores.Teams.GetDefaultForOrgSystem(ctx, orgID)
 	if err != nil || teamID == "" {
 		if err != nil {
-			log.Printf("[main] resolve default team for org %s: %v", orgID, err)
+			log.Printf("[main] resolve default team for org %s: %v (using default model %q)", orgID, err, fallback)
 		}
-		return ""
+		return fallback
 	}
 	teamSet, err := stores.Teams.GetSettingsSystem(ctx, teamID)
 	if err != nil {
-		log.Printf("[main] read team settings %s: %v", teamID, err)
-		return ""
+		log.Printf("[main] read team settings %s: %v (using default model %q)", teamID, err, fallback)
+		return fallback
+	}
+	if teamSet.DefaultModel == "" {
+		return fallback
 	}
 	return teamSet.DefaultModel
 }
@@ -494,6 +499,14 @@ func main() {
 		).Scan(&storedPort, &storedTakeoverDir); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			log.Fatalf("read instance_config: %v", err)
 		}
+	}
+	// Default storedPort to the binary's defaultPort when the row is
+	// missing or holds the zero value — that's what the Settings GET
+	// response should render in its server_port input. Belt-and-
+	// suspenders for pre-seed DBs and the multi-mode branch that
+	// skips the read entirely.
+	if storedPort == 0 {
+		storedPort = defaultPort
 	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)

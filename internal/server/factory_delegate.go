@@ -166,20 +166,16 @@ func (s *Server) handleFactoryDelegate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-	if err != nil {
-		internalError(w, "factory", fmt.Errorf("default team lookup: %w", err))
-		return
-	}
-	if teamID == "" {
-		internalError(w, "factory", fmt.Errorf("org %s has no default team", orgID))
-		return
-	}
-
 	var task *domain.Task
 	var created bool
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-		var e error
+		teamID, e := tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
+		}
+		if teamID == "" {
+			return fmt.Errorf("org %s has no default team", orgID)
+		}
 		task, created, e = tx.Tasks.FindOrCreate(r.Context(), orgID, teamID, req.EntityID, req.EventType, req.DedupKey, primaryEvent.ID, defaultPriority)
 		if e != nil {
 			return e

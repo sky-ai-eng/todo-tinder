@@ -28,9 +28,17 @@ func newTeamsStore(q, _ queryer) db.TeamsStore { return &teamsStore{q: q} }
 
 var _ db.TeamsStore = (*teamsStore)(nil)
 
+func (s *teamsStore) GetDefaultForOrg(ctx context.Context, orgID string) (string, error) {
+	return getDefaultTeamForOrg(ctx, s.q, orgID)
+}
+
 func (s *teamsStore) GetDefaultForOrgSystem(ctx context.Context, orgID string) (string, error) {
+	return getDefaultTeamForOrg(ctx, s.q, orgID)
+}
+
+func getDefaultTeamForOrg(ctx context.Context, q queryer, orgID string) (string, error) {
 	var id string
-	err := s.q.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT id FROM teams
 		WHERE org_id = ?
 		ORDER BY created_at ASC, id ASC

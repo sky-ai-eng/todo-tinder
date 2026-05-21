@@ -89,32 +89,34 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	jiraKey := strings.TrimSpace(req.JiraProjectKey)
 	linearKey := strings.TrimSpace(req.LinearProjectKey)
 
-	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-	if err != nil {
-		internalError(w, "projects", fmt.Errorf("default team lookup: %w", err))
-		return
-	}
-	if teamID == "" {
-		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
-		return
-	}
-
-	// Mirror the PATCH path's lazy-load policy: only read team Jira
-	// rules when the Jira side actually needs validation. Linear is
-	// rejected regardless of stored rules. Read goes through the app
-	// pool inside WithTx so jira_rules_select RLS is enforced under
-	// the user's claims.
-	var teamJiraRules []domain.JiraProjectStatusRules
-	if jiraKey != "" {
-		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-			var rerr error
-			teamJiraRules, rerr = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
-			return rerr
-		}); err != nil {
-			log.Printf("handleProjectCreate: failed to load Jira rules: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira rules"})
-			return
+	// Resolve team + (lazily) jira rules inside one WithTx so
+	// teams_select and jira_rules_select RLS gates fire under the
+	// user's claims. Mirrors the PATCH path's lazy-load policy:
+	// only read rules when the Jira side actually needs validation.
+	var (
+		teamID        string
+		teamJiraRules []domain.JiraProjectStatusRules
+	)
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		teamID, e = tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
 		}
+		if teamID == "" {
+			return fmt.Errorf("org %s has no default team", orgID)
+		}
+		if jiraKey != "" {
+			teamJiraRules, e = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+			if e != nil {
+				return fmt.Errorf("list jira rules: %w", e)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("handleProjectCreate: %v", err)
+		internalError(w, "projects", err)
+		return
 	}
 	if jiraKey != "" || linearKey != "" {
 		var errMsg string
@@ -323,16 +325,27 @@ func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-	if err != nil {
-		internalError(w, "projects", fmt.Errorf("default team lookup: %w", err))
-		return
-	}
-	if teamID == "" {
-		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
-		return
-	}
 	userID := ClaimsFrom(r.Context()).Subject
+	// Resolve the default team inside WithTx so teams_select RLS
+	// gates the lookup under the user's claims. The downstream
+	// projectbundle.Import does its own DB work; we don't include
+	// it in this tx to keep import latency from holding a claims-
+	// bound connection.
+	var teamID string
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		teamID, e = tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
+		}
+		if teamID == "" {
+			return fmt.Errorf("org %s has no default team", orgID)
+		}
+		return nil
+	}); err != nil {
+		internalError(w, "projects", err)
+		return
+	}
 
 	project, warnings, err := projectbundle.Import(
 		r.Context(),
@@ -495,7 +508,7 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 			// pool, jira_rules_select RLS gates by team membership).
 			var teamRules []domain.JiraProjectStatusRules
 			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-				teamID, terr := tx.Teams.GetDefaultForOrgSystem(r.Context(), orgID)
+				teamID, terr := tx.Teams.GetDefaultForOrg(r.Context(), orgID)
 				if terr != nil {
 					return fmt.Errorf("default team lookup: %w", terr)
 				}

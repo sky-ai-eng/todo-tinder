@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	jiraevents "github.com/sky-ai-eng/triage-factory/internal/domain/events"
@@ -60,37 +61,47 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	orgSet, _ := s.orgs.GetSettingsSystem(r.Context(), orgID)
-
-	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-	if err != nil {
-		internalError(w, "stock", fmt.Errorf("default team lookup: %w", err))
-		return
-	}
-	if teamID == "" {
-		internalError(w, "stock", fmt.Errorf("org %s has no default team", orgID))
-		return
-	}
-	jiraRules, err := s.jiraRules.ListForTeamSystem(r.Context(), teamID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira rules: " + err.Error()})
-		return
-	}
-
-	// SKY-270: identity facts live on the users row, not the keychain.
-	// Account ID drives "is this assigned to me" (stable, predicate-grade);
-	// display name drives the optimistic post-claim snapshot update so the
-	// synthesized event metadata reads correctly. Both come from the same
-	// auth.ValidateJira response at PAT setup; missing either means the
-	// bootstrap hasn't run yet or Jira isn't connected.
-	var localAccountID, localDisplayName string
+	// Everything this handler reads from per-tenant state — creds,
+	// org settings, default team, Jira rules, the user's Jira
+	// identity — runs through tx-bound stores under the user's
+	// claims so RLS (org_settings_select / team_settings_select /
+	// jira_rules_select / users_select) gates every read.
+	// SKY-270: identity facts live on the users row, not the
+	// keychain. Account ID drives "is this assigned to me" (stable,
+	// predicate-grade); display name drives the optimistic post-
+	// claim snapshot update so the synthesized event metadata reads
+	// correctly. Both come from the same auth.ValidateJira response
+	// at PAT setup; missing either means the bootstrap hasn't run
+	// yet or Jira isn't connected.
+	var (
+		creds                            auth.Credentials
+		orgSet                           domain.OrgSettings
+		teamID                           string
+		jiraRules                        []domain.JiraProjectStatusRules
+		localAccountID, localDisplayName string
+	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		var e error
+		orgSet, e = tx.Orgs.GetSettings(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("load org settings: %w", e)
+		}
+		teamID, e = tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
+		}
+		if teamID == "" {
+			return fmt.Errorf("org %s has no default team", orgID)
+		}
+		jiraRules, e = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+		if e != nil {
+			return fmt.Errorf("list jira rules: %w", e)
+		}
 		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira state: " + err.Error()})
 		return
 	}
 
@@ -322,29 +333,32 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	var localAccountID, localDisplayName string
+	// All per-tenant state goes through tx-bound stores so RLS gates
+	// fire under the user's claims — mirrors handleJiraStockGet.
+	var (
+		creds                            auth.Credentials
+		teamID                           string
+		jiraRules                        []domain.JiraProjectStatusRules
+		localAccountID, localDisplayName string
+	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		var e error
+		teamID, e = tx.Teams.GetDefaultForOrg(r.Context(), orgID)
+		if e != nil {
+			return fmt.Errorf("default team lookup: %w", e)
+		}
+		if teamID == "" {
+			return fmt.Errorf("org %s has no default team", orgID)
+		}
+		jiraRules, e = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+		if e != nil {
+			return fmt.Errorf("list jira rules: %w", e)
+		}
 		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
 		return e
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira identity: " + err.Error()})
-		return
-	}
-
-	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
-	if err != nil {
-		internalError(w, "stock", fmt.Errorf("default team lookup: %w", err))
-		return
-	}
-	if teamID == "" {
-		internalError(w, "stock", fmt.Errorf("org %s has no default team", orgID))
-		return
-	}
-	jiraRules, err := s.jiraRules.ListForTeamSystem(r.Context(), teamID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira rules: " + err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira state: " + err.Error()})
 		return
 	}
 	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" || localDisplayName == "" {

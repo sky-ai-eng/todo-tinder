@@ -29,6 +29,15 @@ import (
 // SQLite collapses the pool split to one connection; the `...System`
 // variants delegate to their non-System counterparts.
 type TeamsStore interface {
+	// GetDefaultForOrg returns the ID of the org's default team —
+	// defined as the oldest team row by created_at. Same shape as
+	// GetDefaultForOrgSystem but routes through the app pool in
+	// Postgres so teams_select RLS (org_id = current_org_id() AND
+	// user_has_org_access) fires under the caller's claims. Use
+	// this from request handlers; use the System variant from
+	// background services with no claims context.
+	GetDefaultForOrg(ctx context.Context, orgID string) (string, error)
+
 	// GetDefaultForOrgSystem returns the ID of the org's default
 	// team — defined as the oldest team row by created_at. The
 	// single-team-per-org assumption means there's only one row to

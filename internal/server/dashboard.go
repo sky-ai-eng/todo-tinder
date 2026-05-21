@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -22,14 +23,17 @@ func (s *Server) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
-	if err != nil || creds.GitHubPAT == "" {
-		writeJSON(w, http.StatusOK, map[string]any{})
-		return
-	}
-	var username string
-	var stats *domain.DashboardStats
+	var (
+		creds    auth.Credentials
+		username string
+		stats    *domain.DashboardStats
+	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var lerr error
+		creds, lerr = integrations.Load(r.Context(), tx.Secrets, orgID)
+		if lerr != nil || creds.GitHubPAT == "" {
+			return nil
+		}
 		username, _ = tx.Users.GetGitHubUsername(r.Context(), userID)
 		if username == "" {
 			return nil
@@ -56,14 +60,17 @@ func (s *Server) handleDashboardPRs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
-	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
-	if err != nil || creds.GitHubPAT == "" {
-		writeJSON(w, http.StatusOK, []domain.PRSummaryRow{})
-		return
-	}
-	var username string
-	var prs []domain.PRSummaryRow
+	var (
+		creds    auth.Credentials
+		username string
+		prs      []domain.PRSummaryRow
+	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var lerr error
+		creds, lerr = integrations.Load(r.Context(), tx.Secrets, orgID)
+		if lerr != nil || creds.GitHubPAT == "" {
+			return nil
+		}
 		username, _ = tx.Users.GetGitHubUsername(r.Context(), userID)
 		if username == "" {
 			return nil
@@ -110,12 +117,27 @@ func (s *Server) handleDashboardPRStatus(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	creds, err := integrations.Load(r.Context(), s.secrets, orgID)
-	if err != nil || creds.GitHubPAT == "" {
+	userID := ClaimsFrom(r.Context()).Subject
+	var (
+		creds  auth.Credentials
+		orgSet domain.OrgSettings
+	)
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var lerr error
+		creds, lerr = integrations.Load(r.Context(), tx.Secrets, orgID)
+		if lerr != nil {
+			return lerr
+		}
+		orgSet, lerr = tx.Orgs.GetSettings(r.Context(), orgID)
+		return lerr
+	}); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub not configured"})
 		return
 	}
-	orgSet, _ := s.orgs.GetSettingsSystem(r.Context(), orgID)
+	if creds.GitHubPAT == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub not configured"})
+		return
+	}
 	baseURL := orgSet.GitHubBaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL
@@ -164,8 +186,19 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	}
 	userID := ClaimsFrom(r.Context()).Subject
 
-	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	orgSet, _ := s.orgs.GetSettingsSystem(r.Context(), orgID)
+	var (
+		creds  auth.Credentials
+		orgSet domain.OrgSettings
+	)
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
+		var lerr error
+		orgSet, lerr = tx.Orgs.GetSettings(r.Context(), orgID)
+		return lerr
+	}); err != nil {
+		internalError(w, "dashboard", err)
+		return
+	}
 	baseURL := orgSet.GitHubBaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL
