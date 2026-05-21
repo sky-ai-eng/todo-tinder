@@ -34,6 +34,21 @@ func testTaskStore(database *sql.DB) db.TaskStore {
 	return sqlitestore.New(database).Tasks
 }
 
+// testSpawnerStores builds the full db.Stores bundle from the given
+// SQLite handle and overrides Prompts + Tasks with the test-specific
+// fixtures (which wrap the real stores so tests can intercept or
+// observe specific calls). Returns the empty bundle for nil database
+// so the nil-only smoke tests still compile.
+func testSpawnerStores(database *sql.DB) db.Stores {
+	if database == nil {
+		return db.Stores{}
+	}
+	stores := sqlitestore.New(database)
+	stores.Prompts = testPromptStore(database)
+	stores.Tasks = testTaskStore(database)
+	return stores
+}
+
 // ensureTestPrompt is the FindOrCreate replacement for the deleted
 // db.GetPrompt + db.CreatePrompt pair tests used to seed a prompt
 // row for run fixtures. Idempotent: subsequent calls on the same

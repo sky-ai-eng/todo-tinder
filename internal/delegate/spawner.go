@@ -112,22 +112,29 @@ type Spawner struct {
 	stores *db.Stores
 }
 
-func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, chains db.ChainStore, tasks db.TaskStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, events db.EventStore, taskMemory db.TaskMemoryStore, runWorktrees db.RunWorktreeStore, orgs db.OrgsStore, tx db.TxRunner, ghClient *ghclient.Client, wsHub *websocket.Hub, model, takeoverDir string) *Spawner {
+// NewSpawner constructs a Spawner from the per-resource store
+// bundle plus the runtime knobs (GitHub client, WS hub, model,
+// takeover dir). The Spawner keeps individual store fields rather
+// than the full bundle so existing hot paths (s.tasks, s.entities,
+// ...) stay put; New just unpacks once. Tests that only exercise a
+// subset of stores can pass partial db.Stores{} — every field is a
+// nil-safe interface.
+func NewSpawner(database *sql.DB, stores db.Stores, ghClient *ghclient.Client, wsHub *websocket.Hub, model, takeoverDir string) *Spawner {
 	return &Spawner{
 		database:     database,
-		prompts:      prompts,
-		agents:       agents,
-		chains:       chains,
-		tasks:        tasks,
-		agentRuns:    agentRuns,
-		entities:     entities,
-		reviews:      reviews,
-		pendingPRs:   pendingPRs,
-		events:       events,
-		taskMemory:   taskMemory,
-		runWorktrees: runWorktrees,
-		orgs:         orgs,
-		tx:           tx,
+		prompts:      stores.Prompts,
+		agents:       stores.Agents,
+		chains:       stores.Chains,
+		tasks:        stores.Tasks,
+		agentRuns:    stores.AgentRuns,
+		entities:     stores.Entities,
+		reviews:      stores.Reviews,
+		pendingPRs:   stores.PendingPRs,
+		events:       stores.Events,
+		taskMemory:   stores.TaskMemory,
+		runWorktrees: stores.RunWorktrees,
+		orgs:         stores.Orgs,
+		tx:           stores.Tx,
 		ghClient:     ghClient,
 		wsHub:        wsHub,
 		model:        model,

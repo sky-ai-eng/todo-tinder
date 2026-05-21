@@ -275,24 +275,7 @@ func setupAdvanceFixture(t *testing.T, suffix string) (*Spawner, *sql.DB, string
 	if err := database.QueryRow(`SELECT task_id FROM runs WHERE id = ?`, runID).Scan(&taskID); err != nil {
 		t.Fatalf("lookup task_id: %v", err)
 	}
-	s := NewSpawner(
-		database,
-		testPromptStore(database),
-		nil, nil,
-		testTaskStore(database),
-		sqlitestore.New(database).AgentRuns,
-		sqlitestore.New(database).Entities,
-		sqlitestore.New(database).Reviews,
-		sqlitestore.New(database).PendingPRs,
-		sqlitestore.New(database).Events,
-		sqlitestore.New(database).TaskMemory,
-		sqlitestore.New(database).RunWorktrees,
-		sqlitestore.New(database).Orgs,
-		sqlitestore.New(database).Tx,
-		nil, nil,
-		"claude-sonnet-4-6",
-		"",
-	)
+	s := NewSpawner(database, testSpawnerStores(database), nil, nil, "claude-sonnet-4-6", "")
 	return s, database, runID, taskID
 }
 
