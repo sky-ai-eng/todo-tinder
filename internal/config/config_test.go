@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"context"
 	"database/sql"
 	"testing"
 	"time"
@@ -80,11 +81,11 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	cfg.OrgLLM.BedrockCredentialsRef = "vault://orgs/acme/bedrock"
 	cfg.OrgLLM.MaxModelTier = "sonnet"
 
-	if err := config.Save(cfg); err != nil {
+	if err := config.SaveLocal(cfg); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	got, err := config.Load()
+	got, err := config.LoadLocal()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestSave_EmptyOrgLLMRefsPersistAsNull(t *testing.T) {
 	}
 
 	cfg := config.Default()
-	if err := config.Save(cfg); err != nil {
+	if err := config.SaveLocal(cfg); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -141,6 +142,112 @@ func TestSave_EmptyOrgLLMRefsPersistAsNull(t *testing.T) {
 	}
 }
 
+// TestLoad_PerOrgIsolation pins the multi-mode invariant the package
+// gained when Load/Save stopped reading the local sentinel directly:
+// settings saved under one orgID/teamID must not bleed into a read
+// scoped to a different orgID/teamID. Exercised against the SQLite
+// schema so it runs in CI without Docker; the same code paths (just a
+// different driver) carry the same isolation in the Postgres baseline.
+//
+// This is the regression test the de-scope ticket calls for —
+// pre-change, Load() hardcoded the sentinels, so this test was
+// physically impossible to write. Now it is, and it should stay green.
+func TestLoad_PerOrgIsolation(t *testing.T) {
+	conn := openDB(t)
+	if err := config.Init(conn); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	const (
+		orgA  = "00000000-0000-0000-0000-00000000000a"
+		orgB  = "00000000-0000-0000-0000-00000000000b"
+		teamA = "00000000-0000-0000-0000-0000000000a1"
+		teamB = "00000000-0000-0000-0000-0000000000b1"
+	)
+	for _, q := range []string{
+		`INSERT INTO orgs (id, slug, name) VALUES (?, ?, ?)`,
+	} {
+		if _, err := conn.Exec(q, orgA, "a", "A"); err != nil {
+			t.Fatalf("seed orgA: %v", err)
+		}
+		if _, err := conn.Exec(q, orgB, "b", "B"); err != nil {
+			t.Fatalf("seed orgB: %v", err)
+		}
+	}
+	if _, err := conn.Exec(
+		`INSERT INTO teams (id, org_id, slug, name) VALUES (?, ?, 'default', 'Default')`,
+		teamA, orgA,
+	); err != nil {
+		t.Fatalf("seed teamA: %v", err)
+	}
+	if _, err := conn.Exec(
+		`INSERT INTO teams (id, org_id, slug, name) VALUES (?, ?, 'default', 'Default')`,
+		teamB, orgB,
+	); err != nil {
+		t.Fatalf("seed teamB: %v", err)
+	}
+
+	cfgA := config.Default()
+	cfgA.GitHub.BaseURL = "https://github.a.example.com"
+	cfgA.Jira.BaseURL = "https://jira.a.example.com"
+	cfgA.AI.Model = "opus"
+	cfgA.OrgLLM.MaxModelTier = "opus"
+
+	cfgB := config.Default()
+	cfgB.GitHub.BaseURL = "https://github.b.example.com"
+	cfgB.Jira.BaseURL = "https://jira.b.example.com"
+	cfgB.AI.Model = "haiku"
+	cfgB.OrgLLM.MaxModelTier = "sonnet"
+
+	ctx := context.Background()
+	if err := config.Save(ctx, orgA, teamA, "", cfgA); err != nil {
+		t.Fatalf("Save A: %v", err)
+	}
+	if err := config.Save(ctx, orgB, teamB, "", cfgB); err != nil {
+		t.Fatalf("Save B: %v", err)
+	}
+
+	gotA, err := config.Load(ctx, orgA, teamA, "")
+	if err != nil {
+		t.Fatalf("Load A: %v", err)
+	}
+	gotB, err := config.Load(ctx, orgB, teamB, "")
+	if err != nil {
+		t.Fatalf("Load B: %v", err)
+	}
+
+	if gotA.GitHub.BaseURL != "https://github.a.example.com" {
+		t.Errorf("Load A GitHub.BaseURL = %q; want a-side value (bleed from B?)", gotA.GitHub.BaseURL)
+	}
+	if gotB.GitHub.BaseURL != "https://github.b.example.com" {
+		t.Errorf("Load B GitHub.BaseURL = %q; want b-side value (bleed from A?)", gotB.GitHub.BaseURL)
+	}
+	if gotA.AI.Model != "opus" || gotB.AI.Model != "haiku" {
+		t.Errorf("AI.Model bleed: A=%q B=%q (want opus/haiku)", gotA.AI.Model, gotB.AI.Model)
+	}
+	if gotA.OrgLLM.MaxModelTier != "opus" || gotB.OrgLLM.MaxModelTier != "sonnet" {
+		t.Errorf("OrgLLM.MaxModelTier bleed: A=%q B=%q (want opus/sonnet)",
+			gotA.OrgLLM.MaxModelTier, gotB.OrgLLM.MaxModelTier)
+	}
+
+	// Cross-scope read: orgA + teamB must NOT return A's team settings nor B's
+	// org settings paired together. With the cross IDs, A's team_settings row
+	// doesn't match (teamB lookup) so AI.Model falls back to Default("sonnet"),
+	// and B's org_settings row doesn't match (orgA lookup) so GitHub.BaseURL is
+	// A's. The mismatched pair is what proves the queries are scope-correct
+	// rather than coincidentally returning the right row by some other key.
+	cross, err := config.Load(ctx, orgA, teamB, "")
+	if err != nil {
+		t.Fatalf("Load cross: %v", err)
+	}
+	if cross.GitHub.BaseURL != "https://github.a.example.com" {
+		t.Errorf("Cross load GitHub.BaseURL = %q; want orgA value", cross.GitHub.BaseURL)
+	}
+	if cross.AI.Model != "haiku" {
+		t.Errorf("Cross load AI.Model = %q; want teamB value haiku", cross.AI.Model)
+	}
+}
+
 // TestMaxLLMModelTierCheckConstraint pins the CHECK constraint at the
 // SQLite layer: rows with an invalid tier are rejected at write time,
 // so local-mode admin paths that bypass Save() can't slip a bad value
@@ -153,7 +260,7 @@ func TestMaxLLMModelTierCheckConstraint(t *testing.T) {
 	if err := config.Init(conn); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if err := config.Save(config.Default()); err != nil {
+	if err := config.SaveLocal(config.Default()); err != nil {
 		t.Fatalf("seed Save: %v", err)
 	}
 

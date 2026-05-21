@@ -356,7 +356,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, orgID, runID string, task dom
 	// pr.SSHURL is also empty there, and we leave headCloneURL = ""
 	// so CreateForPR's hasHeadRepo=false branch fires correctly.
 	upstreamCloneURL, headCloneURL := pr.BaseCloneURL, pr.CloneURL
-	if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+	if cfg, cErr := config.LoadLocal(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
 		if pr.BaseSSHURL == "" {
 			return runConfig{}, fmt.Errorf("PR #%d on %s/%s: SSH clone protocol selected but GitHub did not return base.repo.ssh_url; switch to HTTPS in Settings or check your GHE config", prNumber, owner, repo)
 		}

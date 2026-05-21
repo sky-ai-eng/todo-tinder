@@ -62,13 +62,13 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := ClaimsFrom(r.Context()).Subject
 	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	cfg, err := config.Load()
+	cfg, err := config.FromContext(r.Context()).Load(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
 	}
 
-	// SKY-270: identity facts live on the users row, not the keychain.
+	// identity facts live on the users row, not the keychain.
 	// Account ID drives "is this assigned to me" (stable, predicate-grade);
 	// display name drives the optimistic post-claim snapshot update so the
 	// synthesized event metadata reads correctly. Both come from the same
@@ -308,7 +308,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := config.Load()
+	cfg, err := config.FromContext(r.Context()).Load(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return

@@ -5,9 +5,11 @@
 // call.
 //
 // The same tables exist in both SQLite and Postgres (multi-mode admins
-// edit them via SKY-257 D14 admin UI). In local mode every read is
-// scoped to runmode.LocalDefaultOrgID / LocalDefaultTeamID /
-// LocalDefaultUserID.
+// edit them via the D14 admin UI). Load/Save take (orgID, teamID, userID)
+// explicitly — callers must thread the active scope through. Local-mode
+// callers that don't have request context use LoadLocal/SaveLocal, which
+// pass runmode.LocalDefault* sentinels. The package no longer references
+// the sentinels itself — that knowledge lives at the boundary.
 package config
 
 import (
@@ -22,8 +24,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // Config is the persisted settings shape. JSON tags are retained for
@@ -260,12 +260,19 @@ func Init(db *sql.DB) error {
 
 // Load assembles a Config from the five tables (instance_config,
 // org_settings, team_settings, user_settings, jira_project_status_rules)
-// scoped to the local-mode sentinel IDs. Missing rows degrade to
-// Default() values — first Save() upserts them.
+// scoped to the supplied orgID / teamID / userID. Missing rows degrade
+// to Default() values — first Save() upserts them.
+//
+// orgID and teamID are required when their respective tables hold the
+// values the caller cares about (poller per-org URLs, per-team Jira
+// projects). userID is reserved for future per-user prefs; today
+// user_settings is empty and an empty userID is accepted. Background
+// workers that don't have request context use LoadLocal() — see the
+// helper below.
 //
 // Error contract: on the first per-table read failure, Load returns
 // (Default(), err) — never a partially-built struct. Callers that
-// swallow the error (cfg, _ := config.Load()) implicitly take
+// swallow the error (cfg, _ := config.LoadLocal()) implicitly take
 // Default() in the error path, matching the fresh-install behavior.
 // Without this contract, a mid-sequence failure would surface a mix
 // of "values from earlier successful reads" + "Default() for later
@@ -278,7 +285,9 @@ func Init(db *sql.DB) error {
 // error path emits a `[config] load failed, degrading to Default()`
 // log line. Callers that need stricter handling still get the error
 // back to act on it.
-func Load() (Config, error) {
+func Load(ctx context.Context, orgID, teamID, userID string) (Config, error) {
+	_ = userID // user_settings is empty post-cleanup; reserved for future per-user prefs.
+
 	pkgMu.RLock()
 	db := pkgDB
 	pkgMu.RUnlock()
@@ -287,7 +296,6 @@ func Load() (Config, error) {
 	}
 
 	cfg := Default()
-	ctx := context.Background()
 
 	// instance_config (server: port + takeover_dir)
 	var port int
@@ -315,7 +323,7 @@ func Load() (Config, error) {
 		       jira_base_url, jira_poll_interval,
 		       anthropic_api_key_ref, bedrock_credentials_ref, max_llm_model_tier
 		FROM org_settings WHERE org_id = ?
-	`, runmode.LocalDefaultOrgID).Scan(
+	`, orgID).Scan(
 		&ghURL, &ghInterval, &cloneProto,
 		&jiraURL, &jiraInterval,
 		&anthRef, &bedRef, &maxTier,
@@ -371,7 +379,7 @@ func Load() (Config, error) {
 		SELECT jira_projects, ai_reprioritize_threshold, ai_preference_update_interval,
 		       default_model, auto_delegate_enabled
 		FROM team_settings WHERE team_id = ?
-	`, runmode.LocalDefaultTeamID).Scan(
+	`, teamID).Scan(
 		&projectsJSON, &aiThreshold, &aiInterval,
 		&defaultModel, &autoDelegate,
 	); {
@@ -389,7 +397,7 @@ func Load() (Config, error) {
 	// jira_project_status_rules — one row per project key, each carrying
 	// its own Pickup/InProgress/Done. Iterated in project_key order so
 	// the in-memory slice is stable across reads.
-	projects, err := loadJiraProjectConfigs(ctx, db, runmode.LocalDefaultTeamID)
+	projects, err := loadJiraProjectConfigs(ctx, db, teamID)
 	if err != nil {
 		return loadFail(fmt.Errorf("read jira_project_status_rules: %w", err))
 	}
@@ -460,7 +468,7 @@ func loadJiraProjectConfigs(ctx context.Context, db *sql.DB, teamID string) ([]J
 // existing row.
 var ErrInvalidConfig = errors.New("config: invalid Config — fields must be populated (use Load() or Default() as a base, then mutate)")
 
-// Save upserts the five settings tables for the local sentinels.
+// Save upserts the five settings tables for the supplied scope.
 // Jira project rules are materialized one row per project in
 // cfg.Jira.Projects, each carrying its own Pickup/InProgress/Done.
 // Rules for projects no longer in the list have their rows deleted
@@ -473,7 +481,9 @@ var ErrInvalidConfig = errors.New("config: invalid Config — fields must be pop
 // otherwise overwrite the persisted port with 0, and there's no
 // meaningful way for a caller to express "leave port alone" with
 // the current API.
-func Save(cfg Config) error {
+func Save(ctx context.Context, orgID, teamID, userID string, cfg Config) error {
+	_ = userID // user_settings is empty post-cleanup; reserved for future per-user prefs.
+
 	if cfg.Server.Port <= 0 {
 		return fmt.Errorf("%w: Server.Port=%d (must be > 0; build the Config from Load() or Default())",
 			ErrInvalidConfig, cfg.Server.Port)
@@ -486,7 +496,6 @@ func Save(cfg Config) error {
 		return ErrNotInitialized
 	}
 
-	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -528,7 +537,7 @@ func Save(cfg Config) error {
 			max_llm_model_tier = excluded.max_llm_model_tier,
 			updated_at = CURRENT_TIMESTAMP
 	`,
-		runmode.LocalDefaultOrgID,
+		orgID,
 		nullIfEmpty(cfg.GitHub.BaseURL),
 		cfg.GitHub.PollInterval.String(),
 		defaultedCloneProtocol(cfg.GitHub.CloneProtocol),
@@ -566,7 +575,7 @@ func Save(cfg Config) error {
 			auto_delegate_enabled = excluded.auto_delegate_enabled,
 			updated_at = CURRENT_TIMESTAMP
 	`,
-		runmode.LocalDefaultTeamID,
+		teamID,
 		string(projectsJSON),
 		cfg.AI.ReprioritizeThreshold,
 		cfg.AI.PreferenceUpdateInterval,
@@ -615,7 +624,7 @@ func Save(cfg Config) error {
 				done_canonical = excluded.done_canonical,
 				updated_at = CURRENT_TIMESTAMP
 		`,
-			runmode.LocalDefaultTeamID, p.Key,
+			teamID, p.Key,
 			string(pickupJSON), string(inProgressJSON), nullIfEmpty(p.InProgress.Canonical),
 			string(doneJSON), nullIfEmpty(p.Done.Canonical),
 		); err != nil {
@@ -628,14 +637,14 @@ func Save(cfg Config) error {
 	if len(keys) == 0 {
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM jira_project_status_rules WHERE team_id = ?`,
-			runmode.LocalDefaultTeamID,
+			teamID,
 		); err != nil {
 			return fmt.Errorf("clear jira_project_status_rules: %w", err)
 		}
 	} else {
 		placeholders := make([]string, len(keys))
 		args := make([]any, 0, len(keys)+1)
-		args = append(args, runmode.LocalDefaultTeamID)
+		args = append(args, teamID)
 		for i, k := range keys {
 			placeholders[i] = "?"
 			args = append(args, k)

@@ -92,7 +92,7 @@ func (m *Manager) reportError(source, orgID string, err error) {
 func (m *Manager) RestartAll(ctx context.Context, orgID string) {
 	m.stopAll()
 
-	cfg, _ := config.Load()
+	cfg, _ := config.LoadLocal()
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 
 	m.startGitHub(cfg, creds)
@@ -109,7 +109,7 @@ func (m *Manager) RestartGitHub(ctx context.Context, orgID string) {
 	}
 	m.mu.Unlock()
 
-	cfg, _ := config.Load()
+	cfg, _ := config.LoadLocal()
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 	m.startGitHub(cfg, creds)
 }
@@ -124,7 +124,7 @@ func (m *Manager) RestartJira(ctx context.Context, orgID string) {
 	}
 	m.mu.Unlock()
 
-	cfg, _ := config.Load()
+	cfg, _ := config.LoadLocal()
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
 	m.startJira(cfg, creds)
 }

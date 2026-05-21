@@ -268,10 +268,10 @@ func TestSettingsPost_PerProjectRules_RoundTrip(t *testing.T) {
 			Done:       config.JiraStatusRule{Members: []string{"Resolved", "Verified"}, Canonical: "Resolved"},
 		},
 	}
-	if err := config.Save(cfg); err != nil {
+	if err := config.SaveLocal(cfg); err != nil {
 		t.Fatalf("config.Save: %v", err)
 	}
-	got, err := config.Load()
+	got, err := config.LoadLocal()
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
@@ -289,10 +289,10 @@ func TestSettingsPost_PerProjectRules_RoundTrip(t *testing.T) {
 			cfg.Jira.Projects[i].Pickup = config.JiraStatusRule{Members: []string{"Ready"}}
 		}
 	}
-	if err := config.Save(cfg); err != nil {
+	if err := config.SaveLocal(cfg); err != nil {
 		t.Fatalf("config.Save (edit SKY): %v", err)
 	}
-	got, err = config.Load()
+	got, err = config.LoadLocal()
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
@@ -312,10 +312,10 @@ func TestSettingsPost_PerProjectRules_RoundTrip(t *testing.T) {
 		}
 	}
 	cfg.Jira.Projects = kept
-	if err := config.Save(cfg); err != nil {
+	if err := config.SaveLocal(cfg); err != nil {
 		t.Fatalf("config.Save (drop SKY): %v", err)
 	}
-	got, err = config.Load()
+	got, err = config.LoadLocal()
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}

@@ -458,7 +458,7 @@ func (s *Spawner) Release(orgID, runID, userID string) error {
 	// handleAgentTakeover already requires this to work, so a release
 	// against a takeover that successfully created should also have
 	// access to the same config.
-	cfg, err := config.Load()
+	cfg, err := config.LoadLocal()
 	if err != nil {
 		return fmt.Errorf("load config for release: %w", err)
 	}

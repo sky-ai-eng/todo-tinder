@@ -368,7 +368,7 @@ func resolvedTakeoversDir(dataDir string) (string, error) {
 	fallback := filepath.Join(dataDir, "takeovers")
 
 	// Settings now live in the DB, so we have to open + init it before
-	// config.Load() can answer. Probe for the file first so a fresh
+	// config.LoadLocal() can answer. Probe for the file first so a fresh
 	// machine (no DB) doesn't materialize state we're about to delete.
 	dbPath := filepath.Join(dataDir, "triagefactory.db")
 	if _, err := os.Stat(dbPath); err != nil {
@@ -389,7 +389,7 @@ func resolvedTakeoversDir(dataDir string) (string, error) {
 		return fallback, err
 	}
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadLocal()
 	if err != nil {
 		return fallback, err
 	}

@@ -128,7 +128,8 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Persist base URLs in config so they survive without keychain access
-	cfg, _ := config.Load()
+	scope := config.FromContext(r.Context())
+	cfg, _ := scope.Load(r.Context())
 	if req.GitHubURL != "" {
 		cfg.GitHub.BaseURL = req.GitHubURL
 	}
@@ -138,7 +139,7 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 	if req.CloneProtocol == "ssh" || req.CloneProtocol == "https" {
 		cfg.GitHub.CloneProtocol = req.CloneProtocol
 	}
-	if err := config.Save(cfg); err != nil {
+	if err := scope.Save(r.Context(), cfg); err != nil {
 		log.Printf("[auth] warning: failed to save config: %v", err)
 	}
 

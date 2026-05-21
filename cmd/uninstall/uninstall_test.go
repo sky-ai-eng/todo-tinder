@@ -34,7 +34,7 @@ func TestResolvedTakeoversDir_ConfigOverride(t *testing.T) {
 	dataDir := filepath.Join(home, ".triagefactory")
 
 	// Settings live in the DB now — open + migrate + Init, then Save the
-	// override so resolvedTakeoversDir's downstream config.Load() sees it.
+	// override so resolvedTakeoversDir's downstream config.LoadLocal() sees it.
 	conn, err := db.Open()
 	if err != nil {
 		t.Fatalf("db.Open(): %v", err)
@@ -49,9 +49,9 @@ func TestResolvedTakeoversDir_ConfigOverride(t *testing.T) {
 	}
 	cfg := config.Default()
 	cfg.Server.TakeoverDir = "~/custom-takeovers"
-	if err := config.Save(cfg); err != nil {
+	if err := config.SaveLocal(cfg); err != nil {
 		conn.Close()
-		t.Fatalf("config.Save(): %v", err)
+		t.Fatalf("config.SaveLocal(): %v", err)
 	}
 	if err := conn.Close(); err != nil {
 		t.Fatalf("conn.Close(): %v", err)

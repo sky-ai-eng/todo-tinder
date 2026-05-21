@@ -696,7 +696,7 @@ func main() {
 			log.Printf("[clone-status] %s/%s clone failed: %v", owner, repo, cloneErr)
 
 			kind := "other"
-			if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+			if cfg, cErr := config.LoadLocal(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
 				// Use the configured GitHub host so GHE installs probe
 				// the right SSH endpoint, not github.com. Falls back to
 				// git@github.com when the URL is empty/unparseable.
@@ -1010,7 +1010,7 @@ func main() {
 		pollerMgr.StopAll()
 
 		ctx := context.Background()
-		cfg, _ := config.Load()
+		cfg, _ := config.LoadLocal()
 		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
 
 		if cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) {
@@ -1129,7 +1129,7 @@ func main() {
 	// return zero values and we'd hand an unauthenticated GitHub client to
 	// every downstream subsystem, then quietly log per-cycle 401s.
 	if runmode.Current() == runmode.ModeLocal {
-		cfg, _ := config.Load()
+		cfg, _ := config.LoadLocal()
 		ctx := context.Background()
 		orgID := runmode.LocalDefaultOrgID
 		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)

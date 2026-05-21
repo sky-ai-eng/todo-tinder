@@ -21,7 +21,7 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, _ := config.Load()
+	cfg, _ := config.FromContext(r.Context()).Load(r.Context())
 	baseURL := cfg.GitHub.BaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL

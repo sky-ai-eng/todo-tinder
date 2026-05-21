@@ -31,7 +31,7 @@ func Handle(args []string) {
 	}
 
 	// Open DB for local state (pending reviews, etc.). Config now lives
-	// in a settings row, so config.Load() requires an initialized DB —
+	// in a settings row, so config.LoadLocal() requires an initialized DB —
 	// open + migrate before calling Init/Load. Credentials follow the
 	// same path — the SecretStore is wired off the DB.
 	//
@@ -62,7 +62,7 @@ func Handle(args []string) {
 		fmt.Fprintf(os.Stderr, "error initializing config: %v\n", err)
 		os.Exit(1)
 	}
-	cfg, err := config.Load()
+	cfg, err := config.LoadLocal()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: loading config: %v (proceeding with defaults)\n", err)
 	}

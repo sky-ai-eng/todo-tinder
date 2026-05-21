@@ -104,7 +104,7 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 	// goroutine — so capturing it here matches actual semantics and
 	// avoids N redundant DB reads + YAML unmarshals.
 	preferSSH := false
-	if cfg, cErr := config.Load(); cErr != nil {
+	if cfg, cErr := config.LoadLocal(); cErr != nil {
 		log.Printf("[repoprofile] load config to pick clone protocol: %v (defaulting to HTTPS)", cErr)
 	} else {
 		preferSSH = cfg.GitHub.CloneProtocol == "ssh"

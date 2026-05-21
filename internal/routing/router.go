@@ -361,7 +361,7 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	// in SKY-189 (collapse on (task_id, trigger_id) covers the same case
 	// the cooldown was protecting against). Triggers with
 	// min_autonomy_suitability > 0 still defer to post-scoring re-derive.
-	if cfg, err := config.Load(); err == nil && cfg.AI.AutoDelegateEnabled {
+	if cfg, err := config.LoadLocal(); err == nil && cfg.AI.AutoDelegateEnabled {
 		for teamID, triggers := range teamTriggers {
 			task, ok := tasksByTeam[teamID]
 			if !ok {
@@ -927,7 +927,7 @@ func (r *Router) revertTaskStatus(orgID, taskID, status string) {
 // tenant.
 func (r *Router) ReDeriveAfterScoring(orgID string, taskIDs []string) {
 	// Global kill switch — same gate as HandleEvent step 9.
-	cfg, err := config.Load()
+	cfg, err := config.LoadLocal()
 	if err != nil || !cfg.AI.AutoDelegateEnabled {
 		return
 	}

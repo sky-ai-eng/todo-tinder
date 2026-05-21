@@ -1233,7 +1233,7 @@ func TestProjectCreate_AcceptsTrackerKeys(t *testing.T) {
 	s := newTestServer(t)
 	cfg := config.Default()
 	cfg.Jira.Projects = []config.JiraProjectConfig{validProject("SKY")}
-	if err := config.Save(cfg); err != nil {
+	if err := config.SaveLocal(cfg); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
 

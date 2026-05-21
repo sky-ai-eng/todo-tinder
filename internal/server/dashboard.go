@@ -116,7 +116,7 @@ func (s *Server) handleDashboardPRStatus(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub not configured"})
 		return
 	}
-	cfg, _ := config.Load()
+	cfg, _ := config.FromContext(r.Context()).Load(r.Context())
 	baseURL := cfg.GitHub.BaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL
@@ -166,7 +166,7 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	userID := ClaimsFrom(r.Context()).Subject
 
 	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	cfg, _ := config.Load()
+	cfg, _ := config.FromContext(r.Context()).Load(r.Context())
 	baseURL := cfg.GitHub.BaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL

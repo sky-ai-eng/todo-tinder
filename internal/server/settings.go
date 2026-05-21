@@ -195,7 +195,7 @@ type aiSettings struct {
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
-	cfg, err := config.Load()
+	cfg, err := config.FromContext(r.Context()).Load(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
@@ -306,7 +306,8 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load existing state — snapshot for change detection
-	cfg, err := config.Load()
+	scope := config.FromContext(r.Context())
+	cfg, err := scope.Load(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
@@ -598,7 +599,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
 		return
 	}
-	if err := config.Save(cfg); err != nil {
+	if err := scope.Save(r.Context(), cfg); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save config: " + err.Error()})
 		return
 	}
@@ -676,7 +677,8 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load credentials: " + err.Error()})
 		return
 	}
-	cfg, err := config.Load()
+	scope := config.FromContext(r.Context())
+	cfg, err := scope.Load(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
@@ -691,7 +693,7 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
 		return
 	}
-	if err := config.Save(cfg); err != nil {
+	if err := scope.Save(r.Context(), cfg); err != nil {
 		// Roll back keychain to avoid creds/config desync. Use Delete
 		// rather than rewriting with empty strings — integrations.Save
 		// skips empty values, so the rollback has to issue an explicit
@@ -728,7 +730,7 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 
 	projects := r.URL.Query()["project"]
 	if len(projects) == 0 {
-		cfg, _ := config.Load()
+		cfg, _ := config.FromContext(r.Context()).Load(r.Context())
 		projects = cfg.Jira.ProjectKeys()
 	}
 	if len(projects) == 0 {

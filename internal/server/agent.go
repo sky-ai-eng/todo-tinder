@@ -143,7 +143,7 @@ func (s *Server) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := config.Load()
+	cfg, err := config.FromContext(r.Context()).Load(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("load config: %v", err)})
 		return

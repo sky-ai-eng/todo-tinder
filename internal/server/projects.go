@@ -97,7 +97,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	// though that field's validation never reads it.
 	cfg := config.Config{}
 	if jiraKey != "" {
-		loaded, err := config.Load()
+		loaded, err := config.FromContext(r.Context()).Load(r.Context())
 		if err != nil {
 			log.Printf("handleProjectCreate: failed to load config: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config"})
@@ -489,7 +489,7 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		if jiraInput == "" {
 			updated.JiraProjectKey = ""
 		} else {
-			cfg, err := config.Load()
+			cfg, err := config.FromContext(r.Context()).Load(r.Context())
 			if err != nil {
 				log.Printf("[projects] patch: config load: %v", err)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config"})
