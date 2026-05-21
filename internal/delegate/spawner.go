@@ -62,6 +62,15 @@ type Spawner struct {
 	// CLI; the defer iterates and removes them). Goroutine-internal
 	// callers, all routed through the admin-pool System variants.
 	runWorktrees db.RunWorktreeStore
+	// orgs reads per-org settings (GitHub clone protocol) from
+	// org_settings during run setup. Post-internal/config deletion;
+	// every per-org read goes through OrgsStore.GetSettingsSystem
+	// (no JWT claims context on the run goroutine).
+	orgs db.OrgsStore
+	// takeoverDir is the resolved filesystem path takeover worktrees
+	// live under. Read once at boot from instance_config; passed via
+	// the constructor so Release/takeover.go don't re-read settings.
+	takeoverDir string
 	// tx runs synthetic-claims write batches for manual runs (the
 	// run's creator_user_id is the synthetic claim subject, so RLS
 	// policies on the writes pass under tf_app). Event-triggered runs
@@ -98,7 +107,7 @@ type Spawner struct {
 	stores *db.Stores
 }
 
-func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, chains db.ChainStore, tasks db.TaskStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, events db.EventStore, taskMemory db.TaskMemoryStore, runWorktrees db.RunWorktreeStore, tx db.TxRunner, ghClient *ghclient.Client, wsHub *websocket.Hub, model string) *Spawner {
+func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, chains db.ChainStore, tasks db.TaskStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, events db.EventStore, taskMemory db.TaskMemoryStore, runWorktrees db.RunWorktreeStore, orgs db.OrgsStore, tx db.TxRunner, ghClient *ghclient.Client, wsHub *websocket.Hub, model, takeoverDir string) *Spawner {
 	return &Spawner{
 		database:     database,
 		prompts:      prompts,
@@ -112,14 +121,31 @@ func NewSpawner(database *sql.DB, prompts db.PromptStore, agents db.AgentStore, 
 		events:       events,
 		taskMemory:   taskMemory,
 		runWorktrees: runWorktrees,
+		orgs:         orgs,
 		tx:           tx,
 		ghClient:     ghClient,
 		wsHub:        wsHub,
 		model:        model,
+		takeoverDir:  takeoverDir,
 		cancels:      make(map[string]context.CancelFunc),
 		takenOver:    make(map[string]bool),
 		chainRunIDs:  make(map[string]bool),
 	}
+}
+
+// useSSHCloneProtocol returns true when the per-org GitHub clone
+// protocol is "ssh". orgs is nil-safe and any store failure logs +
+// defaults to HTTPS, matching the prior config.Load() degrade path.
+func (s *Spawner) useSSHCloneProtocol(ctx context.Context, orgID, runID string) bool {
+	if s.orgs == nil {
+		return false
+	}
+	settings, err := s.orgs.GetSettingsSystem(ctx, orgID)
+	if err != nil {
+		log.Printf("[delegate] load org settings to pick clone protocol for run %s: %v (defaulting to HTTPS)", runID, err)
+		return false
+	}
+	return settings.GitHubCloneProtocol == "ssh"
 }
 
 // SetStores hands the per-run agenthost daemon's store bundle to the

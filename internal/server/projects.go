@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/curator"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -89,30 +88,6 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	jiraKey := strings.TrimSpace(req.JiraProjectKey)
 	linearKey := strings.TrimSpace(req.LinearProjectKey)
-	// Mirror the PATCH path's lazy-load policy: only read config
-	// when the Jira side actually needs validation. Linear validation
-	// rejects non-empty regardless of cfg (integration not configured
-	// yet), so loading config for a Linear-only POST would turn a
-	// deterministic 400 into a 500 if config.yaml is broken — even
-	// though that field's validation never reads it.
-	cfg := config.Config{}
-	if jiraKey != "" {
-		loaded, err := config.Load()
-		if err != nil {
-			log.Printf("handleProjectCreate: failed to load config: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config"})
-			return
-		}
-		cfg = loaded
-	}
-	if jiraKey != "" || linearKey != "" {
-		var errMsg string
-		jiraKey, linearKey, errMsg = validateTrackerKeys(cfg, jiraKey, linearKey)
-		if errMsg != "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
-			return
-		}
-	}
 
 	teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
 	if err != nil {
@@ -122,6 +97,27 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	if teamID == "" {
 		internalError(w, "projects", fmt.Errorf("org %s has no default team", orgID))
 		return
+	}
+
+	// Mirror the PATCH path's lazy-load policy: only read team Jira
+	// rules when the Jira side actually needs validation. Linear is
+	// rejected regardless of stored rules.
+	var teamJiraRules []domain.JiraProjectStatusRules
+	if jiraKey != "" {
+		teamJiraRules, err = s.jiraRules.ListForTeamSystem(r.Context(), teamID)
+		if err != nil {
+			log.Printf("handleProjectCreate: failed to load Jira rules: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira rules"})
+			return
+		}
+	}
+	if jiraKey != "" || linearKey != "" {
+		var errMsg string
+		jiraKey, linearKey, errMsg = validateTrackerKeys(teamJiraRules, jiraKey, linearKey)
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+			return
+		}
 	}
 
 	// Default the spec-authorship skill to the seeded system prompt
@@ -470,32 +466,40 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		updated.PinnedRepos = pinned
 	}
 	// Validate only the fields the client sent. Re-validating the
-	// untouched side against the current config would surface a
-	// confusing error if the config drifted (e.g. a Jira project
-	// got renamed in Settings) on an unrelated PATCH that's only
-	// touching, say, the Linear key. The handler's contract is
+	// untouched side against the current rules would surface a
+	// confusing error if the team's Jira config drifted (e.g. a
+	// project got renamed in Settings) on an unrelated PATCH that's
+	// only touching, say, the Linear key. The handler's contract is
 	// "validate what the client asked to change," not "re-validate
 	// the whole row on every PATCH."
 	//
-	// Config is loaded lazily — and only when the Jira side is being
+	// Rules are loaded lazily — and only when the Jira side is being
 	// set to a non-empty value. Clearing either tracker, or setting
-	// Linear at all, never reads config: validateTrackerKeys with an
-	// empty Jira input doesn't consult cfg, and Linear validation
-	// rejects non-empty regardless of cfg. This keeps a malformed
-	// config.yaml from 500-ing requests like `{"linear_project_key":""}`
+	// Linear at all, never reads them: validateTrackerKeys with an
+	// empty Jira input doesn't consult rules, and Linear validation
+	// rejects non-empty regardless of rules. This keeps a transient
+	// DB hiccup from 500-ing requests like `{"linear_project_key":""}`
 	// that have nothing to do with Jira.
 	if req.JiraProjectKey != nil {
 		jiraInput := strings.TrimSpace(*req.JiraProjectKey)
 		if jiraInput == "" {
 			updated.JiraProjectKey = ""
 		} else {
-			cfg, err := config.Load()
-			if err != nil {
-				log.Printf("[projects] patch: config load: %v", err)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config"})
+			teamID, terr := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+			if terr != nil || teamID == "" {
+				if terr != nil {
+					log.Printf("[projects] patch: default team lookup: %v", terr)
+				}
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to resolve default team"})
 				return
 			}
-			jiraKey, _, errMsg := validateTrackerKeys(cfg, *req.JiraProjectKey, "")
+			teamRules, rerr := s.jiraRules.ListForTeamSystem(r.Context(), teamID)
+			if rerr != nil {
+				log.Printf("[projects] patch: jira rules load: %v", rerr)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load Jira rules"})
+				return
+			}
+			jiraKey, _, errMsg := validateTrackerKeys(teamRules, *req.JiraProjectKey, "")
 			if errMsg != "" {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 				return
@@ -504,12 +508,12 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.LinearProjectKey != nil {
-		// Linear is rejected if non-empty regardless of config; the
-		// empty-cfg argument below makes the no-cfg-needed contract
-		// explicit. When the Linear integration ships, this branch
-		// will need a config.Load() of its own — but only when the
-		// input is non-empty, mirroring the Jira pattern above.
-		_, linearKey, errMsg := validateTrackerKeys(config.Config{}, "", *req.LinearProjectKey)
+		// Linear is rejected if non-empty regardless of rules; passing
+		// nil for the team rules makes the no-rules-needed contract
+		// explicit. When the Linear integration ships, this branch will
+		// need its own rule lookup — but only when the input is
+		// non-empty, mirroring the Jira pattern above.
+		_, linearKey, errMsg := validateTrackerKeys(nil, "", *req.LinearProjectKey)
 		if errMsg != "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
 			return
@@ -777,21 +781,20 @@ func validatePinnedRepos(ctx context.Context, repos db.RepoStore, orgID string, 
 
 // validateTrackerKeys validates jira_project_key and linear_project_key
 // independently. Each is optional; when non-empty, jira_project_key
-// must be present in cfg.Jira.Projects (the user-curated list set up
-// in Settings) and linear_project_key is rejected outright until the
-// Linear integration ships. The Jira key is normalized via
-// normalizeJiraProjectKey (TrimSpace + ToUpper) to match the canonical
-// form persisted by handleSettingsPost — without ToUpper, a stored
-// "SKY" would silently fail to match an inbound "sky".
+// must be present in the team's configured Jira project rules and
+// linear_project_key is rejected outright until the Linear integration
+// ships. The Jira key is normalized via normalizeJiraProjectKey
+// (TrimSpace + ToUpper) to match the canonical form persisted by
+// handleSettingsPost — without ToUpper, a stored "SKY" would silently
+// fail to match an inbound "sky".
 //
-// Takes cfg as a parameter rather than calling config.Load() directly
-// so the function is testable in isolation and so a single PATCH/POST
-// only reads the config file once even when both fields need
-// validating.
+// Takes the team's rules as a parameter so the function is testable in
+// isolation and so a single PATCH/POST only reads them once even when
+// both fields need validating.
 //
 // Returns the normalized values and an empty error string on success,
 // or two empty strings and an error message on failure.
-func validateTrackerKeys(cfg config.Config, jiraKey, linearKey string) (string, string, string) {
+func validateTrackerKeys(teamRules []domain.JiraProjectStatusRules, jiraKey, linearKey string) (string, string, string) {
 	jiraNorm := normalizeJiraProjectKey(jiraKey)
 	linearNorm := strings.TrimSpace(linearKey)
 
@@ -807,8 +810,8 @@ func validateTrackerKeys(cfg config.Config, jiraKey, linearKey string) (string, 
 	if jiraNorm == "" {
 		return "", "", ""
 	}
-	for _, p := range cfg.Jira.Projects {
-		if p.Key == jiraNorm {
+	for _, p := range teamRules {
+		if p.ProjectKey == jiraNorm {
 			return jiraNorm, "", ""
 		}
 	}

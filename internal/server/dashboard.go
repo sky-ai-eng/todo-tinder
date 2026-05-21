@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -116,8 +115,8 @@ func (s *Server) handleDashboardPRStatus(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GitHub not configured"})
 		return
 	}
-	cfg, _ := config.Load()
-	baseURL := cfg.GitHub.BaseURL
+	orgSet, _ := s.orgs.GetSettingsSystem(r.Context(), orgID)
+	baseURL := orgSet.GitHubBaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL
 	}
@@ -166,8 +165,8 @@ func (s *Server) handleDashboardPRDraft(w http.ResponseWriter, r *http.Request) 
 	userID := ClaimsFrom(r.Context()).Subject
 
 	creds, _ := integrations.Load(r.Context(), s.secrets, orgID)
-	cfg, _ := config.Load()
-	baseURL := cfg.GitHub.BaseURL
+	orgSet, _ := s.orgs.GetSettingsSystem(r.Context(), orgID)
+	baseURL := orgSet.GitHubBaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL
 	}

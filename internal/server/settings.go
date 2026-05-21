@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
@@ -35,6 +35,35 @@ func normalizeJiraProjectKey(s string) string {
 	return strings.ToUpper(strings.TrimSpace(s))
 }
 
+// jiraStatusRule is the wire shape for a single status rule (pickup,
+// in-progress, or done). Local to this package now that internal/
+// config is gone; mirrors the prior config.JiraStatusRule view.
+type jiraStatusRule struct {
+	Members   []string `json:"members"`
+	Canonical string   `json:"canonical,omitempty"`
+}
+
+// Contains reports whether the given status is a member of the rule.
+func (r jiraStatusRule) Contains(status string) bool {
+	for _, m := range r.Members {
+		if m == status {
+			return true
+		}
+	}
+	return false
+}
+
+// jiraProjectConfig is the per-project wire shape for the settings
+// handler. Three status rules — pickup, in-progress, done — keyed by
+// project_key. Mirrors what the deleted config.JiraProjectConfig
+// exposed.
+type jiraProjectConfig struct {
+	Key        string         `json:"key"`
+	Pickup     jiraStatusRule `json:"pickup"`
+	InProgress jiraStatusRule `json:"in_progress"`
+	Done       jiraStatusRule `json:"done"`
+}
+
 // validateProjectRules enforces the per-project invariant that every
 // persisted project carries fully-populated Pickup/InProgress/Done
 // rules. The jpsr_*_populated CHECK constraints in the baseline are
@@ -45,7 +74,7 @@ func normalizeJiraProjectKey(s string) string {
 // to pickup). InProgress/Done: members + canonical required, and the
 // canonical must itself be a member (PG CHECK can't subquery, so this
 // check stays in Go).
-func validateProjectRules(p config.JiraProjectConfig) error {
+func validateProjectRules(p jiraProjectConfig) error {
 	if len(p.Pickup.Members) == 0 {
 		return fmt.Errorf("project %s: pickup members are required", p.Key)
 	}
@@ -54,7 +83,7 @@ func validateProjectRules(p config.JiraProjectConfig) error {
 	}
 	for _, r := range []struct {
 		name string
-		rule config.JiraStatusRule
+		rule jiraStatusRule
 	}{
 		{"in_progress", p.InProgress},
 		{"done", p.Done},
@@ -82,30 +111,27 @@ func normalizeMembers(members []string) []string {
 
 // ruleEqual compares two status rules by value. Used by change detection to
 // decide whether a Jira poller restart is needed. Nil-safe on the Members slice.
-func ruleEqual(a, b config.JiraStatusRule) bool {
+func ruleEqual(a, b jiraStatusRule) bool {
 	return a.Canonical == b.Canonical &&
 		slices.Equal(normalizeMembers(a.Members), normalizeMembers(b.Members))
 }
 
 // cloneJiraProjects returns a deep copy so the pre-change snapshot
-// stays stable while the handler mutates cfg.Jira.Projects. The
-// per-project Members slices share backing arrays with the originals
-// otherwise, which silently makes the "did this change?" diff a
-// no-op against itself.
-func cloneJiraProjects(in []config.JiraProjectConfig) []config.JiraProjectConfig {
-	out := make([]config.JiraProjectConfig, len(in))
+// stays stable while the handler mutates the desired project list.
+func cloneJiraProjects(in []jiraProjectConfig) []jiraProjectConfig {
+	out := make([]jiraProjectConfig, len(in))
 	for i, p := range in {
-		out[i] = config.JiraProjectConfig{
+		out[i] = jiraProjectConfig{
 			Key: p.Key,
-			Pickup: config.JiraStatusRule{
+			Pickup: jiraStatusRule{
 				Members:   slices.Clone(p.Pickup.Members),
 				Canonical: p.Pickup.Canonical,
 			},
-			InProgress: config.JiraStatusRule{
+			InProgress: jiraStatusRule{
 				Members:   slices.Clone(p.InProgress.Members),
 				Canonical: p.InProgress.Canonical,
 			},
-			Done: config.JiraStatusRule{
+			Done: jiraStatusRule{
 				Members:   slices.Clone(p.Done.Members),
 				Canonical: p.Done.Canonical,
 			},
@@ -118,7 +144,7 @@ func cloneJiraProjects(in []config.JiraProjectConfig) []config.JiraProjectConfig
 // order as significant (the user-facing UI keeps projects in the order
 // they were added; reordering counts as a change worth restarting the
 // poller for). Rules are compared with set-equality on Members.
-func jiraProjectsEqual(a, b []config.JiraProjectConfig) bool {
+func jiraProjectsEqual(a, b []jiraProjectConfig) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -135,20 +161,66 @@ func jiraProjectsEqual(a, b []config.JiraProjectConfig) bool {
 	return true
 }
 
-// defaultedCloneProtocol normalizes a stored CloneProtocol value for the
-// API surface using the same effective semantics as backend clone URL
-// selection: only the literal value "ssh" selects SSH; empty, "https",
-// and any other invalid/stale value are treated as HTTPS. Clients should
-// always see one of the two known forms.
-func defaultedCloneProtocol(stored string) string {
+// rulesToProjectConfigs converts the domain shape returned by the
+// JiraStatusRulesStore into the wire shape used by the settings
+// handler. Empty input yields a nil slice so the caller can treat
+// "no rules" as the natural zero value.
+func rulesToProjectConfigs(rules []domain.JiraProjectStatusRules) []jiraProjectConfig {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]jiraProjectConfig, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, jiraProjectConfig{
+			Key: r.ProjectKey,
+			Pickup: jiraStatusRule{
+				Members: slices.Clone(r.PickupMembers),
+			},
+			InProgress: jiraStatusRule{
+				Members:   slices.Clone(r.InProgressMembers),
+				Canonical: r.InProgressCanonical,
+			},
+			Done: jiraStatusRule{
+				Members:   slices.Clone(r.DoneMembers),
+				Canonical: r.DoneCanonical,
+			},
+		})
+	}
+	return out
+}
+
+// projectConfigsToRules is the inverse of rulesToProjectConfigs. Used
+// by handleSettingsPost when persisting the team's project list back
+// to jira_project_status_rules via JiraStatusRulesStore.ReplaceForTeam.
+func projectConfigsToRules(projects []jiraProjectConfig) []domain.JiraProjectStatusRules {
+	out := make([]domain.JiraProjectStatusRules, 0, len(projects))
+	for _, p := range projects {
+		out = append(out, domain.JiraProjectStatusRules{
+			ProjectKey:          p.Key,
+			PickupMembers:       slices.Clone(p.Pickup.Members),
+			InProgressMembers:   slices.Clone(p.InProgress.Members),
+			InProgressCanonical: p.InProgress.Canonical,
+			DoneMembers:         slices.Clone(p.Done.Members),
+			DoneCanonical:       p.Done.Canonical,
+		})
+	}
+	return out
+}
+
+// defaultedCloneProtocolView normalizes a stored CloneProtocol value
+// for the API surface using the same effective semantics as backend
+// clone URL selection: only the literal value "ssh" selects SSH;
+// empty, "https", and any other invalid/stale value are treated as
+// HTTPS. Clients should always see one of the two known forms.
+func defaultedCloneProtocolView(stored string) string {
 	if stored == "ssh" {
 		return "ssh"
 	}
 	return "https"
 }
 
-// settingsResponse combines config values with auth status so the frontend
-// can render everything on one page.
+// settingsResponse combines settings values with auth status so the
+// frontend can render everything on one page.
 type settingsResponse struct {
 	GitHub githubSettings `json:"github"`
 	Jira   jiraSettings   `json:"jira"`
@@ -173,14 +245,13 @@ type jiraSettings struct {
 }
 
 // jiraProjectSettings is the per-project wire shape. Mirrors
-// config.JiraProjectConfig but with explicit empty-slice
-// initialization so the JSON response always carries members:[] rather
-// than members:null.
+// jiraProjectConfig but with explicit empty-slice initialization so the
+// JSON response always carries members:[] rather than members:null.
 type jiraProjectSettings struct {
-	Key        string                `json:"key"`
-	Pickup     config.JiraStatusRule `json:"pickup"`
-	InProgress config.JiraStatusRule `json:"in_progress"`
-	Done       config.JiraStatusRule `json:"done"`
+	Key        string         `json:"key"`
+	Pickup     jiraStatusRule `json:"pickup"`
+	InProgress jiraStatusRule `json:"in_progress"`
+	Done       jiraStatusRule `json:"done"`
 }
 
 type serverSettings struct {
@@ -194,13 +265,41 @@ type aiSettings struct {
 	AutoDelegateEnabled      bool   `json:"auto_delegate_enabled"`
 }
 
-func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
-	cfg, err := config.Load()
+// loadSettingsView reads org, team, and per-team Jira rules for the
+// requesting tenant and folds them into the legacy combined view the
+// handler exposes. SKY-357 will split this into per-scope endpoints;
+// until then the single-endpoint shape is preserved.
+func (s *Server) loadSettingsView(ctx context.Context, orgID string) (orgSet domain.OrgSettings, teamSet domain.TeamSettings, projects []jiraProjectConfig, teamID string, err error) {
+	orgSet, err = s.orgs.GetSettingsSystem(ctx, orgID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
 		return
 	}
+	teamID, err = s.teams.GetDefaultForOrgSystem(ctx, orgID)
+	if err != nil {
+		return
+	}
+	if teamID != "" {
+		teamSet, err = s.teams.GetSettingsSystem(ctx, teamID)
+		if err != nil {
+			return
+		}
+		var rules []domain.JiraProjectStatusRules
+		rules, err = s.jiraRules.ListForTeamSystem(ctx, teamID)
+		if err != nil {
+			return
+		}
+		projects = rulesToProjectConfigs(rules)
+	}
+	return
+}
+
+func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	orgID := OrgIDFrom(r.Context())
+	orgSet, teamSet, projects, _, err := s.loadSettingsView(r.Context(), orgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load settings: " + err.Error()})
+		return
+	}
 	creds, _ := integrations.Load(r.Context(), s.secrets, orgID) // store errors are non-fatal (keychain may be empty)
 
 	resp := settingsResponse{
@@ -208,24 +307,24 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 			Enabled:       creds.GitHubPAT != "",
 			BaseURL:       creds.GitHubURL,
 			HasToken:      creds.GitHubPAT != "",
-			PollInterval:  cfg.GitHub.PollInterval.String(),
-			CloneProtocol: defaultedCloneProtocol(cfg.GitHub.CloneProtocol),
+			PollInterval:  orgSet.GitHubPollInterval.String(),
+			CloneProtocol: defaultedCloneProtocolView(orgSet.GitHubCloneProtocol),
 		},
 		Jira: jiraSettings{
 			Enabled:      creds.JiraPAT != "",
 			BaseURL:      creds.JiraURL,
 			HasToken:     creds.JiraPAT != "",
-			PollInterval: cfg.Jira.PollInterval.String(),
-			Projects:     toJiraProjectSettings(cfg.Jira.Projects),
+			PollInterval: orgSet.JiraPollInterval.String(),
+			Projects:     toJiraProjectSettings(projects),
 		},
 		Server: serverSettings{
-			Port: cfg.Server.Port,
+			Port: 0, // deployment-scope; read directly from instance_config at boot — not surfaced per-request anymore
 		},
 		AI: aiSettings{
-			Model:                    cfg.AI.Model,
-			ReprioritizeThreshold:    cfg.AI.ReprioritizeThreshold,
-			PreferenceUpdateInterval: cfg.AI.PreferenceUpdateInterval,
-			AutoDelegateEnabled:      cfg.AI.AutoDelegateEnabled,
+			Model:                    teamSet.DefaultModel,
+			ReprioritizeThreshold:    teamSet.AIReprioritizeThreshold,
+			PreferenceUpdateInterval: teamSet.AIPreferenceUpdateInterval,
+			AutoDelegateEnabled:      teamSet.AutoDelegateEnabled,
 		},
 	}
 
@@ -236,10 +335,10 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// toJiraProjectSettings converts the persisted Config view into the
-// wire shape, normalizing nil Members slices to empty slices so the
-// JSON response is friendly to FE consumers (no `members:null`).
-func toJiraProjectSettings(in []config.JiraProjectConfig) []jiraProjectSettings {
+// toJiraProjectSettings converts the persisted view into the wire
+// shape, normalizing nil Members slices to empty slices so the JSON
+// response is friendly to FE consumers (no `members:null`).
+func toJiraProjectSettings(in []jiraProjectConfig) []jiraProjectSettings {
 	out := make([]jiraProjectSettings, 0, len(in))
 	for _, p := range in {
 		out = append(out, jiraProjectSettings{
@@ -255,7 +354,7 @@ func toJiraProjectSettings(in []config.JiraProjectConfig) []jiraProjectSettings 
 // normalizeRule replaces a nil Members slice with an empty one so the
 // JSON encoding is `[]` rather than `null`. Canonical and other fields
 // pass through unchanged.
-func normalizeRule(r config.JiraStatusRule) config.JiraStatusRule {
+func normalizeRule(r jiraStatusRule) jiraStatusRule {
 	if r.Members == nil {
 		r.Members = []string{}
 	}
@@ -283,7 +382,7 @@ type settingsUpdateRequest struct {
 	JiraProjects   *[]jiraProjectSettings `json:"jira_projects,omitempty"`
 	AIModel        string                 `json:"ai_model"`
 	AIAutoDelegate *bool                  `json:"ai_auto_delegate_enabled"` // pointer to distinguish absent from false
-	ServerPort     int                    `json:"server_port"`
+	ServerPort     int                    `json:"server_port"`              // accepted for compat; deployment-scope, not persisted via this handler post-internal/config deletion
 }
 
 func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
@@ -306,9 +405,13 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load existing state — snapshot for change detection
-	cfg, err := config.Load()
+	orgSet, teamSet, projects, teamID, err := s.loadSettingsView(r.Context(), orgID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load settings: " + err.Error()})
+		return
+	}
+	if teamID == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "org has no default team"})
 		return
 	}
 	creds, _ := integrations.Load(r.Context(), s.secrets, orgID) // store errors are non-fatal
@@ -323,12 +426,12 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	// Snapshot pre-change values for diffing
 	prevGHURL := creds.GitHubURL
 	prevGHPAT := creds.GitHubPAT
-	prevGHPollInterval := cfg.GitHub.PollInterval
-	prevGHCloneProtocol := cfg.GitHub.CloneProtocol
+	prevGHPollInterval := orgSet.GitHubPollInterval
+	prevGHCloneProtocol := orgSet.GitHubCloneProtocol
 	prevJiraURL := creds.JiraURL
 	prevJiraPAT := creds.JiraPAT
-	prevJiraProjects := cloneJiraProjects(cfg.Jira.Projects)
-	prevJiraPollInterval := cfg.Jira.PollInterval
+	prevJiraProjects := cloneJiraProjects(projects)
+	prevJiraPollInterval := orgSet.JiraPollInterval
 
 	// --- Handle GitHub ---
 	//
@@ -337,7 +440,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	// or backfill an empty row.
 	if req.GitHubEnabled {
 		if req.GitHubURL != "" {
-			cfg.GitHub.BaseURL = req.GitHubURL
+			orgSet.GitHubBaseURL = req.GitHubURL
 			creds.GitHubURL = req.GitHubURL
 		}
 		// New token provided — validate it.
@@ -385,7 +488,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			} else if stored == "" {
 				url := creds.GitHubURL
 				if url == "" {
-					url = cfg.GitHub.BaseURL
+					url = orgSet.GitHubBaseURL
 				}
 				if url != "" {
 					if ghUser, err := auth.ValidateGitHub(url, creds.GitHubPAT); err == nil {
@@ -406,7 +509,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		// destructive action (not implemented in v1).
 		creds.GitHubURL = ""
 		creds.GitHubPAT = ""
-		cfg.GitHub.BaseURL = ""
+		orgSet.GitHubBaseURL = ""
 		if err := integrations.ClearGitHub(r.Context(), s.secrets, orgID); err != nil {
 			log.Printf("[settings] failed to clear GitHub keychain entry: %v", err)
 		}
@@ -436,7 +539,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	// --- Handle Jira ---
 	if req.JiraEnabled {
 		if req.JiraURL != "" {
-			cfg.Jira.BaseURL = req.JiraURL
+			orgSet.JiraBaseURL = req.JiraURL
 			creds.JiraURL = req.JiraURL
 		}
 		if req.JiraPAT != "" {
@@ -470,7 +573,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		// Soft disconnect — keep entities/tasks/runs/memory intact.
 		creds.JiraURL = ""
 		creds.JiraPAT = ""
-		cfg.Jira.BaseURL = ""
+		orgSet.JiraBaseURL = ""
 		if err := integrations.ClearJira(r.Context(), s.secrets, orgID); err != nil {
 			log.Printf("[settings] failed to clear Jira keychain entry: %v", err)
 		}
@@ -496,7 +599,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	// --- Update config fields ---
 	if req.GitHubPollInterval != "" {
 		if d, err := time.ParseDuration(req.GitHubPollInterval); err == nil && d >= 10*time.Second {
-			cfg.GitHub.PollInterval = d
+			orgSet.GitHubPollInterval = d
 		}
 	}
 	// Empty string means "don't touch" so the toggle UX (which always
@@ -509,23 +612,24 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "github_clone_protocol must be 'ssh' or 'https'"})
 			return
 		}
-		cfg.GitHub.CloneProtocol = req.GitHubCloneProtocol
+		orgSet.GitHubCloneProtocol = req.GitHubCloneProtocol
 	}
 	if req.JiraPollInterval != "" {
 		if d, err := time.ParseDuration(req.JiraPollInterval); err == nil && d >= 10*time.Second {
-			cfg.Jira.PollInterval = d
+			orgSet.JiraPollInterval = d
 		}
 	}
 	// JiraProjects carries the full per-project array. Validation runs
 	// over each entry's rules before any mutation — one bad rule rejects
-	// the whole request so cfg never lands in a partial state. Keys are
-	// normalized (trim + uppercase) and regex-validated against Jira's
-	// own project-key shape; duplicates after normalization are rejected
-	// so "SKY" and "sky" can't both land. Rule completeness is enforced
-	// by validateProjectRules — partial saves are not a supported state.
+	// the whole request so projects never lands in a partial state. Keys
+	// are normalized (trim + uppercase) and regex-validated against
+	// Jira's own project-key shape; duplicates after normalization are
+	// rejected so "SKY" and "sky" can't both land. Rule completeness is
+	// enforced by validateProjectRules — partial saves are not a
+	// supported state.
 	if req.JiraProjects != nil {
 		seen := map[string]bool{}
-		next := make([]config.JiraProjectConfig, 0, len(*req.JiraProjects))
+		next := make([]jiraProjectConfig, 0, len(*req.JiraProjects))
 		for _, p := range *req.JiraProjects {
 			key := normalizeJiraProjectKey(p.Key)
 			if key == "" {
@@ -543,7 +647,7 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			seen[key] = true
-			normalized := config.JiraProjectConfig{
+			normalized := jiraProjectConfig{
 				Key:        key,
 				Pickup:     p.Pickup,
 				InProgress: p.InProgress,
@@ -555,29 +659,34 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 			}
 			next = append(next, normalized)
 		}
-		cfg.Jira.Projects = next
+		projects = next
 	}
 	if req.AIModel != "" {
-		cfg.AI.Model = req.AIModel
+		teamSet.DefaultModel = req.AIModel
 	}
 	if req.AIAutoDelegate != nil {
-		cfg.AI.AutoDelegateEnabled = *req.AIAutoDelegate
+		teamSet.AutoDelegateEnabled = *req.AIAutoDelegate
 	}
-	if req.ServerPort > 0 {
-		cfg.Server.Port = req.ServerPort
-	}
+	// req.ServerPort is accepted but ignored: server port is deployment
+	// scope (instance_config), read once at boot in main.go and not
+	// editable through this handler. SKY-357's settings split makes the
+	// boundary explicit; until then we just drop the field.
+
+	// JiraProjects is also denormalized onto team_settings.jira_projects
+	// as the fast path "which projects to poll" without joining.
+	teamSet.JiraProjects = projectKeysFromConfigs(projects)
 
 	// Hard-block a transition into SSH mode if our preflight against
 	// the configured GitHub host can't authenticate. Otherwise the
 	// toggle would "succeed" silently — repairOriginURL is a local
-	// config write that doesn't test connectivity, so the failure
+	// settings write that doesn't test connectivity, so the failure
 	// wouldn't surface until the next poll/delegation tries to fetch.
 	// Only gate the transition (prev != "ssh") so a user with broken
 	// SSH today can still save unrelated fields without being held
 	// hostage to fix SSH first; switching AWAY from SSH is also
 	// unblocked. Probe target is derived from creds.GitHubURL so GHE
 	// users see hints with their hostname, not "github.com".
-	if cfg.GitHub.CloneProtocol == "ssh" && prevGHCloneProtocol != "ssh" {
+	if orgSet.GitHubCloneProtocol == "ssh" && prevGHCloneProtocol != "ssh" {
 		sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		err := worktree.PreflightSSH(ctx, sshHost)
@@ -598,8 +707,16 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
 		return
 	}
-	if err := config.Save(cfg); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save config: " + err.Error()})
+	if err := s.orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save org settings: " + err.Error()})
+		return
+	}
+	if err := s.teams.UpdateSettings(r.Context(), teamID, teamSet); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save team settings: " + err.Error()})
+		return
+	}
+	if err := s.jiraRules.ReplaceForTeam(r.Context(), teamID, projectConfigsToRules(projects)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save Jira rules: " + err.Error()})
 		return
 	}
 
@@ -610,13 +727,13 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	// new form.
 	ghChanged := creds.GitHubURL != prevGHURL ||
 		creds.GitHubPAT != prevGHPAT ||
-		cfg.GitHub.PollInterval != prevGHPollInterval ||
-		cfg.GitHub.CloneProtocol != prevGHCloneProtocol
+		orgSet.GitHubPollInterval != prevGHPollInterval ||
+		orgSet.GitHubCloneProtocol != prevGHCloneProtocol
 
 	jiraChanged := creds.JiraURL != prevJiraURL ||
 		creds.JiraPAT != prevJiraPAT ||
-		!jiraProjectsEqual(cfg.Jira.Projects, prevJiraProjects) ||
-		cfg.Jira.PollInterval != prevJiraPollInterval
+		!jiraProjectsEqual(projects, prevJiraProjects) ||
+		orgSet.JiraPollInterval != prevJiraPollInterval
 
 	// Mark Jira restarted synchronously before launching the async callback so
 	// jiraPollReady flips false before this request returns. Otherwise the
@@ -638,6 +755,18 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		resp["env_overlay_blocks_disconnect"] = envOverlayWarn
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// projectKeysFromConfigs returns the ordered project keys from a
+// per-project config slice with empty entries filtered out.
+func projectKeysFromConfigs(projects []jiraProjectConfig) []string {
+	keys := make([]string, 0, len(projects))
+	for _, p := range projects {
+		if p.Key != "" {
+			keys = append(keys, p.Key)
+		}
+	}
+	return keys
 }
 
 // handleJiraConnect validates and stores Jira credentials without saving
@@ -676,28 +805,28 @@ func (s *Server) handleJiraConnect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load credentials: " + err.Error()})
 		return
 	}
-	cfg, err := config.Load()
+	orgSet, err := s.orgs.GetSettingsSystem(r.Context(), orgID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config: " + err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load org settings: " + err.Error()})
 		return
 	}
 
-	// Persist credentials and config
+	// Persist credentials and org settings
 	creds.JiraURL = req.URL
 	creds.JiraPAT = req.PAT
-	cfg.Jira.BaseURL = req.URL
+	orgSet.JiraBaseURL = req.URL
 
 	if err := integrations.Save(r.Context(), s.secrets, orgID, creds); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials: " + err.Error()})
 		return
 	}
-	if err := config.Save(cfg); err != nil {
-		// Roll back keychain to avoid creds/config desync. Use Delete
+	if err := s.orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
+		// Roll back keychain to avoid creds/settings desync. Use Delete
 		// rather than rewriting with empty strings — integrations.Save
 		// skips empty values, so the rollback has to issue an explicit
 		// clear.
 		_ = integrations.ClearJira(r.Context(), s.secrets, orgID)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save config: " + err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save org settings: " + err.Error()})
 		return
 	}
 
@@ -728,8 +857,13 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 
 	projects := r.URL.Query()["project"]
 	if len(projects) == 0 {
-		cfg, _ := config.Load()
-		projects = cfg.Jira.ProjectKeys()
+		teamID, err := s.teams.GetDefaultForOrgSystem(r.Context(), orgID)
+		if err == nil && teamID != "" {
+			teamSet, terr := s.teams.GetSettingsSystem(r.Context(), teamID)
+			if terr == nil {
+				projects = append(projects, teamSet.JiraProjects...)
+			}
+		}
 	}
 	if len(projects) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no projects specified"})
@@ -791,9 +925,9 @@ func (s *Server) handleJiraStatuses(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGitHubPreflightSSH(w http.ResponseWriter, r *http.Request) {
 	// Probe target tracks the configured GitHub base URL so the Test
 	// SSH button on the Settings page works for GHE deployments. We
-	// load creds (not config) because creds.GitHubURL is the URL the
-	// user actually authenticates against; cfg.GitHub.BaseURL mirrors
-	// it but the SecretStore copy is the source of truth.
+	// load creds (not settings) because creds.GitHubURL is the URL the
+	// user actually authenticates against; org_settings.github_base_url
+	// mirrors it but the SecretStore copy is the source of truth.
 	creds, _ := integrations.Load(r.Context(), s.secrets, OrgIDFrom(r.Context()))
 	sshHost := worktree.SSHHostFromBaseURL(creds.GitHubURL)
 

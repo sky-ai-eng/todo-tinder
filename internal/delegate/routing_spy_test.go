@@ -76,7 +76,7 @@ func newRoutingTestSpawner(t *testing.T) (*Spawner, *recordingTxRunner, *recordi
 	stores := sqlitestore.New(database)
 	tx := &recordingTxRunner{TxRunner: stores.Tx}
 	prompts := &recordingPromptStore{PromptStore: stores.Prompts}
-	s := NewSpawner(database, prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, tx, nil, nil, "claude-sonnet-4-6")
+	s := NewSpawner(database, prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, stores.Orgs, tx, nil, nil, "claude-sonnet-4-6", "")
 	return s, tx, prompts, database
 }
 
@@ -164,7 +164,7 @@ func TestTakeover_PreflightUsesSyntheticClaims(t *testing.T) {
 
 	stores := sqlitestore.New(database)
 	tx := &recordingTxRunner{TxRunner: stores.Tx}
-	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, tx, nil, nil, "")
+	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, stores.Orgs, tx, nil, nil, "", "")
 
 	// Takeover will fail downstream (no active cancel goroutine) but
 	// that's after the preflight read; the spy capture is what we're
@@ -197,7 +197,7 @@ func TestCancel_UserInitiated_PreflightUsesSyntheticClaims(t *testing.T) {
 
 	stores := sqlitestore.New(database)
 	tx := &recordingTxRunner{TxRunner: stores.Tx}
-	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, tx, nil, nil, "")
+	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, stores.Orgs, tx, nil, nil, "", "")
 
 	// No goroutine registered in s.cancels — Cancel will fall through
 	// to the DB path. The preflight runs first; the assertion is the
@@ -226,7 +226,7 @@ func TestCancel_SystemInitiated_PreflightSkipsSynthClaims(t *testing.T) {
 
 	stores := sqlitestore.New(database)
 	tx := &recordingTxRunner{TxRunner: stores.Tx}
-	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, tx, nil, nil, "")
+	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, stores.Orgs, tx, nil, nil, "", "")
 
 	_ = s.Cancel(runmode.LocalDefaultOrg, runID, "")
 
@@ -254,7 +254,7 @@ func TestRelease_PreflightUsesSyntheticClaims(t *testing.T) {
 
 	stores := sqlitestore.New(database)
 	tx := &recordingTxRunner{TxRunner: stores.Tx}
-	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, tx, nil, nil, "")
+	s := NewSpawner(database, stores.Prompts, nil, nil, stores.Tasks, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Events, stores.TaskMemory, stores.RunWorktrees, stores.Orgs, tx, nil, nil, "", "")
 
 	// Release will likely fail downstream on the path-safety check
 	// (the seeded worktree_path is /tmp/some-wt which isn't under

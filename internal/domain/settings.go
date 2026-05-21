@@ -71,3 +71,81 @@ type JiraProjectStatusRules struct {
 	DoneMembers         []string
 	DoneCanonical       string
 }
+
+// PickupContains reports whether status is a member of the Pickup rule.
+func (r JiraProjectStatusRules) PickupContains(status string) bool {
+	return containsString(r.PickupMembers, status)
+}
+
+// InProgressContains reports whether status is a member of the InProgress rule.
+func (r JiraProjectStatusRules) InProgressContains(status string) bool {
+	return containsString(r.InProgressMembers, status)
+}
+
+// DoneContains reports whether status is a member of the Done rule.
+func (r JiraProjectStatusRules) DoneContains(status string) bool {
+	return containsString(r.DoneMembers, status)
+}
+
+func containsString(list []string, s string) bool {
+	for _, m := range list {
+		if m == s {
+			return true
+		}
+	}
+	return false
+}
+
+// RuleForProject returns the per-project rule for the given key, or
+// nil when no rule with that key is in the slice. Callers degrade
+// gracefully on nil ("no rules configured" — no terminal check, no
+// transitions).
+func RuleForProject(rules []JiraProjectStatusRules, key string) *JiraProjectStatusRules {
+	for i := range rules {
+		if rules[i].ProjectKey == key {
+			return &rules[i]
+		}
+	}
+	return nil
+}
+
+// JiraProjectKeys returns the ordered list of project keys with empty
+// entries filtered out. Mirrors the helper the deleted config package
+// exposed for poller dispatch and JQL queries.
+func JiraProjectKeys(rules []JiraProjectStatusRules) []string {
+	keys := make([]string, 0, len(rules))
+	for _, p := range rules {
+		if p.ProjectKey != "" {
+			keys = append(keys, p.ProjectKey)
+		}
+	}
+	return keys
+}
+
+// JiraAllPickupMembers returns the union of every project's pickup
+// members, in first-seen order, each member deduped. Used by JQL
+// queries that span every project a team tracks.
+func JiraAllPickupMembers(rules []JiraProjectStatusRules) []string {
+	return jiraUnionMembers(rules, func(p JiraProjectStatusRules) []string { return p.PickupMembers })
+}
+
+// JiraAllDoneMembers returns the union of every project's done members.
+// Used by JQL queries that exclude terminal tickets across the team's
+// full project list.
+func JiraAllDoneMembers(rules []JiraProjectStatusRules) []string {
+	return jiraUnionMembers(rules, func(p JiraProjectStatusRules) []string { return p.DoneMembers })
+}
+
+func jiraUnionMembers(rules []JiraProjectStatusRules, pick func(JiraProjectStatusRules) []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0)
+	for _, p := range rules {
+		for _, m := range pick(p) {
+			if !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
+	}
+	return out
+}

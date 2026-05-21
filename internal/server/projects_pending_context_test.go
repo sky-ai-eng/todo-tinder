@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
@@ -229,13 +228,13 @@ func TestProjectPatch_QueuesJiraChange(t *testing.T) {
 	id, _ := seedProjectWithSessionForPatch(t, s)
 
 	// Seed a configured Jira project so validateTrackerKeys accepts
-	// the value when the PATCH handler does its config.Load(). The
+	// the value when the PATCH handler reads the team's rules. The
 	// jpsr_*_populated CHECK constraints require fully-populated
 	// rules — the test fixture mirrors the handler's strict shape.
-	cfg := config.Default()
-	cfg.Jira.Projects = []config.JiraProjectConfig{validProject("SKY")}
-	if err := config.Save(cfg); err != nil {
-		t.Fatalf("save config: %v", err)
+	if err := s.jiraRules.ReplaceForTeam(t.Context(), runmode.LocalDefaultTeamID, []domain.JiraProjectStatusRules{
+		validProjectRule("SKY"),
+	}); err != nil {
+		t.Fatalf("save jira rules: %v", err)
 	}
 
 	rec := doJSON(t, s, http.MethodPatch, "/api/projects/"+id, map[string]any{

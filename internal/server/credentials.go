@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
@@ -127,19 +127,23 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Persist base URLs in config so they survive without keychain access
-	cfg, _ := config.Load()
+	// Persist base URLs in org_settings so they survive without keychain access.
+	orgSet, oerr := s.orgs.GetSettingsSystem(r.Context(), orgID)
+	if oerr != nil {
+		log.Printf("[auth] warning: failed to load org settings before save: %v", oerr)
+		orgSet = domain.OrgSettings{}
+	}
 	if req.GitHubURL != "" {
-		cfg.GitHub.BaseURL = req.GitHubURL
+		orgSet.GitHubBaseURL = req.GitHubURL
 	}
 	if req.JiraURL != "" {
-		cfg.Jira.BaseURL = req.JiraURL
+		orgSet.JiraBaseURL = req.JiraURL
 	}
 	if req.CloneProtocol == "ssh" || req.CloneProtocol == "https" {
-		cfg.GitHub.CloneProtocol = req.CloneProtocol
+		orgSet.GitHubCloneProtocol = req.CloneProtocol
 	}
-	if err := config.Save(cfg); err != nil {
-		log.Printf("[auth] warning: failed to save config: %v", err)
+	if err := s.orgs.UpdateSettings(r.Context(), orgID, orgSet); err != nil {
+		log.Printf("[auth] warning: failed to save org settings: %v", err)
 	}
 
 	// Setup always includes GitHub — trigger full restart. Mark Jira restarted

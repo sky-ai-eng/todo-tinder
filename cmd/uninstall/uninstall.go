@@ -29,6 +29,7 @@ package uninstall
 
 import (
 	"bufio"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -38,8 +39,8 @@ import (
 	"strings"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 )
 
@@ -367,9 +368,10 @@ func removeClaudeProjectsForCurator(projectsDir, home string) (int, error) {
 func resolvedTakeoversDir(dataDir string) (string, error) {
 	fallback := filepath.Join(dataDir, "takeovers")
 
-	// Settings now live in the DB, so we have to open + init it before
-	// config.Load() can answer. Probe for the file first so a fresh
-	// machine (no DB) doesn't materialize state we're about to delete.
+	// instance_config.server_takeover_dir is the persisted override;
+	// read it directly here rather than via a wrapper package. Probe
+	// for the DB file first so a fresh machine (no DB) doesn't
+	// materialize state we're about to delete.
 	dbPath := filepath.Join(dataDir, "triagefactory.db")
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
@@ -385,15 +387,15 @@ func resolvedTakeoversDir(dataDir string) (string, error) {
 	if err := db.Migrate(conn, "sqlite3"); err != nil {
 		return fallback, err
 	}
-	if err := config.Init(conn); err != nil {
+	var stored string
+	if err := conn.QueryRow(`SELECT server_takeover_dir FROM instance_config WHERE id = 1`).Scan(&stored); err != nil {
+		// No row → use fallback; any other error propagates.
+		if errors.Is(err, sql.ErrNoRows) {
+			return fallback, nil
+		}
 		return fallback, err
 	}
-
-	cfg, err := config.Load()
-	if err != nil {
-		return fallback, err
-	}
-	dir, err := cfg.Server.ResolvedTakeoverDir()
+	dir, err := delegate.ResolveTakeoverDir(stored)
 	if err != nil {
 		return fallback, err
 	}

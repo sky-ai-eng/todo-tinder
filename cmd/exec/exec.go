@@ -14,7 +14,6 @@ import (
 	jiraexec "github.com/sky-ai-eng/triage-factory/cmd/exec/jira"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/runident"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/workspace"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -30,10 +29,9 @@ func Handle(args []string) {
 		return
 	}
 
-	// Open DB for local state (pending reviews, etc.). Config now lives
-	// in a settings row, so config.Load() requires an initialized DB —
-	// open + migrate before calling Init/Load. Credentials follow the
-	// same path — the SecretStore is wired off the DB.
+	// Open DB for local state (pending reviews, etc.). Credentials and
+	// per-org settings (GitHub base URL) follow the same path — both
+	// route through DB-backed stores.
 	//
 	// The DB open is unconditional even when the sandboxed agenthost
 	// path will win below — credential loading (the loadCreds closure)
@@ -57,14 +55,6 @@ func Handle(args []string) {
 	if err := db.Migrate(conn, "sqlite3"); err != nil {
 		fmt.Fprintf(os.Stderr, "error running migrations: %v\n", err)
 		os.Exit(1)
-	}
-	if err := config.Init(conn); err != nil {
-		fmt.Fprintf(os.Stderr, "error initializing config: %v\n", err)
-		os.Exit(1)
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: loading config: %v (proceeding with defaults)\n", err)
 	}
 	stores := sqlite.New(conn)
 
@@ -106,20 +96,30 @@ func Handle(args []string) {
 	// best, leak to the wrong tenant at worst. Help paths short-
 	// circuit before loadCreds runs, so this branch never fires for
 	// genuine `--help`.
-	loadCreds := func() (string, string, string, string, error) {
-		ctx := context.Background()
+	// resolveOrgID picks the right tenant for credential + settings reads.
+	// In local mode it falls back to the sentinel org so `--help` and
+	// stray invocations still work; in multi-mode it errors out since
+	// there's no valid tenant to attribute the read to.
+	resolveOrgID := func(ctx context.Context) (string, error) {
 		ident, err := runident.ResolveRunIdentity(ctx, stores, os.Getenv(runident.RunIdentityEnvVar))
-		var orgID string
 		switch {
 		case err == nil:
-			orgID = ident.OrgID
+			return ident.OrgID, nil
 		case runmode.Current() == runmode.ModeLocal:
-			orgID = runmode.LocalDefaultOrgID
+			return runmode.LocalDefaultOrgID, nil
 		default:
-			return "", "", "", "", fmt.Errorf("cmd/exec invoked without a valid %s; this command can only run inside a delegated agent run", runident.RunIdentityEnvVar)
+			return "", fmt.Errorf("cmd/exec invoked without a valid %s; this command can only run inside a delegated agent run", runident.RunIdentityEnvVar)
+		}
+	}
+	loadCreds := func() (string, string, string, string, string, error) {
+		ctx := context.Background()
+		orgID, err := resolveOrgID(ctx)
+		if err != nil {
+			return "", "", "", "", "", err
 		}
 		c, lerr := integrations.Load(ctx, stores.Secrets, orgID)
-		return c.GitHubURL, c.GitHubPAT, c.JiraURL, c.JiraPAT, lerr
+		orgSet, _ := stores.Orgs.GetSettingsSystem(ctx, orgID) // settings read failures degrade to empty BaseURL — the gh branch already prefers creds.GitHubURL as a fallback
+		return c.GitHubURL, c.GitHubPAT, c.JiraURL, c.JiraPAT, orgSet.GitHubBaseURL, lerr
 	}
 
 	switch cmd {
@@ -128,7 +128,7 @@ func Handle(args []string) {
 			gh.Handle(nil, nil, cmdArgs)
 			return
 		}
-		ghURL, ghPAT, _, _, lerr := loadCreds()
+		ghURL, ghPAT, _, _, ghBase, lerr := loadCreds()
 		if lerr != nil {
 			fmt.Fprintf(os.Stderr, "error loading credentials: %v\n", lerr)
 			os.Exit(1)
@@ -137,7 +137,7 @@ func Handle(args []string) {
 			fmt.Fprintln(os.Stderr, "GitHub not configured. Run triagefactory and complete setup first.")
 			os.Exit(1)
 		}
-		baseURL := cfg.GitHub.BaseURL
+		baseURL := ghBase
 		if baseURL == "" {
 			baseURL = ghURL
 		}
@@ -151,7 +151,7 @@ func Handle(args []string) {
 			jiraexec.Handle(nil, cmdArgs)
 			return
 		}
-		_, _, jURL, jPAT, lerr := loadCreds()
+		_, _, jURL, jPAT, _, lerr := loadCreds()
 		if lerr != nil {
 			fmt.Fprintf(os.Stderr, "error loading credentials: %v\n", lerr)
 			os.Exit(1)

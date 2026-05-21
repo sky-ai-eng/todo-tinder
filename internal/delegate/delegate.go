@@ -13,7 +13,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -356,7 +355,7 @@ func (s *Spawner) setupGitHub(ctx context.Context, orgID, runID string, task dom
 	// pr.SSHURL is also empty there, and we leave headCloneURL = ""
 	// so CreateForPR's hasHeadRepo=false branch fires correctly.
 	upstreamCloneURL, headCloneURL := pr.BaseCloneURL, pr.CloneURL
-	if cfg, cErr := config.Load(); cErr == nil && cfg.GitHub.CloneProtocol == "ssh" {
+	if s.useSSHCloneProtocol(ctx, orgID, runID) {
 		if pr.BaseSSHURL == "" {
 			return runConfig{}, fmt.Errorf("PR #%d on %s/%s: SSH clone protocol selected but GitHub did not return base.repo.ssh_url; switch to HTTPS in Settings or check your GHE config", prNumber, owner, repo)
 		}
@@ -367,8 +366,6 @@ func (s *Spawner) setupGitHub(ctx context.Context, orgID, runID string, task dom
 			}
 			headCloneURL = pr.SSHURL
 		}
-	} else if cErr != nil {
-		log.Printf("[delegate] load config to pick clone protocol for run %s: %v (defaulting to HTTPS)", runID, cErr)
 	}
 	if upstreamCloneURL == "" {
 		return runConfig{}, fmt.Errorf("PR #%d on %s/%s: GitHub did not return a usable upstream URL; cannot create worktree", prNumber, owner, repo)

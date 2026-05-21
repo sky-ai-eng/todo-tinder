@@ -287,9 +287,11 @@ func setupAdvanceFixture(t *testing.T, suffix string) (*Spawner, *sql.DB, string
 		sqlitestore.New(database).Events,
 		sqlitestore.New(database).TaskMemory,
 		sqlitestore.New(database).RunWorktrees,
+		sqlitestore.New(database).Orgs,
 		sqlitestore.New(database).Tx,
 		nil, nil,
 		"claude-sonnet-4-6",
+		"",
 	)
 	return s, database, runID, taskID
 }

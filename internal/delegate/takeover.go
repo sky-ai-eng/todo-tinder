@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
@@ -453,16 +452,11 @@ func (s *Spawner) Release(orgID, runID, userID string) error {
 	//
 	//   - Projects-dir cleanup needs the base for its own safety rail.
 	//
-	// If config can't be loaded (broken on-disk DB or filesystem), we
-	// refuse rather than barrel ahead without the safety check —
-	// handleAgentTakeover already requires this to work, so a release
-	// against a takeover that successfully created should also have
-	// access to the same config.
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("load config for release: %w", err)
-	}
-	takeoverBase, err := cfg.Server.ResolvedTakeoverDir()
+	// Takeover base is the boot-time-resolved instance_config value
+	// stashed on the Spawner. handleAgentTakeover uses the same value
+	// when creating the takeover dir, so the release safety check
+	// reads against an identical baseline.
+	takeoverBase, err := ResolveTakeoverDir(s.takeoverDir)
 	if err != nil {
 		return fmt.Errorf("resolve takeover base: %w", err)
 	}

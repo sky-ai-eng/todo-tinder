@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	dbpkg "github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -63,6 +62,7 @@ type Router struct {
 	firings    dbpkg.PendingFiringsStore // SKY-289: per-entity firing queue + active-run gate
 	events     dbpkg.EventStore          // SKY-305: admin-pool RecordSystem + GetMetadataSystem for the background subscriber
 	orgs       dbpkg.OrgsStore           // per-org iteration for the drain sweeper; nil-safe, falls back to N=1 sentinel when unset
+	teams      dbpkg.TeamsStore          // per-team auto_delegate_enabled kill-switch read post-internal/config deletion
 	spawner    Delegator
 	scorer     Scorer
 	ws         *websocket.Hub
@@ -91,7 +91,7 @@ type Router struct {
 // which over-closes (acceptable: user can reopen via the next poll).
 // orgs is nil-safe — the drain sweeper collapses to a single-org pass
 // over the local sentinel when missing, matching pre-D9 behavior.
-func NewRouter(prompts dbpkg.PromptStore, handlers dbpkg.EventHandlerStore, agents dbpkg.AgentStore, teamAgents dbpkg.TeamAgentStore, users dbpkg.UsersStore, tasks dbpkg.TaskStore, agentRuns dbpkg.AgentRunStore, entities dbpkg.EntityStore, firings dbpkg.PendingFiringsStore, events dbpkg.EventStore, orgs dbpkg.OrgsStore, spawner Delegator, scorer Scorer, ws *websocket.Hub) *Router {
+func NewRouter(prompts dbpkg.PromptStore, handlers dbpkg.EventHandlerStore, agents dbpkg.AgentStore, teamAgents dbpkg.TeamAgentStore, users dbpkg.UsersStore, tasks dbpkg.TaskStore, agentRuns dbpkg.AgentRunStore, entities dbpkg.EntityStore, firings dbpkg.PendingFiringsStore, events dbpkg.EventStore, orgs dbpkg.OrgsStore, teams dbpkg.TeamsStore, spawner Delegator, scorer Scorer, ws *websocket.Hub) *Router {
 	return &Router{
 		prompts:    prompts,
 		handlers:   handlers,
@@ -104,11 +104,28 @@ func NewRouter(prompts dbpkg.PromptStore, handlers dbpkg.EventHandlerStore, agen
 		firings:    firings,
 		events:     events,
 		orgs:       orgs,
+		teams:      teams,
 		spawner:    spawner,
 		scorer:     scorer,
 		ws:         ws,
 		drainLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// autoDelegateEnabledForTeam returns the team's auto_delegate_enabled
+// kill switch. Nil teams store (test wiring) or store error degrades to
+// "enabled" — matches the legacy `cfg.AI.AutoDelegateEnabled` read which
+// returned the Default() value (true) on any DB error.
+func (r *Router) autoDelegateEnabledForTeam(ctx context.Context, teamID string) bool {
+	if r.teams == nil || teamID == "" {
+		return true
+	}
+	settings, err := r.teams.GetSettingsSystem(ctx, teamID)
+	if err != nil {
+		log.Printf("[router] auto_delegate gate: team %s settings read: %v (defaulting to enabled)", teamID, err)
+		return true
+	}
+	return settings.AutoDelegateEnabled
 }
 
 // entityDrainLock returns the per-entity mutex used to serialize
@@ -361,18 +378,19 @@ func (r *Router) HandleEvent(evt domain.Event) {
 	// in SKY-189 (collapse on (task_id, trigger_id) covers the same case
 	// the cooldown was protecting against). Triggers with
 	// min_autonomy_suitability > 0 still defer to post-scoring re-derive.
-	if cfg, err := config.Load(); err == nil && cfg.AI.AutoDelegateEnabled {
-		for teamID, triggers := range teamTriggers {
-			task, ok := tasksByTeam[teamID]
-			if !ok {
-				continue // FindOrCreate failed for this team
+	for teamID, triggers := range teamTriggers {
+		task, ok := tasksByTeam[teamID]
+		if !ok {
+			continue // FindOrCreate failed for this team
+		}
+		if !r.autoDelegateEnabledForTeam(context.Background(), teamID) {
+			continue
+		}
+		for _, trigger := range triggers {
+			if trigger.MinAutonomySuitability != nil && *trigger.MinAutonomySuitability > 0 {
+				continue // deferred to post-scoring handler
 			}
-			for _, trigger := range triggers {
-				if trigger.MinAutonomySuitability != nil && *trigger.MinAutonomySuitability > 0 {
-					continue // deferred to post-scoring handler
-				}
-				r.tryAutoDelegate(orgID, task, trigger, entityID, evt.ID)
-			}
+			r.tryAutoDelegate(orgID, task, trigger, entityID, evt.ID)
 		}
 	}
 
@@ -924,14 +942,9 @@ func (r *Router) revertTaskStatus(orgID, taskID, status string) {
 // during HandleEvent and deferred to this callback, which fires from the
 // scorer's OnScoringCompleted hook. orgID is the scoring context — the
 // scorer batches per-org so every task in the slice belongs to the same
-// tenant.
+// tenant. Per-team auto_delegate_enabled is checked inside reDeriveTask
+// after the task's team_id is resolved.
 func (r *Router) ReDeriveAfterScoring(orgID string, taskIDs []string) {
-	// Global kill switch — same gate as HandleEvent step 9.
-	cfg, err := config.Load()
-	if err != nil || !cfg.AI.AutoDelegateEnabled {
-		return
-	}
-
 	for _, taskID := range taskIDs {
 		r.reDeriveTask(orgID, taskID)
 	}
@@ -950,6 +963,11 @@ func (r *Router) reDeriveTask(orgID, taskID string) {
 	// should not bypass that signal). done/dismissed naturally fall
 	// out of the != "queued" check.
 	if task.Status != "queued" {
+		return
+	}
+
+	// Per-team auto_delegate kill switch.
+	if !r.autoDelegateEnabledForTeam(context.Background(), task.TeamID) {
 		return
 	}
 

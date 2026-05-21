@@ -11,7 +11,6 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/ai"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/github"
@@ -98,16 +97,16 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 	log.Printf("[repoprofile] org %s: profiling %d configured repos", orgID, len(repos))
 
 	// Resolve the clone protocol once for the whole run rather than
-	// re-loading config inside the per-repo loop. The setting can't
-	// change mid-run — handleSettingsPost serializes config writes
-	// behind the same `onGitHubChanged` callback that owns this
-	// goroutine — so capturing it here matches actual semantics and
-	// avoids N redundant DB reads + YAML unmarshals.
+	// re-reading per-org settings inside the per-repo loop. The setting
+	// can't change mid-run — handleSettingsPost serializes the org-
+	// settings write behind the same `onGitHubChanged` callback that
+	// owns this goroutine — so capturing it here matches actual
+	// semantics and avoids N redundant DB reads.
 	preferSSH := false
-	if cfg, cErr := config.Load(); cErr != nil {
-		log.Printf("[repoprofile] load config to pick clone protocol: %v (defaulting to HTTPS)", cErr)
+	if orgSet, oErr := p.orgs.GetSettingsSystem(ctx, orgID); oErr != nil {
+		log.Printf("[repoprofile] load org settings to pick clone protocol: %v (defaulting to HTTPS)", oErr)
 	} else {
-		preferSSH = cfg.GitHub.CloneProtocol == "ssh"
+		preferSSH = orgSet.GitHubCloneProtocol == "ssh"
 	}
 
 	var withDocs []repoWithDocs

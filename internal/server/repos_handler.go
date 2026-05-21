@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
@@ -21,8 +20,8 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, _ := config.Load()
-	baseURL := cfg.GitHub.BaseURL
+	orgSet, _ := s.orgs.GetSettingsSystem(r.Context(), orgID)
+	baseURL := orgSet.GitHubBaseURL
 	if baseURL == "" {
 		baseURL = creds.GitHubURL
 	}

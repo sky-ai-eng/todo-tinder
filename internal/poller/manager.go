@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/eventbus"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
@@ -27,12 +27,14 @@ type Manager struct {
 	// because each poll cycle constructs one Tracker per active org —
 	// orgID is a per-tracker construction parameter, not a per-call
 	// argument. See the per-org loops in runGitHubCycle / runJiraCycle.
-	tasks    db.TaskStore
-	entities db.EntityStore
-	users    db.UsersStore  // source of the session user's github_username
-	repos    db.RepoStore   // configured-repo names for GitHub poller startup
-	orgs     db.OrgsStore   // enumerate active orgs at each poll tick
-	secrets  db.SecretStore // integration creds via SecretStore (keychain in local, vault in multi)
+	tasks     db.TaskStore
+	entities  db.EntityStore
+	users     db.UsersStore           // source of the session user's github_username
+	repos     db.RepoStore            // configured-repo names for GitHub poller startup
+	orgs      db.OrgsStore            // enumerate active orgs at each poll tick + per-org settings (GitHub/Jira base URLs, poll intervals)
+	teams     db.TeamsStore           // resolve each org's default team for per-team Jira project rules
+	jiraRules db.JiraStatusRulesStore // per-team Jira project rules (replaces deleted config.Jira.Projects)
+	secrets   db.SecretStore          // integration creds via SecretStore (keychain in local, vault in multi)
 
 	// OnError fires when a poll cycle returns an error. Source is "github"
 	// or "jira"; orgID identifies the tenant whose cycle errored (empty
@@ -47,16 +49,18 @@ type Manager struct {
 	jiraStop chan struct{}
 }
 
-func NewManager(database *sql.DB, bus *eventbus.Bus, users db.UsersStore, tasks db.TaskStore, entities db.EntityStore, repos db.RepoStore, orgs db.OrgsStore, secrets db.SecretStore) *Manager {
+func NewManager(database *sql.DB, bus *eventbus.Bus, users db.UsersStore, tasks db.TaskStore, entities db.EntityStore, repos db.RepoStore, orgs db.OrgsStore, teams db.TeamsStore, jiraRules db.JiraStatusRulesStore, secrets db.SecretStore) *Manager {
 	return &Manager{
-		database: database,
-		bus:      bus,
-		tasks:    tasks,
-		entities: entities,
-		users:    users,
-		repos:    repos,
-		orgs:     orgs,
-		secrets:  secrets,
+		database:  database,
+		bus:       bus,
+		tasks:     tasks,
+		entities:  entities,
+		users:     users,
+		repos:     repos,
+		orgs:      orgs,
+		teams:     teams,
+		jiraRules: jiraRules,
+		secrets:   secrets,
 	}
 }
 
@@ -92,11 +96,12 @@ func (m *Manager) reportError(source, orgID string, err error) {
 func (m *Manager) RestartAll(ctx context.Context, orgID string) {
 	m.stopAll()
 
-	cfg, _ := config.Load()
+	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
+	rules := m.loadJiraRules(ctx, orgID)
 
-	m.startGitHub(cfg, creds)
-	m.startJira(cfg, creds)
+	m.startGitHub(orgSet, creds)
+	m.startJira(orgSet, creds, rules)
 }
 
 // RestartGitHub stops and restarts only the GitHub polling loop.
@@ -109,9 +114,9 @@ func (m *Manager) RestartGitHub(ctx context.Context, orgID string) {
 	}
 	m.mu.Unlock()
 
-	cfg, _ := config.Load()
+	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
-	m.startGitHub(cfg, creds)
+	m.startGitHub(orgSet, creds)
 }
 
 // RestartJira stops and restarts only the Jira polling loop.
@@ -124,9 +129,33 @@ func (m *Manager) RestartJira(ctx context.Context, orgID string) {
 	}
 	m.mu.Unlock()
 
-	cfg, _ := config.Load()
+	orgSet, _ := m.orgs.GetSettingsSystem(ctx, orgID)
 	creds, _ := integrations.Load(ctx, m.secrets, orgID)
-	m.startJira(cfg, creds)
+	rules := m.loadJiraRules(ctx, orgID)
+	m.startJira(orgSet, creds, rules)
+}
+
+// loadJiraRules pulls the per-team Jira status rules for the org's
+// default team. Local mode collapses to N=1 (the synthetic sentinel
+// team); multi-mode per-org Jira project configuration is a future
+// concern that follows the same per-team grain. Empty list on error.
+func (m *Manager) loadJiraRules(ctx context.Context, orgID string) []domain.JiraProjectStatusRules {
+	if m.teams == nil || m.jiraRules == nil {
+		return nil
+	}
+	teamID, err := m.teams.GetDefaultForOrgSystem(ctx, orgID)
+	if err != nil || teamID == "" {
+		if err != nil {
+			log.Printf("[poller] org %s: resolve default team: %v", orgID, err)
+		}
+		return nil
+	}
+	rules, err := m.jiraRules.ListForTeamSystem(ctx, teamID)
+	if err != nil {
+		log.Printf("[poller] org %s team %s: list jira rules: %v", orgID, teamID, err)
+		return nil
+	}
+	return rules
 }
 
 // StopAll stops all running polling loops without restarting.
@@ -162,7 +191,7 @@ func (m *Manager) stopAll() {
 // poller restart. Local mode collapses to N=1 (the synthetic sentinel
 // org). Bounded per-org concurrency is a future optimization —
 // sequential is fine given the poll period (≥1 minute baseline).
-func (m *Manager) startGitHub(cfg config.Config, creds auth.Credentials) {
+func (m *Manager) startGitHub(orgSet domain.OrgSettings, creds auth.Credentials) {
 	// The GitHub poll loop reads a single users.github_username
 	// keyed by the local synthetic user — in multi mode that row
 	// has no FK target and every per-org iteration would silently
@@ -173,12 +202,12 @@ func (m *Manager) startGitHub(cfg config.Config, creds auth.Credentials) {
 	if runmode.Current() != runmode.ModeLocal {
 		return
 	}
-	if !cfg.GitHub.Ready(creds.GitHubPAT, creds.GitHubURL) {
+	if creds.GitHubPAT == "" || creds.GitHubURL == "" {
 		log.Println("[github] credentials not configured, skipping tracker")
 		return
 	}
 
-	interval := cfg.GitHub.PollInterval
+	interval := orgSet.GitHubPollInterval
 	if interval < 10*time.Second {
 		interval = time.Minute
 	}
@@ -282,13 +311,13 @@ func (m *Manager) runGitHubCycle(client *ghclient.Client, userTeams []string) {
 // sentinel org) and keeps the multi-mode outer-loop shape symmetric
 // with the GitHub path. Per-org Jira project configuration is a
 // future concern.
-func (m *Manager) startJira(cfg config.Config, creds auth.Credentials) {
-	if !cfg.Jira.Ready(creds.JiraPAT, creds.JiraURL) {
+func (m *Manager) startJira(orgSet domain.OrgSettings, creds auth.Credentials, rules []domain.JiraProjectStatusRules) {
+	if creds.JiraPAT == "" || creds.JiraURL == "" || len(rules) == 0 {
 		log.Println("[jira] not fully configured, skipping tracker")
 		return
 	}
 
-	interval := cfg.Jira.PollInterval
+	interval := orgSet.JiraPollInterval
 	if interval < 10*time.Second {
 		interval = time.Minute
 	}
@@ -300,8 +329,8 @@ func (m *Manager) startJira(cfg config.Config, creds auth.Credentials) {
 	m.jiraStop = stop
 	m.mu.Unlock()
 
-	projects := toTrackerJiraRules(cfg.Jira.Projects)
-	projectKeys := cfg.Jira.ProjectKeys()
+	projects := toTrackerJiraRules(rules)
+	projectKeys := domain.JiraProjectKeys(rules)
 
 	go func() {
 		// Initial poll
@@ -341,17 +370,16 @@ func (m *Manager) runJiraCycle(client *jiraclient.Client, baseURL string, projec
 	}
 }
 
-// toTrackerJiraRules converts the config-layer per-project rule slice
-// to the tracker-local view. Kept narrow on purpose — the tracker
-// package doesn't import internal/config so the two shapes stay
-// decoupled.
-func toTrackerJiraRules(projects []config.JiraProjectConfig) tracker.JiraRules {
-	out := make(tracker.JiraRules, 0, len(projects))
-	for _, p := range projects {
+// toTrackerJiraRules converts the domain per-project rule slice into
+// the tracker-local view. Kept narrow on purpose — the tracker package
+// only needs pickup/done members, not the canonicals.
+func toTrackerJiraRules(rules []domain.JiraProjectStatusRules) tracker.JiraRules {
+	out := make(tracker.JiraRules, 0, len(rules))
+	for _, p := range rules {
 		out = append(out, tracker.JiraProjectRules{
-			Key:           p.Key,
-			PickupMembers: p.Pickup.Members,
-			DoneMembers:   p.Done.Members,
+			Key:           p.ProjectKey,
+			PickupMembers: p.PickupMembers,
+			DoneMembers:   p.DoneMembers,
 		})
 	}
 	return out

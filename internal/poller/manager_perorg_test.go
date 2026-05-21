@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
-	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
@@ -98,13 +97,13 @@ func TestManager_RunGitHubCycle_OrgsStoreErrorAbortsCycle(t *testing.T) {
 func TestManager_StartGitHub_MultiModeGatesOut(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeMulti)
 	m := &Manager{}
-	cfg := config.Config{GitHub: config.GitHubConfig{
-		BaseURL:      "https://github.example.com",
-		PollInterval: time.Minute,
-	}}
+	orgSet := domain.OrgSettings{
+		GitHubBaseURL:      "https://github.example.com",
+		GitHubPollInterval: time.Minute,
+	}
 	creds := auth.Credentials{GitHubPAT: "ghp_test", GitHubURL: "https://github.example.com"}
 
-	m.startGitHub(cfg, creds)
+	m.startGitHub(orgSet, creds)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

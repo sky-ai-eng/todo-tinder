@@ -34,19 +34,25 @@ type Server struct {
 	teamAgents    db.TeamAgentStore // SKY-261 D-Claims: re-checks team_agents.enabled on swipe-delegate / factory-delegate
 	users         db.UsersStore     // SKY-264: github_username + display_name on the synthetic local user row
 	chains        db.ChainStore
-	tasks         db.TaskStore        // SKY-283: task lifecycle, claim, queue + factory snapshot reads
-	factory       db.FactoryReadStore // SKY-292: factory snapshot reads
-	agentRuns     db.AgentRunStore    // SKY-285: agent run lifecycle + transcript + yields
-	entities      db.EntityStore      // SKY-284: entity reads/writes for dashboard, factory_handler, stock, backfill, project_entities
-	reviews       db.ReviewStore      // SKY-286: pending_reviews CRUD for reviews handler, swipe-discard, agent status payload
-	pendingPRs    db.PendingPRStore   // SKY-287: pending_prs CRUD for pending_prs handler, agent status payload, drag-back-to-queue cleanup
-	repos         db.RepoStore        // SKY-288: repo_profiles CRUD for repos/settings/projects handlers and curator pinned-repo materialization
-	projects      db.ProjectStore     // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
-	curatorStore  db.CuratorStore     // curator-runtime CRUD (curator_requests / curator_messages / curator_pending_context) — handler-side writes go through here so Postgres mode honors RLS and uses the right placeholder syntax
-	events        db.EventStore       // SKY-305: events audit log Record/Latest for stock carry-over + factory drag-to-delegate
-	taskMemory    db.TaskMemoryStore  // run_memory writes (human verdict capture on review/PR submit, swipe-discard cleanup)
-	secrets       db.SecretStore      // canonical credential read/write path — local-mode keychain, multi-mode vault
-	teams         db.TeamsStore       // resolves the request org's default team for handlers that synthesize team-scoped rows (tasks, projects, prompts)
+	tasks         db.TaskStore            // SKY-283: task lifecycle, claim, queue + factory snapshot reads
+	factory       db.FactoryReadStore     // SKY-292: factory snapshot reads
+	agentRuns     db.AgentRunStore        // SKY-285: agent run lifecycle + transcript + yields
+	entities      db.EntityStore          // SKY-284: entity reads/writes for dashboard, factory_handler, stock, backfill, project_entities
+	reviews       db.ReviewStore          // SKY-286: pending_reviews CRUD for reviews handler, swipe-discard, agent status payload
+	pendingPRs    db.PendingPRStore       // SKY-287: pending_prs CRUD for pending_prs handler, agent status payload, drag-back-to-queue cleanup
+	repos         db.RepoStore            // SKY-288: repo_profiles CRUD for repos/settings/projects handlers and curator pinned-repo materialization
+	projects      db.ProjectStore         // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
+	curatorStore  db.CuratorStore         // curator-runtime CRUD (curator_requests / curator_messages / curator_pending_context) — handler-side writes go through here so Postgres mode honors RLS and uses the right placeholder syntax
+	events        db.EventStore           // SKY-305: events audit log Record/Latest for stock carry-over + factory drag-to-delegate
+	taskMemory    db.TaskMemoryStore      // run_memory writes (human verdict capture on review/PR submit, swipe-discard cleanup)
+	secrets       db.SecretStore          // canonical credential read/write path — local-mode keychain, multi-mode vault
+	teams         db.TeamsStore           // resolves the request org's default team for handlers that synthesize team-scoped rows (tasks, projects, prompts)
+	orgs          db.OrgsStore            // per-org settings (GitHub/Jira base URLs, poll intervals, clone protocol) post-internal/config deletion
+	jiraRules     db.JiraStatusRulesStore // per-team Jira status rules (replaces the deleted config.Jira.Projects view)
+	// takeoverDir is the resolved filesystem path takeover worktrees
+	// live under. Read once at boot from instance_config.
+	// server_takeover_dir, expanded via delegate.ResolveTakeoverDir.
+	takeoverDir string
 	// tx runs handler-cleanup write batches under the request user's
 	// claims even when the cleanup needs to outlive the request
 	// context. Each cleanup wraps in `s.tx.WithTx(cleanupCtx, orgID,
@@ -218,7 +224,7 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 // argument list grows one store at a time as their callers migrate;
 // raw *sql.DB stays available for handlers that haven't been ported
 // to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, teams db.TeamsStore, tx db.TxRunner) *Server {
+func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, teams db.TeamsStore, orgs db.OrgsStore, jiraRules db.JiraStatusRulesStore, tx db.TxRunner, takeoverDir string) *Server {
 	s := &Server{
 		db:            database,
 		prompts:       prompts,
@@ -242,7 +248,10 @@ func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboa
 		secrets:       secrets,
 		curatorStore:  curatorStore,
 		teams:         teams,
+		orgs:          orgs,
+		jiraRules:     jiraRules,
 		tx:            tx,
+		takeoverDir:   takeoverDir,
 		mux:           http.NewServeMux(),
 		ws:            websocket.NewHub(),
 	}
