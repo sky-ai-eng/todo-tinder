@@ -766,11 +766,22 @@ func (s *Server) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Persist everything in one WithTx so credentials + org/team/jira
-	// rules + per-integration clears either all commit or all roll back,
-	// and so the Postgres vault writes + RLS-gated UPDATEs see
-	// request.jwt.claims set. Local mode collapses to a single SQLite
-	// tx with the same shape.
+	// Persist the credential blob + org/team/jira rule updates +
+	// per-integration clears in one WithTx so this block either
+	// fully commits or fully rolls back, and so the Postgres vault
+	// writes + RLS-gated UPDATEs see request.jwt.claims set.
+	//
+	// User-row identity writes (SetGitHubUsername / SetJiraIdentity)
+	// happen earlier in their own short WithTx calls — they're
+	// sequenced with the GitHub/Jira validate-PAT HTTP calls and
+	// commit before this final tx runs. That's an intentional
+	// looseness: the identity row is auxiliary metadata, and a
+	// failure here just leaves a stale username/account-id row that
+	// the next save corrects. The atomicity that *matters* —
+	// "creds + settings + rules can't half-save" — is what this
+	// outer tx enforces.
+	//
+	// Local mode collapses to a single SQLite tx with the same shape.
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		// Process disconnect clears first so a same-request reconnect
 		// (e.g. switch from GitHub PAT A to PAT B by setting

@@ -452,10 +452,12 @@ func (s *Spawner) Release(orgID, runID, userID string) error {
 	//
 	//   - Projects-dir cleanup needs the base for its own safety rail.
 	//
-	// Takeover base is the boot-time-resolved instance_config value
-	// stashed on the Spawner. handleAgentTakeover uses the same value
-	// when creating the takeover dir, so the release safety check
-	// reads against an identical baseline.
+	// s.takeoverDir is the raw instance_config.server_takeover_dir
+	// read at boot; ResolveTakeoverDir applies the empty → default
+	// substitution and "~/" expansion to produce the actual base
+	// path. handleAgentTakeover calls the same helper on the same
+	// stored value when creating the takeover dir, so the release
+	// safety check reads against an identical baseline.
 	takeoverBase, err := ResolveTakeoverDir(s.takeoverDir)
 	if err != nil {
 		return fmt.Errorf("resolve takeover base: %w", err)

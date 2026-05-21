@@ -49,9 +49,12 @@ type Server struct {
 	teams         db.TeamsStore           // resolves the request org's default team for handlers that synthesize team-scoped rows (tasks, projects, prompts)
 	orgs          db.OrgsStore            // per-org settings (GitHub/Jira base URLs, poll intervals, clone protocol) post-internal/config deletion
 	jiraRules     db.JiraStatusRulesStore // per-team Jira status rules (replaces the deleted config.Jira.Projects view)
-	// takeoverDir is the resolved filesystem path takeover worktrees
-	// live under. Read once at boot from instance_config.
-	// server_takeover_dir, expanded via delegate.ResolveTakeoverDir.
+	// takeoverDir is the raw instance_config.server_takeover_dir
+	// value read once at boot — may be empty, "~/..." or an
+	// absolute path. Call sites (handleAgentTakeover, Spawner's
+	// Release path) run it through delegate.ResolveTakeoverDir to
+	// produce the actual filesystem path; the value held here is
+	// the unresolved input that helper takes.
 	takeoverDir string
 	// serverPort is the stored instance_config.server_port value
 	// surfaced to the settings GET response. The actual bind port

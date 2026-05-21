@@ -67,9 +67,14 @@ type Spawner struct {
 	// every per-org read goes through OrgsStore.GetSettingsSystem
 	// (no JWT claims context on the run goroutine).
 	orgs db.OrgsStore
-	// takeoverDir is the resolved filesystem path takeover worktrees
-	// live under. Read once at boot from instance_config; passed via
-	// the constructor so Release/takeover.go don't re-read settings.
+	// takeoverDir is the raw instance_config.server_takeover_dir
+	// value read once at boot — may be empty, "~/..." or an
+	// absolute path. The Release path runs it through
+	// ResolveTakeoverDir to produce the actual filesystem path
+	// (and to apply the empty-string → ~/.triagefactory/takeovers
+	// default); the value held here is the unresolved input.
+	// Passed via the constructor so Release doesn't re-read
+	// instance_config on every request.
 	takeoverDir string
 	// tx runs synthetic-claims write batches for manual runs (the
 	// run's creator_user_id is the synthetic claim subject, so RLS
