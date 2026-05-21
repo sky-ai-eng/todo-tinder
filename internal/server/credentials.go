@@ -148,7 +148,12 @@ func (s *Server) handleIntegrationsSetup(w http.ResponseWriter, r *http.Request)
 		}
 		return nil
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		// Log the underlying wrap-chain (SQL / vault / FK errors) for
+		// operator debugging, but return a stable user-facing message
+		// so we don't leak Postgres internals to API clients. Mirrors
+		// the pattern handleJiraConnect now uses.
+		log.Printf("[setup] handleIntegrationsSetup persist failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store credentials"})
 		return
 	}
 

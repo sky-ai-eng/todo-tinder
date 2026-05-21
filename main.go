@@ -1044,7 +1044,20 @@ func main() {
 		return false
 	}
 
-	// GitHub changed: invalidate profiles → stop all → re-profile → restart all
+	// GitHub changed: invalidate profiles → stop all → re-profile → restart all.
+	//
+	// Gated to local mode. The callback wires process-global state
+	// (ghClient, curator credentials, profiler) shaped for a
+	// single-tenant binary; in multi-mode the same work happens
+	// per-tenant inside the request handlers and on first
+	// delegation per repo. Additionally, the integrations.Load call
+	// below would fail in Postgres without request.jwt.claims set
+	// (SecretStore vault_* enforces org_id == tf.current_org_id()),
+	// and the callback fires from a goroutine with no claims
+	// context. Multi-mode per-tenant credential refresh requires
+	// either a SystemGet-style SecretStore variant or plumbing
+	// userID through the callback for SyntheticClaimsWithTx —
+	// follow-up work alongside per-org GitHub App polling (D11).
 	srv.SetOnGitHubChanged(func(orgID string) {
 		log.Println("[server] GitHub config changed, full restart...")
 		setAnnouncePending("github")
@@ -1056,6 +1069,11 @@ func main() {
 		// back to false in the GitHub-disabled branch — which doesn't
 		// Signal again — would silently freeze scoring forever.
 		pollerMgr.StopAll()
+
+		if runmode.Current() != runmode.ModeLocal {
+			log.Println("[server] GitHub changed: multi-mode skips process-global refresh (per-tenant work happens in request handlers)")
+			return
+		}
 
 		ctx := context.Background()
 		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
@@ -1100,10 +1118,17 @@ func main() {
 		}
 	})
 
-	// Jira changed: restart only the Jira poller
+	// Jira changed: restart only the Jira poller. Same local-mode
+	// gate as onGitHubChanged — process-global Jira client + the
+	// SecretStore claims requirement make this a local-only path.
 	srv.SetOnJiraChanged(func(orgID string) {
 		log.Println("[server] Jira config changed, restarting Jira poller...")
 		setAnnouncePending("jira")
+
+		if runmode.Current() != runmode.ModeLocal {
+			log.Println("[server] Jira changed: multi-mode skips process-global refresh")
+			return
+		}
 
 		ctx := context.Background()
 		creds, _ := integrations.Load(ctx, stores.Secrets, orgID)
