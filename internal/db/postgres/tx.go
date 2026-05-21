@@ -164,18 +164,23 @@ func (s *Store) txStoresFromTx(tx *sql.Tx) db.TxStores {
 		// writes commit autonomously, same shape Events /
 		// AgentRuns / TaskMemory use for their admin-pool halves.
 		RunWorktrees: newRunWorktreeStore(tx, s.admin),
-		// Orgs: tx-bound for shape parity. In practice OrgsStore is
-		// admin-pool by design (background-service iteration) and
-		// nothing inside WithTx legitimately calls ListActiveSystem,
-		// but composing it here keeps wiring drift impossible against
-		// the Stores bundle.
-		Orgs: newOrgsStore(tx),
-		// Teams: pinned to s.admin (not tx). GetDefaultForOrgSystem
-		// is an admin-pool read by design — see the TeamsStore
-		// interface comment. Routing the lookup outside the tx means
-		// it composes safely from any handler regardless of which
-		// pool the surrounding tx was bound to.
-		Teams: newTeamsStore(s.admin),
+		// Orgs: app-side writes route through the tx so settings
+		// upserts compose with the surrounding claims tx; admin half
+		// stays pinned to s.admin so ListActiveSystem +
+		// GetSettingsSystem inside WithTx route outside the tx (those
+		// reads are by-design cross-tenant / claims-less).
+		Orgs: newOrgsStore(tx, s.admin),
+		// Teams: app-side writes route through the tx so per-team
+		// settings upserts compose with the surrounding claims tx;
+		// admin half stays pinned to s.admin so GetDefaultForOrgSystem
+		// + GetSettingsSystem inside WithTx route outside the tx — same
+		// shape Orgs/Events/AgentRuns use for their admin-pool halves.
+		Teams: newTeamsStore(tx, s.admin),
+		// JiraStatusRules: app-side write routes through the tx so
+		// ReplaceForTeam composes with the surrounding claims tx;
+		// admin half stays pinned to s.admin so ListForTeamSystem
+		// inside WithTx routes outside the tx.
+		JiraStatusRules: newJiraStatusRulesStore(tx, s.admin),
 		// Curator: app-side write routes through the tx; admin half
 		// stays pinned to the real admin pool so
 		// CancelOrphanedNonTerminalRequests inside WithTx routes

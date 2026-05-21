@@ -2,16 +2,32 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// orgsStore is the Postgres impl of db.OrgsStore. Every method routes
-// through the admin pool — see the OrgsStore interface comment for the
-// pool-split rationale.
-type orgsStore struct{ admin queryer }
+// orgsStore is the Postgres impl of db.OrgsStore. Holds both pools —
+// see the OrgsStore interface comment for the pool-split rationale.
+//
+//   - admin: ListActiveSystem, GetSettingsSystem. Background services
+//     iterating the active org set or reading per-org settings without
+//     a JWT-claims context.
+//   - app: GetSettings, UpdateSettings. Request-handler reads/writes
+//     gated by the org_settings_select / org_settings_update RLS
+//     policies (org membership / org admin).
+type orgsStore struct {
+	app   queryer
+	admin queryer
+}
 
-func newOrgsStore(admin queryer) db.OrgsStore { return &orgsStore{admin: admin} }
+func newOrgsStore(app, admin queryer) db.OrgsStore {
+	return &orgsStore{app: app, admin: admin}
+}
 
 var _ db.OrgsStore = (*orgsStore)(nil)
 
@@ -34,4 +50,101 @@ func (s *orgsStore) ListActiveSystem(ctx context.Context) ([]string, error) {
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+func (s *orgsStore) GetSettings(ctx context.Context, orgID string) (domain.OrgSettings, error) {
+	return getOrgSettings(ctx, s.app, orgID)
+}
+
+func (s *orgsStore) GetSettingsSystem(ctx context.Context, orgID string) (domain.OrgSettings, error) {
+	return getOrgSettings(ctx, s.admin, orgID)
+}
+
+func getOrgSettings(ctx context.Context, q queryer, orgID string) (domain.OrgSettings, error) {
+	var (
+		ghURL, jiraURL, anthRef, bedRef, maxTier sql.NullString
+		ghSecs, jiraSecs                         float64
+		cloneProto                               string
+	)
+	// EXTRACT(EPOCH FROM interval) returns numeric in PG13+; the
+	// ::double precision cast pins the row-out type so pgx can scan
+	// straight into float64 without a string detour. Cleaner round-
+	// trip than ::text + time.ParseDuration (which can't parse the
+	// Postgres "HH:MM:SS" interval rendering anyway).
+	err := q.QueryRowContext(ctx, `
+		SELECT github_base_url,
+		       EXTRACT(EPOCH FROM github_poll_interval)::double precision,
+		       github_clone_protocol,
+		       jira_base_url,
+		       EXTRACT(EPOCH FROM jira_poll_interval)::double precision,
+		       anthropic_api_key_ref, bedrock_credentials_ref, max_llm_model_tier
+		FROM org_settings WHERE org_id = $1
+	`, orgID).Scan(
+		&ghURL, &ghSecs, &cloneProto,
+		&jiraURL, &jiraSecs,
+		&anthRef, &bedRef, &maxTier,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.OrgSettings{}, nil
+	}
+	if err != nil {
+		return domain.OrgSettings{}, fmt.Errorf("read org_settings: %w", err)
+	}
+	return domain.OrgSettings{
+		GitHubBaseURL:         ghURL.String,
+		GitHubPollInterval:    time.Duration(ghSecs * float64(time.Second)),
+		GitHubCloneProtocol:   cloneProto,
+		JiraBaseURL:           jiraURL.String,
+		JiraPollInterval:      time.Duration(jiraSecs * float64(time.Second)),
+		AnthropicAPIKeyRef:    anthRef.String,
+		BedrockCredentialsRef: bedRef.String,
+		MaxLLMModelTier:       maxTier.String,
+	}, nil
+}
+
+func (s *orgsStore) UpdateSettings(ctx context.Context, orgID string, u domain.OrgSettings) error {
+	cloneProto := u.GitHubCloneProtocol
+	if cloneProto == "" {
+		cloneProto = "ssh"
+	}
+	// make_interval(secs => $N) takes a numeric second count and
+	// returns a properly-typed interval — avoids hand-rolling the
+	// "X seconds"::interval string concat.
+	_, err := s.app.ExecContext(ctx, `
+		INSERT INTO org_settings (
+			org_id, github_base_url, github_poll_interval, github_clone_protocol,
+			jira_base_url, jira_poll_interval,
+			anthropic_api_key_ref, bedrock_credentials_ref, max_llm_model_tier,
+			updated_at
+		) VALUES (
+			$1, $2, make_interval(secs => $3), $4,
+			$5, make_interval(secs => $6),
+			$7, $8, $9,
+			now()
+		)
+		ON CONFLICT (org_id) DO UPDATE SET
+			github_base_url = EXCLUDED.github_base_url,
+			github_poll_interval = EXCLUDED.github_poll_interval,
+			github_clone_protocol = EXCLUDED.github_clone_protocol,
+			jira_base_url = EXCLUDED.jira_base_url,
+			jira_poll_interval = EXCLUDED.jira_poll_interval,
+			anthropic_api_key_ref = EXCLUDED.anthropic_api_key_ref,
+			bedrock_credentials_ref = EXCLUDED.bedrock_credentials_ref,
+			max_llm_model_tier = EXCLUDED.max_llm_model_tier,
+			updated_at = now()
+	`,
+		orgID,
+		nullString(u.GitHubBaseURL),
+		u.GitHubPollInterval.Seconds(),
+		cloneProto,
+		nullString(u.JiraBaseURL),
+		u.JiraPollInterval.Seconds(),
+		nullString(u.AnthropicAPIKeyRef),
+		nullString(u.BedrockCredentialsRef),
+		nullString(u.MaxLLMModelTier),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert org_settings: %w", err)
+	}
+	return nil
 }

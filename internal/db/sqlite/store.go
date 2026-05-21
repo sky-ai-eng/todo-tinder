@@ -63,14 +63,19 @@ func New(conn *sql.DB) db.Stores {
 		// connection so the dual-pool constructor collapses; the
 		// `...System` variants forward to the non-System bodies.
 		RunWorktrees: newRunWorktreeStore(conn, conn),
-		// Orgs is admin-pool in Postgres; SQLite collapses to the one
+		// Orgs is dual-pool in Postgres; SQLite collapses to the one
 		// connection. Callers are background services iterating the
-		// active org set at the top of each cycle.
-		Orgs: newOrgsStore(conn),
-		// Teams is admin-pool in Postgres; SQLite collapses to the one
-		// connection. Callers are request handlers resolving the
-		// org's default team for newly-synthesized rows.
-		Teams: newTeamsStore(conn),
+		// active org set, settings reads/writes from request handlers,
+		// and `...System` settings reads from boot-time goroutines.
+		Orgs: newOrgsStore(conn, conn),
+		// Teams is dual-pool in Postgres; SQLite collapses to the one
+		// connection. Covers default-team lookup for request handlers
+		// + per-team settings reads/writes.
+		Teams: newTeamsStore(conn, conn),
+		// JiraStatusRules is dual-pool in Postgres; SQLite collapses
+		// to the one connection. Bulk-replace semantics match the
+		// existing config.Save() flow.
+		JiraStatusRules: newJiraStatusRulesStore(conn, conn),
 		// Curator: the goroutine wraps each turn in
 		// Stores.Tx.SyntheticClaimsWithTx so the tx-bound variant
 		// (composed inside the tx.go runTx body) is what handles

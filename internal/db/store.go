@@ -182,6 +182,15 @@ type Stores struct {
 	// interface comment for the pool-split rationale.
 	Teams TeamsStore
 
+	// JiraStatusRules owns the jira_project_status_rules table —
+	// one row per (team_id, project_key) carrying the team's per-
+	// project pickup/in_progress/done configuration. App pool in
+	// Postgres for the request-handler reads/writes (RLS gates by
+	// team membership / team admin); admin pool for the boot-time
+	// `...System` reads the poller manager + scorer make. Bulk-
+	// replace semantics on ReplaceForTeam match config.Save() today.
+	JiraStatusRules JiraStatusRulesStore
+
 	// Curator owns the curator-runtime tables (curator_requests,
 	// curator_messages, curator_pending_context). App pool in
 	// Postgres — the per-project goroutine wraps each turn's
@@ -204,31 +213,32 @@ type Stores struct {
 // in the same transaction. Fields are added as their parent stores
 // land in successive waves.
 type TxStores struct {
-	Scores         ScoreStore
-	Prompts        PromptStore
-	Swipes         SwipeStore
-	Dashboard      DashboardStore
-	Secrets        SecretStore
-	EventHandlers  EventHandlerStore
-	Chains         ChainStore
-	Agents         AgentStore
-	TeamAgents     TeamAgentStore
-	Users          UsersStore
-	Tasks          TaskStore
-	Factory        FactoryReadStore
-	AgentRuns      AgentRunStore
-	Entities       EntityStore
-	Reviews        ReviewStore
-	PendingPRs     PendingPRStore
-	Repos          RepoStore
-	PendingFirings PendingFiringsStore
-	Projects       ProjectStore
-	Events         EventStore
-	TaskMemory     TaskMemoryStore
-	RunWorktrees   RunWorktreeStore
-	Orgs           OrgsStore
-	Teams          TeamsStore
-	Curator        CuratorStore
+	Scores          ScoreStore
+	Prompts         PromptStore
+	Swipes          SwipeStore
+	Dashboard       DashboardStore
+	Secrets         SecretStore
+	EventHandlers   EventHandlerStore
+	Chains          ChainStore
+	Agents          AgentStore
+	TeamAgents      TeamAgentStore
+	Users           UsersStore
+	Tasks           TaskStore
+	Factory         FactoryReadStore
+	AgentRuns       AgentRunStore
+	Entities        EntityStore
+	Reviews         ReviewStore
+	PendingPRs      PendingPRStore
+	Repos           RepoStore
+	PendingFirings  PendingFiringsStore
+	Projects        ProjectStore
+	Events          EventStore
+	TaskMemory      TaskMemoryStore
+	RunWorktrees    RunWorktreeStore
+	Orgs            OrgsStore
+	Teams           TeamsStore
+	JiraStatusRules JiraStatusRulesStore
+	Curator         CuratorStore
 }
 
 // TxRunner runs fn inside a single database transaction. Postgres
