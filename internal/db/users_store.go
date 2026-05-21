@@ -1,6 +1,10 @@
 package db
 
-import "context"
+import (
+	"context"
+
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+)
 
 // UsersStore owns the users table — identity facts that aren't secrets
 // (display_name, github_username) live on the row. The keychain holds
@@ -70,4 +74,21 @@ type UsersStore interface {
 	// Jira reassignment consumes this from its eventbus subscriber
 	// goroutine, which has no JWT-claims context.
 	GetJiraIdentitySystem(ctx context.Context, userID string) (accountID, displayName string, err error)
+
+	// GetSettings returns the user's settings row. Empty for v1
+	// post-SKY-354 cleanup — the AI model + auto-delegate toggle
+	// moved to team_settings. The store call exists so future
+	// per-user prefs (theme, notification destinations, swipe
+	// sensitivity, onboarding state) can be added without a
+	// signature change. Returns a zero-value UserSettings with nil
+	// error when no row exists yet. Postgres runs on the app pool
+	// (user_settings_select RLS gates by user_id = current_user_id()).
+	GetSettings(ctx context.Context, userID string) (domain.UserSettings, error)
+
+	// UpdateSettings upserts the user's settings row. v1 carries
+	// no per-user fields, so the call is effectively a touch — the
+	// updated_at trigger fires either way. Future prefs land here.
+	// Postgres runs on the app pool (user_settings_modify RLS gates
+	// by user_id = current_user_id()).
+	UpdateSettings(ctx context.Context, userID string, updates domain.UserSettings) error
 }

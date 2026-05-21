@@ -63,9 +63,10 @@ func TestProfiler_Run_OrgsStoreErrorBubbles(t *testing.T) {
 // --- test doubles ---
 
 type fakeOrgsStore struct {
-	ids   []string
-	err   error
-	calls int
+	db.OrgsStore // embed nil — every method except ListActiveSystem panics if reached
+	ids          []string
+	err          error
+	calls        int
 }
 
 func (f *fakeOrgsStore) ListActiveSystem(ctx context.Context) ([]string, error) {

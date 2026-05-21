@@ -3,9 +3,11 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
 // usersStore is the Postgres impl of db.UsersStore. Holds two pools
@@ -132,6 +134,39 @@ func (s *usersStore) SetJiraIdentity(ctx context.Context, userID, accountID, dis
 	}
 	if rows == 0 {
 		return fmt.Errorf("update users.jira_identity: user %q not found", userID)
+	}
+	return nil
+}
+
+func (s *usersStore) GetSettings(ctx context.Context, userID string) (domain.UserSettings, error) {
+	// user_settings is empty post-SKY-354: just user_id + updated_at.
+	// The probe stays so callers can detect "row exists" vs "first
+	// touch" later when fields are added; current callers ignore the
+	// difference and consume the zero-value struct either way.
+	var updatedAt sql.NullTime
+	err := s.q.QueryRowContext(ctx,
+		`SELECT updated_at FROM user_settings WHERE user_id = $1`,
+		userID,
+	).Scan(&updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.UserSettings{}, nil
+	}
+	if err != nil {
+		return domain.UserSettings{}, fmt.Errorf("read user_settings: %w", err)
+	}
+	return domain.UserSettings{}, nil
+}
+
+func (s *usersStore) UpdateSettings(ctx context.Context, userID string, _ domain.UserSettings) error {
+	// Effectively a touch in v1 — no per-user fields yet, the updated_at
+	// trigger fires either way. Future per-user prefs land here.
+	_, err := s.q.ExecContext(ctx, `
+		INSERT INTO user_settings (user_id, updated_at)
+		VALUES ($1, now())
+		ON CONFLICT (user_id) DO UPDATE SET updated_at = now()
+	`, userID)
+	if err != nil {
+		return fmt.Errorf("upsert user_settings: %w", err)
 	}
 	return nil
 }

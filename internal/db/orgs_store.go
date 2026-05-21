@@ -1,22 +1,31 @@
 package db
 
-import "context"
+import (
+	"context"
 
-// OrgsStore owns the orgs table — the tenancy root every other
-// resource hangs off via FK. Background services (poller, tracker,
-// projectclassify, repoprofile) iterate active orgs at the top of
-// each cycle through this store instead of hardcoding the local-mode
-// sentinel.
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+)
+
+// OrgsStore owns the orgs + org_settings tables — the tenancy root
+// every other resource hangs off via FK plus its sibling settings row.
+// Background services (poller, tracker, projectclassify, repoprofile)
+// iterate active orgs at the top of each cycle through ListActiveSystem;
+// request handlers and system services read per-org settings via
+// GetSettings / GetSettingsSystem.
 //
 // # Pool split (Postgres)
 //
-// Every method on this store routes through the admin pool. The
-// callers are background goroutines launched at boot — they have no
-// JWT-claims context, and iterating active orgs is by definition a
-// cross-org system-service read. The orgs_select RLS policy in the
-// multi-mode schema only exposes rows the calling user is a member
-// of, so the app pool wouldn't return the right set for these
-// callers.
+//   - ListActiveSystem, GetSettingsSystem run on the admin pool. The
+//     callers are background goroutines launched at boot — they have
+//     no JWT-claims context, and the work is by definition a cross-org
+//     system-service read.
+//   - GetSettings and UpdateSettings run on the app pool. The
+//     org_settings_select / org_settings_update RLS policies gate
+//     reads by org membership and writes by org admin; the request-
+//     handler caller has set the JWT claims via the TxRunner.
+//
+// SQLite collapses the pool split to one connection; the `...System`
+// variants delegate to their non-System counterparts.
 type OrgsStore interface {
 	// ListActiveSystem returns the IDs of every active org in
 	// ascending id order. "Active" means deleted_at IS NULL in
@@ -29,4 +38,26 @@ type OrgsStore interface {
 	// partial failure in cycle N is followed by the same org order
 	// in cycle N+1 unless rows changed.
 	ListActiveSystem(ctx context.Context) ([]string, error)
+
+	// GetSettings returns the org's settings row, or a zero-value
+	// OrgSettings with nil error when no row exists yet. Empty
+	// GitHubBaseURL / JiraBaseURL / vault refs / MaxLLMModelTier
+	// reflect NULL columns ("not configured yet" / "use deployment
+	// default" / "no cap"). Postgres routes through the app pool
+	// (org_settings_select RLS gates by org membership).
+	GetSettings(ctx context.Context, orgID string) (domain.OrgSettings, error)
+
+	// GetSettingsSystem mirrors GetSettings but routes through the
+	// admin pool in Postgres for callers without a JWT-claims context
+	// (pollers, scorer, delegation spawner). SQLite collapses to the
+	// same impl.
+	GetSettingsSystem(ctx context.Context, orgID string) (domain.OrgSettings, error)
+
+	// UpdateSettings upserts the org's settings row. An empty
+	// GitHubBaseURL / JiraBaseURL / AnthropicAPIKeyRef /
+	// BedrockCredentialsRef / MaxLLMModelTier writes NULL into the
+	// column. An empty GitHubCloneProtocol substitutes "ssh" — the
+	// column CHECK rejects empty strings. Postgres routes through
+	// the app pool (org_settings_update RLS gates by org admin).
+	UpdateSettings(ctx context.Context, orgID string, updates domain.OrgSettings) error
 }

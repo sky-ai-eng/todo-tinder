@@ -195,18 +195,24 @@ func New(admin, app *sql.DB) db.Stores {
 		// cleanup defers. org_id stays bound everywhere as defense
 		// in depth.
 		RunWorktrees: newRunWorktreeStore(app, admin),
-		// Orgs wires admin — see the OrgsStore interface comment for
-		// pool rationale. Background services iterate the active org
-		// set at boot/poll-tick; they have no JWT-claims context, and
-		// the iteration is by definition cross-org.
-		Orgs: newOrgsStore(admin),
-		// Teams wires admin — see the TeamsStore interface comment.
-		// Callers are request handlers resolving the org's default
-		// team for newly-synthesized rows; the JWT-claims tx around
-		// the call carries the user's identity, the team lookup
-		// itself runs on admin so the path is uniform with
-		// cmd/exec/curator-dispatch callers that have no claims.
-		Teams: newTeamsStore(admin),
+		// Orgs holds both pools: admin for ListActiveSystem +
+		// GetSettingsSystem (background services iterating the active
+		// org set / reading per-org settings without JWT claims) and
+		// app for GetSettings + UpdateSettings (request-handler
+		// reads/writes gated by org_settings_* RLS policies).
+		Orgs: newOrgsStore(app, admin),
+		// Teams holds both pools: admin for GetDefaultForOrgSystem +
+		// GetSettingsSystem (boot-time pollers/scorer/delegation
+		// without JWT claims) and app for GetSettings +
+		// UpdateSettings (request-handler reads/writes gated by
+		// team_settings_* RLS policies).
+		Teams: newTeamsStore(app, admin),
+		// JiraStatusRules holds both pools: app for ListForTeam +
+		// ReplaceForTeam (request-handler reads/writes gated by
+		// jira_rules_* RLS policies) and admin for ListForTeamSystem
+		// (poller manager + scorer reads at boot/poll-tick without
+		// JWT claims).
+		JiraStatusRules: newJiraStatusRulesStore(app, admin),
 		// Curator wires the app pool. The per-project goroutine
 		// wraps each turn's writes in Tx.SyntheticClaimsWithTx
 		// under the requesting user's identity; the tx-bound
@@ -268,18 +274,19 @@ func NewForTx(tx *sql.Tx) db.TxStores {
 		// SKY-296 `...System` methods that bypass RLS in
 		// production) need the production WithTx wiring instead,
 		// which gets the real admin pool via Store.admin.
-		AgentRuns:      newAgentRunStore(tx, tx),
-		Entities:       newEntityStore(tx, tx),
-		Repos:          newRepoStore(tx, tx),
-		Reviews:        newReviewStore(tx, tx),
-		PendingPRs:     newPendingPRStore(tx, tx),
-		PendingFirings: newPendingFiringsStore(tx),
-		Projects:       newProjectStore(tx, tx),
-		Events:         newEventStore(tx, tx),
-		TaskMemory:     newTaskMemoryStore(tx, tx),
-		RunWorktrees:   newRunWorktreeStore(tx, tx),
-		Orgs:           newOrgsStore(tx),
-		Teams:          newTeamsStore(tx),
-		Curator:        newCuratorStore(tx, tx),
+		AgentRuns:       newAgentRunStore(tx, tx),
+		Entities:        newEntityStore(tx, tx),
+		Repos:           newRepoStore(tx, tx),
+		Reviews:         newReviewStore(tx, tx),
+		PendingPRs:      newPendingPRStore(tx, tx),
+		PendingFirings:  newPendingFiringsStore(tx),
+		Projects:        newProjectStore(tx, tx),
+		Events:          newEventStore(tx, tx),
+		TaskMemory:      newTaskMemoryStore(tx, tx),
+		RunWorktrees:    newRunWorktreeStore(tx, tx),
+		Orgs:            newOrgsStore(tx, tx),
+		Teams:           newTeamsStore(tx, tx),
+		JiraStatusRules: newJiraStatusRulesStore(tx, tx),
+		Curator:         newCuratorStore(tx, tx),
 	}
 }
