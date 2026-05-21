@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 // OrgSettings is the org-scope settings row (org_settings table).
 //
@@ -114,26 +117,17 @@ type JiraProjectStatusRules struct {
 
 // PickupContains reports whether status is a member of the Pickup rule.
 func (r JiraProjectStatusRules) PickupContains(status string) bool {
-	return containsString(r.PickupMembers, status)
+	return slices.Contains(r.PickupMembers, status)
 }
 
 // InProgressContains reports whether status is a member of the InProgress rule.
 func (r JiraProjectStatusRules) InProgressContains(status string) bool {
-	return containsString(r.InProgressMembers, status)
+	return slices.Contains(r.InProgressMembers, status)
 }
 
 // DoneContains reports whether status is a member of the Done rule.
 func (r JiraProjectStatusRules) DoneContains(status string) bool {
-	return containsString(r.DoneMembers, status)
-}
-
-func containsString(list []string, s string) bool {
-	for _, m := range list {
-		if m == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(r.DoneMembers, status)
 }
 
 // RuleForProject returns the per-project rule for the given key, or

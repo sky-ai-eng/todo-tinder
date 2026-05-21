@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -565,7 +566,7 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 					state := s.jiraClient.GetClaimState(issueKey)
 
 					needAssign := state == nil || !state.AssignedToSelf
-					needTransition := state == nil || !containsStatus(ipMembers, state.StatusName)
+					needTransition := state == nil || !slices.Contains(ipMembers, state.StatusName)
 
 					if !needAssign && !needTransition {
 						log.Printf("[jira] claim guard: %s already assigned to self and already in in-progress (%q), skipping", issueKey, state.StatusName)

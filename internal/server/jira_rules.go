@@ -29,15 +29,3 @@ func lookupJiraRuleForTask(ctx context.Context, tx db.TxStores, task *domain.Tas
 	}
 	return domain.RuleForProject(rules, projectFromKey(task.EntitySourceID))
 }
-
-// containsStatus reports whether status is a member of the slice.
-// Inlined so callers don't have to construct a domain rule just to
-// run a membership check.
-func containsStatus(members []string, status string) bool {
-	for _, m := range members {
-		if m == status {
-			return true
-		}
-	}
-	return false
-}

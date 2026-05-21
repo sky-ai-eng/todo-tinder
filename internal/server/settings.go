@@ -43,16 +43,6 @@ type jiraStatusRule struct {
 	Canonical string   `json:"canonical,omitempty"`
 }
 
-// Contains reports whether the given status is a member of the rule.
-func (r jiraStatusRule) Contains(status string) bool {
-	for _, m := range r.Members {
-		if m == status {
-			return true
-		}
-	}
-	return false
-}
-
 // jiraProjectConfig is the per-project wire shape for the settings
 // handler. Three status rules — pickup, in-progress, done — keyed by
 // project_key. Mirrors what the deleted config.JiraProjectConfig

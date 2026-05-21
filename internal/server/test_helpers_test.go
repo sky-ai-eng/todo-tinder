@@ -64,7 +64,7 @@ func newTestServer(t *testing.T) *Server {
 	// settings GET see a realistic Server.Port (3000) — keeps test
 	// behavior aligned with production and lets future assertions
 	// on server_port pass through to the schema-mirroring path.
-	return New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.EventHandlers, stores.Agents, stores.TeamAgents, stores.Users, stores.Chains, stores.Tasks, stores.Factory, stores.AgentRuns, stores.Entities, stores.Reviews, stores.PendingPRs, stores.Repos, stores.Projects, stores.Events, stores.TaskMemory, stores.Secrets, stores.Curator, stores.Teams, stores.Orgs, stores.JiraStatusRules, stores.Tx, "", 3000)
+	return New(database, stores, "", 3000)
 }
 
 // doJSON performs a JSON request against the server's mux and returns

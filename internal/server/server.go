@@ -227,38 +227,43 @@ func (s *Server) agentEnabledForOrg(ctx context.Context, orgID, userID string) (
 	return a, enabled, nil
 }
 
-// New creates a new server with the given database + the per-resource
-// stores migrated under SKY-246, and registers all routes. The
-// argument list grows one store at a time as their callers migrate;
-// raw *sql.DB stays available for handlers that haven't been ported
-// to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, eventHandlers db.EventHandlerStore, agents db.AgentStore, teamAgents db.TeamAgentStore, users db.UsersStore, chains db.ChainStore, tasks db.TaskStore, factory db.FactoryReadStore, agentRuns db.AgentRunStore, entities db.EntityStore, reviews db.ReviewStore, pendingPRs db.PendingPRStore, repos db.RepoStore, projects db.ProjectStore, events db.EventStore, taskMemory db.TaskMemoryStore, secrets db.SecretStore, curatorStore db.CuratorStore, teams db.TeamsStore, orgs db.OrgsStore, jiraRules db.JiraStatusRulesStore, tx db.TxRunner, takeoverDir string, serverPort int) *Server {
+// New creates a new server with the given database + the full
+// per-resource store bundle + the boot-time deployment scalars
+// (takeover dir, stored server port), and registers all routes.
+// The Server retains individual store fields rather than a single
+// db.Stores struct so existing handler code keeps working — the
+// constructor just unpacks the bundle once instead of forcing every
+// caller to enumerate 20+ stores positionally.
+//
+// raw *sql.DB stays available for handlers that haven't been
+// ported to a store yet.
+func New(database *sql.DB, stores db.Stores, takeoverDir string, serverPort int) *Server {
 	s := &Server{
 		db:            database,
-		prompts:       prompts,
-		swipes:        swipes,
-		dashboard:     dashboard,
-		eventHandlers: eventHandlers,
-		agents:        agents,
-		teamAgents:    teamAgents,
-		users:         users,
-		chains:        chains,
-		tasks:         tasks,
-		factory:       factory,
-		agentRuns:     agentRuns,
-		entities:      entities,
-		reviews:       reviews,
-		pendingPRs:    pendingPRs,
-		repos:         repos,
-		projects:      projects,
-		events:        events,
-		taskMemory:    taskMemory,
-		secrets:       secrets,
-		curatorStore:  curatorStore,
-		teams:         teams,
-		orgs:          orgs,
-		jiraRules:     jiraRules,
-		tx:            tx,
+		prompts:       stores.Prompts,
+		swipes:        stores.Swipes,
+		dashboard:     stores.Dashboard,
+		eventHandlers: stores.EventHandlers,
+		agents:        stores.Agents,
+		teamAgents:    stores.TeamAgents,
+		users:         stores.Users,
+		chains:        stores.Chains,
+		tasks:         stores.Tasks,
+		factory:       stores.Factory,
+		agentRuns:     stores.AgentRuns,
+		entities:      stores.Entities,
+		reviews:       stores.Reviews,
+		pendingPRs:    stores.PendingPRs,
+		repos:         stores.Repos,
+		projects:      stores.Projects,
+		events:        stores.Events,
+		taskMemory:    stores.TaskMemory,
+		secrets:       stores.Secrets,
+		curatorStore:  stores.Curator,
+		teams:         stores.Teams,
+		orgs:          stores.Orgs,
+		jiraRules:     stores.JiraStatusRules,
+		tx:            stores.Tx,
 		takeoverDir:   takeoverDir,
 		serverPort:    serverPort,
 		mux:           http.NewServeMux(),
